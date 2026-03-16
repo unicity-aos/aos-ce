@@ -126,7 +126,10 @@ mod tests {
     #[test]
     fn estimate_total_saturates_instead_of_overflow() {
         // Verify we use saturating_add, not wrapping sum.
-        let result = [u64::MAX, 1].iter().copied().fold(0u64, u64::saturating_add);
+        let result = [u64::MAX, 1]
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add);
         assert_eq!(result, u64::MAX);
     }
 
@@ -154,8 +157,10 @@ mod tests {
             .map(|i| make_msg(&format!("msg-{i}"), &format!("Message content number {i}")))
             .collect();
 
-        let protected: HashSet<String> =
-            ["msg-0", "msg-3", "msg-7"].iter().map(|s| (*s).to_string()).collect();
+        let protected: HashSet<String> = ["msg-0", "msg-3", "msg-7"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
 
         let result = summarize_and_truncate(&messages, 10, &protected, 5);
 
