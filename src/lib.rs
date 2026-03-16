@@ -90,7 +90,7 @@ fn discover_providers() -> Vec<ProviderEntry> {
         None => {
             let _ = ipc::unsubscribe(&sub);
             return Vec::new();
-        },
+        }
     };
 
     if ipc::publish_json("astrid.v1.request.get_capsule_metadata", &wrapped).is_err() {
@@ -262,7 +262,7 @@ fn handle_set_active_model(payload: &serde_json::Value) {
                 &serde_json::json!({"error": "missing model_id"}),
             );
             return;
-        },
+        }
     };
 
     let mut state = load_state();
@@ -333,8 +333,8 @@ impl Registry {
         let sub = ipc::subscribe("registry.v1.*").map_err(|e| SysError::ApiError(e.to_string()))?;
 
         // Subscribe to CLI command execution so we can handle `/models`.
-        let cmd_sub =
-            ipc::subscribe("cli.v1.command.execute").map_err(|e| SysError::ApiError(e.to_string()))?;
+        let cmd_sub = ipc::subscribe("cli.v1.command.execute")
+            .map_err(|e| SysError::ApiError(e.to_string()))?;
 
         // Subscribe to model selection callbacks from the TUI picker.
         let selection_sub = ipc::subscribe("registry.v1.selection.callback")
@@ -389,7 +389,7 @@ impl Registry {
                     if !bytes.is_empty() {
                         handle_poll_envelope(&bytes);
                     }
-                },
+                }
                 Err(_) => break,
             }
 
@@ -462,7 +462,8 @@ fn handle_poll_envelope(poll_bytes: &[u8]) {
         };
 
         // Skip our own response messages to avoid unnecessary processing.
-        if topic.starts_with("registry.v1.response.") || topic == "registry.v1.active_model_changed" {
+        if topic.starts_with("registry.v1.response.") || topic == "registry.v1.active_model_changed"
+        {
             continue;
         }
 
@@ -473,8 +474,8 @@ fn handle_poll_envelope(poll_bytes: &[u8]) {
                 if let Some(payload) = msg.get("payload") {
                     handle_set_active_model(payload);
                 }
-            },
-            _ => {},
+            }
+            _ => {}
         }
     }
 }
