@@ -196,8 +196,8 @@ impl ContextEngine {
             config.hook_timeout_ms, config.keep_recent
         ));
 
-        let sub = ipc::subscribe("context_engine.v1.*")
-            .map_err(|e| SysError::ApiError(e.to_string()))?;
+        let sub =
+            ipc::subscribe("context_engine.v1.*").map_err(|e| SysError::ApiError(e.to_string()))?;
 
         // Subscribe to our own hook topics so we can drain them.
         let hook_sub = ipc::subscribe("context_engine.v1.hook.before_compaction")
@@ -218,7 +218,7 @@ impl ContextEngine {
                     if !bytes.is_empty() {
                         handle_poll_envelope(&bytes, &config);
                     }
-                },
+                }
                 Err(_) => break,
             }
 
@@ -255,7 +255,7 @@ fn handle_poll_envelope(poll_bytes: &[u8], config: &Config) {
                 format!("failed to deserialize IPC poll envelope: {e}"),
             );
             return;
-        },
+        }
     };
 
     if let Some(dropped) = envelope.get("dropped").and_then(|d| d.as_u64())
@@ -293,7 +293,7 @@ fn handle_poll_envelope(poll_bytes: &[u8], config: &Config) {
         match topic {
             "context_engine.v1.compact" => handle_compact(request_value, config),
             "context_engine.v1.estimate_tokens" => handle_estimate_tokens(request_value),
-            _ => {},
+            _ => {}
         }
     }
 }
@@ -319,7 +319,7 @@ fn handle_compact(payload: &serde_json::Value, config: &Config) {
                 &serde_json::json!({"error": format!("invalid request: {e}")}),
             );
             return;
-        },
+        }
     };
 
     // Enforce: target_tokens must not exceed max_tokens.
@@ -335,7 +335,10 @@ fn handle_compact(payload: &serde_json::Value, config: &Config) {
     if merged.skip {
         let _ = log::log(
             "info",
-            format!("Compaction skipped by plugin for session {}", request.session_id),
+            format!(
+                "Compaction skipped by plugin for session {}",
+                request.session_id
+            ),
         );
         let response = CompactResponse {
             messages: request.messages,
@@ -403,7 +406,7 @@ fn handle_estimate_tokens(payload: &serde_json::Value) {
                 &serde_json::json!({"error": format!("invalid request: {e}")}),
             );
             return;
-        },
+        }
     };
 
     let estimated_tokens = strategy::estimate_total_tokens(&request.messages);
@@ -455,7 +458,7 @@ fn fire_before_compaction(
                 skip: false,
                 protected_ids: HashSet::new(),
             };
-        },
+        }
     };
 
     let payload = BeforeCompactionPayload {
@@ -481,8 +484,8 @@ fn fire_before_compaction(
 
     // Block-wait for hook responses within the configured timeout.
     let mut responses: Vec<BeforeCompactionHookResponse> = Vec::new();
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(config.hook_timeout_ms);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(config.hook_timeout_ms);
 
     while std::time::Instant::now() < deadline && responses.len() < MAX_HOOK_RESPONSES {
         let remaining_ms = deadline
@@ -498,7 +501,7 @@ fn fire_before_compaction(
                 if let Some(new_responses) = parse_hook_responses(&bytes) {
                     responses.extend(new_responses);
                 }
-            },
+            }
             _ => break,
         }
     }
@@ -508,7 +511,10 @@ fn fire_before_compaction(
     if !responses.is_empty() {
         let _ = log::log(
             "info",
-            format!("Collected {} context_engine.v1.hook.before_compaction responses", responses.len()),
+            format!(
+                "Collected {} context_engine.v1.hook.before_compaction responses",
+                responses.len()
+            ),
         );
     }
 
@@ -525,7 +531,7 @@ fn parse_hook_responses(poll_bytes: &[u8]) -> Option<Vec<BeforeCompactionHookRes
                 format!("failed to deserialize compaction response envelope: {e}"),
             );
             return None;
-        },
+        }
     };
     let messages = envelope.get("messages")?.as_array()?;
     let mut responses = Vec::new();
@@ -537,17 +543,19 @@ fn parse_hook_responses(poll_bytes: &[u8]) -> Option<Vec<BeforeCompactionHookRes
         };
 
         // Try direct payload, then nested in Custom `data` envelope.
-        let maybe_response = serde_json::from_value::<BeforeCompactionHookResponse>(payload.clone())
-            .ok()
-            .filter(BeforeCompactionHookResponse::has_any_field)
-            .or_else(|| {
-                payload
-                    .get("data")
-                    .and_then(|data| {
-                        serde_json::from_value::<BeforeCompactionHookResponse>(data.clone()).ok()
-                    })
-                    .filter(BeforeCompactionHookResponse::has_any_field)
-            });
+        let maybe_response =
+            serde_json::from_value::<BeforeCompactionHookResponse>(payload.clone())
+                .ok()
+                .filter(BeforeCompactionHookResponse::has_any_field)
+                .or_else(|| {
+                    payload
+                        .get("data")
+                        .and_then(|data| {
+                            serde_json::from_value::<BeforeCompactionHookResponse>(data.clone())
+                                .ok()
+                        })
+                        .filter(BeforeCompactionHookResponse::has_any_field)
+                });
 
         if let Some(response) = maybe_response {
             responses.push(response);
@@ -568,16 +576,17 @@ fn parse_hook_responses(poll_bytes: &[u8]) -> Option<Vec<BeforeCompactionHookRes
 fn merge_before_compaction_responses(
     responses: &[BeforeCompactionHookResponse],
 ) -> MergedBeforeCompaction {
-    let skip = responses
-        .iter()
-        .any(|r| r.skip == Some(true));
+    let skip = responses.iter().any(|r| r.skip == Some(true));
 
     let protected_ids: HashSet<String> = responses
         .iter()
         .flat_map(|r| r.pinned_message_ids.iter().cloned())
         .collect();
 
-    MergedBeforeCompaction { skip, protected_ids }
+    MergedBeforeCompaction {
+        skip,
+        protected_ids,
+    }
 }
 
 /// Fire the `context_engine.v1.hook.after_compaction` notification (fire-and-forget).

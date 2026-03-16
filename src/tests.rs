@@ -137,8 +137,7 @@ fn hook_response_deserializes_snake_case_alias() {
 
 #[test]
 fn hook_response_deserializes_empty() {
-    let resp: BeforeCompactionHookResponse =
-        serde_json::from_str("{}").expect("should parse");
+    let resp: BeforeCompactionHookResponse = serde_json::from_str("{}").expect("should parse");
     assert!(!resp.has_any_field());
     assert_eq!(resp.skip, None);
     assert!(resp.pinned_message_ids.is_empty());
@@ -146,23 +145,29 @@ fn hook_response_deserializes_empty() {
 
 #[test]
 fn hook_response_has_any_field_detects_each() {
-    assert!(BeforeCompactionHookResponse {
-        skip: Some(false),
-        ..Default::default()
-    }
-    .has_any_field());
+    assert!(
+        BeforeCompactionHookResponse {
+            skip: Some(false),
+            ..Default::default()
+        }
+        .has_any_field()
+    );
 
-    assert!(BeforeCompactionHookResponse {
-        pinned_message_ids: vec!["x".into()],
-        ..Default::default()
-    }
-    .has_any_field());
+    assert!(
+        BeforeCompactionHookResponse {
+            pinned_message_ids: vec!["x".into()],
+            ..Default::default()
+        }
+        .has_any_field()
+    );
 
-    assert!(BeforeCompactionHookResponse {
-        custom_strategy: Some("x".into()),
-        ..Default::default()
-    }
-    .has_any_field());
+    assert!(
+        BeforeCompactionHookResponse {
+            custom_strategy: Some("x".into()),
+            ..Default::default()
+        }
+        .has_any_field()
+    );
 
     assert!(!BeforeCompactionHookResponse::default().has_any_field());
 }
@@ -347,17 +352,28 @@ fn target_tokens_clamped_to_max_tokens() {
     let max_tokens: u64 = 100_000;
     let target_tokens: u64 = 200_000;
     let clamped = target_tokens.min(max_tokens);
-    assert_eq!(clamped, 100_000, "target_tokens should be clamped to max_tokens");
+    assert_eq!(
+        clamped, 100_000,
+        "target_tokens should be clamped to max_tokens"
+    );
 
     // When target <= max, no clamping occurs.
     let target_tokens: u64 = 50_000;
     let clamped = target_tokens.min(max_tokens);
-    assert_eq!(clamped, 50_000, "target_tokens within range should be unchanged");
+    assert_eq!(
+        clamped, 50_000,
+        "target_tokens within range should be unchanged"
+    );
 
     // Verify the strategy respects the clamped value by running compaction
     // with a low max_tokens — messages should be removed.
     let messages: Vec<serde_json::Value> = (0..20)
-        .map(|i| make_msg(&format!("msg-{i}"), &format!("Message content number {i} with padding")))
+        .map(|i| {
+            make_msg(
+                &format!("msg-{i}"),
+                &format!("Message content number {i} with padding"),
+            )
+        })
         .collect();
 
     let over_budget_target: u64 = 200_000;
@@ -405,6 +421,10 @@ fn should_not_dispatch_hook_response_topics() {
 
 #[test]
 fn should_not_dispatch_interceptor_topics() {
-    assert!(!should_dispatch_topic("context_engine.v1.hook.before_compaction"));
-    assert!(!should_dispatch_topic("context_engine.v1.hook.after_compaction"));
+    assert!(!should_dispatch_topic(
+        "context_engine.v1.hook.before_compaction"
+    ));
+    assert!(!should_dispatch_topic(
+        "context_engine.v1.hook.after_compaction"
+    ));
 }
