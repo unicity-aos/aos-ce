@@ -1,0 +1,29 @@
+[package]
+name = "astrid-capsule-openai-compat"
+version = "0.1.0"
+description = "OpenAI-compatible LLM Provider"
+authors = ["Astrid Core Team"]
+astrid-version = ">=0.1.0"
+
+[[component]]
+id = "openai-compat"
+file = "astrid_capsule_openai_compat.wasm"
+type = "executable"
+capabilities = { net = ["*"] }
+
+[capabilities]
+ipc_publish = ["llm.v1.stream.openai-compat"]
+
+[env]
+api_key = { type = "secret", request = "Enter your API key for the OpenAI-compatible provider" }
+base_url = { type = "string", request = "Enter the API base URL (e.g. https://api.openai.com/v1)", default = "https://api.openai.com/v1" }
+model = { type = "string", request = "Enter the default model ID (e.g. gpt-4o)", default = "gpt-4o" }
+
+[[llm_provider]]
+id = "openai-compat"
+description = "OpenAI-compatible provider (configurable via base_url)"
+capabilities = ["text", "vision", "tools"]
+
+[[interceptor]]
+event = "llm.v1.request.generate.openai-compat"
+action = "handle_llm_request"
