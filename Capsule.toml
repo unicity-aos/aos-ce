@@ -16,9 +16,9 @@ net = ["*"]
 ipc_publish = ["llm.v1.stream.openai-compat"]
 
 [env]
-api_key = { type = "secret", request = "Enter your API key for the OpenAI-compatible provider" }
-base_url = { type = "string", request = "Enter the API base URL (e.g. https://api.openai.com/v1)", default = "https://api.openai.com/v1" }
-model = { type = "string", request = "Enter the default model ID (e.g. gpt-4o)", default = "gpt-4o" }
+api_key = { type = "secret", request = "Enter your API key for the OpenAI-compatible provider", placeholder = "sk-..." }
+base_url = { type = "string", request = "Enter the API base URL", default = "https://api.openai.com/v1", placeholder = "https://api.openai.com/v1" }
+model = { type = "string", request = "Enter the default model ID", default = "gpt-5.4", placeholder = "gpt-5.4" }
 
 [[llm_provider]]
 id = "openai-compat"

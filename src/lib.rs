@@ -76,7 +76,7 @@ impl OpenAICompatProvider {
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
         let resolved_model = if model.is_empty() {
-            env::var("model").unwrap_or_else(|_| "gpt-4o".into())
+            env::var("model").unwrap_or_else(|_| "gpt-5.4".into())
         } else {
             model.to_string()
         };
