@@ -12,6 +12,7 @@ type = "executable"
 capabilities = { net = ["*"] }
 
 [capabilities]
+net = ["*"]
 ipc_publish = ["llm.v1.stream.openai-compat"]
 
 [env]
