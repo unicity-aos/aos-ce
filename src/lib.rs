@@ -131,31 +131,16 @@ impl IdentityBuilder {
 
         prompt.push_str(TOOL_GUIDELINES);
 
-        // Load project instructions (AGENTS.md or ASTRID.md)
-        let agents_path = format!("{workspace_root}/AGENTS.md");
-        if let Ok(content) = fs::read_to_string(&agents_path) {
-            if !content.trim().is_empty() {
-                prompt.push_str("\n\n# Agents Guidelines\n\n");
-                prompt.push_str(&content);
-            }
-        } else {
-            let astrid_path = format!("{workspace_root}/ASTRID.md");
-            if let Ok(content) = fs::read_to_string(&astrid_path)
-                && !content.trim().is_empty()
-            {
-                prompt.push_str("\n\n# Project Instructions\n\n");
-                prompt.push_str(&content);
-            }
-        }
-
-        // Load .astridignore workspace bounds
-        let ignore_path = format!("{workspace_root}/.astridignore");
-        if let Ok(content) = fs::read_to_string(&ignore_path)
-            && !content.trim().is_empty()
-        {
-            prompt.push_str("\n\n# Workspace Bounds (.astridignore)\n\n");
-            prompt.push_str(&content);
-        }
+        // Load project instructions (AGENTS.md, ASTRID.md, .astridignore).
+        //
+        // NOTE: The kernel VFS traps (aborts WASM) on security denials instead
+        // of returning errors. Until that's fixed, we must catch panics via
+        // a helper that uses std::panic::catch_unwind internally... except WASM
+        // doesn't support catch_unwind. So we skip file reads entirely for now
+        // and rely on the spark config + hardcoded defaults.
+        //
+        // TODO: Fix kernel VFS to return Err on security denial, then re-enable:
+        //   if let Ok(content) = fs::read_to_string("AGENTS.md") { ... }
 
         let response = BuildResponse {
             prompt,
