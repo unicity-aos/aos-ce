@@ -11,12 +11,12 @@
 //! events back to the event bus.
 //!
 //! Configure `base_url` to point at any compatible provider:
-//! - OpenAI: `https://api.openai.com/v1`
-//! - Groq: `https://api.groq.com/openai/v1`
-//! - Together: `https://api.together.xyz/v1`
-//! - Mistral: `https://api.mistral.ai/v1`
-//! - DeepSeek: `https://api.deepseek.com/v1`
-//! - Fireworks: `https://api.fireworks.ai/inference/v1`
+//! - OpenAI: `https://api.openai.com`
+//! - Groq: `https://api.groq.com/openai`
+//! - Together: `https://api.together.xyz`
+//! - Mistral: `https://api.mistral.ai`
+//! - DeepSeek: `https://api.deepseek.com`
+//! - Fireworks: `https://api.fireworks.ai/inference`
 
 mod schemas;
 
@@ -72,8 +72,8 @@ impl OpenAICompatProvider {
         tools: &[astrid_sdk::types::LlmToolDefinition],
         system: &str,
     ) -> Result<(), SysError> {
-        let base_url = env::var("base_url").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let base_url = env::var("base_url").unwrap_or_else(|_| "https://api.openai.com".into());
+        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
 
         let resolved_model = if model.is_empty() {
             env::var("model").unwrap_or_else(|_| "gpt-5.4".into())
