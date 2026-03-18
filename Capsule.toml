@@ -1,7 +1,7 @@
 [package]
 name = "astrid-capsule-identity"
-version = "0.1.0"
-description = "Context Builder Capsule for Astrid OS"
+version = "0.2.0"
+description = "Agent identity capsule — owns spark config, builds system prompt"
 authors = ["Astrid Core Team"]
 astrid-version = ">=0.1.0"
 
@@ -9,13 +9,23 @@ astrid-version = ">=0.1.0"
 id = "identity-builder"
 file = "astrid_capsule_identity.wasm"
 type = "executable"
-# Identity builder only reads workspace files (AGENTS.md, .astridignore).
-# global:// is not needed — add it here if/when global identity config is supported.
-capabilities = { fs_read = ["workspace://"] }
+capabilities = { fs_read = ["workspace://"], fs_write = ["workspace://"] }
 
 [capabilities]
-ipc_publish = ["identity.v1.response.ready"]
+ipc_publish = ["identity.v1.response.ready", "agent.v1.response"]
 
 [[interceptor]]
 event = "identity.v1.request.build"
 action = "handle_build_request"
+
+[[interceptor]]
+event = "cli.v1.command.execute"
+action = "handle_command"
+
+[[command]]
+name = "identity-export"
+description = "Export agent identity (spark config) to .astrid/spark.toml"
+
+[[command]]
+name = "identity-import"
+description = "Import agent identity from .astrid/spark.toml into KV store"

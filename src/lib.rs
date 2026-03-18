@@ -3,61 +3,82 @@
 #![deny(unreachable_pub)]
 #![warn(missing_docs)]
 
-//! Identity builder capsule for Astrid OS.
+//! Identity capsule for Astrid OS.
 //!
-//! Subscribes to `identity.v1.request.build` IPC events and generates the
-//! system prompt for the react capsule by reading workspace
-//! configuration files (AGENTS.md, .astridignore) and the spark identity.
+//! Owns the agent's identity (spark config) as persistent state. Builds
+//! the system prompt on `identity.v1.request.build` requests. On first
+//! boot, injects an onboarding instruction so the agent walks the user
+//! through identity setup. Provides `/identity-export` and
+//! `/identity-import` CLI commands.
 
 use astrid_sdk::prelude::*;
-use astrid_sdk::schemars;
+use astrid_sdk::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 
-/// Identity builder capsule. Stateless — reads workspace files on each request.
-#[derive(Default)]
-pub struct IdentityBuilder;
+/// Default agent name when no spark config exists.
+const DEFAULT_CALLSIGN: &str = "Astrid";
+/// Default agent class/role.
+const DEFAULT_CLASS: &str = "a secure coding assistant";
 
-/// Request payload for building the system prompt.
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct BuildRequest {
-    /// Absolute path to the workspace root directory.
-    pub workspace_root: String,
-    /// Optional agent identity configuration (from spark.toml).
-    pub spark: Option<SparkConfig>,
-    /// Session ID for correlation. Echoed back in the response so the
-    /// react loop can resolve the correct turn state without a KV lookup.
-    #[serde(default)]
-    pub session_id: Option<String>,
-}
+/// Onboarding instruction appended to the system prompt when the user
+/// hasn't configured their agent identity yet.
+const ONBOARDING_PROMPT: &str = "\
+# Important: Identity Setup Required
 
-/// Agent identity configuration fields from spark.toml.
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+This is your first session. You have no name or identity yet. Introduce
+yourself briefly, then ask the user one open question about how they'd like
+to work together. Let the conversation flow naturally. From it, derive a name,
+personality, and focus that feel right — then surface what you came up with
+and let the user react. Adjust from there. Once you've landed on something,
+call `set_identity` to save it. Always call it — if the user wants to skip,
+derive something fitting from the exchange and confirm it casually before saving.";
+
+/// Agent identity configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct SparkConfig {
     /// Agent name/identifier.
+    #[serde(default)]
     pub callsign: String,
     /// Agent role description.
+    #[serde(default)]
     pub class: String,
     /// Personality traits.
+    #[serde(default)]
     pub aura: String,
     /// Communication style preferences.
+    #[serde(default)]
     pub signal: String,
     /// Core directives and constraints.
+    #[serde(default)]
     pub core: String,
+}
+
+impl Default for SparkConfig {
+    fn default() -> Self {
+        Self {
+            callsign: DEFAULT_CALLSIGN.into(),
+            class: DEFAULT_CLASS.into(),
+            aura: String::new(),
+            signal: String::new(),
+            core: String::new(),
+        }
+    }
 }
 
 impl SparkConfig {
     /// Build the identity preamble from spark fields.
-    /// Returns `None` if the callsign is empty.
-    fn build_preamble(&self) -> Option<String> {
-        if self.callsign.is_empty() {
-            return None;
-        }
+    fn build_preamble(&self) -> String {
+        let callsign = if self.callsign.is_empty() {
+            DEFAULT_CALLSIGN
+        } else {
+            &self.callsign
+        };
 
         let mut parts = vec![];
         if !self.class.is_empty() {
-            parts.push(format!("You are {}, a {}.", self.callsign, self.class));
+            parts.push(format!("You are {callsign}, {class}.", class = self.class));
         } else {
-            parts.push(format!("You are {}.", self.callsign));
+            parts.push(format!("You are {callsign}."));
         }
 
         if !self.aura.is_empty() {
@@ -70,77 +91,67 @@ impl SparkConfig {
             parts.push(format!("# Core Directives\n{}", self.core));
         }
 
-        Some(parts.join("\n\n"))
+        parts.join("\n\n")
+    }
+
+    /// Serialize to TOML for export.
+    fn to_toml(&self) -> String {
+        toml::to_string(self).unwrap_or_default()
     }
 }
 
-/// Response payload containing the assembled system prompt.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BuildResponse {
-    /// The fully assembled system prompt string.
-    pub prompt: String,
-    /// Session ID echoed from the request for correlation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+/// Request payload for building the system prompt.
+#[derive(Debug, Deserialize)]
+pub struct BuildRequest {
+    /// Absolute path to the workspace root directory.
+    pub workspace_root: String,
+    /// Session ID for correlation.
+    #[serde(default)]
     pub session_id: Option<String>,
 }
 
-const TOOL_GUIDELINES: &str = "\
-# Tool Usage Guidelines
+/// Response payload containing the assembled system prompt.
+#[derive(Debug, Serialize)]
+struct BuildResponse {
+    /// The fully assembled system prompt string.
+    prompt: String,
+    /// Session ID echoed from the request for correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+}
 
-## File Operations
-- Always read a file before editing it.
-- Prefer `edit_file` over `write_file` for existing files.
-- Use `read_file` with offset/limit for large files.
-
-## Search
-- Use `glob` to find files by name pattern before using `grep` to search contents.
-- Use `grep` with a file glob filter to narrow searches to relevant file types.
-
-## Execution
-- Use `bash` for git, build tools, package managers, and other terminal operations.
-- Do NOT use `bash` for file operations — use the dedicated file tools.
-- The bash working directory persists between calls.
-
-## General
-- Read before writing. Understand before changing.
-- Make minimal, focused changes.";
+/// Identity capsule state — persisted to KV via `#[capsule(state)]`.
+#[derive(Default, Debug, Serialize, Deserialize)]
+pub struct IdentityBuilder {
+    /// The spark identity configuration.
+    spark: SparkConfig,
+    /// Whether the user has completed identity onboarding.
+    onboarded: bool,
+}
 
 #[capsule]
 impl IdentityBuilder {
-    /// Handles `identity.v1.request.build` events. Reads workspace configuration
-    /// and publishes the assembled system prompt to `identity.v1.response.ready`.
+    /// Builds the system prompt from the spark identity.
     #[astrid::interceptor("handle_build_request")]
-    pub fn build_system_prompt(&self, req: BuildRequest) -> Result<(), SysError> {
+    pub fn build_system_prompt(&mut self, req: BuildRequest) -> Result<(), SysError> {
         let workspace_root = req.workspace_root.trim_end_matches('/');
-        let project_name = workspace_root.rsplit('/').next().unwrap_or("project");
 
-        let opening = req
-            .spark
-            .as_ref()
-            .and_then(|s| s.build_preamble())
-            .unwrap_or_else(|| {
-                format!("You are Astrid, working in the project \"{project_name}\".")
-            });
-
+        // TODO: Move to a new capsule which handles env details. Time would be good too.
         let mut prompt = format!(
-            "{opening}\n\n\
-             # Environment\n\
+            "# Environment\n\
              - Current working directory: {workspace_root}\n\
-             - Platform: astrid-os\n\n"
+             - Platform: astrid-os"
         );
 
-        prompt.push_str(TOOL_GUIDELINES);
-
-        // Load project instructions (AGENTS.md, ASTRID.md, .astridignore).
-        //
-        // NOTE: The kernel VFS traps (aborts WASM) on security denials instead
-        // of returning errors. Until that's fixed, we must catch panics via
-        // a helper that uses std::panic::catch_unwind internally... except WASM
-        // doesn't support catch_unwind. So we skip file reads entirely for now
-        // and rely on the spark config + hardcoded defaults.
-        //
-        // TODO: Fix kernel VFS to return Err on security denial, then re-enable:
-        //   if let Ok(content) = fs::read_to_string("AGENTS.md") { ... }
+        if self.onboarded {
+            // Prepend the established identity preamble.
+            let opening = self.spark.build_preamble();
+            prompt = format!("{opening}\n\n{prompt}");
+        } else {
+            // No preamble — don't anchor the model to a name before onboarding.
+            prompt.push_str("\n\n");
+            prompt.push_str(ONBOARDING_PROMPT);
+        }
 
         let response = BuildResponse {
             prompt,
@@ -150,4 +161,69 @@ impl IdentityBuilder {
 
         Ok(())
     }
+
+    /// Handles `/identity-export` and `/identity-import` CLI commands.
+    #[astrid::interceptor("handle_command")]
+    pub fn handle_command(&mut self, payload: serde_json::Value) -> Result<(), SysError> {
+        let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let session_id = payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+
+        match text.trim() {
+            "identity-export" => {
+                let toml = self.spark.to_toml();
+                fs::write(".astrid/spark.toml", &toml)?;
+
+                ipc::publish_json(
+                    "agent.v1.response",
+                    &serde_json::json!({
+                        "type": "agent_response",
+                        "text": format!("Identity exported to .astrid/spark.toml ({} bytes)", toml.len()),
+                        "is_final": true,
+                        "session_id": session_id,
+                    }),
+                )?;
+            }
+            "identity-import" => {
+                let content = fs::read_to_string(".astrid/spark.toml")?;
+                self.spark = parse_spark_toml(&content);
+                self.onboarded = true;
+
+                ipc::publish_json(
+                    "agent.v1.response",
+                    &serde_json::json!({
+                        "type": "agent_response",
+                        "text": format!("Identity imported from .astrid/spark.toml (callsign: {})", self.spark.callsign),
+                        "is_final": true,
+                        "session_id": session_id,
+                    }),
+                )?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Set the agent identity. Updates the spark config and marks
+    /// onboarding as complete.
+    #[astrid::tool]
+    pub fn set_identity(&mut self, input: SparkConfig) -> Result<serde_json::Value, SysError> {
+        self.spark = input;
+        self.onboarded = true;
+        Ok(serde_json::json!({
+            "status": "ok",
+            "callsign": self.spark.callsign,
+        }))
+    }
+}
+
+/// Parse spark.toml into a `SparkConfig`.
+fn parse_spark_toml(content: &str) -> SparkConfig {
+    toml::from_str(content).unwrap_or_else(|e| {
+        let _ = log::warn(format!("Failed to parse spark.toml, using defaults: {e}"));
+        SparkConfig::default()
+    })
 }
