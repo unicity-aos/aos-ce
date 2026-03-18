@@ -22,7 +22,7 @@ mod schemas;
 
 use astrid_sdk::prelude::*;
 use astrid_sdk::types::{IpcPayload, Message, MessageContent, MessageRole, StreamEvent};
-use schemas::{ChatCompletionChunk, HttpRequest};
+use schemas::ChatCompletionChunk;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -126,20 +126,11 @@ impl OpenAICompatProvider {
             return Err(SysError::ApiError("api_key not configured".into()));
         }
 
-        let mut headers = std::collections::HashMap::new();
-        headers.insert("authorization".to_string(), format!("Bearer {api_key}"));
-        headers.insert("content-type".to_string(), "application/json".to_string());
+        let req = http::Request::post(&url)
+            .header("authorization", format!("Bearer {api_key}"))
+            .json(&request_body)?;
 
-        let req = HttpRequest {
-            url,
-            method: "POST".to_string(),
-            headers,
-            body: Some(serde_json::to_string(&request_body)?),
-        };
-
-        let req_bytes = serde_json::to_vec(&req)?;
-
-        let resp = http::stream_start(&req_bytes)?;
+        let resp = http::stream_start(&req)?;
 
         if resp.status != 200 {
             // Drain the error body for the error message.

@@ -65,19 +65,6 @@ pub(crate) struct OpenAIUsage {
     pub(crate) completion_tokens: usize,
 }
 
-/// HTTP request payload for the SDK http airlock.
-#[derive(serde::Serialize)]
-pub(crate) struct HttpRequest {
-    /// Target URL.
-    pub(crate) url: String,
-    /// HTTP method.
-    pub(crate) method: String,
-    /// Request headers.
-    pub(crate) headers: std::collections::HashMap<String, String>,
-    /// Optional request body.
-    pub(crate) body: Option<String>,
-}
-
 /// HTTP response payload from the SDK http airlock (buffered fallback).
 #[derive(Deserialize)]
 #[expect(dead_code)]
