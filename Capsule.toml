@@ -15,10 +15,10 @@ capabilities = { fs_read = ["workspace://"], fs_write = ["workspace://"] }
 spark = "1.0.0"
 
 [capabilities]
-ipc_publish = ["identity.v1.response.ready", "agent.v1.response"]
+ipc_publish = ["spark.v1.response.ready", "agent.v1.response"]
 
 [[interceptor]]
-event = "identity.v1.request.build"
+event = "spark.v1.request.build"
 action = "handle_build_request"
 
 [[interceptor]]

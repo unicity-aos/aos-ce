@@ -6,7 +6,7 @@
 //! Identity capsule for Astrid OS.
 //!
 //! Owns the agent's identity (spark config) as persistent state. Builds
-//! the system prompt on `identity.v1.request.build` requests. On first
+//! the system prompt on `spark.v1.request.build` requests. On first
 //! boot, injects an onboarding instruction so the agent walks the user
 //! through identity setup. Provides `/identity-export` and
 //! `/identity-import` CLI commands.
@@ -157,7 +157,7 @@ impl IdentityBuilder {
             prompt,
             session_id: req.session_id,
         };
-        ipc::publish_json("identity.v1.response.ready", &response)?;
+        ipc::publish_json("spark.v1.response.ready", &response)?;
 
         Ok(())
     }
