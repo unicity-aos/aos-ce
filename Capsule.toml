@@ -11,6 +11,9 @@ file = "astrid_capsule_openai_compat.wasm"
 type = "executable"
 capabilities = { net = ["*"] }
 
+[exports.astrid]
+llm = "1.0.0"
+
 [capabilities]
 net = ["*"]
 ipc_publish = ["llm.v1.stream.openai-compat"]
