@@ -11,6 +11,9 @@ file = "astrid_capsule_identity.wasm"
 type = "executable"
 capabilities = { fs_read = ["workspace://"], fs_write = ["workspace://"] }
 
+[exports.astrid]
+spark = "1.0.0"
+
 [capabilities]
 ipc_publish = ["identity.v1.response.ready", "agent.v1.response"]
 
