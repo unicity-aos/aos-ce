@@ -9,7 +9,7 @@ astrid-version = ">=0.1.0"
 id = "identity-builder"
 file = "astrid_capsule_identity.wasm"
 type = "executable"
-capabilities = { fs_read = ["cwd://"], fs_write = ["cwd://"] }
+capabilities = { fs_read = ["home://"], fs_write = ["home://"] }
 
 [exports.astrid]
 spark = "1.0.0"
@@ -27,8 +27,8 @@ action = "handle_command"
 
 [[command]]
 name = "identity-export"
-description = "Export agent identity (spark config) to .astrid/spark.toml"
+description = "Export agent identity (spark config) to home://.config/spark.toml"
 
 [[command]]
 name = "identity-import"
-description = "Import agent identity from .astrid/spark.toml into KV store"
+description = "Import agent identity from home://.config/spark.toml into KV store"
