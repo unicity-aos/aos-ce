@@ -9,7 +9,7 @@ astrid-version = ">=0.1.0"
 id = "identity-builder"
 file = "astrid_capsule_identity.wasm"
 type = "executable"
-capabilities = { fs_read = ["workspace://"], fs_write = ["workspace://"] }
+capabilities = { fs_read = ["cwd://"], fs_write = ["cwd://"] }
 
 [exports.astrid]
 spark = "1.0.0"
