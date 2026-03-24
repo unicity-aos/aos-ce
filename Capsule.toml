@@ -2,7 +2,7 @@
 name = "astrid-capsule-context-engine"
 version = "0.1.0"
 description = "Pluggable context window compaction with interceptor hook support"
-authors = ["Astrid Core Team"]
+authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 astrid-version = ">=0.1.0"
 
 [[component]]
