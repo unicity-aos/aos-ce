@@ -4,9 +4,10 @@
 
 //! LLM Provider Registry capsule.
 //!
-//! Discovers available LLM providers from loaded capsule manifests and
-//! manages model selection. Frontends query this capsule to list models
-//! and switch between them.
+//! Discovers available LLM providers via IPC hook fan-out and manages
+//! model selection. Provider capsules respond to `llm.v1.request.describe`
+//! with their capabilities and routing topics, following the same pattern
+//! as tool discovery (`tool.v1.request.describe`).
 //!
 //! # IPC Protocol
 //!
@@ -21,26 +22,32 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use astrid_sdk::prelude::*;
-use astrid_sdk::types::{CapsuleMetadataEntry, KernelRequest, KernelResponse, SYSTEM_SESSION_UUID};
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 use serde::{Deserialize, Serialize};
 
+/// The kernel's system session UUID, used to validate IPC messages from the kernel.
+const KERNEL_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
 /// A resolved LLM provider with its IPC routing topics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderEntry {
-    /// Model ID from the capsule manifest (e.g. "claude-3-5-sonnet-20241022").
+    /// Model ID (e.g. "gpt-5.4", "claude-sonnet-4-20250514").
     id: String,
     /// Human-readable description.
     description: String,
-    /// Capsule that provides this model.
-    capsule: String,
     /// IPC topic to publish LLM requests to.
     request_topic: String,
     /// IPC topic the provider streams responses on.
     stream_topic: String,
-    /// Model capabilities.
+    /// Model capabilities (e.g. "text", "vision", "tools").
     capabilities: Vec<String>,
+    /// Provider's context window size in tokens, if declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window: Option<u64>,
+    /// Provider's max output tokens, if declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u64>,
 }
 
 /// The persisted registry state.
@@ -60,55 +67,58 @@ fn save_state(state: &RegistryState) {
     let _ = kv::set_json(STATE_KEY, state);
 }
 
-/// Wrap a `KernelRequest` value in the `IpcPayload::RawJson` JSON shape
-/// so the host deserializes it as `IpcPayload::RawJson(inner)` instead of
-/// falling back to `IpcPayload::Custom`.
+/// Discover LLM providers via IPC hook fan-out.
 ///
-/// `IpcPayload` uses `#[serde(tag = "type", rename_all = "snake_case")]`,
-/// so `RawJson(value)` serializes as the inner object with `"type": "raw_json"` merged.
-fn wrap_as_raw_json(req: &KernelRequest) -> Option<serde_json::Value> {
-    let mut val = serde_json::to_value(req).ok()?;
-    val.as_object_mut()?
-        .insert("type".to_string(), serde_json::json!("raw_json"));
-    Some(val)
-}
-
-/// Query the kernel for capsule metadata and resolve LLM providers.
+/// Uses `hooks::trigger` with `llm.v1.request.describe` — the kernel fans
+/// out to all capsules with matching interceptors and returns a JSON array
+/// of responses. Each provider capsule returns `{"providers": [...]}`.
 fn discover_providers() -> Vec<ProviderEntry> {
-    // Subscribe BEFORE publishing the request. Broadcast channels do not
-    // replay missed messages, so if we publish first the kernel response
-    // could arrive before our subscription is active and be permanently lost.
-    let sub = match ipc::subscribe("astrid.v1.response.get_capsule_metadata") {
-        Ok(h) => h,
-        Err(_) => return Vec::new(),
+    let request = serde_json::json!({
+        "hook": "llm.v1.request.describe",
+        "payload": {},
+    });
+    let request_bytes = match serde_json::to_vec(&request) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = log::log(
+                "warn",
+                format!("Failed to serialize provider discovery request: {e}"),
+            );
+            return Vec::new();
+        }
     };
-
-    let wrapped = match wrap_as_raw_json(&KernelRequest::GetCapsuleMetadata) {
-        Some(v) => v,
-        None => {
-            let _ = ipc::unsubscribe(&sub);
+    let response_bytes = match hooks::trigger(&request_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = log::log(
+                "warn",
+                format!("Provider discovery hook trigger failed: {e}"),
+            );
+            return Vec::new();
+        }
+    };
+    let responses: Vec<serde_json::Value> = match serde_json::from_slice(&response_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = log::log(
+                "warn",
+                format!("Failed to parse provider discovery response: {e}"),
+            );
             return Vec::new();
         }
     };
 
-    if ipc::publish_json("astrid.v1.request.get_capsule_metadata", &wrapped).is_err() {
-        let _ = ipc::unsubscribe(&sub);
-        return Vec::new();
-    }
-
-    // Block until the kernel responds or timeout (1s).
-    if let Ok(bytes) = ipc::recv_bytes(&sub, 1000)
-        && !bytes.is_empty()
-        && is_from_kernel(&bytes)
-    {
-        let _ = ipc::unsubscribe(&sub);
-        return parse_metadata_response(&bytes);
-    }
-    let _ = ipc::unsubscribe(&sub);
-    Vec::new()
+    responses
+        .iter()
+        .filter_map(|resp| resp.get("providers").and_then(|p| p.as_array()))
+        .flatten()
+        .filter_map(|p| serde_json::from_value::<ProviderEntry>(p.clone()).ok())
+        .collect()
 }
 
 /// Check whether a poll envelope contains at least one message from the kernel.
+///
+/// Used to validate `astrid.v1.capsules_loaded` signals.
 fn is_from_kernel(poll_bytes: &[u8]) -> bool {
     let envelope: serde_json::Value = match serde_json::from_slice(poll_bytes) {
         Ok(v) => v,
@@ -121,84 +131,9 @@ fn is_from_kernel(poll_bytes: &[u8]) -> bool {
             msgs.iter().any(|msg| {
                 msg.get("source_id")
                     .and_then(|s| s.as_str())
-                    .is_some_and(|s| s == SYSTEM_SESSION_UUID)
+                    .is_some_and(|s| s == KERNEL_UUID)
             })
         })
-}
-
-/// Parse the poll envelope and extract provider entries from the kernel response.
-/// Only accepts messages whose `source_id` matches the kernel's system UUID.
-fn parse_metadata_response(poll_bytes: &[u8]) -> Vec<ProviderEntry> {
-    let envelope: serde_json::Value = match serde_json::from_slice(poll_bytes) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    let messages = match envelope.get("messages").and_then(|m| m.as_array()) {
-        Some(arr) => arr,
-        None => return Vec::new(),
-    };
-
-    for msg in messages {
-        // Verify the message came from the kernel router (system session)
-        let source = msg.get("source_id").and_then(|s| s.as_str()).unwrap_or("");
-        if source != SYSTEM_SESSION_UUID {
-            let _ = log::log(
-                "warn",
-                format!("Ignoring metadata response from untrusted source: {source}"),
-            );
-            continue;
-        }
-
-        let payload = match msg.get("payload") {
-            Some(p) => p,
-            None => continue,
-        };
-
-        // The payload is IpcPayload::RawJson wrapping a KernelResponse.
-        // With internal tagging, the serialized form merges the `"type": "raw_json"`
-        // tag into the KernelResponse object, e.g.:
-        //   {"type": "raw_json", "status": "CapsuleMetadata", "data": [...]}
-        // Deserialize the full payload as KernelResponse — serde ignores the
-        // extra "type" field since KernelResponse uses its own tag ("status").
-        if let Ok(KernelResponse::CapsuleMetadata(entries)) =
-            serde_json::from_value::<KernelResponse>(payload.clone())
-        {
-            return resolve_providers(&entries);
-        }
-    }
-    Vec::new()
-}
-
-/// Convert capsule metadata entries into resolved provider entries.
-fn resolve_providers(entries: &[CapsuleMetadataEntry]) -> Vec<ProviderEntry> {
-    let mut providers = Vec::new();
-    for entry in entries {
-        for llm_def in &entry.llm_providers {
-            // Derive the request topic from the capsule's interceptor events
-            let request_topic = entry
-                .interceptor_events
-                .iter()
-                .find(|e| e.starts_with("llm.v1.request.generate"))
-                .cloned()
-                .unwrap_or_else(|| format!("llm.v1.request.generate.{}", entry.name));
-
-            let suffix = request_topic
-                .strip_prefix("llm.v1.request.generate.")
-                .unwrap_or(&entry.name);
-            let stream_topic = format!("llm.v1.stream.{suffix}");
-
-            providers.push(ProviderEntry {
-                id: llm_def.id.clone(),
-                description: llm_def.description.clone(),
-                capsule: entry.name.clone(),
-                request_topic,
-                stream_topic,
-                capabilities: llm_def.capabilities.clone(),
-            });
-        }
-    }
-    providers
 }
 
 /// Publish the active model changed event so the react loop (and frontends) can respond.
@@ -364,7 +299,7 @@ impl Registry {
             );
         }
 
-        // Now that all capsules are loaded, discover providers.
+        // Now that all capsules are loaded, discover providers via IPC hook.
         let providers = discover_providers();
         let mut state = load_state();
         if !providers.is_empty() {
