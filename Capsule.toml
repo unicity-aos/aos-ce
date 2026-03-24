@@ -15,7 +15,8 @@ capabilities = { fs_read = ["home://"], fs_write = ["home://"] }
 spark = "1.0.0"
 
 [capabilities]
-ipc_publish = ["spark.v1.response.ready", "agent.v1.response"]
+ipc_publish = ["spark.v1.response.ready", "agent.v1.response", "tool.v1.execute.*.result", "tool.v1.response.describe.*"]
+ipc_subscribe = ["tool.v1.execute.save_identity", "tool.v1.request.describe"]
 
 [[interceptor]]
 event = "spark.v1.request.build"
@@ -24,6 +25,14 @@ action = "handle_build_request"
 [[interceptor]]
 event = "cli.v1.command.execute"
 action = "handle_command"
+
+[[interceptor]]
+event = "tool.v1.execute.save_identity"
+action = "tool_execute_save_identity"
+
+[[interceptor]]
+event = "tool.v1.request.describe"
+action = "tool_describe"
 
 [[command]]
 name = "identity-export"

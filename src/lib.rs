@@ -33,7 +33,7 @@ yourself briefly, then ask the user one open question about how they'd like
 to work together. Let the conversation flow naturally. From it, derive a name,
 personality, and focus that feel right — then surface what you came up with
 and let the user react. Adjust from there. Once you've landed on something,
-call `set_identity` to save it. Always call it — if the user wants to skip,
+call `save_identity` to save it. Always call it — if the user wants to skip,
 derive something fitting from the exchange and confirm it casually before saving.";
 
 /// Agent identity configuration.
@@ -236,12 +236,19 @@ impl IdentityBuilder {
         Ok(())
     }
 
-    /// Set the agent identity. Updates the spark config and marks
-    /// onboarding as complete.
-    #[astrid::tool]
-    pub fn set_identity(&mut self, input: SparkConfig) -> Result<serde_json::Value, SysError> {
-        self.spark = input;
+    /// Save the agent's identity. Called by the LLM after onboarding to
+    /// persist the chosen callsign, personality, and style. Writes both
+    /// KV state (for immediate use) and spark.toml (for persistence
+    /// across KV resets).
+    #[astrid::tool("save_identity")]
+    pub fn save_identity(&mut self, args: SparkConfig) -> Result<serde_json::Value, SysError> {
+        self.spark = args;
         self.onboarded = true;
+
+        // Persist to spark.toml so identity survives KV resets.
+        let toml = self.spark.to_toml();
+        fs::write(SPARK_CONFIG_PATH, &toml)?;
+
         Ok(serde_json::json!({
             "status": "ok",
             "callsign": self.spark.callsign,
