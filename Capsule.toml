@@ -2,7 +2,7 @@
 name = "astrid-capsule-registry"
 version = "0.1.0"
 description = "LLM provider registry — discovers and manages available models"
-authors = ["Astrid Core Team"]
+authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 astrid-version = ">=0.1.0"
 
 [[component]]
