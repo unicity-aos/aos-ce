@@ -106,10 +106,7 @@ impl SkillsLoader {
         match fs::read_to_string(&home_skill_path) {
             Ok(content) => Ok(content),
             Err(e) => {
-                let _ = log::log(
-                    "warn",
-                    format!("failed to read skill '{}': {}", args.skill_id, e),
-                );
+                log::warn(format!("failed to read skill '{}': {}", args.skill_id, e));
                 Err(SysError::ApiError(format!(
                     "Skill '{}' could not be read",
                     args.skill_id
@@ -195,7 +192,7 @@ fn collect_skills_from(
         Ok(rd) => rd,
         Err(e) => {
             if !is_not_found_error(&e) {
-                let _ = log::warn(format!("readdir failed for {dir}: {e}"));
+                log::warn(format!("readdir failed for {dir}: {e}"));
             }
             return;
         }
@@ -219,10 +216,7 @@ fn collect_skills_from(
                     description: fm.description,
                 });
             } else {
-                let _ = log::log(
-                    "warn",
-                    format!("skipping {dir}/{name}: invalid frontmatter"),
-                );
+                log::warn(format!("skipping {dir}/{name}: invalid frontmatter"));
             }
         }
     }
