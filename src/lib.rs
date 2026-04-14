@@ -50,7 +50,7 @@ impl OpenAICompatProvider {
         } = req
             && let Err(e) = Self::execute_request(request_id, &model, &messages, &tools, &system)
         {
-            let _ = log::error(format!("LLM request failed: {e}"));
+            log::error(format!("LLM request failed: {e}"));
             let _ = ipc::publish_json(
                 STREAM_TOPIC,
                 &IpcPayload::LlmStreamEvent {
