@@ -188,10 +188,10 @@ struct ContextEngine;
 impl ContextEngine {
     #[astrid::run]
     fn run(&self) -> Result<(), SysError> {
-        let _ = log::info("Context Engine capsule starting");
+        log::info("Context Engine capsule starting");
 
         let config = Config::load();
-        let _ = log::info(format!(
+        log::info(format!(
             "Hook timeout: {}ms, keep_recent: {}",
             config.hook_timeout_ms, config.keep_recent
         ));
@@ -209,22 +209,20 @@ impl ContextEngine {
         // Best-effort: failure means the host mutex is poisoned (unrecoverable).
         let _ = runtime::signal_ready();
 
-        let _ = log::info("Context Engine capsule ready");
+        log::info("Context Engine capsule ready");
 
         loop {
             // Block until a message arrives (up to 60s), eliminating busy-spin polling.
-            match ipc::recv_bytes(&sub, 60_000) {
-                Ok(bytes) => {
-                    if !bytes.is_empty() {
-                        handle_poll_envelope(&bytes, &config);
-                    }
+            match ipc::recv(&sub, 60_000) {
+                Ok(result) => {
+                    dispatch_poll_result(&result, &config);
                 }
                 Err(_) => break,
             }
 
             // Drain hook topics to prevent backpressure.
-            let _ = ipc::poll_bytes(&hook_sub);
-            let _ = ipc::poll_bytes(&after_sub);
+            let _ = ipc::poll(&hook_sub);
+            let _ = ipc::poll(&after_sub);
         }
 
         let _ = ipc::unsubscribe(&sub);
@@ -245,52 +243,32 @@ fn should_dispatch_topic(topic: &str) -> bool {
         && topic != "context_engine.v1.hook.after_compaction"
 }
 
-/// Parse the poll envelope and dispatch individual messages.
-fn handle_poll_envelope(poll_bytes: &[u8], config: &Config) {
-    let envelope: serde_json::Value = match serde_json::from_slice(poll_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = log::log(
-                "warn",
-                format!("failed to deserialize IPC poll envelope: {e}"),
-            );
-            return;
-        }
-    };
-
-    if let Some(dropped) = envelope.get("dropped").and_then(|d| d.as_u64())
-        && dropped > 0
-    {
-        let _ = log::log(
-            "warn",
-            format!("Event bus dropped {dropped} messages in context engine poll"),
-        );
+/// Dispatch messages from a typed `PollResult`.
+fn dispatch_poll_result(result: &ipc::PollResult, config: &Config) {
+    if result.dropped > 0 {
+        log::warn(format!(
+            "Event bus dropped {} messages in context engine poll",
+            result.dropped
+        ));
     }
 
-    let messages = match envelope.get("messages").and_then(|m| m.as_array()) {
-        Some(arr) => arr,
-        None => return,
-    };
-
-    for msg in messages {
-        let topic = match msg.get("topic").and_then(|t| t.as_str()) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        if !should_dispatch_topic(topic) {
+    for msg in &result.messages {
+        if !should_dispatch_topic(&msg.topic) {
             continue;
         }
 
-        let payload = match msg.get("payload") {
-            Some(p) => p,
-            None => continue,
+        let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn(format!("failed to deserialize IPC message payload: {e}"));
+                continue;
+            }
         };
 
         // Extract from Custom payload envelope or direct.
-        let request_value = payload.get("data").unwrap_or(payload);
+        let request_value = payload.get("data").unwrap_or(&payload);
 
-        match topic {
+        match msg.topic.as_str() {
             "context_engine.v1.compact" => handle_compact(request_value, config),
             "context_engine.v1.estimate_tokens" => handle_estimate_tokens(request_value),
             _ => {}
@@ -305,7 +283,7 @@ fn handle_poll_envelope(poll_bytes: &[u8], config: &Config) {
 /// 1. Parse the request
 /// 2. Clamp `target_tokens` to not exceed `max_tokens`
 /// 3. Fire `context_engine.v1.hook.before_compaction` hook via IPC
-/// 4. Merge responses (any skip → skip, union of pinned IDs)
+/// 4. Merge responses (any skip -> skip, union of pinned IDs)
 /// 5. Run compaction strategy
 /// 6. Fire `context_engine.v1.hook.after_compaction` notification
 /// 7. Publish compacted result
@@ -313,7 +291,7 @@ fn handle_compact(payload: &serde_json::Value, config: &Config) {
     let request: CompactRequest = match serde_json::from_value(payload.clone()) {
         Ok(r) => r,
         Err(e) => {
-            let _ = log::error(format!("Failed to parse compact request: {e}"));
+            log::error(format!("Failed to parse compact request: {e}"));
             let _ = ipc::publish_json(
                 "context_engine.v1.response.compact",
                 &serde_json::json!({"error": format!("invalid request: {e}")}),
@@ -333,13 +311,10 @@ fn handle_compact(payload: &serde_json::Value, config: &Config) {
 
     // If any plugin says skip, return messages unchanged.
     if merged.skip {
-        let _ = log::log(
-            "info",
-            format!(
-                "Compaction skipped by plugin for session {}",
-                request.session_id
-            ),
-        );
+        log::info(format!(
+            "Compaction skipped by plugin for session {}",
+            request.session_id
+        ));
         let response = CompactResponse {
             messages: request.messages,
             compacted: false,
@@ -383,14 +358,11 @@ fn handle_compact(payload: &serde_json::Value, config: &Config) {
     };
     let _ = ipc::publish_json("context_engine.v1.response.compact", &response);
 
-    let _ = log::log(
-        "info",
-        format!(
-            "Compaction completed: session={}, removed={messages_removed}, \
-             tokens {tokens_before} → {tokens_after}",
-            request.session_id
-        ),
-    );
+    log::info(format!(
+        "Compaction completed: session={}, removed={messages_removed}, \
+         tokens {tokens_before} -> {tokens_after}",
+        request.session_id
+    ));
 }
 
 // ── Estimate handler ────────────────────────────────────────────────
@@ -400,7 +372,7 @@ fn handle_estimate_tokens(payload: &serde_json::Value) {
     let request: EstimateRequest = match serde_json::from_value(payload.clone()) {
         Ok(r) => r,
         Err(e) => {
-            let _ = log::error(format!("Failed to parse estimate_tokens request: {e}"));
+            log::error(format!("Failed to parse estimate_tokens request: {e}"));
             let _ = ipc::publish_json(
                 "context_engine.v1.response.estimate_tokens",
                 &serde_json::json!({"error": format!("invalid request: {e}")}),
@@ -450,10 +422,7 @@ fn fire_before_compaction(
     let sub = match ipc::subscribe(&response_topic) {
         Ok(h) => h,
         Err(e) => {
-            let _ = log::log(
-                "error",
-                format!("Failed to subscribe to hook response topic: {e}"),
-            );
+            log::error(format!("Failed to subscribe to hook response topic: {e}"));
             return MergedBeforeCompaction {
                 skip: false,
                 protected_ids: HashSet::new(),
@@ -471,10 +440,9 @@ fn fire_before_compaction(
     };
 
     if let Err(e) = ipc::publish_json("context_engine.v1.hook.before_compaction", &payload) {
-        let _ = log::log(
-            "error",
-            format!("Failed to publish context_engine.v1.hook.before_compaction event: {e}"),
-        );
+        log::error(format!(
+            "Failed to publish context_engine.v1.hook.before_compaction event: {e}"
+        ));
         let _ = ipc::unsubscribe(&sub);
         return MergedBeforeCompaction {
             skip: false,
@@ -496,11 +464,9 @@ fn fire_before_compaction(
         }
         let timeout = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
 
-        match ipc::recv_bytes(&sub, timeout) {
-            Ok(bytes) if !bytes.is_empty() => {
-                if let Some(new_responses) = parse_hook_responses(&bytes) {
-                    responses.extend(new_responses);
-                }
+        match ipc::recv(&sub, timeout) {
+            Ok(result) => {
+                responses.extend(parse_hook_responses(&result));
             }
             _ => break,
         }
@@ -509,37 +475,28 @@ fn fire_before_compaction(
     let _ = ipc::unsubscribe(&sub);
 
     if !responses.is_empty() {
-        let _ = log::log(
-            "info",
-            format!(
-                "Collected {} context_engine.v1.hook.before_compaction responses",
-                responses.len()
-            ),
-        );
+        log::info(format!(
+            "Collected {} context_engine.v1.hook.before_compaction responses",
+            responses.len()
+        ));
     }
 
     merge_before_compaction_responses(&responses)
 }
 
-/// Parse the IPC poll envelope and extract hook responses.
-fn parse_hook_responses(poll_bytes: &[u8]) -> Option<Vec<BeforeCompactionHookResponse>> {
-    let envelope: serde_json::Value = match serde_json::from_slice(poll_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = log::log(
-                "warn",
-                format!("failed to deserialize compaction response envelope: {e}"),
-            );
-            return None;
-        }
-    };
-    let messages = envelope.get("messages")?.as_array()?;
+/// Parse hook responses from a typed `PollResult`.
+fn parse_hook_responses(result: &ipc::PollResult) -> Vec<BeforeCompactionHookResponse> {
     let mut responses = Vec::new();
 
-    for msg in messages {
-        let payload = match msg.get("payload") {
-            Some(p) => p,
-            None => continue,
+    for msg in &result.messages {
+        let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn(format!(
+                    "failed to deserialize compaction response payload: {e}"
+                ));
+                continue;
+            }
         };
 
         // Try direct payload, then nested in Custom `data` envelope.
@@ -562,16 +519,12 @@ fn parse_hook_responses(poll_bytes: &[u8]) -> Option<Vec<BeforeCompactionHookRes
         }
     }
 
-    if responses.is_empty() {
-        None
-    } else {
-        Some(responses)
-    }
+    responses
 }
 
 /// Merge `context_engine.v1.hook.before_compaction` responses from multiple plugins.
 ///
-/// - `skip`: any `true` → skip compaction
+/// - `skip`: any `true` -> skip compaction
 /// - `pinned_message_ids`: union of all responses
 fn merge_before_compaction_responses(
     responses: &[BeforeCompactionHookResponse],

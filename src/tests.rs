@@ -10,6 +10,22 @@ fn make_msg(id: &str, content: &str) -> serde_json::Value {
     })
 }
 
+/// Helper to build an `ipc::PollResult` from a list of (topic, payload_value) pairs.
+fn make_poll_result(messages: Vec<(&str, serde_json::Value)>) -> ipc::PollResult {
+    ipc::PollResult {
+        messages: messages
+            .into_iter()
+            .map(|(topic, payload)| ipc::Message {
+                topic: topic.to_string(),
+                payload: serde_json::to_string(&payload).unwrap(),
+                source_id: "test".to_string(),
+            })
+            .collect(),
+        dropped: 0,
+        lagged: 0,
+    }
+}
+
 // ── Merge semantics unit tests ──────────────────────────────────────
 
 #[test]
@@ -259,27 +275,18 @@ fn after_compaction_payload_serializes() {
 // ── parse_hook_responses tests ──────────────────────────────────────
 
 #[test]
-fn parse_hook_responses_from_ipc_envelope() {
-    let envelope = serde_json::json!({
-        "messages": [
-            {
-                "topic": "context_engine.v1.hook_response.compact-1",
-                "source_id": "plugin-a",
-                "payload": {
-                    "pinnedMessageIds": ["msg-1", "msg-2"]
-                }
-            },
-            {
-                "topic": "context_engine.v1.hook_response.compact-1",
-                "source_id": "plugin-b",
-                "payload": {
-                    "skip": true
-                }
-            }
-        ]
-    });
-    let bytes = serde_json::to_vec(&envelope).expect("serialize");
-    let responses = parse_hook_responses(&bytes).expect("should parse");
+fn parse_hook_responses_from_poll_result() {
+    let result = make_poll_result(vec![
+        (
+            "context_engine.v1.hook_response.compact-1",
+            serde_json::json!({"pinnedMessageIds": ["msg-1", "msg-2"]}),
+        ),
+        (
+            "context_engine.v1.hook_response.compact-1",
+            serde_json::json!({"skip": true}),
+        ),
+    ]);
+    let responses = parse_hook_responses(&result);
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[0].pinned_message_ids, vec!["msg-1", "msg-2"]);
     assert_eq!(responses[1].skip, Some(true));
@@ -287,58 +294,47 @@ fn parse_hook_responses_from_ipc_envelope() {
 
 #[test]
 fn parse_hook_responses_nested_in_custom_data() {
-    let envelope = serde_json::json!({
-        "messages": [{
-            "topic": "hook",
-            "payload": {
-                "data": {
-                    "skip": true,
-                    "pinnedMessageIds": ["msg-99"]
-                }
+    let result = make_poll_result(vec![(
+        "hook",
+        serde_json::json!({
+            "data": {
+                "skip": true,
+                "pinnedMessageIds": ["msg-99"]
             }
-        }]
-    });
-    let bytes = serde_json::to_vec(&envelope).expect("serialize");
-    let responses = parse_hook_responses(&bytes).expect("should parse");
+        }),
+    )]);
+    let responses = parse_hook_responses(&result);
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0].skip, Some(true));
     assert_eq!(responses[0].pinned_message_ids, vec!["msg-99"]);
 }
 
 #[test]
-fn parse_hook_responses_empty_envelope() {
-    let envelope = serde_json::json!({"messages": []});
-    let bytes = serde_json::to_vec(&envelope).expect("serialize");
-    assert!(parse_hook_responses(&bytes).is_none());
-}
-
-#[test]
-fn parse_hook_responses_invalid_json() {
-    assert!(parse_hook_responses(b"not json").is_none());
+fn parse_hook_responses_empty_poll_result() {
+    let result = ipc::PollResult {
+        messages: vec![],
+        dropped: 0,
+        lagged: 0,
+    };
+    assert!(parse_hook_responses(&result).is_empty());
 }
 
 #[test]
 fn parse_hook_responses_ignores_unrelated_payload() {
-    let envelope = serde_json::json!({
-        "messages": [{
-            "topic": "hook",
-            "payload": {"status": "ok", "unrelated": 42}
-        }]
-    });
-    let bytes = serde_json::to_vec(&envelope).expect("serialize");
-    assert!(parse_hook_responses(&bytes).is_none());
+    let result = make_poll_result(vec![(
+        "hook",
+        serde_json::json!({"status": "ok", "unrelated": 42}),
+    )]);
+    assert!(parse_hook_responses(&result).is_empty());
 }
 
 #[test]
 fn parse_hook_responses_mixed_valid_and_invalid() {
-    let envelope = serde_json::json!({
-        "messages": [
-            {"topic": "hook", "payload": {"status": "irrelevant"}},
-            {"topic": "hook", "payload": {"pinnedMessageIds": ["msg-1"]}}
-        ]
-    });
-    let bytes = serde_json::to_vec(&envelope).expect("serialize");
-    let responses = parse_hook_responses(&bytes).expect("should parse valid one");
+    let result = make_poll_result(vec![
+        ("hook", serde_json::json!({"status": "irrelevant"})),
+        ("hook", serde_json::json!({"pinnedMessageIds": ["msg-1"]})),
+    ]);
+    let responses = parse_hook_responses(&result);
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0].pinned_message_ids, vec!["msg-1"]);
 }
@@ -348,7 +344,6 @@ fn parse_hook_responses_mixed_valid_and_invalid() {
 #[test]
 fn target_tokens_clamped_to_max_tokens() {
     // Verify that the clamp logic (target_tokens.min(max_tokens)) works.
-    // This mirrors the enforcement in handle_compact at line 315.
     let max_tokens: u64 = 100_000;
     let target_tokens: u64 = 200_000;
     let clamped = target_tokens.min(max_tokens);
@@ -366,7 +361,7 @@ fn target_tokens_clamped_to_max_tokens() {
     );
 
     // Verify the strategy respects the clamped value by running compaction
-    // with a low max_tokens — messages should be removed.
+    // with a low max_tokens -- messages should be removed.
     let messages: Vec<serde_json::Value> = (0..20)
         .map(|i| {
             make_msg(

@@ -13,6 +13,22 @@ type = "executable"
 [exports.astrid]
 context = "1.0.0"
 
+[[topic]]
+name = "context_engine.v1.response.compact"
+description = "Compacted messages and stats"
+
+[[topic]]
+name = "context_engine.v1.response.estimate_tokens"
+description = "Estimated token count"
+
+[[topic]]
+name = "context_engine.v1.hook.before_compaction"
+description = "Interceptor hook: plugins can mark messages as protected or skip compaction"
+
+[[topic]]
+name = "context_engine.v1.hook.after_compaction"
+description = "Fire-and-forget notification with compaction stats"
+
 [capabilities]
 ipc_publish = [
     "context_engine.v1.response.*",
