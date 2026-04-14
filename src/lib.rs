@@ -366,8 +366,8 @@ impl ShellTools {
         let action = extract_action(trimmed);
 
         // Request approval - blocks until the user responds or timeout.
-        let result = approval::request(&action, trimmed, "high")?;
-        if !result.approved {
+        let approved = approval::request(&action, trimmed)?;
+        if !approved {
             return Err(SysError::ApiError(format!(
                 "Command '{trimmed}' was not approved by user",
             )));
@@ -406,8 +406,8 @@ impl ShellTools {
 
         let action = extract_action(trimmed);
 
-        let result = approval::request(&action, trimmed, "high")?;
-        if !result.approved {
+        let approved = approval::request(&action, trimmed)?;
+        if !approved {
             return Err(SysError::ApiError(format!(
                 "Command '{trimmed}' was not approved by user",
             )));
