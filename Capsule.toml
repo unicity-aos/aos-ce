@@ -28,6 +28,27 @@ ipc_subscribe = [
     "astrid.v1.capsules_loaded",
 ]
 
+[[topic]]
+name = "registry.v1.active_model_changed"
+direction = "publish"
+description = "Published when the active LLM model changes"
+wit_type = "provider-entry"
+
+[[topic]]
+name = "registry.v1.response.get_providers"
+direction = "publish"
+description = "Response with the list of available providers"
+
+[[topic]]
+name = "registry.v1.response.get_active_model"
+direction = "publish"
+description = "Response with the currently active model"
+
+[[topic]]
+name = "registry.v1.response.set_active_model"
+direction = "publish"
+description = "Response confirming model change"
+
 [[command]]
 name = "models"
 description = "List available LLM models or switch the active model"
