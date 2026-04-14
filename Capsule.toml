@@ -12,6 +12,22 @@ file = "astrid_capsule_prompt_builder.wasm"
 [exports.astrid]
 prompt = "1.0.0"
 
+[[topic]]
+name = "prompt_builder.v1.response.assemble"
+description = "Assembled prompt result returned to the react loop"
+
+[[topic]]
+name = "prompt_builder.v1.hook.before_build"
+description = "Interceptor hook fired before prompt assembly for plugin contributions"
+
+[[topic]]
+name = "prompt_builder.v1.hook.after_build"
+description = "Notification fired after prompt assembly completes (fire-and-forget)"
+
+[[topic]]
+name = "session.v1.request.get_messages"
+description = "Request to session capsule for conversation history"
+
 [capabilities]
 ipc_publish = [
     "prompt_builder.v1.response.*",

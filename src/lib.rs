@@ -184,14 +184,11 @@ fn filter_by_permission(
                     || s.response.prepend_system_context.is_some()
                     || s.response.append_system_context.is_some()
                 {
-                    let _ = log::log(
-                        "warn",
-                        format!(
-                            "Stripped prompt-mutating fields from capsule {:?} \
-                             (missing allow_prompt_injection capability)",
-                            s.source_id
-                        ),
-                    );
+                    log::warn(format!(
+                        "Stripped prompt-mutating fields from capsule {:?} \
+                         (missing allow_prompt_injection capability)",
+                        s.source_id
+                    ));
                 }
                 HookResponse {
                     prepend_context: s.response.prepend_context,
@@ -280,10 +277,7 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
     let sub = match ipc::subscribe(&response_topic) {
         Ok(h) => h,
         Err(e) => {
-            let _ = log::log(
-                "error",
-                format!("Failed to subscribe to hook response topic: {e}"),
-            );
+            log::error(format!("Failed to subscribe to hook response topic: {e}"));
             return Vec::new();
         }
     };
@@ -298,10 +292,9 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
     };
 
     if let Err(e) = ipc::publish_json("prompt_builder.v1.hook.before_build", &payload) {
-        let _ = log::log(
-            "error",
-            format!("Failed to publish prompt_builder.v1.hook.before_build event: {e}"),
-        );
+        log::error(format!(
+            "Failed to publish prompt_builder.v1.hook.before_build event: {e}"
+        ));
         let _ = ipc::unsubscribe(&sub);
         return Vec::new();
     }
@@ -320,10 +313,15 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
         }
         let timeout = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
 
-        match ipc::recv_bytes(&sub, timeout) {
-            Ok(bytes) if !bytes.is_empty() => {
-                if let Some(new_responses) = parse_hook_responses(&bytes) {
-                    sourced_responses.extend(new_responses);
+        match ipc::recv(&sub, timeout) {
+            Ok(result) => {
+                if result.messages.is_empty() {
+                    break;
+                }
+                for msg in &result.messages {
+                    if let Some(new_responses) = parse_hook_message(msg) {
+                        sourced_responses.extend(new_responses);
+                    }
                 }
             }
             _ => break,
@@ -332,14 +330,11 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
 
     let _ = ipc::unsubscribe(&sub);
 
-    let _ = log::log(
-        "info",
-        format!(
-            "Collected {} hook responses for request {}",
-            sourced_responses.len(),
-            request.request_id
-        ),
-    );
+    log::info(format!(
+        "Collected {} hook responses for request {}",
+        sourced_responses.len(),
+        request.request_id
+    ));
 
     // Cache capability results per-UUID to avoid redundant host function calls.
     // Multiple hook responses can come from the same capsule.
@@ -351,25 +346,64 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
         *cache.entry(uuid.to_owned()).or_insert_with(|| {
             capabilities::check(uuid, "allow_prompt_injection")
                 .inspect_err(|e| {
-                    let _ = log::log(
-                        "warn",
-                        format!("capability check failed for {uuid}: {e}, denying"),
-                    );
+                    log::warn(format!("capability check failed for {uuid}: {e}, denying"));
                 })
                 .unwrap_or(false)
         })
     })
 }
 
+/// Parse a single IPC message and extract hook responses with source capsule IDs.
+fn parse_hook_message(msg: &ipc::Message) -> Option<Vec<SourcedHookResponse>> {
+    let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn(format!("failed to deserialize hook response payload: {e}"));
+            return None;
+        }
+    };
+
+    let source_id = if msg.source_id.is_empty() {
+        None
+    } else {
+        Some(msg.source_id.clone())
+    };
+
+    // Try to parse the payload directly as a HookResponse.
+    // Since all fields are optional, an unrelated JSON object would
+    // parse as an empty HookResponse — check `has_any_field()` to
+    // distinguish real responses from false positives.
+    // Plugins may wrap it in various IPC payload envelopes, so we
+    // also check inside `data` for Custom payloads.
+    let maybe_response = serde_json::from_value::<HookResponse>(payload.clone())
+        .ok()
+        .filter(HookResponse::has_any_field)
+        .or_else(|| {
+            payload
+                .get("data")
+                .and_then(|data| serde_json::from_value::<HookResponse>(data.clone()).ok())
+                .filter(HookResponse::has_any_field)
+        });
+
+    if let Some(response) = maybe_response {
+        Some(vec![SourcedHookResponse {
+            source_id,
+            response,
+        }])
+    } else {
+        None
+    }
+}
+
 /// Parse the poll envelope and extract hook responses with source capsule IDs.
+///
+/// Retained for unit tests that construct raw JSON envelopes.
+#[cfg(test)]
 fn parse_hook_responses(poll_bytes: &[u8]) -> Option<Vec<SourcedHookResponse>> {
     let envelope: serde_json::Value = match serde_json::from_slice(poll_bytes) {
         Ok(v) => v,
         Err(e) => {
-            let _ = log::log(
-                "warn",
-                format!("failed to deserialize hook response envelope: {e}"),
-            );
+            log::warn(format!("failed to deserialize hook response envelope: {e}"));
             return None;
         }
     };
@@ -389,12 +423,6 @@ fn parse_hook_responses(poll_bytes: &[u8]) -> Option<Vec<SourcedHookResponse>> {
             .and_then(|s| s.as_str())
             .map(String::from);
 
-        // Try to parse the payload directly as a HookResponse.
-        // Since all fields are optional, an unrelated JSON object would
-        // parse as an empty HookResponse — check `has_any_field()` to
-        // distinguish real responses from false positives.
-        // Plugins may wrap it in various IPC payload envelopes, so we
-        // also check inside `data` for Custom payloads.
         let maybe_response = serde_json::from_value::<HookResponse>(payload.clone())
             .ok()
             .filter(HookResponse::has_any_field)
@@ -451,10 +479,7 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
     if let Ok(cached) = kv::get_json::<Vec<serde_json::Value>>(TOOL_SCHEMA_CACHE_KEY)
         && !cached.is_empty()
     {
-        let _ = log::log(
-            "debug",
-            format!("Returning {} cached tool schemas", cached.len()),
-        );
+        log::debug(format!("Returning {} cached tool schemas", cached.len()));
         return cached;
     }
 
@@ -466,21 +491,18 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
         "payload": {},
     });
 
-    let request_bytes = match serde_json::to_vec(&request) {
-        Ok(b) => b,
+    let request_str = match serde_json::to_string(&request) {
+        Ok(s) => s,
         Err(e) => {
-            let _ = log::log(
-                "error",
-                format!("Failed to serialize trigger_hook request: {e}"),
-            );
+            log::error(format!("Failed to serialize trigger_hook request: {e}"));
             return Vec::new();
         }
     };
 
-    let response_bytes = match hooks::trigger(&request_bytes) {
-        Ok(b) => b,
+    let response_str = match hooks::trigger(&request_str) {
+        Ok(s) => s,
         Err(e) => {
-            let _ = log::log("error", format!("trigger_hook failed: {e}"));
+            log::error(format!("trigger_hook failed: {e}"));
             return Vec::new();
         }
     };
@@ -489,13 +511,10 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
     // Each response is the JSON value returned by that capsule's interceptor.
     // For WASM tool capsules: { "tools": [...] } (from SDK macro tool_describe)
     // For MCP capsules: { "tools": [...] } (from astrid_bridge.mjs tool_describe)
-    let responses: Vec<serde_json::Value> = match serde_json::from_slice(&response_bytes) {
+    let responses: Vec<serde_json::Value> = match serde_json::from_str(&response_str) {
         Ok(r) => r,
         Err(e) => {
-            let _ = log::log(
-                "warn",
-                format!("Failed to parse trigger_hook response: {e}"),
-            );
+            log::warn(format!("Failed to parse trigger_hook response: {e}"));
             Vec::new()
         }
     };
@@ -517,17 +536,14 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
         }
     });
 
-    let _ = log::log(
-        "info",
-        format!(
-            "Collected {} tool schemas via trigger_hook",
-            all_tools.len()
-        ),
-    );
+    log::info(format!(
+        "Collected {} tool schemas via trigger_hook",
+        all_tools.len()
+    ));
 
     // Cache the result for subsequent calls.
     if let Err(e) = kv::set_json(TOOL_SCHEMA_CACHE_KEY, &all_tools) {
-        let _ = log::log("warn", format!("Failed to cache tool schemas in KV: {e}"));
+        log::warn(format!("Failed to cache tool schemas in KV: {e}"));
     }
 
     all_tools
@@ -545,10 +561,9 @@ fn fetch_session_messages(session_id: &str) -> Vec<serde_json::Value> {
     let handle = match ipc::subscribe(&reply_topic) {
         Ok(h) => h,
         Err(e) => {
-            let _ = log::log(
-                "error",
-                format!("Failed to subscribe to session response topic: {e}"),
-            );
+            log::error(format!(
+                "Failed to subscribe to session response topic: {e}"
+            ));
             return Vec::new();
         }
     };
@@ -559,52 +574,38 @@ fn fetch_session_messages(session_id: &str) -> Vec<serde_json::Value> {
     });
 
     if let Err(e) = ipc::publish_json("session.v1.request.get_messages", &request) {
-        let _ = log::log(
-            "error",
-            format!("Failed to publish session.v1.request.get_messages: {e}"),
-        );
+        log::error(format!(
+            "Failed to publish session.v1.request.get_messages: {e}"
+        ));
         let _ = ipc::unsubscribe(&handle);
         return Vec::new();
     }
 
     let result = (|| -> Vec<serde_json::Value> {
-        let response_bytes = match ipc::recv_bytes(&handle, SESSION_FETCH_TIMEOUT_MS) {
-            Ok(bytes) => bytes,
+        let poll_result = match ipc::recv(&handle, SESSION_FETCH_TIMEOUT_MS) {
+            Ok(r) => r,
             Err(e) => {
-                let _ = log::log(
-                    "warn",
-                    format!("Session response timed out after {SESSION_FETCH_TIMEOUT_MS}ms: {e}"),
-                );
+                log::warn(format!(
+                    "Session response timed out after {SESSION_FETCH_TIMEOUT_MS}ms: {e}"
+                ));
                 return Vec::new();
             }
         };
 
-        let envelope: serde_json::Value = match serde_json::from_slice(&response_bytes) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = log::log("warn", format!("Failed to parse session response: {e}"));
-                return Vec::new();
-            }
-        };
-
-        // Navigate the IPC drain envelope: envelope.messages[*].payload.data.messages
-        let ipc_messages = match envelope.get("messages").and_then(|m| m.as_array()) {
-            Some(arr) => arr,
-            None => return Vec::new(),
-        };
-
-        if ipc_messages.is_empty() {
-            let _ = log::log(
-                "warn",
-                "Session capsule responded but the message list was empty.",
-            );
+        if poll_result.messages.is_empty() {
+            log::warn("Session capsule responded but the message list was empty.");
             return Vec::new();
         }
 
         // The topic is scoped to this request, so iterate to find the first
         // message with a Custom payload (payload.data).
-        for msg in ipc_messages {
-            let data = match msg.get("payload").and_then(|p| p.get("data")) {
+        for msg in &poll_result.messages {
+            let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let data = match payload.get("data") {
                 Some(d) => d,
                 None => continue,
             };
@@ -613,10 +614,7 @@ fn fetch_session_messages(session_id: &str) -> Vec<serde_json::Value> {
                 match serde_json::from_value::<Vec<serde_json::Value>>(messages.clone()) {
                     Ok(msgs) => return msgs,
                     Err(e) => {
-                        let _ = log::log(
-                            "warn",
-                            format!("Failed to parse session messages array: {e}"),
-                        );
+                        log::warn(format!("Failed to parse session messages array: {e}"));
                     }
                 }
             }
@@ -627,13 +625,10 @@ fn fetch_session_messages(session_id: &str) -> Vec<serde_json::Value> {
 
     let _ = ipc::unsubscribe(&handle);
 
-    let _ = log::log(
-        "debug",
-        format!(
-            "Fetched {} session messages for session {session_id}",
-            result.len()
-        ),
-    );
+    log::debug(format!(
+        "Fetched {} session messages for session {session_id}",
+        result.len()
+    ));
 
     result
 }
@@ -644,7 +639,7 @@ fn fetch_session_messages(session_id: &str) -> Vec<serde_json::Value> {
 /// `collect_tool_schemas()` call fetches fresh data from all capsules.
 fn invalidate_tool_cache() {
     let _ = kv::delete(TOOL_SCHEMA_CACHE_KEY);
-    let _ = log::log("info", "Tool schema cache invalidated");
+    log::info("Tool schema cache invalidated");
 }
 
 /// Handle a single `prompt_builder.v1.assemble` request.
@@ -655,7 +650,7 @@ fn handle_assemble(payload: &serde_json::Value, config: &Config) {
     let request: AssembleRequest = match serde_json::from_value(request_value.clone()) {
         Ok(r) => r,
         Err(e) => {
-            let _ = log::log("error", format!("Failed to parse assemble request: {e}"));
+            log::error(format!("Failed to parse assemble request: {e}"));
             let _ = ipc::publish_json(
                 "prompt_builder.v1.response.assemble",
                 &serde_json::json!({"error": format!("invalid request: {e}")}),
@@ -719,42 +714,27 @@ fn should_dispatch_topic(topic: &str) -> bool {
         && topic != "prompt_builder.v1.hook.after_build"
 }
 
-/// Parse the poll envelope and dispatch individual messages.
-fn handle_poll_envelope(poll_bytes: &[u8], config: &Config) {
-    let envelope: serde_json::Value = match serde_json::from_slice(poll_bytes) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    if let Some(dropped) = envelope.get("dropped").and_then(|d| d.as_u64())
-        && dropped > 0
-    {
-        let _ = log::log(
-            "warn",
-            format!("Event bus dropped {dropped} messages in prompt builder poll"),
-        );
+/// Dispatch IPC messages from a PollResult to appropriate handlers.
+fn handle_poll_result(result: &ipc::PollResult, config: &Config) {
+    if result.dropped > 0 {
+        log::warn(format!(
+            "Event bus dropped {} messages in prompt builder poll",
+            result.dropped
+        ));
     }
 
-    let messages = match envelope.get("messages").and_then(|m| m.as_array()) {
-        Some(arr) => arr,
-        None => return,
-    };
-
-    for msg in messages {
-        let topic = match msg.get("topic").and_then(|t| t.as_str()) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        if !should_dispatch_topic(topic) {
+    for msg in &result.messages {
+        if !should_dispatch_topic(&msg.topic) {
             continue;
         }
 
-        if topic == "prompt_builder.v1.assemble"
-            && let Some(payload) = msg.get("payload")
-        {
-            handle_assemble(payload, config);
-        } else if topic == "prompt_builder.v1.invalidate_tool_cache" {
+        if msg.topic == "prompt_builder.v1.assemble" {
+            let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            handle_assemble(&payload, config);
+        } else if msg.topic == "prompt_builder.v1.invalidate_tool_cache" {
             invalidate_tool_cache();
         }
     }
@@ -767,10 +747,10 @@ struct PromptBuilder;
 impl PromptBuilder {
     #[astrid::run]
     fn run(&self) -> Result<(), SysError> {
-        let _ = log::info("Prompt Builder capsule starting");
+        log::info("Prompt Builder capsule starting");
 
         let config = Config::load();
-        let _ = log::info(format!("Hook timeout: {}ms", config.hook_timeout_ms));
+        log::info(format!("Hook timeout: {}ms", config.hook_timeout_ms));
 
         let sub =
             ipc::subscribe("prompt_builder.v1.*").map_err(|e| SysError::ApiError(e.to_string()))?;
@@ -785,22 +765,22 @@ impl PromptBuilder {
         // Best-effort: failure means the host mutex is poisoned (unrecoverable).
         let _ = runtime::signal_ready();
 
-        let _ = log::info("Prompt Builder capsule ready");
+        log::info("Prompt Builder capsule ready");
 
         loop {
             // Block until a message arrives (up to 60s), eliminating busy-spin polling.
-            match ipc::recv_bytes(&sub, 60_000) {
-                Ok(bytes) => {
-                    if !bytes.is_empty() {
-                        handle_poll_envelope(&bytes, &config);
+            match ipc::recv(&sub, 60_000) {
+                Ok(result) => {
+                    if !result.messages.is_empty() {
+                        handle_poll_result(&result, &config);
                     }
                 }
                 Err(_) => break,
             }
 
             // Drain hook/after topics to prevent backpressure.
-            let _ = ipc::poll_bytes(&hook_sub);
-            let _ = ipc::poll_bytes(&after_sub);
+            let _ = ipc::poll(&hook_sub);
+            let _ = ipc::poll(&after_sub);
         }
 
         let _ = ipc::unsubscribe(&sub);
