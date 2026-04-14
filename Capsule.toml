@@ -34,6 +34,17 @@ action = "tool_execute_save_identity"
 event = "tool.v1.request.describe"
 action = "tool_describe"
 
+[[topic]]
+name = "spark.v1.response.ready"
+direction = "publish"
+description = "Published when the system prompt has been built"
+wit_type = "build-response"
+
+[[topic]]
+name = "agent.v1.response"
+direction = "publish"
+description = "Published to send command results back to the user"
+
 [[command]]
 name = "identity-export"
 description = "Export agent identity (spark config) to home://.config/spark.toml"

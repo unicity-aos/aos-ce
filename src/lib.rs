@@ -162,10 +162,9 @@ impl IdentityBuilder {
                 }
                 Ok(_) => {} // Empty callsign — treat as stub, don't onboard.
                 Err(e) => {
-                    let _ = log::log(
-                        "warn",
-                        format!("Failed to parse {SPARK_CONFIG_PATH} during auto-detect: {e}"),
-                    );
+                    log::warn(format!(
+                        "Failed to parse {SPARK_CONFIG_PATH} during auto-detect: {e}"
+                    ));
                 }
             }
         }
@@ -203,7 +202,7 @@ impl IdentityBuilder {
         match text.trim() {
             "identity-export" => {
                 let toml = self.spark.to_toml();
-                fs::write(spark_path, &toml)?;
+                fs::write(spark_path, toml.as_bytes())?;
 
                 ipc::publish_json(
                     "agent.v1.response",
@@ -247,7 +246,7 @@ impl IdentityBuilder {
 
         // Persist to spark.toml so identity survives KV resets.
         let toml = self.spark.to_toml();
-        fs::write(SPARK_CONFIG_PATH, &toml)?;
+        fs::write(SPARK_CONFIG_PATH, toml.as_bytes())?;
 
         Ok(serde_json::json!({
             "status": "ok",
@@ -259,7 +258,7 @@ impl IdentityBuilder {
 /// Parse spark.toml into a `SparkConfig`.
 fn parse_spark_toml(content: &str) -> SparkConfig {
     toml::from_str(content).unwrap_or_else(|e| {
-        let _ = log::warn(format!("Failed to parse spark.toml, using defaults: {e}"));
+        log::warn(format!("Failed to parse spark.toml, using defaults: {e}"));
         SparkConfig::default()
     })
 }
