@@ -80,6 +80,13 @@ action = "on_kernel_started"
 event = "astrid.v1.lifecycle.kernel_shutdown"
 action = "on_kernel_shutdown"
 
+# ── Published topics ──
+[[topic]]
+name = "hook.v1.result.*"
+direction = "publish"
+description = "Merged hook results from lifecycle event fan-out"
+wit_type = "hook-result"
+
 [exports.astrid]
 hook = "1.0.0"
 
