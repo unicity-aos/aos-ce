@@ -10,131 +10,35 @@ id = "react"
 file = "astrid_capsule_react.wasm"
 type = "executable"
 
-# User input from frontends (CLI, Telegram, etc.)
-[[interceptor]]
-event = "user.v1.prompt"
-action = "handle_user_prompt"
+[imports]
+"astrid:llm" = "^1.0"
+"astrid:session" = "^1.0"
+"astrid:spark" = "^1.0"
+"astrid:context" = "^1.0"
 
-# System prompt returned by the identity capsule
-[[interceptor]]
-event = "spark.v1.response.ready"
-action = "handle_identity_response"
+[publish]
+"spark.v1.request.build" = { wit = "@unicity-astrid/wit/spark/build-request" }
+"prompt_builder.v1.assemble" = { wit = "@unicity-astrid/wit/prompt/assemble-request" }
+"agent.v1.response" = { wit = "@unicity-astrid/wit/agent/response" }
+"agent.v1.session_changed" = { wit = "@unicity-astrid/wit/agent/session-changed" }
+"tool.v1.request.execute" = { wit = "@unicity-astrid/wit/types/tool-call" }
+"tool.v1.request.cancel" = { wit = "@unicity-astrid/wit/tool/cancel-request" }
+"llm.v1.request.generate.*" = { wit = "@unicity-astrid/wit/llm/generate-request" }
+"context_engine.v1.compact" = { wit = "@unicity-astrid/wit/context/compact-request" }
+"session.v1.request.get_messages" = { wit = "@unicity-astrid/wit/session/get-messages-request" }
+"session.v1.request.clear" = { wit = "@unicity-astrid/wit/session/clear-request" }
 
-# Assembled prompt returned by the prompt builder capsule
-[[interceptor]]
-event = "prompt_builder.v1.response.assemble"
-action = "handle_prompt_response"
-
-# LLM streaming events from any provider capsule
-[[interceptor]]
-event = "llm.v1.stream.*"
-action = "handle_llm_stream"
-
-# Tool execution results from the tool router
-[[interceptor]]
-event = "tool.v1.execute.result"
-action = "handle_tool_result"
-
-# Active model changed by the registry capsule
-[[interceptor]]
-event = "registry.v1.active_model_changed"
-action = "handle_model_changed"
-
-# Periodic watchdog tick from the kernel for timeout enforcement
-[[interceptor]]
-event = "astrid.v1.watchdog.tick"
-action = "handle_watchdog_tick"
-
-# Event bus broadcast lag notification from the dispatcher
-[[interceptor]]
-event = "astrid.v1.event_bus.lagged"
-action = "handle_bus_lag"
-
-# Lifecycle restart signal from the kernel (ephemeral key cleanup)
-[[interceptor]]
-event = "system.v1.lifecycle.restart"
-action = "handle_lifecycle_restart"
-
-# Session clear request from frontends
-[[interceptor]]
-event = "session.v1.clear"
-action = "handle_session_clear"
-
-[imports.astrid]
-llm = "^1.0"
-session = "^1.0"
-spark = "^1.0"
-context = "^1.0"
-
-# Guest-initiated subscriptions (ACL-gated via ipc_subscribe below):
-#   session.v1.response.get_messages.<correlation_id>  <- covered by session.v1.response.get_messages.*
-#   session.v1.response.clear.<correlation_id>          <- covered by session.v1.response.clear.*
-
-[capabilities]
-ipc_publish = [
-    "spark.v1.request.build",
-    "prompt_builder.v1.assemble",
-    "agent.v1.response",
-    "agent.v1.session_changed",
-    "tool.v1.request.execute",
-    "tool.v1.request.cancel",
-    "llm.v1.request.generate.*",
-    "context_engine.v1.compact",
-    "session.v1.request.get_messages",
-    "session.v1.request.clear",
-]
-ipc_subscribe = [
-    "session.v1.response.get_messages.*",
-    "session.v1.response.clear.*",
-    "context_engine.v1.response.compact",
-]
-
-[[topic]]
-name = "spark.v1.request.build"
-direction = "publish"
-description = "Request the identity capsule to build the system prompt"
-
-[[topic]]
-name = "prompt_builder.v1.assemble"
-direction = "publish"
-description = "Request the prompt builder to assemble the final prompt"
-
-[[topic]]
-name = "agent.v1.response"
-direction = "publish"
-description = "Final or error response sent to frontends"
-
-[[topic]]
-name = "agent.v1.session_changed"
-direction = "publish"
-description = "Notification when the active session ID changes"
-
-[[topic]]
-name = "tool.v1.request.execute"
-direction = "publish"
-description = "Request the tool router to execute a tool call"
-
-[[topic]]
-name = "tool.v1.request.cancel"
-direction = "publish"
-description = "Request the tool router to cancel in-flight tool calls"
-
-[[topic]]
-name = "llm.v1.request.generate.*"
-direction = "publish"
-description = "LLM generation request routed to the active provider capsule"
-
-[[topic]]
-name = "context_engine.v1.compact"
-direction = "publish"
-description = "Request the context engine to compact messages within a token budget"
-
-[[topic]]
-name = "session.v1.request.get_messages"
-direction = "publish"
-description = "Request conversation history from the session capsule"
-
-[[topic]]
-name = "session.v1.request.clear"
-direction = "publish"
-description = "Request the session capsule to clear/rotate a session"
+[subscribe]
+"session.v1.response.get_messages.*" = { wit = "@unicity-astrid/wit/session/get-messages-response" }
+"session.v1.response.clear.*" = { wit = "@unicity-astrid/wit/session/clear-response" }
+"context_engine.v1.response.compact" = { wit = "@unicity-astrid/wit/context/compact-response" }
+"user.v1.prompt" = { wit = "@unicity-astrid/wit/user/prompt", handler = "handle_user_prompt" }
+"spark.v1.response.ready" = { wit = "@unicity-astrid/wit/spark/build-response", handler = "handle_identity_response" }
+"prompt_builder.v1.response.assemble" = { wit = "@unicity-astrid/wit/prompt/assemble-response", handler = "handle_prompt_response" }
+"llm.v1.stream.*" = { wit = "@unicity-astrid/wit/llm/stream-event", handler = "handle_llm_stream" }
+"tool.v1.execute.result" = { wit = "@unicity-astrid/wit/types/tool-call-result", handler = "handle_tool_result" }
+"registry.v1.active_model_changed" = { wit = "@unicity-astrid/wit/registry/provider-entry", handler = "handle_model_changed" }
+"astrid.v1.watchdog.tick" = { wit = "@unicity-astrid/wit/system/watchdog-tick", handler = "handle_watchdog_tick" }
+"astrid.v1.event_bus.lagged" = { wit = "@unicity-astrid/wit/system/event-bus-lagged", handler = "handle_bus_lag" }
+"system.v1.lifecycle.restart" = { wit = "@unicity-astrid/wit/system/lifecycle-restart", handler = "handle_lifecycle_restart" }
+"session.v1.clear" = { wit = "@unicity-astrid/wit/session/clear-request", handler = "handle_session_clear" }
