@@ -12,13 +12,11 @@ type = "executable"
 
 [capabilities]
 net = ["*"]
-ipc_publish = ["tool.v1.execute.*.result", "tool.v1.response.describe.*"]
-ipc_subscribe = ["tool.v1.execute.fetch_url", "tool.v1.request.describe"]
 
-[[interceptor]]
-event = "tool.v1.execute.fetch_url"
-action = "tool_execute_fetch_url"
+[publish]
+"tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }
+"tool.v1.response.describe.*" = { wit = "@unicity-astrid/wit/tool/describe-response" }
 
-[[interceptor]]
-event = "tool.v1.request.describe"
-action = "tool_describe"
+[subscribe]
+"tool.v1.execute.fetch_url" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_fetch_url" }
+"tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }
