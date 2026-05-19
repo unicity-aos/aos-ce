@@ -15,42 +15,17 @@ type = "executable"
 # when needed (e.g. a plugin installer capsule).
 capabilities = { fs_read = ["cwd://", "home://"], fs_write = ["cwd://"] }
 
-[capabilities]
-ipc_publish = ["tool.v1.execute.*.result", "tool.v1.response.describe.*"]
-ipc_subscribe = ["tool.v1.execute.read_file", "tool.v1.execute.write_file", "tool.v1.execute.replace_in_file", "tool.v1.execute.list_directory", "tool.v1.execute.grep_search", "tool.v1.execute.create_directory", "tool.v1.execute.delete_file", "tool.v1.execute.move_file", "tool.v1.request.describe"]
+[publish]
+"tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }
+"tool.v1.response.describe.*" = { wit = "@unicity-astrid/wit/tool/describe-response" }
 
-[[interceptor]]
-event = "tool.v1.execute.read_file"
-action = "tool_execute_read_file"
-
-[[interceptor]]
-event = "tool.v1.execute.write_file"
-action = "tool_execute_write_file"
-
-[[interceptor]]
-event = "tool.v1.execute.replace_in_file"
-action = "tool_execute_replace_in_file"
-
-[[interceptor]]
-event = "tool.v1.execute.list_directory"
-action = "tool_execute_list_directory"
-
-[[interceptor]]
-event = "tool.v1.execute.grep_search"
-action = "tool_execute_grep_search"
-
-[[interceptor]]
-event = "tool.v1.execute.create_directory"
-action = "tool_execute_create_directory"
-
-[[interceptor]]
-event = "tool.v1.execute.delete_file"
-action = "tool_execute_delete_file"
-
-[[interceptor]]
-event = "tool.v1.execute.move_file"
-action = "tool_execute_move_file"
-
-[[interceptor]]
-event = "tool.v1.request.describe"
-action = "tool_describe"
+[subscribe]
+"tool.v1.execute.read_file" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_read_file" }
+"tool.v1.execute.write_file" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_write_file" }
+"tool.v1.execute.replace_in_file" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_replace_in_file" }
+"tool.v1.execute.list_directory" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_list_directory" }
+"tool.v1.execute.grep_search" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_grep_search" }
+"tool.v1.execute.create_directory" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_create_directory" }
+"tool.v1.execute.delete_file" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_delete_file" }
+"tool.v1.execute.move_file" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_move_file" }
+"tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }
