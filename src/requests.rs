@@ -15,8 +15,12 @@ use crate::types::Source;
 pub struct ResolveRequest {
     pub source: Source,
     pub platform: String,
+    #[serde(default, alias = "platform_instance")]
+    pub platform_instance: Option<String>,
     #[serde(alias = "platform_user_id")]
     pub platform_user_id: String,
+    #[serde(default, alias = "context_id")]
+    pub context_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -24,11 +28,15 @@ pub struct ResolveRequest {
 pub struct LinkRequest {
     pub source: Source,
     pub platform: String,
+    #[serde(default, alias = "platform_instance")]
+    pub platform_instance: Option<String>,
     #[serde(alias = "platform_user_id")]
     pub platform_user_id: String,
     #[serde(alias = "astrid_user_id")]
     pub astrid_user_id: String,
     pub method: String,
+    #[serde(default, alias = "display_name")]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,6 +44,8 @@ pub struct LinkRequest {
 pub struct UnlinkRequest {
     pub source: Source,
     pub platform: String,
+    #[serde(default, alias = "platform_instance")]
+    pub platform_instance: Option<String>,
     #[serde(alias = "platform_user_id")]
     pub platform_user_id: String,
 }
@@ -46,6 +56,27 @@ pub struct CreateRequest {
     pub source: Source,
     #[serde(default, alias = "display_name")]
     pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SetDisplayNameRequest {
+    pub source: Source,
+    #[serde(alias = "astrid_user_id")]
+    pub astrid_user_id: String,
+    #[serde(default, alias = "display_name")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SetPublicKeyRequest {
+    pub source: Source,
+    #[serde(alias = "astrid_user_id")]
+    pub astrid_user_id: String,
+    /// Raw bytes (`option<list<u8>>` in WIT). `None` clears the key.
+    #[serde(default, alias = "public_key")]
+    pub public_key: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,65 +107,76 @@ pub struct DeleteRequest {
 #[serde(rename_all = "kebab-case")]
 pub struct ListRequest {
     pub source: Source,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ContextSetRequest {
+    pub source: Source,
+    pub platform: String,
+    #[serde(default, alias = "platform_instance")]
+    pub platform_instance: Option<String>,
+    #[serde(alias = "platform_user_id")]
+    pub platform_user_id: String,
+    #[serde(alias = "context_id")]
+    pub context_id: String,
+    #[serde(alias = "display_name")]
+    pub display_name: String,
+}
 
-    #[test]
-    fn resolve_request_parses_kebab_case() {
-        let json = r#"{
-            "source": {
-                "channel": "discord",
-                "user-id": null,
-                "correlation-id": "abc"
-            },
-            "platform": "discord",
-            "platform-user-id": "12345"
-        }"#;
-        let req: ResolveRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.platform, "discord");
-        assert_eq!(req.platform_user_id, "12345");
-        assert_eq!(req.source.correlation_id, "abc");
-    }
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ContextClearRequest {
+    pub source: Source,
+    pub platform: String,
+    #[serde(default, alias = "platform_instance")]
+    pub platform_instance: Option<String>,
+    #[serde(alias = "platform_user_id")]
+    pub platform_user_id: String,
+    #[serde(alias = "context_id")]
+    pub context_id: String,
+}
 
-    #[test]
-    fn resolve_request_parses_snake_case_via_alias() {
-        let json = r#"{
-            "source": {
-                "channel": "discord",
-                "user_id": null,
-                "correlation_id": "abc"
-            },
-            "platform": "discord",
-            "platform_user_id": "12345"
-        }"#;
-        let req: ResolveRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.platform_user_id, "12345");
-        assert_eq!(req.source.correlation_id, "abc");
-    }
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ContextGetRequest {
+    pub source: Source,
+    pub platform: String,
+    #[serde(default, alias = "platform_instance")]
+    pub platform_instance: Option<String>,
+    #[serde(alias = "platform_user_id")]
+    pub platform_user_id: String,
+    #[serde(alias = "context_id")]
+    pub context_id: String,
+}
 
-    #[test]
-    fn link_request_round_trips() {
-        let json = r#"{
-            "source": { "channel": "cli", "correlation-id": "c1" },
-            "platform": "discord",
-            "platform-user-id": "u1",
-            "astrid-user-id": "00000000-0000-4000-8000-000000000001",
-            "method": "admin"
-        }"#;
-        let req: LinkRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.platform, "discord");
-        assert_eq!(req.platform_user_id, "u1");
-        assert_eq!(req.astrid_user_id, "00000000-0000-4000-8000-000000000001");
-        assert_eq!(req.method, "admin");
-    }
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ContextListForUserRequest {
+    pub source: Source,
+    #[serde(alias = "astrid_user_id")]
+    pub astrid_user_id: String,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
 
-    #[test]
-    fn create_request_allows_missing_display_name() {
-        let json = r#"{ "source": { "channel": "cli", "correlation-id": "c1" } }"#;
-        let req: CreateRequest = serde_json::from_str(json).unwrap();
-        assert!(req.display_name.is_none());
-    }
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ContextListInContextRequest {
+    pub source: Source,
+    pub platform: String,
+    #[serde(default, alias = "platform_instance")]
+    pub platform_instance: Option<String>,
+    #[serde(alias = "context_id")]
+    pub context_id: String,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
 }

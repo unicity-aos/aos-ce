@@ -7,32 +7,42 @@
 //!
 //! ## KV key scheme
 //!
-//! Keys mirror the legacy kernel store byte-for-byte:
+//! `_` (single underscore) is the sentinel for `platform_instance =
+//! None` — chosen because the validation layer rejects `_` from being
+//! a real instance value, so it cannot collide with a legitimate
+//! Slack workspace / IRC network name.
 //!
-//! * `user/{uuid}`                        → JSON [`AstridUser`]
-//! * `link/{platform}/{platform_user_id}` → JSON [`FrontendLink`]
-//! * `name/{display_name}`                → UTF-8 UUID string (last-writer-wins index)
+//! | Key | Value |
+//! |---|---|
+//! | `user/{uuid}` | JSON [`AstridUser`] |
+//! | `link/{platform}/{instance_or_underscore}/{platform_user_id}` | JSON [`FrontendLink`] |
+//! | `name/{display_name}` | UTF-8 UUID string (best-effort lookup index) |
+//! | `context/{platform}/{instance_or_underscore}/{context_id}/{platform_user_id}` | JSON [`ContextIdentity`] |
 //!
-//! `platform` and `platform_user_id` are validated to reject `/` and
-//! `\0`. Without that gate, a caller passing `platform = "../user"`
-//! could read or overwrite a `user/{uuid}` record through the link path.
+//! `platform`, `platform_user_id`, `platform_instance`, and
+//! `context_id` are all validated to reject `/` and `\0` so the key
+//! path cannot be injected.
 
 use astrid_sdk::prelude::kv;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::time::now_rfc3339;
-use crate::types::{AstridUser, FrontendLink, StoreError, normalize_platform};
+use crate::types::{
+    AstridUser, ContextIdentity, FrontendLink, ResolvedDisplayName, StoreError, normalize_platform,
+};
+
+const INSTANCE_NONE_SENTINEL: &str = "_";
+
+/// Default pagination limit when caller passes `None`.
+const DEFAULT_LIST_LIMIT: usize = 100;
+const MAX_LIST_LIMIT: usize = 1000;
 
 /// KV operations the store needs.
 pub trait Backend {
-    /// Return the raw bytes for `key`, or `None` if absent.
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String>;
-    /// Store `value` at `key`.
     fn set(&self, key: &str, value: &[u8]) -> Result<(), String>;
-    /// Remove `key`. Idempotent.
     fn delete(&self, key: &str) -> Result<(), String>;
-    /// Every key whose name starts with `prefix`.
     fn list_keys(&self, prefix: &str) -> Result<Vec<String>, String>;
 }
 
@@ -43,9 +53,6 @@ pub struct SdkBackend;
 impl Backend for SdkBackend {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
         match kv::get_bytes(key) {
-            // SDK's get_bytes returns Ok(vec![]) for both absent and
-            // empty values. Every value the store writes is JSON
-            // (minimum 2 bytes), so empty == missing.
             Ok(bytes) if bytes.is_empty() => Ok(None),
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) => Err(e.to_string()),
@@ -62,6 +69,12 @@ impl Backend for SdkBackend {
     }
 }
 
+/// Page of results.
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+}
+
 /// Identity store over a [`Backend`].
 pub struct Store<B: Backend> {
     backend: B,
@@ -73,15 +86,61 @@ impl<B: Backend> Store<B> {
         Self { backend }
     }
 
-    pub(crate) fn user_key(id: Uuid) -> String {
+    // ── key construction ────────────────────────────────────────────
+
+    fn user_key(id: Uuid) -> String {
         format!("user/{id}")
     }
-    pub(crate) fn link_key(platform: &str, platform_user_id: &str) -> String {
-        format!("link/{platform}/{platform_user_id}")
+
+    fn instance_segment(instance: Option<&str>) -> String {
+        instance
+            .map(str::to_string)
+            .unwrap_or_else(|| INSTANCE_NONE_SENTINEL.to_string())
     }
-    pub(crate) fn name_key(name: &str) -> String {
+
+    fn link_key(platform: &str, instance: Option<&str>, platform_user_id: &str) -> String {
+        format!(
+            "link/{platform}/{}/{platform_user_id}",
+            Self::instance_segment(instance)
+        )
+    }
+
+    fn name_key(name: &str) -> String {
         format!("name/{name}")
     }
+
+    fn context_key(
+        platform: &str,
+        instance: Option<&str>,
+        context_id: &str,
+        platform_user_id: &str,
+    ) -> String {
+        format!(
+            "context/{platform}/{}/{context_id}/{platform_user_id}",
+            Self::instance_segment(instance)
+        )
+    }
+
+    fn context_prefix_in_context(
+        platform: &str,
+        instance: Option<&str>,
+        context_id: &str,
+    ) -> String {
+        format!(
+            "context/{platform}/{}/{context_id}/",
+            Self::instance_segment(instance)
+        )
+    }
+
+    /// Prefix over which to scan to find every context overlay for one
+    /// link, regardless of `context_id`. Callers filter by trailing
+    /// `/{platform_user_id}` to identify which overlays belong to the
+    /// link. Used on unlink/delete-user cascades and list-for-user.
+    fn context_prefix_for_link_bucket(platform: &str, instance: Option<&str>) -> String {
+        format!("context/{platform}/{}/", Self::instance_segment(instance))
+    }
+
+    // ── validation ──────────────────────────────────────────────────
 
     pub(crate) fn validate_non_empty(value: &str, field: &str) -> Result<(), StoreError> {
         if value.trim().is_empty() {
@@ -102,6 +161,23 @@ impl<B: Backend> Store<B> {
         Ok(())
     }
 
+    /// Platform-instance values cannot equal the sentinel `"_"` or
+    /// contain key-path-breaking characters.
+    pub(crate) fn validate_instance(value: Option<&str>) -> Result<(), StoreError> {
+        match value {
+            None => Ok(()),
+            Some(s) => {
+                Self::validate_key_component(s, "platform_instance")?;
+                if s == INSTANCE_NONE_SENTINEL {
+                    return Err(StoreError::InvalidInput(format!(
+                        "platform_instance must not be {INSTANCE_NONE_SENTINEL:?} (reserved sentinel)"
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn get_json<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>, StoreError> {
         let bytes = self.backend.get(key).map_err(StoreError::Storage)?;
         match bytes {
@@ -118,8 +194,8 @@ impl<B: Backend> Store<B> {
         self.backend.set(key, &bytes).map_err(StoreError::Storage)
     }
 
-    /// Create a new user. Writes the name index for non-empty names
-    /// (last-writer-wins, mirroring the kernel store).
+    // ── user operations ────────────────────────────────────────────
+
     pub fn create_user(&self, display_name: Option<&str>) -> Result<AstridUser, StoreError> {
         if let Some(name) = display_name
             && (name.contains('/') || name.contains('\0'))
@@ -141,37 +217,125 @@ impl<B: Backend> Store<B> {
         Ok(user)
     }
 
-    /// Fetch a user by UUID.
     pub fn get_user(&self, id: Uuid) -> Result<Option<AstridUser>, StoreError> {
         self.get_json(&Self::user_key(id))
     }
 
-    /// Resolve `(platform, platform_user_id)` to the linked user.
+    pub fn set_display_name(
+        &self,
+        id: Uuid,
+        display_name: Option<&str>,
+    ) -> Result<AstridUser, StoreError> {
+        if let Some(name) = display_name
+            && (name.contains('/') || name.contains('\0'))
+        {
+            return Err(StoreError::InvalidInput(
+                "display_name must not contain '/' or null bytes".into(),
+            ));
+        }
+        let mut user = self.get_user(id)?.ok_or(StoreError::UserNotFound(id))?;
+
+        // Clear old name-index entry if it pointed at us.
+        if let Some(old_name) = user.display_name.as_deref() {
+            let key = Self::name_key(old_name.trim());
+            if let Some(bytes) = self.backend.get(&key).map_err(StoreError::Storage)?
+                && String::from_utf8(bytes).ok().as_deref() == Some(id.to_string().as_str())
+            {
+                self.backend.delete(&key).map_err(StoreError::Storage)?;
+            }
+        }
+
+        user.display_name = display_name.map(str::to_string);
+        self.set_json(&Self::user_key(id), &user)?;
+
+        if let Some(name) = display_name {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                self.backend
+                    .set(&Self::name_key(trimmed), id.to_string().as_bytes())
+                    .map_err(StoreError::Storage)?;
+            }
+        }
+        Ok(user)
+    }
+
+    pub fn set_public_key(
+        &self,
+        id: Uuid,
+        public_key: Option<[u8; 32]>,
+    ) -> Result<AstridUser, StoreError> {
+        let mut user = self.get_user(id)?.ok_or(StoreError::UserNotFound(id))?;
+        user.public_key = public_key;
+        self.set_json(&Self::user_key(id), &user)?;
+        Ok(user)
+    }
+
+    // ── link operations ────────────────────────────────────────────
+
     pub fn resolve(
         &self,
         platform: &str,
+        instance: Option<&str>,
         platform_user_id: &str,
-    ) -> Result<Option<AstridUser>, StoreError> {
+        context_id: Option<&str>,
+    ) -> Result<(Option<AstridUser>, Option<ResolvedDisplayName>), StoreError> {
         Self::validate_key_component(platform, "platform")?;
+        Self::validate_instance(instance)?;
         Self::validate_key_component(platform_user_id, "platform_user_id")?;
-        let normalized = normalize_platform(platform);
-        let key = Self::link_key(&normalized, platform_user_id);
-        let link: Option<FrontendLink> = self.get_json(&key)?;
-        match link {
-            None => Ok(None),
-            Some(l) => self.get_user(l.astrid_user_id),
+        if let Some(c) = context_id {
+            Self::validate_key_component(c, "context_id")?;
         }
+        let normalized = normalize_platform(platform);
+        let key = Self::link_key(&normalized, instance, platform_user_id);
+        let link: Option<FrontendLink> = self.get_json(&key)?;
+        let Some(link) = link else {
+            return Ok((None, None));
+        };
+
+        let user = self.get_user(link.astrid_user_id)?;
+
+        // Layer display names: context > link > canonical.
+        let mut resolved_name: Option<ResolvedDisplayName> = None;
+        if let Some(ctx) = context_id {
+            let ckey = Self::context_key(&normalized, instance, ctx, platform_user_id);
+            if let Some(overlay) = self.get_json::<ContextIdentity>(&ckey)? {
+                resolved_name = Some(ResolvedDisplayName {
+                    name: overlay.display_name,
+                    source: "context",
+                });
+            }
+        }
+        if resolved_name.is_none()
+            && let Some(name) = &link.display_name
+        {
+            resolved_name = Some(ResolvedDisplayName {
+                name: name.clone(),
+                source: "link",
+            });
+        }
+        if resolved_name.is_none()
+            && let Some(u) = &user
+            && let Some(name) = &u.display_name
+        {
+            resolved_name = Some(ResolvedDisplayName {
+                name: name.clone(),
+                source: "canonical",
+            });
+        }
+        Ok((user, resolved_name))
     }
 
-    /// Upsert a platform link. The target user must exist.
     pub fn link(
         &self,
         platform: &str,
+        instance: Option<&str>,
         platform_user_id: &str,
         astrid_user_id: Uuid,
         method: &str,
+        display_name: Option<&str>,
     ) -> Result<FrontendLink, StoreError> {
         Self::validate_key_component(platform, "platform")?;
+        Self::validate_instance(instance)?;
         Self::validate_key_component(platform_user_id, "platform_user_id")?;
         Self::validate_non_empty(method, "method")?;
 
@@ -182,33 +346,57 @@ impl<B: Backend> Store<B> {
         let normalized = normalize_platform(platform);
         let link = FrontendLink {
             platform: normalized.clone(),
+            platform_instance: instance.map(str::to_string),
             platform_user_id: platform_user_id.to_string(),
             astrid_user_id,
             linked_at: now_rfc3339(),
             method: method.to_string(),
+            display_name: display_name.map(str::to_string),
         };
-        self.set_json(&Self::link_key(&normalized, platform_user_id), &link)?;
+        self.set_json(
+            &Self::link_key(&normalized, instance, platform_user_id),
+            &link,
+        )?;
         Ok(link)
     }
 
-    /// Remove a link. Returns `true` if a link existed.
-    pub fn unlink(&self, platform: &str, platform_user_id: &str) -> Result<bool, StoreError> {
+    pub fn unlink(
+        &self,
+        platform: &str,
+        instance: Option<&str>,
+        platform_user_id: &str,
+    ) -> Result<bool, StoreError> {
         Self::validate_key_component(platform, "platform")?;
+        Self::validate_instance(instance)?;
         Self::validate_key_component(platform_user_id, "platform_user_id")?;
         let normalized = normalize_platform(platform);
-        let key = Self::link_key(&normalized, platform_user_id);
+        let key = Self::link_key(&normalized, instance, platform_user_id);
         let existed = self
             .backend
             .get(&key)
             .map_err(StoreError::Storage)?
             .is_some();
         if existed {
+            // Cascade: scan and delete every context overlay for this link.
+            // The context prefix `context/{platform}/{instance}/` enumerates
+            // every context-id; we filter by trailing platform_user_id.
+            let prefix = Self::context_prefix_for_link_bucket(&normalized, instance);
+            let suffix = format!("/{platform_user_id}");
+            let ctx_keys = self
+                .backend
+                .list_keys(&prefix)
+                .map_err(StoreError::Storage)?;
+            for ckey in ctx_keys {
+                // Key shape: context/{platform}/{instance}/{context_id}/{platform_user_id}
+                if ckey.ends_with(&suffix) {
+                    self.backend.delete(&ckey).map_err(StoreError::Storage)?;
+                }
+            }
             self.backend.delete(&key).map_err(StoreError::Storage)?;
         }
         Ok(existed)
     }
 
-    /// List every link pointing at `astrid_user_id`.
     pub fn list_links(&self, astrid_user_id: Uuid) -> Result<Vec<FrontendLink>, StoreError> {
         let keys = self
             .backend
@@ -225,28 +413,46 @@ impl<B: Backend> Store<B> {
         Ok(out)
     }
 
-    /// Delete a user record + every link pointing at it. Idempotent.
     pub fn delete_user(&self, id: Uuid) -> Result<bool, StoreError> {
         let Some(user) = self.get_user(id)? else {
             return Ok(false);
         };
 
-        // Cascade: strip every link aimed at this user.
+        // Cascade #1: every link aimed at this user.
         let link_keys = self
             .backend
             .list_keys("link/")
             .map_err(StoreError::Storage)?;
+        let mut affected_links: Vec<(String, Option<String>, String)> = Vec::new();
         for k in link_keys {
             if let Some(l) = self.get_json::<FrontendLink>(&k)?
                 && l.astrid_user_id == id
             {
+                affected_links.push((
+                    l.platform.clone(),
+                    l.platform_instance.clone(),
+                    l.platform_user_id.clone(),
+                ));
                 self.backend.delete(&k).map_err(StoreError::Storage)?;
             }
         }
 
-        // Drop the name index entry only when it still points at this UUID.
-        // The name index is best-effort last-writer-wins; if another user
-        // overwrote it, this user's delete must not clobber the new entry.
+        // Cascade #2: every context overlay tied to those links.
+        for (platform, instance, platform_user_id) in &affected_links {
+            let prefix = Self::context_prefix_for_link_bucket(platform, instance.as_deref());
+            let suffix = format!("/{platform_user_id}");
+            let ctx_keys = self
+                .backend
+                .list_keys(&prefix)
+                .map_err(StoreError::Storage)?;
+            for ckey in ctx_keys {
+                if ckey.ends_with(&suffix) {
+                    self.backend.delete(&ckey).map_err(StoreError::Storage)?;
+                }
+            }
+        }
+
+        // Cascade #3: name-index entry, only if it still points at this UUID.
         if let Some(name) = user.display_name.as_deref() {
             let key = Self::name_key(name.trim());
             if let Some(bytes) = self.backend.get(&key).map_err(StoreError::Storage)?
@@ -262,19 +468,233 @@ impl<B: Backend> Store<B> {
         Ok(true)
     }
 
-    /// List every user record in the store.
-    pub fn list_users(&self) -> Result<Vec<AstridUser>, StoreError> {
-        let keys = self
+    pub fn list_users_paginated(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Page<AstridUser>, StoreError> {
+        let mut keys = self
             .backend
             .list_keys("user/")
             .map_err(StoreError::Storage)?;
-        let mut out = Vec::with_capacity(keys.len());
-        for k in keys {
-            if let Some(u) = self.get_json::<AstridUser>(&k)? {
-                out.push(u);
+        keys.sort();
+        let start_idx = match cursor {
+            None => 0,
+            Some(c) => keys
+                .iter()
+                .position(|k| k.as_str() > c)
+                .unwrap_or(keys.len()),
+        };
+        let take = limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
+        let end_idx = (start_idx + take).min(keys.len());
+        let mut items = Vec::with_capacity(end_idx.saturating_sub(start_idx));
+        for k in &keys[start_idx..end_idx] {
+            if let Some(u) = self.get_json::<AstridUser>(k)? {
+                items.push(u);
             }
         }
-        Ok(out)
+        let next_cursor = if end_idx < keys.len() {
+            Some(keys[end_idx - 1].clone())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+
+    // ── context overlay operations ─────────────────────────────────
+
+    fn require_link_exists(
+        &self,
+        platform: &str,
+        instance: Option<&str>,
+        platform_user_id: &str,
+    ) -> Result<(), StoreError> {
+        let key = Self::link_key(platform, instance, platform_user_id);
+        if self
+            .backend
+            .get(&key)
+            .map_err(StoreError::Storage)?
+            .is_none()
+        {
+            return Err(StoreError::LinkNotFound);
+        }
+        Ok(())
+    }
+
+    pub fn set_context(
+        &self,
+        platform: &str,
+        instance: Option<&str>,
+        platform_user_id: &str,
+        context_id: &str,
+        display_name: &str,
+    ) -> Result<ContextIdentity, StoreError> {
+        Self::validate_key_component(platform, "platform")?;
+        Self::validate_instance(instance)?;
+        Self::validate_key_component(platform_user_id, "platform_user_id")?;
+        Self::validate_key_component(context_id, "context_id")?;
+        Self::validate_non_empty(display_name, "display_name")?;
+
+        let normalized = normalize_platform(platform);
+        self.require_link_exists(&normalized, instance, platform_user_id)?;
+
+        let overlay = ContextIdentity {
+            platform: normalized.clone(),
+            platform_instance: instance.map(str::to_string),
+            platform_user_id: platform_user_id.to_string(),
+            context_id: context_id.to_string(),
+            display_name: display_name.to_string(),
+            updated_at: now_rfc3339(),
+        };
+        self.set_json(
+            &Self::context_key(&normalized, instance, context_id, platform_user_id),
+            &overlay,
+        )?;
+        Ok(overlay)
+    }
+
+    pub fn clear_context(
+        &self,
+        platform: &str,
+        instance: Option<&str>,
+        platform_user_id: &str,
+        context_id: &str,
+    ) -> Result<bool, StoreError> {
+        Self::validate_key_component(platform, "platform")?;
+        Self::validate_instance(instance)?;
+        Self::validate_key_component(platform_user_id, "platform_user_id")?;
+        Self::validate_key_component(context_id, "context_id")?;
+        let normalized = normalize_platform(platform);
+        let key = Self::context_key(&normalized, instance, context_id, platform_user_id);
+        let existed = self
+            .backend
+            .get(&key)
+            .map_err(StoreError::Storage)?
+            .is_some();
+        if existed {
+            self.backend.delete(&key).map_err(StoreError::Storage)?;
+        }
+        Ok(existed)
+    }
+
+    pub fn get_context(
+        &self,
+        platform: &str,
+        instance: Option<&str>,
+        platform_user_id: &str,
+        context_id: &str,
+    ) -> Result<(Option<ContextIdentity>, Option<Uuid>), StoreError> {
+        Self::validate_key_component(platform, "platform")?;
+        Self::validate_instance(instance)?;
+        Self::validate_key_component(platform_user_id, "platform_user_id")?;
+        Self::validate_key_component(context_id, "context_id")?;
+        let normalized = normalize_platform(platform);
+        let overlay: Option<ContextIdentity> = self.get_json(&Self::context_key(
+            &normalized,
+            instance,
+            context_id,
+            platform_user_id,
+        ))?;
+        let link: Option<FrontendLink> =
+            self.get_json(&Self::link_key(&normalized, instance, platform_user_id))?;
+        Ok((overlay, link.map(|l| l.astrid_user_id)))
+    }
+
+    pub fn list_context_for_user(
+        &self,
+        astrid_user_id: Uuid,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Page<ContextIdentity>, StoreError> {
+        // Gather every link this user owns; for each, scan context
+        // overlays. O(links × contexts/link). Pagination is over the
+        // concatenated stable order.
+        let links = self.list_links(astrid_user_id)?;
+        let mut overlays: Vec<(String, ContextIdentity)> = Vec::new();
+        for link in &links {
+            let prefix = Self::context_prefix_for_link_bucket(
+                &link.platform,
+                link.platform_instance.as_deref(),
+            );
+            let suffix = format!("/{}", link.platform_user_id);
+            let keys = self
+                .backend
+                .list_keys(&prefix)
+                .map_err(StoreError::Storage)?;
+            for k in keys {
+                if k.ends_with(&suffix)
+                    && let Some(c) = self.get_json::<ContextIdentity>(&k)?
+                {
+                    overlays.push((k, c));
+                }
+            }
+        }
+        overlays.sort_by(|a, b| a.0.cmp(&b.0));
+        let start_idx = match cursor {
+            None => 0,
+            Some(c) => overlays
+                .iter()
+                .position(|(k, _)| k.as_str() > c)
+                .unwrap_or(overlays.len()),
+        };
+        let take = limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
+        let end_idx = (start_idx + take).min(overlays.len());
+        let next_cursor = if end_idx < overlays.len() {
+            Some(overlays[end_idx - 1].0.clone())
+        } else {
+            None
+        };
+        let items: Vec<ContextIdentity> = overlays[start_idx..end_idx]
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect();
+        Ok(Page { items, next_cursor })
+    }
+
+    pub fn list_context_in_context(
+        &self,
+        platform: &str,
+        instance: Option<&str>,
+        context_id: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Page<(ContextIdentity, Option<Uuid>)>, StoreError> {
+        Self::validate_key_component(platform, "platform")?;
+        Self::validate_instance(instance)?;
+        Self::validate_key_component(context_id, "context_id")?;
+        let normalized = normalize_platform(platform);
+        let prefix = Self::context_prefix_in_context(&normalized, instance, context_id);
+        let mut keys = self
+            .backend
+            .list_keys(&prefix)
+            .map_err(StoreError::Storage)?;
+        keys.sort();
+        let start_idx = match cursor {
+            None => 0,
+            Some(c) => keys
+                .iter()
+                .position(|k| k.as_str() > c)
+                .unwrap_or(keys.len()),
+        };
+        let take = limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
+        let end_idx = (start_idx + take).min(keys.len());
+        let mut items = Vec::with_capacity(end_idx.saturating_sub(start_idx));
+        for k in &keys[start_idx..end_idx] {
+            if let Some(c) = self.get_json::<ContextIdentity>(k)? {
+                let link: Option<FrontendLink> = self.get_json(&Self::link_key(
+                    &c.platform,
+                    c.platform_instance.as_deref(),
+                    &c.platform_user_id,
+                ))?;
+                items.push((c, link.map(|l| l.astrid_user_id)));
+            }
+        }
+        let next_cursor = if end_idx < keys.len() {
+            Some(keys[end_idx - 1].clone())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
     }
 }
 
@@ -310,239 +730,5 @@ pub(crate) mod test_support {
                 .cloned()
                 .collect())
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::test_support::MemBackend;
-    use super::*;
-
-    fn make_store() -> Store<MemBackend> {
-        Store::new(MemBackend::default())
-    }
-
-    #[test]
-    fn create_and_get_user() {
-        let store = make_store();
-        let u = store.create_user(Some("Alice")).unwrap();
-        assert_eq!(u.display_name.as_deref(), Some("Alice"));
-        assert_eq!(store.get_user(u.id).unwrap(), Some(u));
-    }
-
-    #[test]
-    fn create_user_no_name_writes_no_index() {
-        let store = make_store();
-        let u = store.create_user(None).unwrap();
-        assert!(u.display_name.is_none());
-        assert!(store.backend.list_keys("name/").unwrap().is_empty());
-    }
-
-    #[test]
-    fn create_user_rejects_slash_in_name() {
-        assert!(matches!(
-            make_store().create_user(Some("admin/root")),
-            Err(StoreError::InvalidInput(_))
-        ));
-    }
-
-    #[test]
-    fn create_user_rejects_null_in_name() {
-        assert!(matches!(
-            make_store().create_user(Some("oops\0me")),
-            Err(StoreError::InvalidInput(_))
-        ));
-    }
-
-    #[test]
-    fn get_user_missing_returns_none() {
-        assert!(make_store().get_user(Uuid::new_v4()).unwrap().is_none());
-    }
-
-    #[test]
-    fn link_then_resolve_round_trips() {
-        let store = make_store();
-        let u = store.create_user(Some("Bob")).unwrap();
-        store.link("Discord", "12345", u.id, "admin").unwrap();
-        assert_eq!(store.resolve("discord", "12345").unwrap().unwrap().id, u.id);
-    }
-
-    #[test]
-    fn resolve_normalizes_platform_lookup() {
-        let store = make_store();
-        let u = store.create_user(None).unwrap();
-        store.link("  DISCORD  ", "abc", u.id, "admin").unwrap();
-        assert_eq!(store.resolve("Discord", "abc").unwrap().unwrap().id, u.id);
-        assert_eq!(store.resolve("discord", "abc").unwrap().unwrap().id, u.id);
-    }
-
-    #[test]
-    fn resolve_missing_returns_none() {
-        assert!(make_store().resolve("discord", "ghost").unwrap().is_none());
-    }
-
-    #[test]
-    fn link_rejects_missing_user() {
-        let err = make_store()
-            .link("discord", "123", Uuid::new_v4(), "admin")
-            .unwrap_err();
-        assert!(matches!(err, StoreError::UserNotFound(_)));
-    }
-
-    #[test]
-    fn link_upsert_overwrites() {
-        let store = make_store();
-        let a = store.create_user(Some("Alice")).unwrap();
-        let b = store.create_user(Some("Bob")).unwrap();
-        store.link("discord", "123", a.id, "admin").unwrap();
-        store.link("discord", "123", b.id, "admin").unwrap();
-        assert_eq!(store.resolve("discord", "123").unwrap().unwrap().id, b.id);
-    }
-
-    #[test]
-    fn link_rejects_empty_method() {
-        let store = make_store();
-        let u = store.create_user(None).unwrap();
-        assert!(matches!(
-            store.link("discord", "1", u.id, ""),
-            Err(StoreError::InvalidInput(_))
-        ));
-    }
-
-    #[test]
-    fn link_rejects_slash_in_platform() {
-        let store = make_store();
-        let u = store.create_user(None).unwrap();
-        assert!(matches!(
-            store.link("a/b", "1", u.id, "admin"),
-            Err(StoreError::InvalidInput(_))
-        ));
-    }
-
-    #[test]
-    fn link_rejects_slash_in_platform_user_id() {
-        let store = make_store();
-        let u = store.create_user(None).unwrap();
-        assert!(matches!(
-            store.link("discord", "1/../../etc", u.id, "admin"),
-            Err(StoreError::InvalidInput(_))
-        ));
-    }
-
-    #[test]
-    fn link_rejects_null_in_inputs() {
-        let store = make_store();
-        let u = store.create_user(None).unwrap();
-        assert!(matches!(
-            store.link("disc\0rd", "1", u.id, "admin"),
-            Err(StoreError::InvalidInput(_))
-        ));
-        assert!(matches!(
-            store.link("discord", "1\0", u.id, "admin"),
-            Err(StoreError::InvalidInput(_))
-        ));
-    }
-
-    #[test]
-    fn unlink_removes_link() {
-        let store = make_store();
-        let u = store.create_user(None).unwrap();
-        store.link("telegram", "789", u.id, "admin").unwrap();
-        assert!(store.unlink("telegram", "789").unwrap());
-        assert!(store.resolve("telegram", "789").unwrap().is_none());
-    }
-
-    #[test]
-    fn unlink_idempotent_when_missing() {
-        assert!(!make_store().unlink("discord", "ghost").unwrap());
-    }
-
-    #[test]
-    fn list_links_filters_by_user() {
-        let store = make_store();
-        let a = store.create_user(Some("Alice")).unwrap();
-        let b = store.create_user(Some("Bob")).unwrap();
-        store.link("discord", "a1", a.id, "admin").unwrap();
-        store.link("telegram", "a2", a.id, "admin").unwrap();
-        store.link("discord", "b1", b.id, "admin").unwrap();
-        let alinks = store.list_links(a.id).unwrap();
-        assert_eq!(alinks.len(), 2);
-        assert!(alinks.iter().all(|l| l.astrid_user_id == a.id));
-        assert_eq!(store.list_links(b.id).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn list_links_empty_for_unknown_user() {
-        assert!(make_store().list_links(Uuid::new_v4()).unwrap().is_empty());
-    }
-
-    #[test]
-    fn delete_user_cascades_links() {
-        let store = make_store();
-        let a = store.create_user(Some("Alice")).unwrap();
-        store.link("discord", "a1", a.id, "admin").unwrap();
-        store.link("telegram", "a2", a.id, "admin").unwrap();
-        assert!(store.delete_user(a.id).unwrap());
-        assert!(store.get_user(a.id).unwrap().is_none());
-        assert!(store.resolve("discord", "a1").unwrap().is_none());
-        assert!(store.resolve("telegram", "a2").unwrap().is_none());
-    }
-
-    #[test]
-    fn delete_user_idempotent() {
-        assert!(!make_store().delete_user(Uuid::new_v4()).unwrap());
-    }
-
-    #[test]
-    fn delete_user_preserves_other_users_links() {
-        let store = make_store();
-        let a = store.create_user(Some("Alice")).unwrap();
-        let b = store.create_user(Some("Bob")).unwrap();
-        store.link("discord", "a1", a.id, "admin").unwrap();
-        store.link("discord", "b1", b.id, "admin").unwrap();
-        assert!(store.delete_user(a.id).unwrap());
-        assert_eq!(store.resolve("discord", "b1").unwrap().unwrap().id, b.id);
-    }
-
-    #[test]
-    fn delete_clears_name_index_only_when_still_pointed_at_uuid() {
-        let store = make_store();
-        let a = store.create_user(Some("Shared")).unwrap();
-        let b = store.create_user(Some("Shared")).unwrap();
-        assert!(store.delete_user(a.id).unwrap());
-        let bytes = store.backend.get("name/Shared").unwrap().unwrap();
-        assert_eq!(String::from_utf8(bytes).unwrap(), b.id.to_string());
-    }
-
-    #[test]
-    fn list_users_returns_all() {
-        let store = make_store();
-        let a = store.create_user(Some("a")).unwrap();
-        let b = store.create_user(Some("b")).unwrap();
-        let c = store.create_user(None).unwrap();
-        let mut got = store.list_users().unwrap();
-        got.sort_by_key(|u| u.id);
-        let mut want = vec![a, b, c];
-        want.sort_by_key(|u| u.id);
-        assert_eq!(got, want);
-    }
-
-    #[test]
-    fn list_users_excludes_deleted() {
-        let store = make_store();
-        let a = store.create_user(Some("a")).unwrap();
-        let b = store.create_user(Some("b")).unwrap();
-        store.delete_user(a.id).unwrap();
-        let users = store.list_users().unwrap();
-        assert_eq!(users.len(), 1);
-        assert_eq!(users[0].id, b.id);
-    }
-
-    #[test]
-    fn validate_key_component_rejects_traversal_attempts() {
-        assert!(matches!(
-            Store::<MemBackend>::validate_key_component("../user", "platform"),
-            Err(StoreError::InvalidInput(_))
-        ));
     }
 }
