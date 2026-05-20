@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: Check & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (wasm)
+        run: cargo clippy --target wasm32-wasip1 -- -D warnings
+
+      - name: Build WASM
+        run: cargo build --release --target wasm32-wasip1
+
+      - name: Unit tests (host)
+        # Tests run on the host target — `cargo test` would otherwise pick
+        # up the workspace default of wasm32-wasip1 and fail to link a
+        # test runner. We test pure-Rust logic (validation, KV key
+        # construction, user record serde); IPC dispatch is exercised by
+        # the kernel's integration tests against the built WASM.
+        run: cargo test --target ${{ runner.os == 'macOS' && 'aarch64-apple-darwin' || 'x86_64-unknown-linux-gnu' }} --lib
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: capsule-wasm
+          path: target/wasm32-wasip1/release/*.wasm
+          if-no-files-found: error

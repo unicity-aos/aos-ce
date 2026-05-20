@@ -1,0 +1,37 @@
+[package]
+name = "astrid-capsule-users"
+version = "0.1.0"
+description = "Within-principal user identity store — platform-to-AstridUserId mapping over IPC"
+authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
+astrid-version = ">=0.1.0"
+
+[[component]]
+id = "users-store"
+file = "astrid_capsule_users.wasm"
+type = "executable"
+# No host capabilities. The capsule's entire surface is IPC pub/sub and
+# the per-capsule KV scope (granted by default).
+capabilities = {}
+
+[exports]
+"astrid:users" = "1.0.0"
+
+[publish]
+"users.v1.resolve.response" = { wit = "@unicity-astrid/wit/users/resolve-response" }
+"users.v1.link.response" = { wit = "@unicity-astrid/wit/users/link-response" }
+"users.v1.unlink.response" = { wit = "@unicity-astrid/wit/users/unlink-response" }
+"users.v1.create.response" = { wit = "@unicity-astrid/wit/users/create-response" }
+"users.v1.links.response" = { wit = "@unicity-astrid/wit/users/links-response" }
+"users.v1.get.response" = { wit = "@unicity-astrid/wit/users/get-response" }
+"users.v1.delete.response" = { wit = "@unicity-astrid/wit/users/delete-response" }
+"users.v1.list.response" = { wit = "@unicity-astrid/wit/users/list-response" }
+
+[subscribe]
+"users.v1.resolve.request" = { wit = "@unicity-astrid/wit/users/resolve-request", handler = "handle_resolve" }
+"users.v1.link.request" = { wit = "@unicity-astrid/wit/users/link-request", handler = "handle_link" }
+"users.v1.unlink.request" = { wit = "@unicity-astrid/wit/users/unlink-request", handler = "handle_unlink" }
+"users.v1.create.request" = { wit = "@unicity-astrid/wit/users/create-request", handler = "handle_create" }
+"users.v1.links.request" = { wit = "@unicity-astrid/wit/users/links-request", handler = "handle_links" }
+"users.v1.get.request" = { wit = "@unicity-astrid/wit/users/get-request", handler = "handle_get" }
+"users.v1.delete.request" = { wit = "@unicity-astrid/wit/users/delete-request", handler = "handle_delete" }
+"users.v1.list.request" = { wit = "@unicity-astrid/wit/users/list-request", handler = "handle_list" }

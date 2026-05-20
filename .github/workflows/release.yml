@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release WASM
+        run: cargo build --release --target wasm32-wasip1
+
+      - name: Prepare release asset
+        run: |
+          WASM_FILE=$(find target/wasm32-wasip1/release -maxdepth 1 -name '*.wasm' -not -name '*.d' | head -1)
+          if [ -z "$WASM_FILE" ]; then
+            echo "Error: No .wasm file found"
+            exit 1
+          fi
+          BASENAME=$(basename "$WASM_FILE")
+          cp "$WASM_FILE" "$BASENAME"
+          echo "WASM_ASSET=$BASENAME" >> "$GITHUB_ENV"
+
+          # Generate BLAKE3 hash for integrity verification
+          cargo install b3sum --quiet 2>/dev/null || true
+          if command -v b3sum &>/dev/null; then
+            b3sum "$BASENAME" > "${BASENAME}.blake3"
+            echo "HASH_ASSET=${BASENAME}.blake3" >> "$GITHUB_ENV"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.WASM_ASSET }}
+            ${{ env.HASH_ASSET }}
+          generate_release_notes: true
