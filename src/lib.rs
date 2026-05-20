@@ -32,6 +32,9 @@ mod types;
 #[cfg(test)]
 mod store_tests;
 
+#[cfg(test)]
+mod platform_scenarios;
+
 pub use requests::{
     ContextClearRequest, ContextGetRequest, ContextListForUserRequest, ContextListInContextRequest,
     ContextSetRequest, CreateRequest, DeleteRequest, GetRequest, LinkRequest, LinksRequest,
