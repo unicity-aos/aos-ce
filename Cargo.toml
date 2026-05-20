@@ -23,8 +23,3 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
-
-[patch.crates-io]
-astrid-sdk = { path = "/Users/joshuaj.bouw/dev/astrid.worktrees/agent2/sdk-rust/astrid-sdk" }
-astrid-sdk-macros = { path = "/Users/joshuaj.bouw/dev/astrid.worktrees/agent2/sdk-rust/astrid-sdk-macros" }
-astrid-sys = { path = "/Users/joshuaj.bouw/dev/astrid.worktrees/agent2/sdk-rust/astrid-sys" }
