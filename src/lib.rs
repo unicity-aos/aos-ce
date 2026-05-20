@@ -42,7 +42,7 @@ pub use requests::{
     CreateRequest, DeleteRequest, GetRequest, LinkRequest, LinksRequest, ListRequest,
     ResolveRequest, UnlinkRequest,
 };
-pub use responses::{link_to_json, user_to_json};
+pub use responses::{link_to_json, user_to_json, user_value};
 pub use store::{Backend, SdkBackend, Store};
 pub use types::{AstridUser, FrontendLink, Source, StoreError, normalize_platform};
 
@@ -238,10 +238,7 @@ impl UsersCapsule {
                 TOPIC,
                 serde_json::json!({
                     "correlation-id": cid,
-                    "users": users
-                        .iter()
-                        .filter_map(|u| user_to_json(Some(u)))
-                        .collect::<Vec<_>>(),
+                    "users": users.iter().map(user_value).collect::<Vec<_>>(),
                 }),
             ),
             Err(e) => Self::publish_error(TOPIC, cid, e),

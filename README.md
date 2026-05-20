@@ -44,7 +44,7 @@ Identity-as-domain is business logic: what counts as a link, how platforms map, 
 
 ## Storage layout
 
-KV keys mirror the legacy kernel store byte-for-byte so a future cutover can read existing data without migration:
+KV keys share the legacy kernel store's scheme so a future cutover can locate records by the same paths. Value shapes follow the WIT contract rather than the kernel's Rust serialization — `public_key` is a byte list (not base64), timestamps are millisecond-precision RFC 3339, and the kernel's redundant `principal` field is dropped (the capsule's per-principal KV scope already encodes it). Pre-launch there are no production records to migrate; any future migration tool transforms kernel records at cutover.
 
 | Key | Value |
 |---|---|

@@ -10,25 +10,29 @@ use serde_json::{Map, Value};
 use crate::types::{AstridUser, FrontendLink};
 
 /// Project an [`AstridUser`] into the kebab-case JSON shape from
-/// `users.wit`. Returns `None` when the input is `None`, so the
-/// `user: option<astrid-user>` field can be passed through unchanged.
+/// `users.wit`.
+#[must_use]
+pub fn user_value(u: &AstridUser) -> Value {
+    let mut obj = Map::new();
+    obj.insert("id".into(), Value::String(u.id.to_string()));
+    if let Some(name) = &u.display_name {
+        obj.insert("display-name".into(), Value::String(name.clone()));
+    }
+    if let Some(key) = &u.public_key {
+        obj.insert(
+            "public-key".into(),
+            Value::Array(key.iter().map(|b| Value::Number((*b).into())).collect()),
+        );
+    }
+    obj.insert("created-at".into(), Value::String(u.created_at.clone()));
+    Value::Object(obj)
+}
+
+/// Project an `Option<&AstridUser>` for the `user: option<astrid-user>`
+/// response field. Convenience wrapper around [`user_value`].
 #[must_use]
 pub fn user_to_json(user: Option<&AstridUser>) -> Option<Value> {
-    user.map(|u| {
-        let mut obj = Map::new();
-        obj.insert("id".into(), Value::String(u.id.to_string()));
-        if let Some(name) = &u.display_name {
-            obj.insert("display-name".into(), Value::String(name.clone()));
-        }
-        if let Some(key) = &u.public_key {
-            obj.insert(
-                "public-key".into(),
-                Value::Array(key.iter().map(|b| Value::Number((*b).into())).collect()),
-            );
-        }
-        obj.insert("created-at".into(), Value::String(u.created_at.clone()));
-        Value::Object(obj)
-    })
+    user.map(user_value)
 }
 
 /// Project a [`FrontendLink`] into the kebab-case JSON shape from

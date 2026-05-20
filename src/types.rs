@@ -1,9 +1,22 @@
 //! Domain types for the users capsule.
 //!
-//! The on-disk JSON layout matches the legacy kernel
+//! The on-disk JSON layout shares the key scheme of the legacy kernel
 //! `astrid-storage::identity` store (`user/{uuid}`, `link/{platform}/{id}`,
-//! `name/{name}`) so a future kernel-side cutover can read existing
-//! records without migration.
+//! `name/{name}`). The value shapes are deliberately closer to the WIT
+//! contract than to the kernel's Rust serialization:
+//!
+//! * `public_key` is a `list<u8>` (matches WIT `option<list<u8>>`); the
+//!   kernel encodes the same bytes as a base64 string.
+//! * `created_at` / `linked_at` are millisecond-precision RFC 3339
+//!   strings; the kernel uses chrono's microsecond default.
+//! * `AstridUser` carries no `principal` field — the capsule's per-
+//!   principal KV scope already encodes it, so the kernel record's
+//!   redundant `principal: PrincipalId` is dropped on first re-write.
+//!
+//! Pre-launch there are no production records to migrate, so these
+//! divergences are deliberate. Any future migration tool transforms
+//! kernel records into capsule records (base64-decode public keys,
+//! reformat timestamps, strip principal) at cutover time.
 
 use crate::time::now_rfc3339;
 use serde::{Deserialize, Serialize};
