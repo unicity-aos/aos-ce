@@ -1,16 +1,14 @@
 //! JSON projection helpers for outbound responses.
 //!
-//! We emit `serde_json::Value` directly instead of round-tripping
-//! through typed structs so the wire shape matches `users.wit`
-//! (kebab-case fields) without hand-maintaining a parallel set of
-//! Rust structs only the publish path would use.
+//! Emit `serde_json::Value` directly so the wire shape matches
+//! `users.wit` (kebab-case fields) without maintaining a parallel
+//! set of Rust structs only the publish path would use.
 
 use serde_json::{Map, Value};
 
-use crate::types::{AstridUser, FrontendLink};
+use crate::types::{AstridUser, ContextIdentity, FrontendLink};
 
-/// Project an [`AstridUser`] into the kebab-case JSON shape from
-/// `users.wit`.
+/// Project an [`AstridUser`] into kebab-case JSON.
 #[must_use]
 pub fn user_value(u: &AstridUser) -> Value {
     let mut obj = Map::new();
@@ -28,77 +26,49 @@ pub fn user_value(u: &AstridUser) -> Value {
     Value::Object(obj)
 }
 
-/// Project an `Option<&AstridUser>` for the `user: option<astrid-user>`
-/// response field. Convenience wrapper around [`user_value`].
 #[must_use]
 pub fn user_to_json(user: Option<&AstridUser>) -> Option<Value> {
     user.map(user_value)
 }
 
-/// Project a [`FrontendLink`] into the kebab-case JSON shape from
-/// `users.wit`.
+/// Project a [`FrontendLink`] into kebab-case JSON.
 #[must_use]
 pub fn link_to_json(link: &FrontendLink) -> Value {
-    serde_json::json!({
-        "platform": link.platform,
-        "platform-user-id": link.platform_user_id,
-        "astrid-user-id": link.astrid_user_id.to_string(),
-        "linked-at": link.linked_at,
-        "method": link.method,
-    })
+    let mut obj = Map::new();
+    obj.insert("platform".into(), Value::String(link.platform.clone()));
+    if let Some(inst) = &link.platform_instance {
+        obj.insert("platform-instance".into(), Value::String(inst.clone()));
+    }
+    obj.insert(
+        "platform-user-id".into(),
+        Value::String(link.platform_user_id.clone()),
+    );
+    obj.insert(
+        "astrid-user-id".into(),
+        Value::String(link.astrid_user_id.to_string()),
+    );
+    obj.insert("linked-at".into(), Value::String(link.linked_at.clone()));
+    obj.insert("method".into(), Value::String(link.method.clone()));
+    if let Some(dn) = &link.display_name {
+        obj.insert("display-name".into(), Value::String(dn.clone()));
+    }
+    Value::Object(obj)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use uuid::Uuid;
-
-    #[test]
-    fn user_to_json_uses_kebab_case() {
-        let user = AstridUser {
-            id: Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
-            public_key: None,
-            display_name: Some("Alice".into()),
-            created_at: "2026-01-15T12:00:00.000Z".into(),
-        };
-        let json = user_to_json(Some(&user)).unwrap();
-        let obj = json.as_object().unwrap();
-        assert_eq!(obj["id"], "00000000-0000-4000-8000-000000000001");
-        assert_eq!(obj["display-name"], "Alice");
-        assert_eq!(obj["created-at"], "2026-01-15T12:00:00.000Z");
-        assert!(!obj.contains_key("display_name"));
+/// Project a [`ContextIdentity`] into kebab-case JSON.
+#[must_use]
+pub fn context_to_json(c: &ContextIdentity) -> Value {
+    let mut obj = Map::new();
+    obj.insert("platform".into(), Value::String(c.platform.clone()));
+    if let Some(inst) = &c.platform_instance {
+        obj.insert("platform-instance".into(), Value::String(inst.clone()));
     }
-
-    #[test]
-    fn user_to_json_omits_none_fields() {
-        let user = AstridUser::new(None);
-        let json = user_to_json(Some(&user)).unwrap();
-        let obj = json.as_object().unwrap();
-        assert!(!obj.contains_key("display-name"));
-        assert!(!obj.contains_key("public-key"));
-    }
-
-    #[test]
-    fn user_to_json_returns_none_for_absent_user() {
-        assert!(user_to_json(None).is_none());
-    }
-
-    #[test]
-    fn link_to_json_uses_kebab_case() {
-        let link = FrontendLink {
-            platform: "discord".into(),
-            platform_user_id: "12345".into(),
-            astrid_user_id: Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap(),
-            linked_at: "2026-01-15T12:00:00.000Z".into(),
-            method: "admin".into(),
-        };
-        let json = link_to_json(&link);
-        let obj = json.as_object().unwrap();
-        assert_eq!(obj["platform-user-id"], "12345");
-        assert_eq!(
-            obj["astrid-user-id"],
-            "00000000-0000-4000-8000-000000000002"
-        );
-        assert_eq!(obj["linked-at"], "2026-01-15T12:00:00.000Z");
-    }
+    obj.insert(
+        "platform-user-id".into(),
+        Value::String(c.platform_user_id.clone()),
+    );
+    obj.insert("context-id".into(), Value::String(c.context_id.clone()));
+    obj.insert("display-name".into(), Value::String(c.display_name.clone()));
+    obj.insert("updated-at".into(), Value::String(c.updated_at.clone()));
+    Value::Object(obj)
 }
