@@ -46,8 +46,8 @@ Workspace-relative and `/tmp` paths are always allowed through to the approval p
 ## Development
 
 ```bash
-rustup target add wasm32-wasip2
-cargo build --target wasm32-wasip2 --release
+rustup target add wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown --release
 cargo test
 ```
 
