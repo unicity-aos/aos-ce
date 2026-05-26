@@ -34,6 +34,14 @@ const DEFAULT_SESSION_ID: &str = "default";
 /// Current schema version for `SessionData`.
 const SESSION_DATA_SCHEMA_VERSION: u32 = 1;
 
+/// Maximum number of CAS retry attempts before giving up.
+///
+/// Concurrent writers to the same session ID race on `kv::cas`. Eight
+/// retries is generous for the realistic concurrency level (a single
+/// react loop per session) and bounds worst-case latency under
+/// adversarial contention.
+const CAS_RETRY_LIMIT: u32 = 8;
+
 /// Build the KV key for a session's data.
 fn session_key(session_id: &str) -> String {
     format!("{SESSION_KEY_PREFIX}.{session_id}")
@@ -87,37 +95,113 @@ impl SessionData {
     }
 
     /// Load session data from KV, applying schema migration as needed.
-    fn load(session_id: &str) -> Self {
+    ///
+    /// Returns `(data, raw_bytes)` where `raw_bytes` is the exact KV
+    /// payload that was read (or `None` for a missing key). Callers use
+    /// `raw_bytes` as the `expected` value in [`kv::cas`] to detect
+    /// concurrent writers. Returns `Self::default()` with `raw_bytes =
+    /// None` if the key is absent.
+    fn load(session_id: &str) -> (Self, Option<Vec<u8>>) {
         let key = session_key(session_id);
-        let data = kv::get_json::<Self>(&key).unwrap_or_else(|e| {
-            log::error(format!("Failed to load session data, starting fresh: {e}"));
+        let raw = match kv::get_bytes_opt(&key) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error(format!("Failed to load session bytes, starting fresh: {e}"));
+                return (Self::default(), None);
+            }
+        };
+
+        let Some(bytes) = raw else {
+            // Key is absent: fresh default with no expected bytes (CAS
+            // will use `expected = None` for create-if-absent semantics).
+            return (Self::default(), None);
+        };
+
+        let data = serde_json::from_slice::<Self>(&bytes).unwrap_or_else(|e| {
+            log::error(format!("Failed to parse session data, starting fresh: {e}"));
             Self::default()
         });
 
         match data.migrate() {
             Ok((migrated, needs_save)) => {
-                // If version was bumped (v0 -> v1), persist the migration.
-                // No retry on save failure - the in-memory data is still
-                // usable and re-save will be attempted on next modification.
-                if needs_save && let Err(e) = migrated.save(session_id) {
-                    log::warn(format!("Failed to re-save session after migration: {e}"));
+                // If version was bumped (v0 -> v1), persist the migration
+                // via CAS so we don't clobber a concurrent writer. Best-
+                // effort: in-memory data is usable either way, and the
+                // next modification will retry the migration if this one
+                // races out.
+                if needs_save {
+                    let migrated_bytes = match serde_json::to_vec(&migrated) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::warn(format!("Failed to serialize migrated session: {e}"));
+                            return (migrated, Some(bytes));
+                        }
+                    };
+                    match kv::cas(&key, Some(&bytes), &migrated_bytes) {
+                        Ok(true) => (migrated, Some(migrated_bytes)),
+                        Ok(false) => {
+                            // Lost the race to another writer; their value
+                            // is now authoritative. Caller will pick it up
+                            // on its own retry loop.
+                            log::debug(format!(
+                                "session '{session_id}' migration CAS lost \
+                                 race; another writer migrated first"
+                            ));
+                            (migrated, Some(bytes))
+                        }
+                        Err(e) => {
+                            log::warn(format!("Failed to CAS-save session after migration: {e}"));
+                            (migrated, Some(bytes))
+                        }
+                    }
+                } else {
+                    (migrated, Some(bytes))
                 }
-                migrated
             }
             Err(fresh) => {
                 log::error(format!(
                     "Session '{session_id}' has unknown schema version \
                          (expected {SESSION_DATA_SCHEMA_VERSION}), starting fresh"
                 ));
-                fresh
+                (fresh, Some(bytes))
             }
         }
     }
 
-    /// Persist session data to KV.
-    fn save(&self, session_id: &str) -> Result<(), SysError> {
+    /// Atomically read-modify-write session data using [`kv::cas`].
+    ///
+    /// Retries up to [`CAS_RETRY_LIMIT`] times if a concurrent writer
+    /// wins the swap. The `mutate` closure is called fresh on every
+    /// retry so logic that derives state (e.g. truncation, dedup) sees
+    /// the current stored value. Returns the post-write [`SessionData`]
+    /// so callers that need the merged history (e.g. append-before-read)
+    /// avoid a second `load`.
+    fn modify_atomic<F>(session_id: &str, mut mutate: F) -> Result<Self, SysError>
+    where
+        F: FnMut(&mut Self),
+    {
         let key = session_key(session_id);
-        kv::set_json(&key, self)
+
+        for attempt in 0..CAS_RETRY_LIMIT {
+            let (mut data, expected) = Self::load(session_id);
+            mutate(&mut data);
+            let new_bytes = serde_json::to_vec(&data)?;
+            let expected_slice = expected.as_deref();
+
+            if kv::cas(&key, expected_slice, &new_bytes)? {
+                return Ok(data);
+            }
+
+            log::debug(format!(
+                "session '{session_id}' CAS attempt {} lost race; retrying",
+                attempt + 1
+            ));
+        }
+
+        Err(SysError::ApiError(format!(
+            "session '{session_id}' write contended for {CAS_RETRY_LIMIT} attempts; \
+             giving up to avoid unbounded retry"
+        )))
     }
 }
 
@@ -162,9 +246,14 @@ impl Session {
             return Ok(());
         }
 
-        let mut data = SessionData::load(session_id);
-        data.messages.extend(messages);
-        data.save(session_id)
+        // Atomic append: `kv::cas` guarantees we never clobber a
+        // concurrent writer's appends. The closure is re-run on each
+        // retry against the freshly-loaded value, so all messages from
+        // both writers end up in the final list.
+        SessionData::modify_atomic(session_id, |data| {
+            data.messages.extend(messages.iter().cloned());
+        })
+        .map(|_| ())
     }
 
     /// Extracts and validates `correlation_id` from a request payload.
@@ -207,19 +296,24 @@ impl Session {
 
         let correlation_id = Self::require_correlation_id(&payload, "get_messages")?;
 
-        let mut data = SessionData::load(session_id);
-
         // Atomic append-before-read: if the requester provides messages to
         // append, store them first so the returned history includes them.
-        if let Some(append_msgs) = payload.get("append_before_read").cloned() {
+        // `kv::cas` makes the read-modify-write race-free against any
+        // concurrent `handle_append` on the same session.
+        let data = if let Some(append_msgs) = payload.get("append_before_read").cloned() {
             let msgs: Vec<Message> = serde_json::from_value(append_msgs).map_err(|e| {
                 SysError::ApiError(format!("Failed to parse append_before_read: {e}"))
             })?;
-            if !msgs.is_empty() {
-                data.messages.extend(msgs);
-                data.save(session_id)?;
+            if msgs.is_empty() {
+                SessionData::load(session_id).0
+            } else {
+                SessionData::modify_atomic(session_id, |data| {
+                    data.messages.extend(msgs.iter().cloned());
+                })?
             }
-        }
+        } else {
+            SessionData::load(session_id).0
+        };
 
         // correlation_id is redundant with the scoped topic but retained
         // in the payload for observability (log inspection, debugging).
@@ -255,7 +349,18 @@ impl Session {
             parent_session_id: Some(old_session_id.to_string()),
             messages: Vec::new(),
         };
-        new_data.save(&new_session_id)?;
+        let new_bytes = serde_json::to_vec(&new_data)?;
+        // Create-if-absent: a UUID v4 collision with an existing session
+        // key is astronomically unlikely but still fail-secure rather
+        // than silently overwrite. `cas(key, None, ...)` returns false
+        // if the key already exists.
+        let created = kv::cas(&session_key(&new_session_id), None, &new_bytes)?;
+        if !created {
+            return Err(SysError::ApiError(format!(
+                "session '{new_session_id}' UUID collision detected; \
+                 refusing to overwrite existing session"
+            )));
+        }
 
         log::info(format!(
             "Session cleared: '{old_session_id}' -> '{new_session_id}' \
