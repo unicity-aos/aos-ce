@@ -40,8 +40,8 @@ Only accepts capsule metadata responses from the kernel's system session UUID. M
 ## Development
 
 ```bash
-rustup target add wasm32-wasip2
-cargo build --target wasm32-wasip2 --release
+rustup target add wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown --release
 ```
 
 ## License
