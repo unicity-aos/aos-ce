@@ -28,8 +28,8 @@ Returns error results for invalid tool names or failed publishes. Completely sta
 ## Development
 
 ```bash
-rustup target add wasm32-wasip2
-cargo build --target wasm32-wasip2 --release
+rustup target add wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown --release
 ```
 
 ## License
