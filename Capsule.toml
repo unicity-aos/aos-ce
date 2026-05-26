@@ -14,7 +14,7 @@ type = "executable"
 "astrid:hook" = "1.0.0"
 
 [publish]
-"hook.v1.result.*" = { wit = "@unicity-astrid/wit/hook/hook-result" }
+"hook.v1.event.*" = { wit = "@unicity-astrid/wit/hook/hook-event-request" }
 
 [subscribe]
 "astrid.v1.lifecycle.session_created" = { wit = "@unicity-astrid/wit/hook/lifecycle-event", handler = "on_session_created" }

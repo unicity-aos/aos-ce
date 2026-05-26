@@ -7,38 +7,52 @@
 //!
 //! The kernel dispatches lifecycle events (e.g. `tool_call_started`,
 //! `session_created`) to this capsule via interceptors. The Hook Bridge
-//! maps each event to a semantic hook name, calls `hooks::trigger` to
-//! fan out to all subscriber capsules, and applies merge strategies to
-//! the collected responses.
+//! maps each event to a semantic hook name, fans out to subscriber
+//! capsules over IPC, and applies merge strategies to the collected
+//! responses.
 //!
-//! # Architecture
+//! # Architecture (post per-domain WIT split)
 //!
 //! ```text
 //! Kernel EventBus → EventDispatcher → Hook Bridge (this capsule)
-//!                                        ↓ hooks::trigger("before_tool_call", payload)
-//!                                     Kernel astrid_trigger_hook host fn
-//!                                        ↓ iterates CapsuleRegistry
-//!                                     Subscriber capsule A, B, C...
-//!                                        ↑ collect responses
-//!                                     Hook Bridge applies merge strategy
+//!                                        ↓ ipc::publish("hook.v1.event.<hook>", req)
+//!                                     Subscriber capsules A, B, C...
+//!                                        ↓ publish "hook.v1.response.<hook>.<corr_id>"
+//!                                     Hook Bridge collects responses, applies merge
+//!                                        ↓ returns merged result via interceptor reply
 //! ```
 //!
-//! This is a **policy** capsule: it defines which events map to which
-//! hooks and how responses are merged. The **mechanism** (fan-out and
-//! response collection) lives in the kernel's `astrid_trigger_hook`
-//! host function.
+//! Before the per-domain WIT split, fan-out was driven by the
+//! `sys::trigger-hook` host fn (removed in `sdk-rust` 0.7). The kernel
+//! iterated `CapsuleRegistry` itself and returned a concatenated list
+//! of responses. Post-split, fan-out is a capsule-to-capsule IPC
+//! convention: the Hook Bridge publishes a request, listens on a
+//! correlation-keyed reply topic, and applies the merge.
+//!
+//! This is a **policy** capsule: it defines which lifecycle events map
+//! to which hook names and how responses are merged.
 
 use astrid_sdk::prelude::*;
 use serde::Serialize;
+
+/// Hard deadline for collecting hook responses, per dispatch.
+///
+/// The bus capped `request_response` at 60 s; we use a much shorter
+/// window because interceptors block the lifecycle event chain and any
+/// hook handler that takes >1 s is misbehaving. If no responses arrive
+/// in this window, we return the merge of whatever did arrive (which
+/// may be the `MergeSemantics::None` result).
+const HOOK_COLLECT_DEADLINE_MS: u64 = 5_000;
 
 /// Merged result from hook fan-out.
 ///
 /// Uses `serde_json::Value` for `data` (not `String`) to preserve the
 /// wire format: consumers expect `data` as a nested JSON object, not a
-/// JSON-encoded string. The WIT contract describes this as `option<string>`
-/// for schema purposes, but the Rust type must match what goes on the wire.
+/// JSON-encoded string. The WIT contract describes this as
+/// `option<string>` for schema purposes, but the Rust type must match
+/// what goes on the wire.
 #[derive(Serialize)]
-struct HookResult {
+pub struct HookResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     skip: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,12 +81,18 @@ struct HookMapping {
 
 // ── Hook Trigger Protocol ──────────────────────────────────────────────────────────
 
-/// Request payload sent to `hooks::trigger` (consumed by the kernel's
-/// `astrid_trigger_hook` host function).
+/// Request payload sent to subscriber capsules.
+///
+/// Subscribers see `hook.v1.event.<hook_name>` envelopes carrying this
+/// shape. When `correlation_id` is present, they must publish their
+/// reply to `hook.v1.response.<hook_name>.<correlation_id>`; when it's
+/// absent, the dispatch is fire-and-forget.
 #[derive(Serialize)]
-struct TriggerRequest<'a> {
+struct HookEventRequest<'a> {
     hook: &'a str,
     payload: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation_id: Option<&'a str>,
 }
 
 // ── Event-to-Hook Mapping Table ────────────────────────────────────────────────────
@@ -164,7 +184,7 @@ fn mapping_for_event(event_type: &str) -> Option<HookMapping> {
 
 // ── Merge Logic ────────────────────────────────────────────────────────────────────
 
-/// Apply merge semantics to a list of interceptor responses.
+/// Apply merge semantics to a list of subscriber responses.
 fn apply_merge(merge: &MergeSemantics, responses: &[serde_json::Value]) -> HookResult {
     match merge {
         MergeSemantics::None => HookResult {
@@ -214,45 +234,111 @@ fn apply_merge(merge: &MergeSemantics, responses: &[serde_json::Value]) -> HookR
     }
 }
 
+// ── Correlation IDs ────────────────────────────────────────────────────────────────
+
+/// Generate a 16-byte hex correlation id from the host CSPRNG.
+///
+/// We can't depend on `uuid` directly (not re-exported from
+/// `astrid-sdk`), and using a monotonic timestamp would collide if two
+/// dispatches landed in the same nanosecond. `runtime::random_bytes` is
+/// the documented CSPRNG path.
+fn correlation_id() -> Result<String, SysError> {
+    let bytes = runtime::random_bytes(16)?;
+    let mut s = String::with_capacity(32);
+    for b in bytes {
+        s.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        s.push(char::from_digit(u32::from(b & 0x0F), 16).unwrap_or('0'));
+    }
+    Ok(s)
+}
+
 // ── Core Dispatch ──────────────────────────────────────────────────────────────────
 
 /// Dispatch a lifecycle event through the hook system.
 ///
-/// 1. Look up the event-to-hook mapping
-/// 2. Call `hooks::trigger` to fan out to subscriber capsules
-/// 3. Apply merge strategy to collected responses
-/// 4. Return the merged result
-fn dispatch_hook(event_type: &str, payload: &serde_json::Value) -> Result<Vec<u8>, SysError> {
+/// 1. Look up the event-to-hook mapping.
+/// 2. For `MergeSemantics::None`: publish on
+///    `hook.v1.event.<hook_name>` fire-and-forget.
+/// 3. For merge cases: subscribe to a correlation-keyed reply topic,
+///    publish the event with the correlation id, collect responses
+///    until quiescence or deadline, apply the merge.
+fn dispatch_hook(
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> Result<Option<HookResult>, SysError> {
     let Some(mapping) = mapping_for_event(event_type) else {
         // No hook mapping for this event — nothing to do.
-        return Ok(Vec::new());
+        return Ok(Option::None);
     };
 
-    let request = TriggerRequest {
-        hook: mapping.hook_name,
-        payload,
-    };
-    let request_str = serde_json::to_string(&request)
-        .map_err(|e| SysError::ApiError(format!("failed to serialize trigger request: {e}")))?;
+    let event_topic = format!("hook.v1.event.{}", mapping.hook_name);
 
-    let response_str = hooks::trigger(&request_str)?;
-
-    // Parse the response array from the kernel.
-    let responses: Vec<serde_json::Value> = match serde_json::from_str(&response_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn(format!("failed to deserialize hook responses: {e}"));
-            Vec::new()
-        }
-    };
-
-    if responses.is_empty() && matches!(mapping.merge, MergeSemantics::None) {
-        return Ok(Vec::new());
+    // Fire-and-forget for None-merge events. No responder is expected,
+    // so we don't allocate a subscription handle.
+    if matches!(mapping.merge, MergeSemantics::None) {
+        let request = HookEventRequest {
+            hook: mapping.hook_name,
+            payload,
+            correlation_id: Option::None,
+        };
+        ipc::publish_json(&event_topic, &request)?;
+        return Ok(Option::None);
     }
 
-    let result = apply_merge(&mapping.merge, &responses);
-    serde_json::to_vec(&result)
-        .map_err(|e| SysError::ApiError(format!("failed to serialize hook result: {e}")))
+    // Fan-out + collect. Subscribe BEFORE publishing so a fast responder
+    // can't beat us to the reply topic.
+    let corr_id = correlation_id()?;
+    let reply_topic = format!("hook.v1.response.{}.{corr_id}", mapping.hook_name);
+
+    let sub = ipc::subscribe(&reply_topic)?;
+
+    let request = HookEventRequest {
+        hook: mapping.hook_name,
+        payload,
+        correlation_id: Some(&corr_id),
+    };
+    ipc::publish_json(&event_topic, &request)?;
+
+    // Drain replies until the collection window closes, or `recv`
+    // returns an empty batch (quiescence). The Drop on `sub` releases
+    // the kernel-side subscription on every return path.
+    let mut responses: Vec<serde_json::Value> = Vec::new();
+    let start = time::monotonic();
+    loop {
+        let elapsed_ms = u64::try_from((time::monotonic().saturating_sub(start)).as_millis())
+            .unwrap_or(HOOK_COLLECT_DEADLINE_MS);
+        if elapsed_ms >= HOOK_COLLECT_DEADLINE_MS {
+            break;
+        }
+        let remaining = HOOK_COLLECT_DEADLINE_MS - elapsed_ms;
+
+        match sub.recv(remaining) {
+            Ok(poll) => {
+                if poll.messages.is_empty() {
+                    // Either the host returned early-empty or we hit the
+                    // deadline without new messages. Either way, stop.
+                    break;
+                }
+                for msg in poll.messages {
+                    match serde_json::from_str::<serde_json::Value>(&msg.payload) {
+                        Ok(v) => responses.push(v),
+                        Err(e) => {
+                            log::warn(format!(
+                                "hook-bridge: dropping malformed reply on {reply_topic}: {e}"
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(SysError::HostError(msg)) if msg.contains("Timeout") => {
+                // No more replies inside the window. Done.
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(Some(apply_merge(&mapping.merge, &responses)))
 }
 
 // ── Capsule Implementation ─────────────────────────────────────────────────────────
@@ -260,12 +346,15 @@ fn dispatch_hook(event_type: &str, payload: &serde_json::Value) -> Result<Vec<u8
 /// Hook Bridge capsule.
 ///
 /// Maps lifecycle events to semantic hooks, fans out to subscribers via
-/// `hooks::trigger`, and applies merge strategies to the responses.
+/// IPC, and applies merge strategies to the responses.
 #[derive(Default)]
 pub struct HookBridge;
 
 /// Extract event type and dispatch the hook. Used by all interceptor handlers.
-fn handle_lifecycle(event_type: &str, payload: serde_json::Value) -> Result<Vec<u8>, SysError> {
+fn handle_lifecycle(
+    event_type: &str,
+    payload: serde_json::Value,
+) -> Result<Option<HookResult>, SysError> {
     dispatch_hook(event_type, &payload)
 }
 
@@ -293,13 +382,19 @@ impl HookBridge {
     ///
     /// Returns merged result with potential skip/modified_params.
     #[astrid::interceptor("on_tool_call_started")]
-    pub fn on_tool_call_started(&self, payload: serde_json::Value) -> Result<Vec<u8>, SysError> {
+    pub fn on_tool_call_started(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<Option<HookResult>, SysError> {
         handle_lifecycle("astrid.v1.lifecycle.tool_call_started", payload)
     }
 
     /// Handle `tool_call_completed` — maps to `after_tool_call` hook.
     #[astrid::interceptor("on_tool_call_completed")]
-    pub fn on_tool_call_completed(&self, payload: serde_json::Value) -> Result<Vec<u8>, SysError> {
+    pub fn on_tool_call_completed(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<Option<HookResult>, SysError> {
         handle_lifecycle("astrid.v1.lifecycle.tool_call_completed", payload)
     }
 
@@ -308,7 +403,7 @@ impl HookBridge {
     pub fn on_tool_result_persisting(
         &self,
         payload: serde_json::Value,
-    ) -> Result<Vec<u8>, SysError> {
+    ) -> Result<Option<HookResult>, SysError> {
         handle_lifecycle("astrid.v1.lifecycle.tool_result_persisting", payload)
     }
 
@@ -323,7 +418,10 @@ impl HookBridge {
 
     /// Handle `message_sending` — maps to `message_sending` hook.
     #[astrid::interceptor("on_message_sending")]
-    pub fn on_message_sending(&self, payload: serde_json::Value) -> Result<Vec<u8>, SysError> {
+    pub fn on_message_sending(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<Option<HookResult>, SysError> {
         handle_lifecycle("astrid.v1.lifecycle.message_sending", payload)
     }
 
