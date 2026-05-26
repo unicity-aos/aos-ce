@@ -24,7 +24,6 @@
 
 use astrid_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// Runtime configuration loaded from capsule config at startup.
 struct Config {
@@ -295,25 +294,30 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
         log::error(format!(
             "Failed to publish prompt_builder.v1.hook.before_build event: {e}"
         ));
-        let _ = ipc::unsubscribe(&sub);
+        // sub dropped on return — kernel-side resource released automatically.
         return Vec::new();
     }
 
     // Block-wait for hook responses within the configured timeout.
+    // `std::time::Instant::now()` panics on `wasm32-unknown-unknown`
+    // (the Astrid-canonical capsule target); track the deadline as a
+    // host-monotonic instant via `astrid_sdk::time::monotonic`, which
+    // routes through `astrid:sys.clock-monotonic-ns`.
     let mut sourced_responses = Vec::new();
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(config.hook_timeout_ms);
+    let start = astrid_sdk::time::monotonic();
+    let timeout_dur = std::time::Duration::from_millis(config.hook_timeout_ms);
 
-    while std::time::Instant::now() < deadline && sourced_responses.len() < MAX_HOOK_RESPONSES {
-        let remaining_ms = deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .as_millis();
+    while astrid_sdk::time::monotonic().saturating_sub(start) < timeout_dur
+        && sourced_responses.len() < MAX_HOOK_RESPONSES
+    {
+        let elapsed = astrid_sdk::time::monotonic().saturating_sub(start);
+        let remaining_ms = timeout_dur.saturating_sub(elapsed).as_millis();
         if remaining_ms == 0 {
             break;
         }
         let timeout = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
 
-        match ipc::recv(&sub, timeout) {
+        match sub.recv(timeout) {
             Ok(result) => {
                 if result.messages.is_empty() {
                     break;
@@ -328,7 +332,7 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
         }
     }
 
-    let _ = ipc::unsubscribe(&sub);
+    // sub drops here, releasing the kernel-side subscription.
 
     log::info(format!(
         "Collected {} hook responses for request {}",
@@ -465,15 +469,25 @@ const TOOL_SCHEMA_CACHE_KEY: &str = "__tool_schema_cache";
 /// Timeout (ms) for fetching session messages from the session capsule.
 const SESSION_FETCH_TIMEOUT_MS: u64 = 5000;
 
-/// Collect tool schemas from all capsules via `trigger_hook`.
+/// Timeout (ms) for fanning out the tool-describe request and collecting
+/// responses from every tool-providing capsule.
+const TOOL_DESCRIBE_FANOUT_TIMEOUT_MS: u64 = 2000;
+
+/// Maximum number of tool-describe responses to collect before proceeding.
+const MAX_TOOL_DESCRIBE_RESPONSES: usize = 256;
+
+/// Collect tool schemas from all capsules via IPC fan-out.
 ///
-/// Checks `__tool_schema_cache` in KV first. On cache miss, it uses the
-/// kernel's `trigger_hook` host function to fan out a `tool.v1.request.describe`
-/// request to all capsules with matching interceptors. This works for both WASM
-/// and MCP capsules.
+/// Checks `__tool_schema_cache` in KV first. On cache miss, subscribes to
+/// `tool.v1.response.describe.*` and publishes a `tool.v1.request.describe`
+/// event. Tool-providing capsules respond on their own
+/// `tool.v1.response.describe.<source_id>` topic. Responses are collected
+/// within `TOOL_DESCRIBE_FANOUT_TIMEOUT_MS` and deduplicated by tool name.
 ///
-/// The collected tool schemas are deduplicated by name and cached in KV for
-/// subsequent calls.
+/// The pre-#752 implementation used `hooks::trigger`, which has been removed
+/// from the host ABI surface. This IPC-based fan-out replaces it; the same
+/// `{ "tools": [...] }` envelope (from SDK macro `tool_describe` and
+/// `astrid_bridge.mjs`) is honoured.
 fn collect_tool_schemas() -> Vec<serde_json::Value> {
     // Check KV cache first.
     if let Ok(cached) = kv::get_json::<Vec<serde_json::Value>>(TOOL_SCHEMA_CACHE_KEY)
@@ -483,46 +497,53 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
         return cached;
     }
 
-    // Use trigger_hook to fan out to all capsules with matching interceptors.
-    // trigger_hook calls invoke_interceptor on each capsule and collects
-    // the JSON responses into an array.
-    let request = serde_json::json!({
-        "hook": "tool.v1.request.describe",
-        "payload": {},
-    });
-
-    let request_str = match serde_json::to_string(&request) {
+    // Subscribe BEFORE publishing so we don't miss fast responders.
+    let sub = match ipc::subscribe("tool.v1.response.describe.*") {
         Ok(s) => s,
         Err(e) => {
-            log::error(format!("Failed to serialize trigger_hook request: {e}"));
+            log::error(format!(
+                "Failed to subscribe to tool.v1.response.describe.*: {e}"
+            ));
             return Vec::new();
         }
     };
 
-    let response_str = match hooks::trigger(&request_str) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error(format!("trigger_hook failed: {e}"));
-            return Vec::new();
-        }
-    };
+    // Fire the fan-out request. Empty payload — every responder publishes its
+    // own tool schema set onto `tool.v1.response.describe.<source_id>`.
+    if let Err(e) = ipc::publish("tool.v1.request.describe", "{}") {
+        log::error(format!("Failed to publish tool.v1.request.describe: {e}"));
+        return Vec::new();
+    }
 
-    // trigger_hook returns a JSON array of responses from each capsule.
-    // Each response is the JSON value returned by that capsule's interceptor.
-    // For WASM tool capsules: { "tools": [...] } (from SDK macro tool_describe)
-    // For MCP capsules: { "tools": [...] } (from astrid_bridge.mjs tool_describe)
-    let responses: Vec<serde_json::Value> = match serde_json::from_str(&response_str) {
-        Ok(r) => r,
-        Err(e) => {
-            log::warn(format!("Failed to parse trigger_hook response: {e}"));
-            Vec::new()
-        }
-    };
-
+    // Collect responses until we time out or hit the cap. Monotonic
+    // clock via `astrid_sdk::time` — `std::time::Instant::now()`
+    // panics on `wasm32-unknown-unknown`.
     let mut all_tools: Vec<serde_json::Value> = Vec::new();
-    for response in &responses {
-        if let Some(tools) = response.get("tools").and_then(|t| t.as_array()) {
-            all_tools.extend(tools.iter().cloned());
+    let start = astrid_sdk::time::monotonic();
+    let timeout_dur = std::time::Duration::from_millis(TOOL_DESCRIBE_FANOUT_TIMEOUT_MS);
+
+    while astrid_sdk::time::monotonic().saturating_sub(start) < timeout_dur
+        && all_tools.len() < MAX_TOOL_DESCRIBE_RESPONSES
+    {
+        let elapsed = astrid_sdk::time::monotonic().saturating_sub(start);
+        let remaining_ms = timeout_dur.saturating_sub(elapsed).as_millis();
+        if remaining_ms == 0 {
+            break;
+        }
+        let timeout = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
+
+        match sub.recv(timeout) {
+            Ok(result) => {
+                if result.messages.is_empty() {
+                    break;
+                }
+                for msg in &result.messages {
+                    if let Some(tools) = extract_tools_from_response(&msg.payload) {
+                        all_tools.extend(tools);
+                    }
+                }
+            }
+            _ => break,
         }
     }
 
@@ -537,7 +558,7 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
     });
 
     log::info(format!(
-        "Collected {} tool schemas via trigger_hook",
+        "Collected {} tool schemas via tool.v1.request.describe fan-out",
         all_tools.len()
     ));
 
@@ -549,81 +570,63 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
     all_tools
 }
 
+/// Extract the `tools` array from a `tool.v1.response.describe.*` payload.
+///
+/// Honours both the direct envelope (`{ "tools": [...] }`, emitted by the
+/// SDK macro `tool_describe` and `astrid_bridge.mjs`) and the wrapped
+/// `{ "data": { "tools": [...] } }` envelope used by some Custom payload
+/// publishers.
+fn extract_tools_from_response(payload: &str) -> Option<Vec<serde_json::Value>> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let tools = value
+        .get("tools")
+        .or_else(|| value.get("data").and_then(|d| d.get("tools")))
+        .and_then(|t| t.as_array())?;
+    Some(tools.clone())
+}
+
 /// Fetch session conversation history from the session capsule via IPC.
 ///
-/// Uses a per-request scoped reply topic to prevent cross-instance response
-/// contamination under concurrent load. Returns an empty vec on timeout or error.
+/// Uses [`ipc::request_response`], which generates a v4 correlation ID,
+/// subscribes to the scoped reply topic *before* publishing, injects the
+/// correlation ID into the request body, and tears the subscription down
+/// on every return path via the [`ipc::Subscription`] Drop. Returns an
+/// empty vec on timeout, parse failure, or transport error.
 fn fetch_session_messages(session_id: &str) -> Vec<serde_json::Value> {
-    let correlation_id = Uuid::new_v4().to_string();
-    let reply_topic = format!("session.v1.response.get_messages.{correlation_id}");
+    let request = serde_json::json!({ "session_id": session_id });
 
-    // Subscribe BEFORE publishing to avoid delivery race.
-    let handle = match ipc::subscribe(&reply_topic) {
-        Ok(h) => h,
+    // Responder publishes onto `session.v1.response.get_messages.<corr_id>`.
+    let raw: serde_json::Value = match ipc::request_response(
+        "session.v1.request.get_messages",
+        "session.v1.response.get_messages",
+        &request,
+        SESSION_FETCH_TIMEOUT_MS,
+    ) {
+        Ok(v) => v,
         Err(e) => {
-            log::error(format!(
-                "Failed to subscribe to session response topic: {e}"
+            log::warn(format!(
+                "session.v1.request.get_messages failed (timeout={SESSION_FETCH_TIMEOUT_MS}ms): {e}"
             ));
             return Vec::new();
         }
     };
 
-    let request = serde_json::json!({
-        "correlation_id": correlation_id,
-        "session_id": session_id,
-    });
+    // The session capsule may wrap the array in a Custom `data` envelope.
+    let messages_value = raw
+        .get("messages")
+        .or_else(|| raw.get("data").and_then(|d| d.get("messages")));
 
-    if let Err(e) = ipc::publish_json("session.v1.request.get_messages", &request) {
-        log::error(format!(
-            "Failed to publish session.v1.request.get_messages: {e}"
-        ));
-        let _ = ipc::unsubscribe(&handle);
-        return Vec::new();
-    }
-
-    let result = (|| -> Vec<serde_json::Value> {
-        let poll_result = match ipc::recv(&handle, SESSION_FETCH_TIMEOUT_MS) {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn(format!(
-                    "Session response timed out after {SESSION_FETCH_TIMEOUT_MS}ms: {e}"
-                ));
-                return Vec::new();
-            }
-        };
-
-        if poll_result.messages.is_empty() {
-            log::warn("Session capsule responded but the message list was empty.");
-            return Vec::new();
+    let result = match messages_value {
+        Some(messages) => serde_json::from_value::<Vec<serde_json::Value>>(messages.clone())
+            .unwrap_or_else(|e| {
+                log::warn(format!("Failed to parse session messages array: {e}"));
+                Vec::new()
+            }),
+        None => {
+            log::warn("Session response missing `messages` field");
+            Vec::new()
         }
-
-        // The topic is scoped to this request, so iterate to find the first
-        // message with a Custom payload (payload.data).
-        for msg in &poll_result.messages {
-            let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let data = match payload.get("data") {
-                Some(d) => d,
-                None => continue,
-            };
-
-            if let Some(messages) = data.get("messages") {
-                match serde_json::from_value::<Vec<serde_json::Value>>(messages.clone()) {
-                    Ok(msgs) => return msgs,
-                    Err(e) => {
-                        log::warn(format!("Failed to parse session messages array: {e}"));
-                    }
-                }
-            }
-        }
-
-        Vec::new()
-    })();
-
-    let _ = ipc::unsubscribe(&handle);
+    };
 
     log::debug(format!(
         "Fetched {} session messages for session {session_id}",
@@ -769,7 +772,7 @@ impl PromptBuilder {
 
         loop {
             // Block until a message arrives (up to 60s), eliminating busy-spin polling.
-            match ipc::recv(&sub, 60_000) {
+            match sub.recv(60_000) {
                 Ok(result) => {
                     if !result.messages.is_empty() {
                         handle_poll_result(&result, &config);
@@ -779,14 +782,12 @@ impl PromptBuilder {
             }
 
             // Drain hook/after topics to prevent backpressure.
-            let _ = ipc::poll(&hook_sub);
-            let _ = ipc::poll(&after_sub);
+            let _ = hook_sub.poll();
+            let _ = after_sub.poll();
         }
 
-        let _ = ipc::unsubscribe(&sub);
-        let _ = ipc::unsubscribe(&hook_sub);
-        let _ = ipc::unsubscribe(&after_sub);
-
+        // sub / hook_sub / after_sub drop here — RAII releases the kernel
+        // subscriptions; no explicit unsubscribe needed.
         Ok(())
     }
 }
