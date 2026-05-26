@@ -1,6 +1,4 @@
-use astrid_sdk::net::{
-    StreamHandle, TryRecvError, accept, bind_unix, close, send, try_accept, try_recv,
-};
+use astrid_sdk::net::{TcpStream, TryRecvError, bind_unix};
 use astrid_sdk::prelude::*;
 
 #[derive(Default)]
@@ -26,9 +24,11 @@ impl CliProxy {
             "registry.v1.selection.*",
             "session.v1.response.*",
         ];
-        let sub_handles: Vec<_> = topics
+        // Subscriptions are RAII handles - drop releases the kernel-side
+        // resource. Keep them owned by the run loop for the proxy's lifetime.
+        let subs: Vec<ipc::Subscription> = topics
             .iter()
-            .map(|t| ipc::subscribe(t).map_err(|e| SysError::ApiError(e.to_string())))
+            .map(|t| ipc::subscribe(t))
             .collect::<Result<Vec<_>, _>>()?;
 
         // Signal readiness so the kernel can proceed with loading dependent capsules.
@@ -42,18 +42,22 @@ impl CliProxy {
             .map_err(|e| SysError::ApiError(format!("Failed to resolve socket path: {e}")))?;
 
         log::info(format!("CLI Proxy: accepting connections on {path}"));
-        let listener = bind_unix().map_err(|e| SysError::ApiError(e.to_string()))?;
+        let listener = bind_unix()?;
 
         // 3. Multi-connection accept loop.
         // Supports up to 8 concurrent CLI clients (enforced at host level).
         // IPC events are broadcast to all connected clients. Any authenticated
         // client can send prompts - the daemon is a single agent.
-        let mut streams: Vec<StreamHandle> = Vec::new();
+        //
+        // TcpStream is the post-#752 unified handle (Unix-domain accepts and
+        // outbound TCP share the same resource type). Drop releases the
+        // kernel-side stream entry, so we no longer need a manual close.
+        let mut streams: Vec<TcpStream> = Vec::new();
 
         'proxy: loop {
             // Phase A: block until at least one client is connected.
             if streams.is_empty() {
-                let stream = match accept(&listener) {
+                let stream = match listener.accept() {
                     Ok(s) => s,
                     Err(e) => {
                         log::warn(format!("Accept error: {e:?}, backing off"));
@@ -67,7 +71,9 @@ impl CliProxy {
 
             // Phase B: poll for one additional connection (non-blocking).
             // Max one per iteration to bound handshake stall to ~5s worst case.
-            if let Ok(Some(new_stream)) = try_accept(&listener) {
+            // The new try_accept takes a timeout - 0 means non-blocking, matching
+            // the pre-#752 semantics.
+            if let Ok(Some(new_stream)) = listener.try_accept(0) {
                 log::info("Additional CLI client connected to proxy");
                 streams.push(new_stream);
             }
@@ -77,7 +83,7 @@ impl CliProxy {
             // Acceptable for CLI use (2-3 typical, 8 max = 400ms worst case).
             let mut dead_indices: Vec<usize> = Vec::new();
             for (i, stream) in streams.iter().enumerate() {
-                match try_recv(stream) {
+                match stream.try_recv() {
                     Ok(bytes) => handle_ingress(&bytes),
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Closed) => {
@@ -88,19 +94,18 @@ impl CliProxy {
             }
 
             // Remove dead streams in reverse order to preserve indices.
-            // close() is required to release the host-side active_streams entry.
-            // Without it, active_streams.len() grows monotonically and poll_accept
-            // refuses new connections after MAX_ACTIVE_STREAMS cumulative disconnects.
+            // Drop releases the host-side active_streams entry automatically -
+            // no explicit close() needed (the pre-#752 manual close was a
+            // workaround for the lack of resource Drop in the old ABI).
             for &i in dead_indices.iter().rev() {
-                let dead = streams.remove(i);
-                let _ = close(&dead);
+                streams.remove(i);
             }
 
             // Phase D: poll IPC subscriptions and broadcast to all live streams.
             // NOTE: broadcast_dead indices are into streams AFTER Phase C removals.
             let mut broadcast_dead: Vec<usize> = Vec::new();
-            for handle in &sub_handles {
-                match ipc::poll(handle) {
+            for sub in &subs {
+                match sub.poll() {
                     Ok(result) => {
                         if !result.messages.is_empty() {
                             broadcast_poll_messages(&streams, &result, &mut broadcast_dead);
@@ -119,8 +124,7 @@ impl CliProxy {
             broadcast_dead.sort_unstable();
             broadcast_dead.dedup();
             for &i in broadcast_dead.iter().rev() {
-                let dead = streams.remove(i);
-                let _ = close(&dead);
+                streams.remove(i);
                 log::info("CLI client disconnected during broadcast");
             }
         }
@@ -163,7 +167,7 @@ fn handle_ingress(bytes: &[u8]) {
 /// Broadcast each IPC message from a `PollResult` to every connected stream.
 /// Tracks failed stream indices in `dead`.
 fn broadcast_poll_messages(
-    streams: &[StreamHandle],
+    streams: &[TcpStream],
     poll_result: &ipc::PollResult,
     dead: &mut Vec<usize>,
 ) {
@@ -199,7 +203,7 @@ fn broadcast_poll_messages(
             continue;
         }
         for msg_bytes in &serialized {
-            if let Err(e) = send(stream, msg_bytes) {
+            if let Err(e) = stream.send(msg_bytes) {
                 log::warn(format!(
                     "Socket send error, client likely disconnected: {e:?}"
                 ));
@@ -212,8 +216,8 @@ fn broadcast_poll_messages(
 
 /// Exact topics the CLI is allowed to publish to the internal IPC bus.
 /// Note: `client.v1.disconnect` is NOT here - the authoritative disconnect
-/// event is published by `close()` (via `net_close_stream_impl`) to avoid
-/// double-counting in the idle monitor.
+/// event is published by the kernel-side stream-close path (TcpStream Drop)
+/// to avoid double-counting in the idle monitor.
 const ALLOWED_INGRESS_EXACT: &[&str] = &["user.v1.prompt", "cli.v1.command.execute"];
 
 /// Topic prefixes the CLI is allowed to publish (suffix-routed topics).
