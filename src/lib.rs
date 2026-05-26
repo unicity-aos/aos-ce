@@ -29,6 +29,11 @@ use astrid_sdk::prelude::*;
 use astrid_sdk::schemars;
 use serde::{Deserialize, Serialize};
 
+// The per-domain WIT split (post-PR #752) gives `http::send` a
+// proper typed `Response` whose body is the raw HTTP payload — no
+// more host-side JSON wrapper to unmarshal. We read `status()`,
+// `headers()`, and `text()` directly off the response.
+
 /// Maximum response body size returned to the LLM (200 KB).
 ///
 /// The host enforces a hard 10 MB cap; this soft limit prevents a single
@@ -50,14 +55,6 @@ pub struct FetchUrlArgs {
     pub headers: Option<HashMap<String, String>>,
     /// Optional request body (for POST/PUT/PATCH).
     pub body: Option<String>,
-}
-
-/// The response format returned by the host.
-#[derive(Deserialize)]
-struct HostHttpResponse {
-    status: u16,
-    headers: HashMap<String, String>,
-    body: String,
 }
 
 /// The structured response returned to the LLM.
@@ -188,15 +185,21 @@ impl HttpTools {
         }
 
         let response = http::send(&req)?;
-        let response: HostHttpResponse = response
-            .json()
-            .map_err(|e| SysError::ApiError(format!("failed to parse host response: {e}")))?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        // `Response::text()` validates UTF-8; non-UTF-8 bodies (binary
+        // downloads, gzipped content the host didn't decode) are surfaced
+        // as an error instead of being passed through as mojibake.
+        let body = response
+            .text()
+            .map_err(|e| SysError::ApiError(format!("response body is not valid UTF-8: {e}")))?
+            .to_owned();
 
-        let (body, truncated) = truncate_body(response.body, MAX_RESPONSE_BODY_LEN);
+        let (body, truncated) = truncate_body(body, MAX_RESPONSE_BODY_LEN);
 
         let result = FetchResult {
-            status: response.status,
-            headers: response.headers,
+            status,
+            headers,
             body,
             truncated,
         };
