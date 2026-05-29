@@ -57,12 +57,12 @@ KV keys share the legacy kernel store's scheme so a future cutover can locate re
 ## Development
 
 ```bash
-rustup target add wasm32-wasip1
-cargo build --release --target wasm32-wasip1
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown
 cargo test --lib --target $(rustc -vV | sed -n 's/host: //p')
 ```
 
-Tests run on the host target (host-target `cargo test` won't link a runner for `wasm32-wasip1`). They exercise pure-Rust logic — KV store operations, validation, request deserialization, JSON projection. IPC dispatch is exercised by the kernel's integration suite against the built WASM.
+Tests run on the host target (host-target `cargo test` won't link a runner for `wasm32-unknown-unknown`). They exercise pure-Rust logic — KV store operations, validation, request deserialization, JSON projection. IPC dispatch is exercised by the kernel's integration suite against the built WASM.
 
 ## License
 
