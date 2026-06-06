@@ -39,6 +39,15 @@ impl CliProxy {
             "astrid.v1.elicit.*",
             "astrid.v1.approval",
             "astrid.v1.response.*",
+            // Admin response topics are astrid.v1.admin.response.<group>.<verb>
+            // (and .<sub> for the deeper variants). With strict segment-count
+            // matching a single `*` matches exactly one segment, so the deeper
+            // patterns are required or multi-segment admin responses are
+            // silently dropped and CLI admin calls time out. Mirrors the
+            // ipc_publish depth list (admin.*.* / admin.*.*.*).
+            "astrid.v1.admin.response.*",
+            "astrid.v1.admin.response.*.*",
+            "astrid.v1.admin.response.*.*.*",
             "astrid.v1.capsules_loaded",
             "registry.v1.response.*",
             "registry.v1.active_model_changed",
@@ -205,7 +214,17 @@ fn handle_ingress(bytes: &[u8]) -> Option<String> {
     };
 
     if is_allowed_ingress_topic(topic) {
-        if let Err(e) = ipc::publish_json(topic, payload) {
+        // Forward under the client's authenticated principal so the kernel's
+        // admin / capability gating sees the real caller. Publishing without it
+        // attributes the request to the proxy capsule's own (admin-seeded)
+        // identity — so any authenticated socket client could run admin
+        // commands (privilege escalation) — or, if the router gates on the
+        // envelope principal, denies every admin request because it's missing.
+        let res = match principal.as_deref() {
+            Some(p) => ipc::publish_json_as(topic, payload, p),
+            None => ipc::publish_json(topic, payload),
+        };
+        if let Err(e) = res {
             log::error(format!("Failed to publish IPC: {e:?}"));
         }
     } else {
@@ -303,13 +322,28 @@ const ALLOWED_INGRESS_EXACT: &[&str] = &["user.v1.prompt", "cli.v1.command.execu
 /// IMPORTANT: Update this list when adding new CLI-originated topic prefixes.
 const ALLOWED_INGRESS_PREFIXES: &[&str] = &[
     "astrid.v1.request.",
+    "astrid.v1.admin.",
     "astrid.v1.elicit.response.",
     "astrid.v1.approval.response.",
     "registry.v1.selection.",
     "session.v1.request.",
 ];
 
+/// Prefixes a socket client may NEVER publish, even when they fall under an
+/// allowed prefix above. Admin RESPONSE topics (`astrid.v1.admin.response.…`)
+/// are kernel-originated; the `astrid.v1.admin.` allow-prefix is for *request*
+/// topics. The allowlist is a plain `starts_with`, so without this carve-out a
+/// socket client could publish `astrid.v1.admin.response.*` — spoofing or
+/// flooding admin responses on the bus and racing the real kernel replies.
+const BLOCKED_INGRESS_PREFIXES: &[&str] = &["astrid.v1.admin.response."];
+
 fn is_allowed_ingress_topic(topic: &str) -> bool {
+    if BLOCKED_INGRESS_PREFIXES
+        .iter()
+        .any(|p| topic.starts_with(p))
+    {
+        return false;
+    }
     ALLOWED_INGRESS_EXACT.contains(&topic)
         || ALLOWED_INGRESS_PREFIXES
             .iter()

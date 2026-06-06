@@ -10,29 +10,53 @@ file = "astrid_capsule_cli.wasm"
 [capabilities]
 uplink = true
 net_bind = ["unix:*"]
-ipc_publish = [
-    "user.v1.prompt",
-    "client.v1.connect",
-    "client.v1.disconnect",
-    "cli.v1.command.execute",
-    "astrid.v1.request.*",
-    "astrid.v1.elicit.response.*",
-    "astrid.v1.approval.response.*",
-    "registry.v1.get_providers",
-    "registry.v1.set_active_model",
-    "registry.v1.selection.*",
-    "session.v1.request.*",
-]
-ipc_subscribe = [
-    "agent.v1.response",
-    "agent.v1.stream.delta",
-    "astrid.v1.approval",
-    "astrid.v1.capsules_loaded",
-    "astrid.v1.elicit.*",
-    "astrid.v1.onboarding.required",
-    "astrid.v1.response.*",
-    "registry.v1.response.*",
-    "registry.v1.active_model_changed",
-    "registry.v1.selection.*",
-    "session.v1.response.*",
-]
+
+# Opaque uplink proxy: the CLI bridges raw bytes between the socket client and
+# the bus without typing payloads, so every publish/subscribe entry is
+# `wit = "opaque"` and ACL-only (no handler). The keys are the IPC ACL — the
+# only way to declare what the proxy may publish/subscribe to.
+[publish]
+"user.v1.prompt" = { wit = "opaque" }
+"client.v1.connect" = { wit = "opaque" }
+"client.v1.disconnect" = { wit = "opaque" }
+"cli.v1.command.execute" = { wit = "opaque" }
+"astrid.v1.request.*" = { wit = "opaque" }
+# KernelClient adds a correlation UUID suffix to its request topics
+# (astrid.v1.request.<verb>.<uuid>) so concurrent in-flight calls each get a
+# private response channel. Without the 5-seg pattern below, every gateway-side
+# KernelRequest (e.g. /api/capsules) — and every CLI command going through
+# KernelClient (astrid who, astrid daemon status, astrid ps) — is denied at
+# publish time.
+"astrid.v1.request.*.*" = { wit = "opaque" }
+# Admin topics under astrid.v1.admin.<group>.<verb>[.<sub>] — host publish
+# cap-check uses strict segment-count matching, so list each depth (5-seg
+# covers invite/agent/group/quota/caps, 6-seg covers auth.pair.*).
+"astrid.v1.admin.*.*" = { wit = "opaque" }
+"astrid.v1.admin.*.*.*" = { wit = "opaque" }
+"astrid.v1.elicit.response.*" = { wit = "opaque" }
+"astrid.v1.approval.response.*" = { wit = "opaque" }
+"registry.v1.get_providers" = { wit = "opaque" }
+"registry.v1.set_active_model" = { wit = "opaque" }
+"registry.v1.selection.*" = { wit = "opaque" }
+"session.v1.request.*" = { wit = "opaque" }
+
+[subscribe]
+"agent.v1.response" = { wit = "opaque" }
+"agent.v1.stream.delta" = { wit = "opaque" }
+"astrid.v1.approval" = { wit = "opaque" }
+"astrid.v1.capsules_loaded" = { wit = "opaque" }
+"astrid.v1.elicit.*" = { wit = "opaque" }
+"astrid.v1.onboarding.required" = { wit = "opaque" }
+"astrid.v1.response.*" = { wit = "opaque" }
+# Admin response topics are astrid.v1.admin.response.<group>.<verb>[.<sub>].
+# Strict segment-count matching means a single `*` matches one segment, so the
+# deeper patterns are needed or multi-segment admin responses never reach the
+# proxy and CLI admin calls time out. Mirrors the [publish] depth enumeration
+# (astrid.v1.admin.*.* / *.*.*).
+"astrid.v1.admin.response.*" = { wit = "opaque" }
+"astrid.v1.admin.response.*.*" = { wit = "opaque" }
+"astrid.v1.admin.response.*.*.*" = { wit = "opaque" }
+"registry.v1.response.*" = { wit = "opaque" }
+"registry.v1.active_model_changed" = { wit = "opaque" }
+"registry.v1.selection.*" = { wit = "opaque" }
+"session.v1.response.*" = { wit = "opaque" }
