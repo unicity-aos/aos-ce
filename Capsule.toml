@@ -13,12 +13,16 @@ capabilities = { fs_read = ["cwd://"] }
 
 [capabilities]
 allow_prompt_injection = true
-ipc_publish = ["prompt_builder.v1.hook_response.*"]
+
+# Publish ACL: the [publish] keys are the only IPC-publish declaration.
+[publish]
+"prompt_builder.v1.hook_response.*" = { wit = "@unicity-astrid/wit/prompt/before-build-hook-response" }
 
 [env]
 # Project folder name — set by the distro, not prompted during onboarding.
 cwd_dir = { type = "string", request = "Project folder name", default = ".astrid" }
 
-[[interceptor]]
-event = "prompt_builder.v1.hook.before_build"
-action = "on_before_prompt_build"
+# Interceptor binding: a [subscribe] entry's `handler` binds the topic to a
+# `#[astrid::interceptor]` export. The key also serves as the subscribe ACL.
+[subscribe]
+"prompt_builder.v1.hook.before_build" = { wit = "@unicity-astrid/wit/prompt/before-build-hook", handler = "on_before_prompt_build" }
