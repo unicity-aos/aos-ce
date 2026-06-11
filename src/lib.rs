@@ -764,6 +764,15 @@ impl PromptBuilder {
         let after_sub = ipc::subscribe("prompt_builder.v1.hook.after_build")
             .map_err(|e| SysError::ApiError(e.to_string()))?;
 
+        // Invalidate the tool-schema cache whenever the capsule set changes.
+        // The kernel broadcasts `astrid.v1.capsules_loaded` after (un)loading
+        // capsules. Nothing publishes `prompt_builder.v1.invalidate_tool_cache`,
+        // so without this the cache is stale forever — it lives in KV and so
+        // survives even a daemon restart, meaning newly installed tool capsules
+        // never reach the LLM until the cache is cleared by hand.
+        let loaded_sub = ipc::subscribe("astrid.v1.capsules_loaded")
+            .map_err(|e| SysError::ApiError(e.to_string()))?;
+
         // Signal readiness so the kernel can proceed with loading dependent capsules.
         // Best-effort: failure means the host mutex is poisoned (unrecoverable).
         let _ = runtime::signal_ready();
@@ -774,6 +783,14 @@ impl PromptBuilder {
             // Block until a message arrives (up to 60s), eliminating busy-spin polling.
             match sub.recv(60_000) {
                 Ok(result) => {
+                    // Honour a pending capsule (un)load before serving this
+                    // request, so the assemble we are about to handle collects a
+                    // fresh tool set rather than a stale cached one.
+                    if let Ok(loaded) = loaded_sub.poll()
+                        && !loaded.messages.is_empty()
+                    {
+                        invalidate_tool_cache();
+                    }
                     if !result.messages.is_empty() {
                         handle_poll_result(&result, &config);
                     }
