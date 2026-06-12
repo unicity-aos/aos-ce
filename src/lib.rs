@@ -27,20 +27,43 @@ use serde::{Deserialize, Serialize};
 
 /// Runtime configuration loaded from capsule config at startup.
 struct Config {
-    /// Maximum time (in milliseconds) to wait for plugin hook responses.
+    /// Maximum time (in milliseconds) to wait for plugin hook responses — the
+    /// OUTER cap for the multi-responder accumulation case.
     hook_timeout_ms: u64,
+    /// First-response window (ms): how long to wait for the FIRST hook response
+    /// before concluding no plugin will reply. Defaults to
+    /// [`HOOK_FIRST_RESPONSE_MS`]; an operator with a genuinely slow plugin can
+    /// raise it (per principal) instead of having it silently excluded.
+    hook_first_response_ms: u64,
+    /// Idle-grace window (ms) once at least one response has arrived. Defaults
+    /// to [`HOOK_IDLE_GRACE_MS`].
+    hook_idle_grace_ms: u64,
 }
 
 impl Config {
-    /// Load configuration from the capsule's config store, falling back to defaults.
+    /// Load configuration from the capsule's config store, falling back to
+    /// defaults.
+    ///
+    /// Read per assemble invocation, **not** cached: `env::var` resolves the
+    /// per-invocation, per-principal env overlay, so a global cache would pin
+    /// one principal's tuning for every principal. The cost is a few host calls,
+    /// negligible against the hook fan-out they gate.
     fn load() -> Self {
-        let hook_timeout_ms = env::var("hook_timeout_ms")
-            .ok()
-            .and_then(|s| s.trim().trim_matches('"').parse::<u64>().ok())
-            .unwrap_or(DEFAULT_HOOK_POLL_TIMEOUT_MS);
-
-        Self { hook_timeout_ms }
+        Self {
+            hook_timeout_ms: env_u64("hook_timeout_ms", DEFAULT_HOOK_POLL_TIMEOUT_MS),
+            hook_first_response_ms: env_u64("hook_first_response_ms", HOOK_FIRST_RESPONSE_MS),
+            hook_idle_grace_ms: env_u64("hook_idle_grace_ms", HOOK_IDLE_GRACE_MS),
+        }
     }
+}
+
+/// Read a `u64` capsule config value from `env`, falling back to `default` when
+/// the key is missing or unparseable. Trims surrounding whitespace and quotes.
+fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|s| s.trim().trim_matches('"').parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 /// Request from the react loop to assemble a prompt.
@@ -146,6 +169,23 @@ const DEFAULT_HOOK_POLL_TIMEOUT_MS: u64 = 2000;
 
 /// Maximum number of hook responses to collect before proceeding.
 const MAX_HOOK_RESPONSES: usize = 50;
+
+/// First-response window (ms): how long to wait for the FIRST hook
+/// response before concluding no plugin is going to reply. Hook
+/// responders are local pooled capsules that reply within a few bus
+/// hops (~1ms), so the old behaviour of waiting the full
+/// `hook_timeout_ms` (2s) for a first response was a pure per-prompt
+/// floor — and the COMMON case is zero responders (no plugin injects
+/// for a given prompt), which always hit that full backstop. Capping
+/// the first-response wait un-floors throughput under the Store pool
+/// (astrid#816: was pool_size / 2s). `hook_timeout_ms` is retained as
+/// the OUTER cap for the multi-responder accumulation case.
+const HOOK_FIRST_RESPONSE_MS: u64 = 250;
+
+/// Idle-grace window (ms) for the hook fan-out once at least one
+/// response has arrived: poll only this long for stragglers and return
+/// as soon as responders go quiet, instead of waiting the full window.
+const HOOK_IDLE_GRACE_MS: u64 = 100;
 
 /// A hook response paired with its source capsule identifier.
 ///
@@ -315,7 +355,24 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
         if remaining_ms == 0 {
             break;
         }
-        let timeout = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
+        let remaining = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
+        // First-response window: wait up to `hook_first_response_ms` for the
+        // FIRST response, measured from the START of the loop (NOT reset each
+        // iteration), so a stream of non-matching messages cannot extend it
+        // past the cap; give up once it elapses with still no response (the
+        // no-responder backstop). Once we have one, switch to a short
+        // idle-grace so the loop returns shortly after responders fall quiet
+        // instead of burning the whole window.
+        let timeout = if sourced_responses.is_empty() {
+            let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+            let first_remaining = config.hook_first_response_ms.saturating_sub(elapsed_ms);
+            if first_remaining == 0 {
+                break;
+            }
+            first_remaining.min(remaining)
+        } else {
+            config.hook_idle_grace_ms.min(remaining)
+        };
 
         match sub.recv(timeout) {
             Ok(result) => {
@@ -465,6 +522,16 @@ fn fire_after_prompt_build(system_prompt: &str, user_context_prefix: &str, reque
 /// KV key for cached tool schemas. First call populates it via IPC broadcast;
 /// subsequent calls read directly from KV until invalidated.
 const TOOL_SCHEMA_CACHE_KEY: &str = "__tool_schema_cache";
+
+/// Invalidate the cached tool schemas in KV.
+///
+/// Called when the capsule set changes (`astrid.v1.capsules_loaded`) so the
+/// next `collect_tool_schemas()` re-runs the describe fan-out instead of
+/// serving a stale (KV-persisted, restart-surviving) list.
+fn invalidate_tool_cache() {
+    let _ = kv::delete(TOOL_SCHEMA_CACHE_KEY);
+    log::info("Tool schema cache invalidated");
+}
 
 /// Timeout (ms) for fetching session messages from the session capsule.
 const SESSION_FETCH_TIMEOUT_MS: u64 = 5000;
@@ -636,17 +703,8 @@ fn fetch_session_messages(session_id: &str) -> Vec<serde_json::Value> {
     result
 }
 
-/// Invalidate the cached tool schemas in KV.
-///
-/// Called when capsules are loaded or unloaded to ensure the next
-/// `collect_tool_schemas()` call fetches fresh data from all capsules.
-fn invalidate_tool_cache() {
-    let _ = kv::delete(TOOL_SCHEMA_CACHE_KEY);
-    log::info("Tool schema cache invalidated");
-}
-
-/// Handle a single `prompt_builder.v1.assemble` request.
-fn handle_assemble(payload: &serde_json::Value, config: &Config) {
+/// Assemble a single prompt for a `prompt_builder.v1.assemble` request.
+fn assemble(payload: &serde_json::Value, config: &Config) {
     // Extract from Custom payload envelope or direct.
     let request_value = payload.get("data").unwrap_or(payload);
 
@@ -706,105 +764,41 @@ fn handle_assemble(payload: &serde_json::Value, config: &Config) {
     );
 }
 
-/// Returns `true` if the topic should be dispatched (not a self-echo).
-///
-/// Filters out our own response topics, hook response topics, and the
-/// interceptor topics we publish. Only `prompt_builder.v1.assemble` passes.
-fn should_dispatch_topic(topic: &str) -> bool {
-    !topic.starts_with("prompt_builder.v1.response.")
-        && !topic.starts_with("prompt_builder.v1.hook_response.")
-        && topic != "prompt_builder.v1.hook.before_build"
-        && topic != "prompt_builder.v1.hook.after_build"
-}
-
-/// Dispatch IPC messages from a PollResult to appropriate handlers.
-fn handle_poll_result(result: &ipc::PollResult, config: &Config) {
-    if result.dropped > 0 {
-        log::warn(format!(
-            "Event bus dropped {} messages in prompt builder poll",
-            result.dropped
-        ));
-    }
-
-    for msg in &result.messages {
-        if !should_dispatch_topic(&msg.topic) {
-            continue;
-        }
-
-        if msg.topic == "prompt_builder.v1.assemble" {
-            let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            handle_assemble(&payload, config);
-        } else if msg.topic == "prompt_builder.v1.invalidate_tool_cache" {
-            invalidate_tool_cache();
-        }
-    }
-}
-
 #[derive(Default)]
 struct PromptBuilder;
 
 #[capsule]
 impl PromptBuilder {
-    #[astrid::run]
-    fn run(&self) -> Result<(), SysError> {
-        log::info("Prompt Builder capsule starting");
+    /// Assembles a prompt for a `prompt_builder.v1.assemble` request.
+    ///
+    /// Pooled interceptor: the kernel leases one of the capsule's pooled
+    /// Stores per invocation, so concurrent prompts assemble in parallel
+    /// (one in-flight assemble per Store). This replaces the former
+    /// single-threaded `#[astrid::run]` recv loop, which drained
+    /// `prompt_builder.v1.assemble` strictly one-at-a-time and so capped
+    /// end-to-end orchestration throughput at one prompt per hook
+    /// round-trip regardless of how many were in flight (astrid#816).
+    /// The hook fan-out (`fire_before_prompt_build`) still does a nested
+    /// `recv` — that works inside an interceptor exactly as it did in the
+    /// run loop, and now overlaps across pooled invocations instead of
+    /// serializing.
+    #[astrid::interceptor("handle_assemble")]
+    pub(crate) fn handle_assemble(&self, payload: serde_json::Value) -> Result<(), SysError> {
+        assemble(&payload, &Config::load());
+        Ok(())
+    }
 
-        let config = Config::load();
-        log::info(format!("Hook timeout: {}ms", config.hook_timeout_ms));
-
-        let sub =
-            ipc::subscribe("prompt_builder.v1.*").map_err(|e| SysError::ApiError(e.to_string()))?;
-
-        // Also subscribe to our own hook topics so we can filter them out.
-        let hook_sub = ipc::subscribe("prompt_builder.v1.hook.before_build")
-            .map_err(|e| SysError::ApiError(e.to_string()))?;
-        let after_sub = ipc::subscribe("prompt_builder.v1.hook.after_build")
-            .map_err(|e| SysError::ApiError(e.to_string()))?;
-
-        // Invalidate the tool-schema cache whenever the capsule set changes.
-        // The kernel broadcasts `astrid.v1.capsules_loaded` after (un)loading
-        // capsules. Nothing publishes `prompt_builder.v1.invalidate_tool_cache`,
-        // so without this the cache is stale forever — it lives in KV and so
-        // survives even a daemon restart, meaning newly installed tool capsules
-        // never reach the LLM until the cache is cleared by hand.
-        let loaded_sub = ipc::subscribe("astrid.v1.capsules_loaded")
-            .map_err(|e| SysError::ApiError(e.to_string()))?;
-
-        // Signal readiness so the kernel can proceed with loading dependent capsules.
-        // Best-effort: failure means the host mutex is poisoned (unrecoverable).
-        let _ = runtime::signal_ready();
-
-        log::info("Prompt Builder capsule ready");
-
-        loop {
-            // Block until a message arrives (up to 60s), eliminating busy-spin polling.
-            match sub.recv(60_000) {
-                Ok(result) => {
-                    // Honour a pending capsule (un)load before serving this
-                    // request, so the assemble we are about to handle collects a
-                    // fresh tool set rather than a stale cached one.
-                    if let Ok(loaded) = loaded_sub.poll()
-                        && !loaded.messages.is_empty()
-                    {
-                        invalidate_tool_cache();
-                    }
-                    if !result.messages.is_empty() {
-                        handle_poll_result(&result, &config);
-                    }
-                }
-                Err(_) => break,
-            }
-
-            // Drain hook/after topics to prevent backpressure.
-            let _ = hook_sub.poll();
-            let _ = after_sub.poll();
-        }
-
-        // sub / hook_sub / after_sub drop here — RAII releases the kernel
-        // subscriptions; no explicit unsubscribe needed.
+    /// Invalidates the cached tool schemas when the capsule set changes.
+    ///
+    /// The kernel broadcasts `astrid.v1.capsules_loaded` after (un)loading
+    /// capsules. Under the pooled-interceptor model there is no run loop to
+    /// poll, so a dedicated interceptor drops `__tool_schema_cache` here — the
+    /// next `handle_assemble` re-collects a fresh tool set instead of serving a
+    /// stale (KV-persisted, restart-surviving) list, so newly installed tool
+    /// capsules reach the LLM on the next prompt without a manual cache clear.
+    #[astrid::interceptor("on_capsules_loaded")]
+    pub(crate) fn on_capsules_loaded(&self, _payload: serde_json::Value) -> Result<(), SysError> {
+        invalidate_tool_cache();
         Ok(())
     }
 }

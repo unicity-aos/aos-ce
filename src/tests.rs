@@ -489,46 +489,6 @@ fn assemble_response_deserializes_without_optional_fields() {
     assert!(resp.session_id.is_none());
 }
 
-// ── Topic filtering tests ─────────────────────────────────────
-
-#[test]
-fn should_dispatch_assemble_topic() {
-    assert!(should_dispatch_topic("prompt_builder.v1.assemble"));
-}
-
-#[test]
-fn should_not_dispatch_own_response_topics() {
-    assert!(!should_dispatch_topic(
-        "prompt_builder.v1.response.assemble"
-    ));
-    assert!(!should_dispatch_topic("prompt_builder.v1.response.foo"));
-}
-
-#[test]
-fn should_not_dispatch_hook_response_topics() {
-    assert!(!should_dispatch_topic(
-        "prompt_builder.v1.hook_response.req-42"
-    ));
-    assert!(!should_dispatch_topic(
-        "prompt_builder.v1.hook_response.abc-123"
-    ));
-}
-
-#[test]
-fn should_not_dispatch_interceptor_topics() {
-    assert!(!should_dispatch_topic(
-        "prompt_builder.v1.hook.before_build"
-    ));
-    assert!(!should_dispatch_topic("prompt_builder.v1.hook.after_build"));
-}
-
-#[test]
-fn should_dispatch_unrelated_topics() {
-    // These would be ignored by the match anyway, but shouldn't be filtered.
-    assert!(should_dispatch_topic("prompt_builder.v1.some_other_action"));
-    assert!(should_dispatch_topic("prompt_builder.v1.status"));
-}
-
 // ── Response topic isolation tests ────────────────────────────
 
 #[test]
