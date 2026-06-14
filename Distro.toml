@@ -3,8 +3,8 @@ schema-version = 1
 [distro]
 id = "astralis"
 name = "Astralis"
-pretty-name = "Astralis 0.1.0 (Genesis)"
-version = "0.1.0"
+pretty-name = "Astralis 0.1.1 (Genesis)"
+version = "0.1.1"
 codename = "genesis"
 release-date = "2026-03-21"
 description = "The complete Astrid AI assistant experience"
@@ -77,6 +77,11 @@ source = "@unicity-astrid/capsule-identity"
 version = "0.1.0"
 
 [[capsule]]
+name = "astrid-capsule-users"
+source = "@unicity-astrid/capsule-users"
+version = "0.1.0"
+
+[[capsule]]
 name = "astrid-capsule-router"
 source = "@unicity-astrid/capsule-router"
 version = "0.1.0"
@@ -113,6 +118,11 @@ version = "0.1.0"
 [[capsule]]
 name = "astrid-capsule-fs"
 source = "@unicity-astrid/capsule-fs"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-system"
+source = "@unicity-astrid/capsule-system"
 version = "0.1.0"
 
 # ---------------------------------------------------------------------------
