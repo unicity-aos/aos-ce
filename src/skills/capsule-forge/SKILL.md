@@ -1,0 +1,394 @@
+---
+name: Capsule Forge
+description: Build, configure, install, and debug Astrid capsules from zero. The cozy front door for writing your first capsule.
+---
+
+# Capsule Forge — Build an Astrid Capsule From Zero
+
+You are about to write a **capsule**: a small WebAssembly module, compiled from
+Rust, that the Astrid kernel loads into a sandbox and lets it expose **tools** to
+the LLM over an event bus. You need no prior Astrid knowledge — this page is the
+whole map. Read the 60-second quickstart, copy the five files, build, install.
+
+> **One sentence to anchor everything:** A capsule is a WASM tool provider over a
+> message bus. The kernel is *dumb* — it only routes events, enforces
+> capabilities, and runs the sandbox. **All the intelligence lives in capsules.**
+> Your `Capsule.toml` is not just config; its `[publish]`/`[subscribe]` keys *are*
+> the capability ACL the kernel enforces.
+
+---
+
+## 1. 60-Second Quickstart
+
+There is no `astrid capsule new` yet (it is coming). For now, get a complete
+skeleton one of two ways:
+
+- **Easiest:** call the forge tool `scaffold_capsule { "name": "my-capsule" }`.
+  It returns a JSON map of `path -> file content` for a complete, *compiling*
+  tool capsule. Write each file, then build.
+- **By hand:** copy the five files from section 3 below, substituting your name.
+
+Then the build → install → verify loop:
+
+```bash
+# 1. Make sure the WASM target is installed (one time):
+rustup target add wasm32-unknown-unknown
+
+# 2. Build the capsule (produces ./dist/<name>.capsule):
+astrid capsule build
+
+# 3. Install it into the running daemon:
+astrid capsule install ./dist/my-capsule.capsule
+
+# 4. Verify it loaded:
+astrid capsule list          # your capsule should appear
+astrid status                # daemon should still be healthy
+```
+
+Then ask the LLM to call your tool. If the manifest has tools but the model
+doesn't see them, see the describe fan-out footgun in section 8 — re-prompt or
+restart the daemon; it is usually a known kernel race, not your bug.
+
+---
+
+## 2. What You Are Actually Building
+
+```
+my-capsule/
+├── .cargo/config.toml     # selects the wasm target + the getrandom flag (#1 footgun)
+├── rust-toolchain.toml    # pins the toolchain + wasm target
+├── Cargo.toml             # cdylib crate, depends on astrid-sdk
+├── Capsule.toml           # the manifest — capabilities + the bus ACL
+└── src/
+    └── lib.rs             # your tools
+```
+
+A capsule:
+
+- runs in a **WASM sandbox** (`wasm32-unknown-unknown`) with **zero** `wasi:*`
+  imports — every host call is an audited `astrid:*` SDK call.
+- talks to the world **only over the bus**. It cannot open a socket, read a file,
+  or spawn a process except through a capability the manifest declares and the
+  kernel grants.
+- exposes **tools** the LLM can call. A tool is just a Rust method; the SDK
+  macro wires it onto the bus and publishes a JSON-schema description of it.
+
+---
+
+## 3. The Minimal File Set (copy verbatim, substitute the name)
+
+### `.cargo/config.toml`
+
+```toml
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+# THE #1 FOOTGUN. Activates astrid-sys's custom getrandom backend that
+# routes to astrid:sys.random-bytes. WITHOUT THIS, uuid v4 / HashMap fail
+# to LINK on wasm32-unknown-unknown. A library cannot set this for you —
+# it MUST live here, in the final capsule crate.
+rustflags = ["--cfg=getrandom_backend=\"custom\""]
+```
+
+### `rust-toolchain.toml`
+
+```toml
+[toolchain]
+channel = "1.94.0"
+targets = ["wasm32-unknown-unknown"]
+components = ["rustfmt", "clippy"]
+```
+
+### `Cargo.toml`
+
+```toml
+[package]
+name = "my-capsule"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]      # capsules are cdylib — NOT bin, NOT rlib
+
+[dependencies]
+# 0.7 resolves to 0.7.1+ which has the tool_describe publish fix.
+astrid-sdk = { version = "0.7", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "z"      # optimise for size — capsules ship as wasm
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+```
+
+### `Capsule.toml`
+
+```toml
+[package]
+name = "my-capsule"
+version = "0.1.0"
+description = "What this capsule does"
+authors = ["Your Name <you@example.com>"]
+astrid-version = ">=0.7.0"
+
+[[component]]
+id = "my-capsule"
+file = "my_capsule.wasm"      # crate name with hyphens -> underscores, + .wasm
+type = "executable"
+
+[capabilities]
+# Declare ONLY what you use. Least capability. (See section 6.)
+fs_read = ["home://"]
+
+# --- The mandatory tool-bus ACL. Without these two publish keys, tool
+#     results never return and describe can't answer. ---
+[publish]
+"tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }
+"tool.v1.response.describe.*" = { wit = "@unicity-astrid/wit/tool/describe-response" }
+
+# One subscribe row per tool, plus the describe request. The `handler`
+# is `tool_execute_<tool_name>`. `tool_describe` is AUTO-GENERATED by the
+# macro — you declare it here but never write it.
+[subscribe]
+"tool.v1.execute.hello" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_hello" }
+"tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }
+```
+
+### `src/lib.rs`
+
+```rust
+#![deny(unsafe_code)]
+#![deny(clippy::all)]
+
+use astrid_sdk::prelude::*;
+use astrid_sdk::schemars;
+use serde::Deserialize;
+
+#[derive(Default)]
+pub struct MyCapsule;
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct HelloArgs {
+    /// Who to greet (shown to the LLM as the parameter description).
+    pub name: String,
+}
+
+#[capsule]
+impl MyCapsule {
+    /// Greet someone. This doc-comment becomes the tool description the
+    /// LLM sees, so write it for the model.
+    #[astrid::tool("hello")]
+    pub fn hello(&self, args: HelloArgs) -> Result<String, SysError> {
+        Ok(format!("Hello, {}!", args.name))
+    }
+}
+```
+
+> **Do NOT create a checked-in `wit/` directory.** The WIT the manifest
+> references (`@unicity-astrid/wit/...`) is resolved by the build/host — it is
+> *generated*, never hand-authored in your repo.
+
+---
+
+## 4. Macro Reference
+
+Everything you need lives behind one prelude import:
+
+```rust
+use astrid_sdk::prelude::*;   // brings: capsule, SysError, fs, ipc, kv, http, log, runtime, ...
+use astrid_sdk::schemars;     // for #[derive(schemars::JsonSchema)] on args
+```
+
+- **`#[capsule]`** on an `impl Struct` block. Generates the WASM exports and the
+  auto `tool_describe`. The struct must `#[derive(Default)]`.
+- **`#[astrid::tool("name")]`** on a method. Signature:
+  `fn name(&self, args: ArgsType) -> Result<T, E>` where:
+  - `ArgsType` derives `serde::Deserialize + schemars::JsonSchema`.
+  - `T: serde::Serialize` (`String` is fine — return JSON or markdown text).
+  - `E: Display` (use `SysError`).
+  - **The method's doc-comment becomes the tool's description** shown to the LLM.
+  - Mutable form: `#[astrid::tool("name", mutable)]` or take `&mut self` — the
+    macro loads `self` from KV before the call and persists it after (on success).
+- **`#[astrid::install]`** — `fn(&self) -> Result<(), SysError>`. Runs once on
+  install. Use it to create directories and write files (e.g. a Skill). See
+  section 8 — this is how a Skill actually lands on disk.
+- **`#[astrid::upgrade]`** — same signature; runs on version upgrade.
+- **`#[astrid::run]`** — `fn(&self) -> ...`. A long-lived background loop (rare;
+  most capsules are pure tool providers and need none).
+- **`#[astrid::interceptor("topic")]`** — raw event handler:
+  `fn(&self, payload: Vec<u8>) -> Result<InterceptResult, SysError>`. Returns
+  `Continue(payload)` / `Final(payload)` / `Deny { reason }`. The `handler =` in
+  a `[subscribe]` row binds a topic to one of these. (Tools are sugar over this.)
+
+---
+
+## 5. The Manifest IS the ACL
+
+This is the single most important concept. The kernel is dumb and **fail-closed**:
+it will deny any publish or subscribe whose topic is not literally listed in your
+manifest.
+
+- **`[publish]` keys** = the exact topics this capsule may publish to.
+- **`[subscribe]` keys** = the exact topics it may receive, and `handler = "..."`
+  binds each to a generated export.
+- For a tool capsule, the **mandatory boilerplate** is always:
+  - publish `tool.v1.execute.*.result` (so results return) and
+    `tool.v1.response.describe.*` (so describe can answer),
+  - subscribe one `tool.v1.execute.<tool>` per tool (with its
+    `tool_execute_<tool>` handler) plus `tool.v1.request.describe`
+    (handler `tool_describe`).
+- **`tool_describe` is auto-generated** from your `#[astrid::tool]` annotations.
+  You list it in `[subscribe]` but never write the function.
+- If `[publish]` or `[subscribe]` is **empty**, the capsule can't talk on the bus
+  at all — fail-closed means silence, not an error you'll notice quickly.
+
+---
+
+## 6. Capability Catalog
+
+Declare only what you use (least capability). Common keys in `[capabilities]`:
+
+| Key | What it grants |
+|---|---|
+| `uplink = true` | Connect as an uplink / use `publish_as` (uplink-only, trust-the-uplink). |
+| `net = ["host"]` or `["*"]` | Outbound HTTP via `astrid_sdk::http`. |
+| `net_connect = ["host:port"]` | Raw outbound TCP. |
+| `net_bind = ["..."]` | Bind a listening socket (e.g. a Unix socket uplink). |
+| `kv = true` | Per-capsule, per-principal key-value store (`astrid_sdk::kv`). |
+| `fs_read = ["home://"]` | Read files under the given VFS scheme/prefix. |
+| `fs_write = ["home://skills/"]` | Write files under the given prefix. |
+| `host_process = ["git", "cargo"]` | Spawn the named host binaries (`astrid_sdk::process`). |
+| `allow_persistent = true` | Allow persistent, reattachable spawned processes. |
+| `identity = true` | Identity / signing operations (`astrid_sdk::identity`). |
+| `allow_prompt_injection = true` | Capsule output may be injected into the prompt. |
+
+**VFS schemes** for `fs_*` prefixes:
+
+- `home://` — the calling principal's home directory (most common).
+- `cwd://` — the working directory.
+- `"*"` — workspace-confined access (broad — prefer a narrow prefix).
+
+---
+
+## 7. The ACL Topic-Matching Rule (the conceptual footgun)
+
+Wildcards in `[publish]`/`[subscribe]` ACL keys do **not** mean what a glob
+usually means. There are **two different matchers** in the system and they behave
+differently — name this so you don't trip on it:
+
+- **ACL / route matcher (subtree):** a **trailing `.*`** matches the whole subtree
+  — *any depth one or more segments deeper*. A **mid `*`** matches **exactly one**
+  segment. So:
+  - `tool.v1.execute.*.result` matches `tool.v1.execute.search.result`
+    (one segment for `*`) but **not** `tool.v1.execute.result` (nothing for `*`).
+  - `tool.v1.response.describe.*` matches `tool.v1.response.describe.self`,
+    `...describe.anything.deeper`, etc.
+- **Interceptor-dispatch matcher (strict equal-segment):** when the kernel routes
+  a concrete event to your handler, the segment count must match exactly. This is
+  why each tool gets its **own** concrete `tool.v1.execute.<tool>` subscribe row —
+  you cannot collapse them into one wildcard for dispatch.
+
+Subscribe only supports **trailing** wildcards (`foo.bar.*`); mid-segment
+wildcards in a *subscribe* key are host-rejected. Per-capsule cap: 128
+subscriptions.
+
+---
+
+## 8. Footguns (read these before you waste an hour)
+
+1. **The getrandom flag.** `.cargo/config.toml` must carry
+   `rustflags = ["--cfg=getrandom_backend=\"custom\""]`. Without it, `uuid::v4`
+   and `HashMap` fail to **link** on `wasm32-unknown-unknown`. A library can't set
+   it for you — it lives in *your* crate. This is the #1 cause of confusing build
+   failures.
+2. **`crate-type = ["cdylib"]`.** Not `bin`, not the default `rlib`. The kernel
+   loads a cdylib WASM module.
+3. **No checked-in `wit/`.** The WIT contracts are generated at build time.
+   Authoring a `wit/` directory is wrong and will confuse the build.
+4. **Content-addressed install.** You install with
+   `astrid capsule install ./dist/<name>.capsule`. **Do not** copy the `.wasm`
+   into `~/.astrid` by hand — the install is content-addressed and the daemon
+   tracks it by hash. A hand-copied file is invisible to the runtime.
+5. **A Skill needs an `#[astrid::install]` hook to land.** The static engine that
+   would otherwise place skill files is a no-op. If your capsule ships a Skill,
+   `include_str!` it into a const and `fs::write` it to `home://skills/.../SKILL.md`
+   from an `#[astrid::install]` hook (create the dir first). Otherwise the file
+   never appears.
+6. **Hot-reload is dead code.** There is no live reload. To iterate: rebuild and
+   **reinstall**. Each `astrid capsule install` replaces the prior version.
+7. **Describe fan-out can be incomplete on the first prompt after boot.** If your
+   tools are in the manifest, the capsule loaded (`astrid capsule list`), but the
+   model still doesn't see them — re-prompt, or restart the daemon. The kernel's
+   describe fan-out is non-deterministically incomplete on the first prompt after
+   boot. **This is a known kernel limitation, not your capsule.** Use the
+   `capsule_doctor` forge tool to rule out a real manifest problem first.
+
+---
+
+## 9. The Dev Loop & Where Logs Go
+
+```
+edit src/lib.rs / Capsule.toml
+      │
+      ▼
+astrid capsule build            # -> ./dist/<name>.capsule
+      │
+      ▼
+astrid capsule install ./dist/<name>.capsule
+      │
+      ▼
+astrid capsule list             # confirm it's loaded
+astrid status                   # confirm the daemon is healthy
+      │
+      ▼
+ask the LLM to call the tool    # verify behaviour
+      │
+      └── tools missing? -> capsule_doctor, then re-prompt/restart (section 8.7)
+```
+
+- **Logs** live under `~/.astrid/log/`. A guest panic shows as
+  `capsule panic at src/lib.rs:NN` there (the SDK installs a panic hook) — grep
+  the per-capsule log when a tool traps.
+- If `astrid` isn't on your PATH, it is at `~/.astrid/bin/astrid`.
+- If `astrid capsule build` is unavailable, `cargo build --release` works because
+  `.cargo/config.toml` selects the target; the `.wasm` lands under
+  `target/wasm32-unknown-unknown/release/`.
+
+---
+
+## 10. The Forge Tools
+
+This Skill is installed alongside the **forge** capsule, which gives you tools to
+do all of the above without leaving the chat:
+
+| Tool | Use it when |
+|---|---|
+| `forge_quickstart` | You want the build-your-first-capsule guide inline. |
+| `scaffold_capsule { name }` | You want a complete compiling skeleton as `path -> content` JSON to write out. |
+| `explain_interface { name }` | You need to read a WIT contract (e.g. `tool`, `llm`, `session`) and a plain-English summary. |
+| `suggest_capabilities { intent }` | You describe what the capsule should do and get the exact manifest lines (incl. real LLM-provider topics). |
+| `validate_manifest { toml }` | You want your `Capsule.toml` checked for the common mistakes before you build. |
+| `capsule_doctor { name }` | A capsule loaded but its tools don't appear, or an import is unsatisfied — diagnose it. |
+
+---
+
+## 11. Security Mindset
+
+Capsules run other people's prompts and handle untrusted LLM-supplied arguments.
+Three rules, always:
+
+1. **Validate untrusted input.** Reject path traversal in any name/path argument
+   (`/`, `\`, `..`). The LLM will, eventually, hand you `../../etc/passwd`.
+2. **Least capability.** Declare the narrowest `fs_*`/`net`/`host_process` scope
+   that works. The manifest ACL is your blast radius.
+3. **Fail closed.** On any doubt — missing capability, malformed input, denied
+   topic — refuse rather than guess. The kernel already fails closed; your code
+   should too.
+
+Welcome to capsule authoring. Scaffold one and ship it.
