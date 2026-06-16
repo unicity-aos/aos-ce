@@ -16,6 +16,10 @@ net_bind = ["unix:*"]
 "client.v1.connect" = { wit = "opaque" }
 "client.v1.disconnect" = { wit = "opaque" }
 "cli.v1.command.execute" = { wit = "opaque" }
+# Forwarded provider-targeted run requests for capsule CLI verbs (astrid#891):
+# every ingress topic the proxy forwards must also be declared here — the
+# publish ACL applies to publish-as forwards, not just self-originated events.
+"cli.v1.command.run.*" = { wit = "opaque" }
 "astrid.v1.request.*" = { wit = "opaque" }
 "astrid.v1.request.*.*" = { wit = "opaque" }
 "astrid.v1.request.mcp.tools.list" = { wit = "opaque" }
@@ -43,3 +47,4 @@ net_bind = ["unix:*"]
 "registry.v1.active_model_changed" = { wit = "opaque" }
 "registry.v1.selection.*" = { wit = "opaque" }
 "session.v1.response.*" = { wit = "opaque" }
+"cli.v1.command.result.*" = { wit = "opaque" }

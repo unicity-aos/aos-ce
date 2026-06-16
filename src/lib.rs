@@ -158,6 +158,9 @@ impl CliProxy {
             "registry.v1.active_model_changed",
             "registry.v1.selection.*",
             "session.v1.response.*",
+            // Forwards capsule CLI verb results (`astrid capsule <verb>`) back to
+            // the requesting socket client (astrid#891).
+            "cli.v1.command.result.*",
         ];
         // Subscriptions are RAII handles - drop releases the kernel-side
         // resource. Keep them owned by the run loop for the proxy's lifetime.
@@ -484,6 +487,11 @@ const ALLOWED_INGRESS_PREFIXES: &[&str] = &[
     "astrid.v1.approval.response.",
     "registry.v1.selection.",
     "session.v1.request.",
+    // Provider-targeted run requests for capsule CLI verbs (astrid#891). The
+    // provider id suffix means each capsule subscribes only its own command
+    // traffic; the trailing dot keeps bare `cli.v1.command.run` (no provider
+    // segment) blocked.
+    "cli.v1.command.run.",
 ];
 
 /// Prefixes a socket client may NEVER publish, even when they fall under an
