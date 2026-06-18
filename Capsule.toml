@@ -13,8 +13,11 @@ net_bind = ["unix:*"]
 
 [publish]
 "user.v1.prompt" = { wit = "opaque" }
-"client.v1.connect" = { wit = "opaque" }
-"client.v1.disconnect" = { wit = "opaque" }
+# `client.v1.connect` / `client.v1.disconnect` are NOT published by the proxy:
+# the host emits those connection-lifecycle events from the inbound-socket
+# accept/drop path, stamped with the handshake-verified principal, so connect
+# and disconnect always pair on the same identity (the proxy's post-close
+# disconnect lost its principal and leaked the kernel connection counter).
 "cli.v1.command.execute" = { wit = "opaque" }
 # Forwarded provider-targeted run requests for capsule CLI verbs (astrid#891):
 # every ingress topic the proxy forwards must also be declared here — the

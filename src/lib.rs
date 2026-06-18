@@ -12,16 +12,20 @@ struct CliProxy;
 ///
 /// * First message carrying a valid `principal` binds to it.
 /// * First message with no `principal` binds to `"default"` (auto-attribution
-///   for un-stamped clients, which keeps the kernel connection tracker from
-///   undercounting them).
+///   for un-stamped clients).
 /// * A first message whose principal is malformed is dropped and the
 ///   connection stays `None` (unbound) so a later well-formed message can bind.
 ///
 /// Once bound, all of this connection's traffic attributes to its principal,
 /// and it only receives outbound IPC stamped with that same principal (plus
-/// unprincipaled system events). `principal` stays `None` only for a connection
-/// that has not yet sent a usable message; such a connection is uncounted and
-/// receives only unprincipaled events.
+/// unprincipaled system events) — `principal` is the key the outbound demux
+/// ([`should_deliver`]) routes on. It stays `None` only for a connection that
+/// has not yet sent a usable message; such a connection receives only
+/// unprincipaled events.
+///
+/// This binding is independent of connection-count tracking: the kernel's
+/// per-principal connection counter is driven by host-emitted
+/// `client.v1.connect` / `client.v1.disconnect`, not by this field.
 struct ProxyClient {
     stream: TcpStream,
     principal: Option<String>,
@@ -197,12 +201,15 @@ impl CliProxy {
         // outbound TCP share the same resource type). Drop releases the
         // kernel-side stream entry, so we no longer need a manual close.
         //
-        // The proxy is the authority on socket lifecycle: it emits
-        // `client.v1.connect` once a connection binds and the matching
-        // `client.v1.disconnect` when the socket closes, both stamped with the
-        // bound principal. The kernel connection tracker turns those into the
-        // per-principal active-connection count that drives ephemeral
-        // idle-shutdown and `astrid who`.
+        // Connection lifecycle tracking (`client.v1.connect` /
+        // `client.v1.disconnect`, which drive the kernel's per-principal
+        // active-connection count for ephemeral idle-shutdown and `astrid
+        // who`) is emitted HOST-side, not here. The host owns the inbound
+        // socket and holds the handshake-verified principal for the whole
+        // connection lifetime, so connect and disconnect always pair on the
+        // identical principal. The proxy used to emit them, but its disconnect
+        // fired after the connection's verified identity was already gone — the
+        // host stamped it `anonymous`, so the real principal's count leaked.
         let mut clients: Vec<ProxyClient> = Vec::new();
 
         'proxy: loop {
@@ -245,12 +252,14 @@ impl CliProxy {
             for (i, client) in clients.iter_mut().enumerate() {
                 match client.stream.try_recv() {
                     Ok(bytes) => {
-                        // Apply the binding state machine, forward if allowed,
-                        // and emit `client.v1.connect` exactly once when the
-                        // connection first binds.
+                        // Apply the binding state machine and forward if allowed.
+                        // The first usable message binds the connection's
+                        // principal, which the outbound demux (`should_deliver`)
+                        // then keys on. Connection lifecycle tracking
+                        // (`client.v1.connect` / `client.v1.disconnect`) is NOT
+                        // emitted here — the host owns it (see below).
                         if let Some(bound) = handle_ingress(&bytes, client.principal.as_deref()) {
                             log::info(format!("CLI connection bound to principal {bound}"));
-                            publish_client_connect(&bound);
                             client.principal = Some(bound);
                         }
                     }
@@ -263,12 +272,15 @@ impl CliProxy {
             }
 
             // Remove dead streams in reverse order to preserve indices.
-            // Drop releases the host-side active_streams entry automatically -
-            // no explicit close() needed (the pre-#752 manual close was a
-            // workaround for the lack of resource Drop in the old ABI).
+            // Dropping the `ProxyClient` drops its `TcpStream`, which releases
+            // the host-side stream entry — and that drop is exactly where the
+            // host emits `client.v1.disconnect` for the kernel connection
+            // tracker, stamped with the connection's verified principal. The
+            // proxy no longer emits it (the old proxy-side emission fired after
+            // the connection's verified identity was gone, so the kernel
+            // stamped it `anonymous` and the per-principal count leaked).
             for &i in dead_indices.iter().rev() {
-                let client = clients.remove(i);
-                announce_disconnect(&client, "socket closed");
+                clients.remove(i);
             }
 
             // Phase D: poll IPC subscriptions and broadcast to all live streams.
@@ -294,9 +306,11 @@ impl CliProxy {
             broadcast_dead.sort_unstable();
             broadcast_dead.dedup();
             for &i in broadcast_dead.iter().rev() {
-                let client = clients.remove(i);
+                clients.remove(i);
                 log::info("CLI client disconnected during broadcast");
-                announce_disconnect(&client, "broadcast send failed");
+                // See the Phase-C removal above: the host emits
+                // `client.v1.disconnect` when the dropped stream's resource is
+                // torn down, so the proxy does not.
             }
         }
 
@@ -374,30 +388,6 @@ fn handle_ingress(bytes: &[u8], current_binding: Option<&str>) -> Option<String>
     newly_bound
 }
 
-/// Publish `client.v1.connect` stamped with the authenticated principal so
-/// the kernel connection tracker increments that principal's active count.
-fn publish_client_connect(principal: &str) {
-    if let Err(e) = ipc::publish_json_as("client.v1.connect", &serde_json::json!({}), principal) {
-        log::error(format!("Failed to publish client.v1.connect: {e:?}"));
-    }
-}
-
-/// Publish `client.v1.disconnect` (with a reason) for a connection that bound
-/// to a principal. No-op for a socket that never sent a usable message (never
-/// bound, never counted), so there is nothing to decrement.
-fn announce_disconnect(client: &ProxyClient, reason: &str) {
-    let Some(principal) = client.principal.as_deref() else {
-        return;
-    };
-    if let Err(e) = ipc::publish_json_as(
-        "client.v1.disconnect",
-        &serde_json::json!({ "reason": reason }),
-        principal,
-    ) {
-        log::error(format!("Failed to publish client.v1.disconnect: {e:?}"));
-    }
-}
-
 /// A polled IPC message ready for outbound delivery: the serialized wire bytes
 /// the TUI expects, plus the principal it is attributed to (`None` = a
 /// system/broadcast event with no principal).
@@ -471,11 +461,11 @@ fn broadcast_poll_messages(
 /// Exact topics a client may publish *through* the proxy to the internal bus.
 ///
 /// `client.v1.connect` / `client.v1.disconnect` are deliberately absent: the
-/// proxy is the authority on socket lifecycle and emits them itself (see
-/// [`publish_client_connect`] / [`announce_disconnect`]) keyed to the
-/// stream's authenticated principal. Forwarding a client-sent copy would
-/// double-count and would miss ungraceful disconnects (the socket dies without
-/// the client getting a chance to send anything).
+/// HOST emits them from the inbound-socket accept/drop path, stamped with the
+/// connection's handshake-verified principal. A client (or the proxy) cannot
+/// forge them — the proxy does not publish them at all, and a client-sent copy
+/// over this allowlist would let an untrusted socket move the kernel's
+/// connection counter.
 const ALLOWED_INGRESS_EXACT: &[&str] = &["user.v1.prompt", "cli.v1.command.execute"];
 
 /// Topic prefixes the CLI is allowed to publish (suffix-routed topics).
