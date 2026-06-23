@@ -11,31 +11,38 @@ Configure `base_url` to point at any compatible provider:
 
 | Provider | `base_url` |
 |---|---|
-| OpenAI | `https://api.openai.com/v1` |
-| Groq | `https://api.groq.com/openai/v1` |
-| Together | `https://api.together.xyz/v1` |
-| Mistral | `https://api.mistral.ai/v1` |
-| DeepSeek | `https://api.deepseek.com/v1` |
-| Fireworks | `https://api.fireworks.ai/inference/v1` |
+| OpenAI | `https://api.openai.com` |
+| Groq | `https://api.groq.com/openai` |
+| Together | `https://api.together.ai` |
+| Mistral | `https://api.mistral.ai` |
+| DeepSeek | `https://api.deepseek.com` |
+| Fireworks | `https://api.fireworks.ai/inference` |
+
+Set `base_url` to the provider **origin only** — the capsule appends `/v1/chat/completions` itself, so do not include a `/v1` suffix.
 
 ## How it works
 
 1. Subscribes to `llm.v1.request.generate.openai-compat` IPC events
 2. Converts Astrid's `Message` format to the OpenAI Chat Completions JSON format (text, tool calls, tool results, multipart)
-3. Opens a streaming HTTP connection to `{base_url}/chat/completions` via the HTTP streaming airlock
+3. Opens a streaming HTTP connection to `{base_url}/v1/chat/completions` via the HTTP streaming airlock
 4. Parses the SSE response in real-time and publishes standardized `llm.v1.stream.openai-compat` events back to the IPC bus as chunks arrive
 
 Stream events cover the full response lifecycle: text deltas, parallel tool call start/delta/end, usage reporting (prompt + completion tokens), and completion.
 
 ## Configuration
 
-The capsule reads these environment variables during `astrid init`:
+The capsule prompts for these environment variables during `astrid init`; every field except `api_key` has a default.
 
-| Variable | Type | Description |
-|---|---|---|
-| `api_key` | secret | API key for the provider |
-| `base_url` | string | API base URL (default: `https://api.openai.com/v1`) |
-| `model` | string | Default model ID (default: `gpt-4o`) |
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `api_key` | secret | — | Provider API key, sent as `Authorization: Bearer …` |
+| `base_url` | string | `https://api.openai.com` | Provider origin **without** `/v1` — the capsule appends `/v1/chat/completions` |
+| `model` | string | `gpt-5.4` | Default model ID; a request may override it per call |
+| `context_window` | integer | `128000` | Context window (tokens) advertised to the provider registry |
+| `max_output_tokens` | integer | `8192` | Sent as `max_tokens` on each request |
+| `temperature` | string | _(unset)_ | Default sampling temperature (`0.0`–`2.0`); blank uses the provider default |
+
+`model` is required on every Chat Completions request (`CreateChatCompletionRequest.required = [model, messages]`). The capsule resolves it as request value → `model` env default → `gpt-5.4`.
 
 ## IPC protocol
 

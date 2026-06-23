@@ -13,7 +13,7 @@
 //! Configure `base_url` to point at any compatible provider:
 //! - OpenAI: `https://api.openai.com`
 //! - Groq: `https://api.groq.com/openai`
-//! - Together: `https://api.together.xyz`
+//! - Together: `https://api.together.ai`
 //! - Mistral: `https://api.mistral.ai`
 //! - DeepSeek: `https://api.deepseek.com`
 //! - Fireworks: `https://api.fireworks.ai/inference`
