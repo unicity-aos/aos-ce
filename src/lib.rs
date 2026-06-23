@@ -75,6 +75,11 @@ const KV_CONTEXT_WINDOW: &str = "react.context_window";
 /// KV key for cached provider max output tokens.
 const KV_MAX_OUTPUT_TOKENS: &str = "react.max_output_tokens";
 
+/// KV key for the cached active model id (the registry selection's
+/// `ProviderEntry.id`). Per-principal, exactly like the topic cache — no
+/// global cache, or one principal's model would pin every other's.
+const KV_PROVIDER_MODEL: &str = "react.llm_provider_model";
+
 /// IPC topic for context engine compact requests.
 const COMPACT_REQUEST_TOPIC: &str = "context_engine.v1.compact";
 
@@ -329,6 +334,12 @@ pub(crate) struct TurnState {
     /// Millisecond timestamp when the current phase was entered.
     #[serde(default)]
     phase_entered_at_ms: u64,
+    /// Per-request model override from the originating prompt's
+    /// `context.model` (gateway per-request selection). Takes precedence
+    /// over the registry selection for this turn only. Empty/None = no
+    /// override, fall through to the registry selection.
+    #[serde(default)]
+    request_model_override: Option<String>,
 }
 
 impl Default for TurnState {
@@ -345,6 +356,7 @@ impl Default for TurnState {
             current_tools: Vec::new(),
             iteration_count: 0,
             phase_entered_at_ms: 0,
+            request_model_override: None,
         }
     }
 }
@@ -411,6 +423,12 @@ impl TurnState {
         self.reset_turn();
         self.current_tools.clear();
         self.iteration_count = 0;
+        // A new user prompt is a new turn — the previous prompt's
+        // per-request model override must not leak forward. Cleared here
+        // (the new-prompt reset) but NOT in `reset_turn` (the per-iteration
+        // reset), so the override survives every continuation request
+        // within the same turn.
+        self.request_model_override = None;
     }
 
     /// Set the phase and record the wall-clock timestamp.
@@ -662,6 +680,23 @@ impl ReactLoop {
             Self::cleanup_inflight_mappings(&state);
         }
         state.reset_conversation_turn();
+
+        // Carry the gateway's per-request model override (`context.model`)
+        // through TurnState. `publish_llm_request` runs after the
+        // spark + prompt-builder bus hops, so the only way the override
+        // survives to the request is via persisted state. Set it AFTER the
+        // reset so the reset (which clears it) does not wipe this turn's
+        // value. Empty/whitespace-only/absent => None => fall through to
+        // the registry selection (consistent with `parse_active_provider`,
+        // which treats a whitespace-only id as absent). The string is
+        // opaque — react never parses it beyond this presence check.
+        state.request_model_override = context
+            .as_ref()
+            .and_then(|c| c.get("model"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned);
+
         state.set_phase(Phase::AwaitingIdentity);
         register_active_session(&state.session_id);
         state.save()?;
@@ -784,11 +819,27 @@ impl ReactLoop {
 
         state.save()?;
 
-        let model = env::var("model").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+        // Resolve the active selection once so the `model` we hand the
+        // prompt builder matches what the LLM request will carry (some
+        // prompt-builder hooks branch on the model name). Same precedence as
+        // the request: per-request override -> registry selection -> None.
+        //
+        // This is the earliest hop where the model is known, so it is the
+        // single fail-fast gate: if nothing is selected, terminate the turn
+        // with the "no model selected" outcome here rather than handing a
+        // fabricated/empty model to the prompt builder and the LLM. The turn
+        // is already saved in `AwaitingPromptBuild`; `fail_no_model_selected`
+        // tears it down to `Idle` cleanly.
+        let active = Self::active_llm();
+        let Some(model) = resolve_request_model(state.request_model_override.as_deref(), &active)
+        else {
+            return Self::fail_no_model_selected(&mut state);
+        };
 
-        // Derive the active provider from the registry's LLM topic.
-        let llm_topic = Self::active_llm_topic();
-        let provider = llm_topic
+        // Derive the active provider from the registry's LLM topic
+        // (independent of the model id — strips the topic prefix).
+        let provider = active
+            .topic
             .strip_prefix("llm.v1.request.generate.")
             .unwrap_or("unknown")
             .to_string();
@@ -863,7 +914,7 @@ impl ReactLoop {
         state.set_phase(Phase::Streaming);
         state.save()?;
 
-        Self::publish_llm_request(&state, &messages)
+        Self::publish_llm_request(&mut state, &messages)
     }
 
     /// Handles `llm.stream.*` events from the LLM provider capsule.
@@ -1082,7 +1133,7 @@ impl ReactLoop {
         // Safe to clean up now - new state is committed.
         delete_call_sessions(&call_ids);
 
-        Self::publish_llm_request(&state, &messages)
+        Self::publish_llm_request(&mut state, &messages)
     }
 
     /// Handle active model change from the registry capsule.
@@ -1091,35 +1142,277 @@ impl ReactLoop {
     /// route to the correct provider. Validates that the topic follows
     /// the expected `llm.request.generate.*` pattern as defense-in-depth.
     /// Caches context window limits from the provider metadata.
+    ///
+    /// A bare JSON `null` payload is the registry's *cleared* signal (emitted
+    /// on `astrid models unset` or a reconcile that genuinely clears). It must
+    /// drop BOTH cache keys so the next `active_llm` is a miss that re-asks the
+    /// registry — otherwise a warm-cache react keeps serving the unset model.
     #[astrid::interceptor("handle_model_changed")]
     pub fn handle_model_changed(&self, payload: serde_json::Value) -> Result<(), SysError> {
-        if let Some(topic) = payload.get("request_topic").and_then(|t| t.as_str()) {
-            if !topic.starts_with("llm.v1.request.generate.") {
-                log::warn(format!("Rejected model change with invalid topic: {topic}"));
-                return Ok(());
-            }
-            kv::set_bytes("llm_provider_topic", topic.as_bytes())?;
-
-            // Cache context window limits from the provider metadata.
-            for (kv_key, payload_key, log_on_set) in [
-                (KV_CONTEXT_WINDOW, "context_window", true),
-                (KV_MAX_OUTPUT_TOKENS, "max_output_tokens", false),
-            ] {
-                let value = payload
-                    .get(payload_key)
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if let Err(e) = kv::set_bytes(kv_key, &value.to_le_bytes()) {
-                    log::error(format!("Failed to cache {payload_key}: {e}"));
-                } else if log_on_set && value > 0 {
-                    log::info(format!("Cached provider {payload_key}: {value} tokens"));
+        match broadcast_action(&payload) {
+            // Cleared signal (`null` payload): drop the topic and model cache
+            // keys for this principal. The next `active_llm` misses both, does
+            // a fresh registry round-trip, and picks up the auto-selected
+            // default — or, if the registry has no provider either, resolves
+            // to no model and the turn terminates with the "no model selected"
+            // outcome (there is no env/literal fallback). Without this, an
+            // `unset` silently no-ops for a warm-cache react.
+            //
+            // Best-effort — a delete failure is non-fatal; the next fetch-on-
+            // miss path will overwrite stale entries anyway.
+            BroadcastAction::ClearAll => {
+                // Drop every provider-specific cache key so a cleared selection
+                // starts from a clean slate. The topic and model keys must go
+                // (a warm-cache react would otherwise keep serving the unset
+                // model). The context-window limits must go too: they are only
+                // ever overwritten by a later `SetTopic`/fetch when the *new*
+                // provider supplies them, so if the next provider's reply omits
+                // those fields the unset provider's limits would survive and
+                // keep clamping requests. `cleared_cache_keys` is the single
+                // source of truth for this set (pinned by a regression test);
+                // each delete is best-effort — the next fetch-on-miss path
+                // overwrites any stale entry anyway.
+                for key in cleared_cache_keys() {
+                    let _ = kv::delete(key);
                 }
             }
-        } else {
-            log::warn("handle_model_changed: payload missing 'request_topic', ignoring");
+            BroadcastAction::SetTopic(topic) => {
+                // Best-effort, consistent with the model and context-window
+                // writes below: a transient KV failure must not fail the whole
+                // interceptor. A dropped topic write just leaves the cache cold,
+                // and the next `active_llm` cache-miss re-fetches from the
+                // registry and self-heals — preferable to surfacing a `?` that
+                // aborts the broadcast handler and leaves the other writes in an
+                // inconsistent half-applied state.
+                let _ = kv::set_bytes("llm_provider_topic", topic.as_bytes());
+
+                // Reconcile the cached model id with the new selection from the
+                // same broadcast payload (the `ProviderEntry.id`). The topic and
+                // model must move together: a new topic with a stale model id is
+                // a foreign model name sent to the new provider.
+                //
+                // Best-effort — a cache write/delete failure is non-fatal,
+                // consistent with the context-window cache writes below.
+                match cached_model_action(&payload) {
+                    ModelCacheAction::Set(model) => {
+                        let _ = kv::set_bytes(KV_PROVIDER_MODEL, model.as_bytes());
+                    }
+                    // Migration-window case: the broadcast carries a valid topic
+                    // but no (or an empty/whitespace-only) `id`. The previous
+                    // selection's model id must NOT survive — clearing it makes
+                    // the cache-hit path in `active_llm` report `model: None`,
+                    // so resolution yields no model and the turn terminates with
+                    // the "no model selected" outcome rather than pairing the new
+                    // topic with the old provider's stale id (there is no
+                    // env/literal fallback).
+                    ModelCacheAction::Clear => {
+                        let _ = kv::delete(KV_PROVIDER_MODEL);
+                    }
+                }
+
+                // Cache context window limits from the provider metadata.
+                for (kv_key, payload_key, log_on_set) in [
+                    (KV_CONTEXT_WINDOW, "context_window", true),
+                    (KV_MAX_OUTPUT_TOKENS, "max_output_tokens", false),
+                ] {
+                    let value = payload
+                        .get(payload_key)
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if let Err(e) = kv::set_bytes(kv_key, &value.to_le_bytes()) {
+                        log::error(format!("Failed to cache {payload_key}: {e}"));
+                    } else if log_on_set && value > 0 {
+                        log::info(format!("Cached provider {payload_key}: {value} tokens"));
+                    }
+                }
+            }
+            BroadcastAction::RejectTopic(topic) => {
+                log::warn(format!("Rejected model change with invalid topic: {topic}"));
+            }
+            BroadcastAction::Ignore => {
+                log::warn("handle_model_changed: payload missing 'request_topic', ignoring");
+            }
         }
         Ok(())
     }
+}
+
+/// The active LLM selection resolved from the registry: the provider topic
+/// the request is published to, and the selected model id.
+///
+/// `topic` is load-bearing and always non-empty (it is what react publishes
+/// to). `model` is optional: a malformed or legacy registry reply may lack
+/// `id`, in which case `resolve_request_model` yields `None` (no per-request
+/// override either) and the turn terminates with the "no model selected"
+/// outcome — there is no fabricated fallback. react treats `model` as an
+/// opaque string — it never splits a `<capsule>:<model>` qualifier; that
+/// canonicalisation is the registry's concern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveLlm {
+    topic: String,
+    model: Option<String>,
+}
+
+/// What `handle_model_changed` must do with the *whole* cached selection
+/// (topic + model) when a `registry.v1.active_model_changed` broadcast lands.
+///
+/// This is the outer decision; [`ModelCacheAction`] is the inner one applied
+/// only on the topic-bearing path. Both are pure so the routing is testable
+/// without a live bus (the SDK `astrid:kv` imports trap off-wasm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BroadcastAction {
+    /// A bare JSON `null` payload — the registry's *cleared* signal
+    /// (`astrid models unset` or a reconcile that genuinely clears). Both the
+    /// topic and model cache keys must be dropped so a warm-cache react stops
+    /// serving the unset model and re-asks the registry on its next request.
+    ClearAll,
+    /// A well-formed broadcast carrying a valid `request_topic` (the
+    /// `llm.v1.request.generate.` prefix). Cache the topic and reconcile the
+    /// model id per [`cached_model_action`].
+    SetTopic(String),
+    /// A `request_topic` that does not match the expected provider-topic
+    /// prefix — rejected as defense-in-depth, leaving the cache untouched.
+    RejectTopic(String),
+    /// Any other shape (a non-null payload with no string `request_topic`) —
+    /// ignored, leaving the cache untouched.
+    Ignore,
+}
+
+/// The full set of provider-specific KV cache keys that a `ClearAll`
+/// (`astrid models unset`) must drop. Pure so the deletion list is testable
+/// without a live bus — the SDK `astrid:kv` imports trap off-wasm, so the
+/// interceptor's actual `kv::delete` calls can't run in a host test.
+///
+/// All four keys are written together when a provider is selected
+/// (topic + model id via `handle_model_changed`, context-window + max-output
+/// via the same broadcast / fetch path) and so must be cleared together.
+/// Leaving any behind lets a warm-cache react serve the unset provider's
+/// state: the topic/model would re-route to the old provider, and the
+/// context-window limits would keep clamping requests to the old provider's
+/// token budget.
+fn cleared_cache_keys() -> [&'static str; 4] {
+    [
+        "llm_provider_topic",
+        KV_PROVIDER_MODEL,
+        KV_CONTEXT_WINDOW,
+        KV_MAX_OUTPUT_TOKENS,
+    ]
+}
+
+/// Decide how `handle_model_changed` must treat an `active_model_changed`
+/// broadcast payload.
+///
+/// The registry sends the active `ProviderEntry` on a model *change* and a
+/// bare JSON `null` on a model *clear* (both on the same topic). A `null`
+/// payload is the only signal that the selection was unset, so it must clear
+/// the cache rather than fall through to the "missing request_topic" ignore
+/// path — otherwise a warm-cache react keeps the previously-pinned model alive
+/// across an `unset` until it happens to re-fetch.
+///
+/// The provider-topic prefix is validated here so the rejection is part of the
+/// pure decision, keeping the interceptor a thin dispatcher.
+fn broadcast_action(payload: &serde_json::Value) -> BroadcastAction {
+    if payload.is_null() {
+        return BroadcastAction::ClearAll;
+    }
+    match payload.get("request_topic").and_then(|t| t.as_str()) {
+        Some(topic) if topic.starts_with("llm.v1.request.generate.") => {
+            BroadcastAction::SetTopic(topic.to_owned())
+        }
+        Some(topic) => BroadcastAction::RejectTopic(topic.to_owned()),
+        None => BroadcastAction::Ignore,
+    }
+}
+
+/// What `handle_model_changed` must do to the cached model id
+/// ([`KV_PROVIDER_MODEL`]) when an `active_model_changed` broadcast lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelCacheAction {
+    /// The broadcast carries a non-empty `id`: cache it as the new model.
+    Set(String),
+    /// The broadcast carries no `id` (or an empty one) — the migration
+    /// window, where a provider was selected before the model id rode along
+    /// the broadcast. The previously cached id belongs to the *old* topic, so
+    /// it must be cleared rather than left to pair with the new topic.
+    Clear,
+}
+
+/// Decide how to reconcile the cached model id with an `active_model_changed`
+/// broadcast payload.
+///
+/// The topic and the cached model id are written together by
+/// `handle_model_changed` and read together on the cache-hit path in
+/// `active_llm`. They must therefore move as a unit: when the topic changes
+/// the cached model must change with it. A broadcast with a valid topic but no
+/// `id` ([`ModelCacheAction::Clear`]) cannot be allowed to leave the previous
+/// model id in place — `active_llm` would then pair the new topic with the old
+/// provider's model, sending a foreign model name to the new provider.
+///
+/// The `id` is read verbatim; an empty or whitespace-only string is treated
+/// as absent (consistent with `parse_active_provider`).
+fn cached_model_action(payload: &serde_json::Value) -> ModelCacheAction {
+    match payload.get("id").and_then(|v| v.as_str()) {
+        Some(model) if !model.trim().is_empty() => ModelCacheAction::Set(model.to_owned()),
+        _ => ModelCacheAction::Clear,
+    }
+}
+
+/// Parse a registry active-model reply into an [`ActiveLlm`].
+///
+/// Reads `request_topic` (required) and `id` (the selected model id, optional).
+/// Returns `None` for JSON `null` (no active model), a non-object payload, an
+/// empty/absent `request_topic`, or a `request_topic` that does not start with
+/// the `llm.v1.request.generate.` provider prefix. An absent, empty, or
+/// whitespace-only `id` yields `model: None` — an empty model name is not a
+/// usable selection, so it is treated as absent rather than paired with the
+/// topic. This mirrors [`cached_model_action`] (empty `id` => `Clear`) and the
+/// `active_llm` cache-hit path (empty cached model => `None`); all three feed
+/// `ActiveLlm`, so all three must collapse an empty id the same way. A
+/// non-empty `id` is read verbatim — never split or reinterpreted.
+///
+/// The prefix check is the same defense-in-depth that the broadcast path
+/// applies in [`broadcast_action`]. Without it the cache-MISS fetch path would
+/// accept and cache *any* non-empty topic a buggy or compromised registry
+/// returned, then publish the next LLM request to it — while a forged broadcast
+/// of the same shape would be rejected. Both paths feed the same cache, so both
+/// must enforce the same provider-topic invariant.
+fn parse_active_provider(payload: &serde_json::Value) -> Option<ActiveLlm> {
+    if payload.is_null() {
+        return None;
+    }
+    let provider = payload.as_object()?;
+    let topic = provider.get("request_topic")?.as_str()?.to_string();
+    if !topic.starts_with("llm.v1.request.generate.") {
+        return None;
+    }
+    let model = provider
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned);
+    Some(ActiveLlm { topic, model })
+}
+
+/// Resolve the model id for an LLM request by precedence (highest first):
+///
+/// 1. Per-request override (`context.model` from the originating prompt).
+/// 2. Active registry selection (`ProviderEntry.id`).
+///
+/// Each tier is skipped when empty or whitespace-only (consistent with
+/// `parse_active_provider`), so a blank override never shadows a usable
+/// registry id. All inputs are opaque strings — passed through verbatim
+/// once a tier clears the presence check. Returns `None` when neither tier
+/// yields a usable id: there is
+/// **no fabricated default**. A literal fallback (historically a Claude id)
+/// could be stamped onto a non-Anthropic provider's request, so when nothing
+/// is selected react surfaces a "no model selected" turn outcome instead of
+/// inventing one. The registry already auto-selects a default provider when
+/// any provider is installed, so `None` means genuinely nothing is available.
+fn resolve_request_model(override_model: Option<&str>, active: &ActiveLlm) -> Option<String> {
+    override_model
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| active.model.clone().filter(|s| !s.trim().is_empty()))
 }
 
 impl ReactLoop {
@@ -1306,16 +1599,57 @@ impl ReactLoop {
         state.save()
     }
 
+    /// Actionable message shown to the user when no LLM model is selected.
+    const NO_MODEL_MESSAGE: &'static str = "No LLM model is selected. Run `astrid models` to choose one, or install/configure an LLM provider.";
+
+    /// Terminally fail the turn because no LLM model is selected.
+    ///
+    /// react must never fabricate a model id when nothing is selected — a
+    /// literal fallback could send e.g. a Claude id to a non-Anthropic
+    /// provider. This is a TERMINAL turn outcome, so it tears the turn down on
+    /// the same terminal-teardown discipline every other failure path uses
+    /// (stream error, timeout, iteration cap): surface an actionable error to
+    /// the frontend, clean up the in-flight KV correlation mappings, reset the
+    /// conversation turn, and return to `Idle` — `set_phase(Idle)` also
+    /// unregisters the session from the watchdog's active set. No
+    /// `llm.v1.request.generate.*` request is published.
+    fn fail_no_model_selected(state: &mut TurnState) -> Result<(), SysError> {
+        log::error("No LLM model selected; aborting turn without publishing an LLM request");
+        let _ = ipc::publish_json(
+            "agent.v1.response",
+            &IpcPayload::AgentResponse {
+                text: Self::NO_MODEL_MESSAGE.to_string(),
+                is_final: true,
+                session_id: state.session_id.clone(),
+            },
+        );
+        Self::cleanup_inflight_mappings(state);
+        state.reset_conversation_turn();
+        state.set_phase(Phase::Idle);
+        state.save()
+    }
+
     /// Publish an LLM generation request to the provider capsule.
     ///
     /// Tools and messages are provided by the caller — either from the prompt
     /// builder response (initial request) or from turn state (tool iterations).
     /// Messages are compacted via the context engine if a context window budget
     /// is available.
-    fn publish_llm_request(state: &TurnState, messages: &[Message]) -> Result<(), SysError> {
-        let model = env::var("model").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+    ///
+    /// When no model can be resolved (no per-request override and no registry
+    /// selection), the turn is terminated with the "no model selected" outcome
+    /// instead of publishing a request with a fabricated model id.
+    fn publish_llm_request(state: &mut TurnState, messages: &[Message]) -> Result<(), SysError> {
+        // Resolve topic + model together so the request carries the
+        // registry's selected model id, never a fabricated default.
+        // Precedence: per-request override -> registry selection -> None.
+        let active = Self::active_llm();
+        let Some(model) = resolve_request_model(state.request_model_override.as_deref(), &active)
+        else {
+            return Self::fail_no_model_selected(state);
+        };
 
-        let llm_topic = Self::active_llm_topic();
+        let llm_topic = active.topic;
 
         // Compact messages to fit within the provider's context window.
         let messages = Self::compact_messages(&state.session_id, messages.to_vec());
@@ -1409,11 +1743,27 @@ impl ReactLoop {
         Ok(messages)
     }
 
-    /// Resolve the active LLM provider topic from the registry.
-    fn active_llm_topic() -> String {
+    /// Resolve the active LLM selection (provider topic + model id) from the
+    /// registry.
+    ///
+    /// The topic is the load-bearing field and follows the same four-tier
+    /// resolution as before (per-principal cache -> operator env override ->
+    /// lazy registry fetch -> sane default). The model id rides alongside it:
+    /// it is read from the same cache / registry reply, and is `None` on the
+    /// env-override and topic-default paths (no model id is available there) —
+    /// `resolve_request_model` then yields `None` and the turn terminates with
+    /// the "no model selected" outcome.
+    fn active_llm() -> ActiveLlm {
         // 1. Per-principal cache (populated by handle_model_changed for
         //    the load-time principal, and by the fetch-on-miss path
-        //    below for every other principal).
+        //    below for every other principal). Read BOTH keys: a cached
+        //    topic with a missing model key is the migration window (a
+        //    principal cached its topic before this change shipped) —
+        //    honour the topic and report `model: None`, never invalidate
+        //    the topic just because the model is absent. A `None` model
+        //    then resolves to no model and the turn terminates with the
+        //    "no model selected" outcome (there is no env/literal
+        //    fallback model).
         //
         //    `get_bytes_opt` distinguishes "key absent" from "key with
         //    empty value" — important because the kernel collapsed
@@ -1425,18 +1775,24 @@ impl ReactLoop {
             && let Ok(topic) = String::from_utf8(bytes)
             && !topic.is_empty()
         {
-            return topic;
+            let model = kv::get_bytes_opt(KV_PROVIDER_MODEL)
+                .ok()
+                .flatten()
+                .and_then(|b| String::from_utf8(b).ok())
+                .filter(|m| !m.trim().is_empty());
+            return ActiveLlm { topic, model };
         }
         // 2. Operator env override. `env::var` collapses missing keys
         //    to `Ok("")` (SDK 0.7 documented behaviour) — relying on
         //    `unwrap_or_else` here used to silently bypass the
         //    fallback default and return the empty string, which the
         //    host then rejected as `InvalidInput` on publish. Use
-        //    `var_opt` so the missing case actually falls through.
+        //    `var_opt` so the missing case actually falls through. No
+        //    model id is available on this path.
         if let Ok(Some(topic)) = env::var_opt("llm_provider_topic")
             && !topic.is_empty()
         {
-            return topic;
+            return ActiveLlm { topic, model: None };
         }
         // 3. Lazy fetch from the registry capsule. Registry broadcasts
         //    `registry.v1.active_model_changed` once at startup; every
@@ -1446,25 +1802,32 @@ impl ReactLoop {
         //    and have to ask the registry directly the first time they
         //    publish. Subscribe before publish to avoid a delivery
         //    race; the subscription is dropped at scope exit.
-        if let Some(topic) = Self::fetch_active_llm_topic_from_registry() {
-            return topic;
+        if let Some(active) = Self::fetch_active_llm_topic_from_registry() {
+            return active;
         }
-        // 4. Sane default. Reachable when neither the cache, env
-        //    override, nor the registry has a usable provider —
-        //    surfaces upstream as a publish failure rather than a
-        //    silent stamp on the wrong topic.
-        "llm.v1.request.generate.anthropic".into()
+        // 4. Sane topic default. Reachable when neither the cache, env
+        //    override, nor the registry has a usable provider. It carries
+        //    no model id, so `resolve_request_model` yields `None` and the
+        //    turn terminates with the "no model selected" outcome rather
+        //    than silently stamping a fabricated model on this topic.
+        ActiveLlm {
+            topic: "llm.v1.request.generate.anthropic".into(),
+            model: None,
+        }
     }
 
-    /// Fetch the active LLM provider's `request_topic` from the
+    /// Fetch the active LLM selection (`request_topic` + model `id`) from the
     /// registry capsule via a synchronous request/response round-trip.
-    /// Caches the result (topic + context window + max output tokens)
-    /// into the current principal's KV so subsequent prompts skip the
+    /// Caches the result (topic + model id + context window + max output
+    /// tokens) into the current principal's KV so subsequent prompts skip the
     /// IPC hop.
     ///
     /// Returns `None` if the registry doesn't reply within 5s, has no
-    /// active model, or returns a payload missing `request_topic`.
-    fn fetch_active_llm_topic_from_registry() -> Option<String> {
+    /// active model, or returns a payload missing `request_topic`. A reply
+    /// with a topic but no `id` returns `Some(ActiveLlm { model: None, .. })`
+    /// — the topic is the required field; a `None` model then yields the
+    /// "no model selected" turn outcome downstream (no fabricated default).
+    fn fetch_active_llm_topic_from_registry() -> Option<ActiveLlm> {
         const RESPONSE_TOPIC: &str = "registry.v1.response.get_active_model";
         const REQUEST_TOPIC: &str = "registry.v1.get_active_model";
         const TIMEOUT_MS: u64 = 5_000;
@@ -1481,40 +1844,53 @@ impl ReactLoop {
 
         // Registry replies with `Option<ProviderEntry>` — JSON `null`
         // means "no active model"; anything else is the active entry
-        // shape with a `request_topic` field.
+        // shape with a `request_topic` field (and the selected model `id`).
         let payload: serde_json::Value = serde_json::from_str(&msg.payload).ok()?;
-        // `null` is the valid "no active model" reply; anything that isn't an
-        // object is a corrupt/unexpected response worth a warning rather than a
-        // silent `None` (which is indistinguishable from "no model").
-        if payload.is_null() {
-            return None;
-        }
-        let provider = payload.as_object().or_else(|| {
+        // A non-object, non-null payload is a corrupt/unexpected response
+        // worth a warning rather than a silent `None` (which is
+        // indistinguishable from "no model"). `parse_active_provider` already
+        // returns `None` for it, so warn here before delegating.
+        if !payload.is_null() && !payload.is_object() {
             log::warn("react: registry active-model response is not a JSON object");
-            None
-        })?;
-        let topic = provider.get("request_topic")?.as_str()?.to_string();
-        if topic.is_empty() {
-            return None;
         }
+        let active = parse_active_provider(&payload)?;
 
         // Best-effort cache so subsequent prompts under this principal
         // skip the round-trip. Errors are non-fatal — a transient KV
         // failure just means we'll re-fetch next time.
-        let _ = kv::set_bytes("llm_provider_topic", topic.as_bytes());
-        for (kv_key, payload_key) in [
-            (KV_CONTEXT_WINDOW, "context_window"),
-            (KV_MAX_OUTPUT_TOKENS, "max_output_tokens"),
-        ] {
-            if let Some(v) = provider
-                .get(payload_key)
-                .and_then(serde_json::Value::as_u64)
-            {
-                let _ = kv::set_bytes(kv_key, &v.to_le_bytes());
+        let _ = kv::set_bytes("llm_provider_topic", active.topic.as_bytes());
+        // Reconcile the cached model id with the freshly-fetched topic, the
+        // same way `handle_model_changed` does on the broadcast path. The two
+        // keys can evict independently, so a fresh topic must never inherit a
+        // previously-cached model id: when the reply carries no (or an
+        // empty/whitespace-only) `id`, the stale `KV_PROVIDER_MODEL` is deleted
+        // so the cache-hit path in `active_llm` reports `model: None`, which
+        // resolves to no model and terminates the turn with the "no model
+        // selected" outcome (there is no env/literal fallback). Reuses the
+        // shared pure decision.
+        match cached_model_action(&payload) {
+            ModelCacheAction::Set(model) => {
+                let _ = kv::set_bytes(KV_PROVIDER_MODEL, model.as_bytes());
+            }
+            ModelCacheAction::Clear => {
+                let _ = kv::delete(KV_PROVIDER_MODEL);
+            }
+        }
+        if let Some(provider) = payload.as_object() {
+            for (kv_key, payload_key) in [
+                (KV_CONTEXT_WINDOW, "context_window"),
+                (KV_MAX_OUTPUT_TOKENS, "max_output_tokens"),
+            ] {
+                if let Some(v) = provider
+                    .get(payload_key)
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    let _ = kv::set_bytes(kv_key, &v.to_le_bytes());
+                }
             }
         }
 
-        Some(topic)
+        Some(active)
     }
 
     /// Read cached context window from KV. Returns `None` if not yet queried.
@@ -1642,4 +2018,411 @@ fn parse_json_array_field<T: serde::de::DeserializeOwned>(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an `ActiveLlm` for tests without going through the registry.
+    fn active(topic: &str, model: Option<&str>) -> ActiveLlm {
+        ActiveLlm {
+            topic: topic.to_string(),
+            model: model.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn request_model_uses_registry_id() {
+        // The registry reply carries the selected model id under `id`,
+        // sitting next to the `request_topic` react already reads.
+        let reply = serde_json::json!({
+            "id": "qwen2.5-coder:32b",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        let parsed = parse_active_provider(&reply).expect("active provider parses");
+        assert_eq!(parsed.model.as_deref(), Some("qwen2.5-coder:32b"));
+
+        // With no override, the registry id is resolved.
+        let resolved = resolve_request_model(None, &parsed);
+        assert_eq!(resolved.as_deref(), Some("qwen2.5-coder:32b"));
+    }
+
+    #[test]
+    fn request_model_override_beats_registry() {
+        let active = active("llm.v1.request.generate.openai", Some("gpt-5.4-registry"));
+
+        // The per-request `context.model` override wins over the registry
+        // selection.
+        let resolved = resolve_request_model(Some("gpt-5.4"), &active);
+        assert_eq!(resolved.as_deref(), Some("gpt-5.4"));
+
+        // An empty override is ignored — the registry id wins.
+        let resolved_empty = resolve_request_model(Some(""), &active);
+        assert_eq!(resolved_empty.as_deref(), Some("gpt-5.4-registry"));
+    }
+
+    #[test]
+    fn request_model_is_none_when_no_selection() {
+        // JSON `null` is the registry's "no active model" reply.
+        assert!(parse_active_provider(&serde_json::Value::Null).is_none());
+
+        // No override and no registry model resolves to `None` — there is NO
+        // env or literal fallback. The old impl returned the literal
+        // `"claude-sonnet-4-20250514"` here, fabricating a Claude id for any
+        // provider; this asserts that fabrication is gone. A `None` here is
+        // what drives the terminal "no model selected" turn outcome, so react
+        // never publishes an `llm.v1.request.generate.*` request with an
+        // invented model.
+        let no_model = active("llm.v1.request.generate.anthropic", None);
+        assert_eq!(resolve_request_model(None, &no_model), None);
+    }
+
+    #[test]
+    fn no_model_turn_does_not_publish_a_request() {
+        // `publish_llm_request` and the `handle_identity_response` gate both
+        // branch on exactly this decision: when `resolve_request_model` is
+        // `None`, they call `fail_no_model_selected` and return WITHOUT
+        // reaching any `ipc::publish_json("llm.v1.request.generate.*", ..)`.
+        // The publish is IO-buried (the SDK host imports trap off-wasm), so we
+        // pin the documented decision seam here: a `None` resolution is the
+        // sole input that diverts the turn off the publish path.
+        let no_model = active("llm.v1.request.generate.anthropic", None);
+        let resolved = resolve_request_model(None, &no_model);
+        assert!(
+            resolved.is_none(),
+            "no selection must resolve to None, which is what suppresses the LLM request publish",
+        );
+
+        // A real selection (override or registry id) is `Some`, which is the
+        // only branch that proceeds to publish.
+        let selected = active("llm.v1.request.generate.openai-compat", Some("qwen2.5"));
+        assert!(resolve_request_model(None, &selected).is_some());
+        assert!(resolve_request_model(Some("override-model"), &no_model).is_some());
+
+        // The terminal outcome the gate emits is the actionable no-model
+        // message — it points the user at `astrid models` / provider setup,
+        // never a fabricated model name.
+        assert!(ReactLoop::NO_MODEL_MESSAGE.contains("astrid models"));
+        assert!(!ReactLoop::NO_MODEL_MESSAGE.contains("claude"));
+    }
+
+    #[test]
+    fn request_model_passthrough_is_opaque() {
+        // A colon-bearing id (Ollama-style) must round-trip unmodified —
+        // react never splits a `<capsule>:<model>` qualifier.
+        let reply = serde_json::json!({
+            "id": "llama3.3:70b",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        let parsed = parse_active_provider(&reply).expect("active provider parses");
+        assert_eq!(parsed.model.as_deref(), Some("llama3.3:70b"));
+
+        let resolved = resolve_request_model(None, &parsed);
+        assert_eq!(resolved.as_deref(), Some("llama3.3:70b"));
+
+        // Same opacity for a colon-bearing `context.model` override.
+        let resolved_override = resolve_request_model(Some("vendor:custom-model:v2"), &parsed);
+        assert_eq!(resolved_override.as_deref(), Some("vendor:custom-model:v2"));
+    }
+
+    #[test]
+    fn active_provider_ignores_missing_id() {
+        // A reply with a topic but no `id` keeps the topic and reports no
+        // model — guards the migration-window cache state.
+        let reply = serde_json::json!({
+            "request_topic": "llm.v1.request.generate.anthropic",
+        });
+        let parsed = parse_active_provider(&reply).expect("active provider parses");
+        assert_eq!(parsed.topic, "llm.v1.request.generate.anthropic");
+        assert_eq!(parsed.model, None);
+
+        // A missing model id resolves to `None` — no fabricated fallback.
+        assert_eq!(resolve_request_model(None, &parsed), None);
+    }
+
+    #[test]
+    fn active_provider_treats_empty_id_as_no_model() {
+        // Regression: a reply with a valid provider topic but an empty (or
+        // whitespace-only) `id` must report `model: None`, NOT pair the topic
+        // with an empty model name. Before the fix `parse_active_provider` read
+        // the `id` verbatim, so an empty `id` became `Some("")` — inconsistent
+        // with `cached_model_action` (empty => Clear) and the `active_llm`
+        // cache-hit path (empty cached model => None), the two other inputs to
+        // `ActiveLlm`. An empty model would then survive into the request as a
+        // usable (but invalid) selection in `resolve_request_model`.
+        let empty = serde_json::json!({
+            "id": "",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        let parsed = parse_active_provider(&empty).expect("valid topic still parses");
+        assert_eq!(parsed.topic, "llm.v1.request.generate.openai-compat");
+        assert_eq!(parsed.model, None);
+
+        // A whitespace-only id is just as unusable and is treated identically.
+        let blank = serde_json::json!({
+            "id": "   ",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert_eq!(parse_active_provider(&blank).unwrap().model, None);
+
+        // With no usable registry model the resolution yields `None` — the
+        // empty id is never paired into a request and there is no fallback.
+        assert_eq!(resolve_request_model(None, &parsed), None);
+    }
+
+    #[test]
+    fn whitespace_only_model_id_is_absent_across_paths() {
+        // Regression: a whitespace-only id (e.g. " ", "\t", "\n") is just as
+        // unusable as an empty one and must resolve to NO model on every path
+        // that feeds a request, consistent with `parse_active_provider` (which
+        // already trims). Before the fix these paths checked `!is_empty()`, so a
+        // single space slipped through as a "selection" and got published to the
+        // provider as a model name. The pure decision seams pinned here are the
+        // same ones the IO-buried call sites (`handle_user_prompt`'s
+        // `context.model` filter, `active_llm`'s cached-model filter) delegate
+        // to, so trimming here is trimming there.
+        for blank in ["   ", "\t", "\n", " \t\n "] {
+            // Tier 1: a whitespace-only `context.model` override never shadows a
+            // usable registry id — it is treated as absent and the registry id
+            // wins.
+            let with_registry = active("llm.v1.request.generate.openai", Some("gpt-5.4-registry"));
+            assert_eq!(
+                resolve_request_model(Some(blank), &with_registry).as_deref(),
+                Some("gpt-5.4-registry"),
+                "whitespace override must not shadow the registry id",
+            );
+
+            // Tier 2: a whitespace-only registry/cache model id resolves to
+            // `None` (no fabricated fallback), driving the terminal "no model
+            // selected" outcome rather than publishing a blank model.
+            let blank_registry = active("llm.v1.request.generate.openai-compat", Some(blank));
+            assert_eq!(
+                resolve_request_model(None, &blank_registry),
+                None,
+                "whitespace registry id must resolve to no model",
+            );
+
+            // Both tiers blank => `None`.
+            assert_eq!(resolve_request_model(Some(blank), &blank_registry), None);
+
+            // `cached_model_action` (the shared reconcile decision used by both
+            // the broadcast and registry-fetch cache paths) treats a
+            // whitespace-only `id` as absent => Clear, so a warm cache never
+            // pairs the new topic with a blank model.
+            let broadcast = serde_json::json!({
+                "id": blank,
+                "request_topic": "llm.v1.request.generate.openai-compat",
+            });
+            assert_eq!(cached_model_action(&broadcast), ModelCacheAction::Clear);
+
+            // `parse_active_provider` agrees — the registry reply with a blank
+            // `id` yields `model: None`, keeping the three `ActiveLlm` inputs
+            // consistent.
+            assert_eq!(parse_active_provider(&broadcast).unwrap().model, None);
+        }
+    }
+
+    #[test]
+    fn active_provider_rejects_empty_topic() {
+        let reply = serde_json::json!({
+            "id": "some-model",
+            "request_topic": "",
+        });
+        assert!(parse_active_provider(&reply).is_none());
+
+        // A non-object payload is also rejected.
+        assert!(parse_active_provider(&serde_json::json!("not-an-object")).is_none());
+    }
+
+    #[test]
+    fn override_cleared_on_new_turn() {
+        let mut state = TurnState {
+            request_model_override: Some("gpt-5.4".to_string()),
+            ..TurnState::default()
+        };
+
+        // The per-iteration reset (between ReAct tool iterations within the
+        // same turn) must PRESERVE the override.
+        state.reset_turn();
+        assert_eq!(state.request_model_override.as_deref(), Some("gpt-5.4"));
+
+        // The new-turn reset (a new user prompt) must CLEAR it so the
+        // previous prompt's override does not leak forward.
+        state.reset_conversation_turn();
+        assert_eq!(state.request_model_override, None);
+    }
+
+    // The KV-backed assertion the fix calls for ("pre-set KV_PROVIDER_MODEL,
+    // call handle_model_changed with a topic but no id, assert
+    // active_llm().model is None") cannot run on the host test triple: the
+    // `astrid:kv/host` WIT imports trap with "unreachable" off-wasm, so any
+    // test that touches `kv::*` aborts. The decision that the fix changed —
+    // whether the cached model id is overwritten or cleared — lives in the
+    // pure `cached_model_action`, which is what these regressions pin. The
+    // `Clear` arm is exactly what makes `active_llm`'s cache-hit path report
+    // `model: None` (line ~1568 already filters empty/absent to `None`), so a
+    // `Clear` here is the cleared-cache assertion in pure form.
+
+    #[test]
+    fn model_change_without_id_clears_stale_model() {
+        // Migration-window broadcast: a valid topic, no `id`. Before the fix
+        // the cached model id was left untouched, so the next cache hit paired
+        // the NEW topic with the OLD provider's model. The fix clears it.
+        let broadcast = serde_json::json!({
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert_eq!(cached_model_action(&broadcast), ModelCacheAction::Clear);
+    }
+
+    #[test]
+    fn model_change_with_empty_id_clears_stale_model() {
+        // An explicitly empty `id` is treated identically to an absent one —
+        // an empty model name is not a usable selection, and leaving the old
+        // id cached would send a foreign model to the new provider.
+        let broadcast = serde_json::json!({
+            "id": "",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert_eq!(cached_model_action(&broadcast), ModelCacheAction::Clear);
+    }
+
+    #[test]
+    fn registry_fetch_reply_without_id_clears_stale_model() {
+        // Symmetric to the broadcast path: the cache-MISS registry round-trip
+        // in `fetch_active_llm_topic_from_registry` reconciles the cached model
+        // id against the SAME `cached_model_action` decision. A reply that
+        // carries a valid `request_topic` but no `id` must clear (not preserve)
+        // a previously-cached `KV_PROVIDER_MODEL`, so the freshly-fetched topic
+        // is never paired with the old provider's stale model on the next cache
+        // hit. The `Clear` arm is what drives that delete; before the fix the
+        // fetch path only conditionally *wrote* the model and never deleted,
+        // leaving the topic and model keys desynced.
+        let reply = serde_json::json!({
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert_eq!(cached_model_action(&reply), ModelCacheAction::Clear);
+
+        // And `parse_active_provider` — the very thing the fetch path feeds
+        // into `ActiveLlm` — yields `model: None` for that same reply, so the
+        // cleared cache and the parsed selection agree: no model id survives.
+        let active = parse_active_provider(&reply).expect("topic-bearing reply parses");
+        assert_eq!(active.model, None);
+    }
+
+    #[test]
+    fn model_change_with_id_sets_model() {
+        // The normal path: a non-empty `id` is cached verbatim alongside the
+        // topic, opaque (colon-bearing ids round-trip unmodified).
+        let broadcast = serde_json::json!({
+            "id": "qwen2.5-coder:32b",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert_eq!(
+            cached_model_action(&broadcast),
+            ModelCacheAction::Set("qwen2.5-coder:32b".to_string())
+        );
+    }
+
+    #[test]
+    fn cleared_broadcast_clears_both_cache_keys() {
+        // The registry sends a bare JSON `null` on `active_model_changed` when
+        // the selection is cleared (`astrid models unset`). Before the fix this
+        // fell into the "missing request_topic" ignore path, so a warm-cache
+        // react kept serving the unset model. The fix routes it to `ClearAll`,
+        // which drops BOTH the topic and model cache keys — the next
+        // `active_llm` then misses and re-asks the registry.
+        let broadcast = serde_json::Value::Null;
+        assert_eq!(broadcast_action(&broadcast), BroadcastAction::ClearAll);
+    }
+
+    #[test]
+    fn normal_broadcast_still_sets_topic() {
+        // A normal `set` broadcast carries a valid `request_topic` and must
+        // still update (not clear) — the cleared-broadcast handling is scoped
+        // strictly to the `null` payload.
+        let broadcast = serde_json::json!({
+            "id": "qwen2.5-coder:32b",
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert_eq!(
+            broadcast_action(&broadcast),
+            BroadcastAction::SetTopic("llm.v1.request.generate.openai-compat".to_string())
+        );
+    }
+
+    #[test]
+    fn cleared_broadcast_drops_context_window_keys() {
+        // Regression: `ClearAll` (`astrid models unset`) must drop the
+        // provider-specific context-window limits, not just the topic and model
+        // keys. The limits are only ever overwritten by a later select/fetch
+        // when the *new* provider supplies them, so if they survived an unset a
+        // warm-cache react would keep clamping requests to the unset provider's
+        // token budget. The interceptor iterates `cleared_cache_keys` (the
+        // kv::delete calls themselves can't run off-wasm — the SDK kv imports
+        // trap), so pinning that set here is the cleared-cache assertion in pure
+        // form. Before the fix this list was the topic + model keys only.
+        let keys = cleared_cache_keys();
+        assert!(
+            keys.contains(&KV_CONTEXT_WINDOW),
+            "ClearAll must drop the cached context window"
+        );
+        assert!(
+            keys.contains(&KV_MAX_OUTPUT_TOKENS),
+            "ClearAll must drop the cached max output tokens"
+        );
+        // The topic and model keys must still be dropped — clearing the limits
+        // is additive, not a replacement.
+        assert!(keys.contains(&"llm_provider_topic"));
+        assert!(keys.contains(&KV_PROVIDER_MODEL));
+    }
+
+    #[test]
+    fn active_provider_rejects_bad_prefix_topic() {
+        // Regression: the cache-MISS fetch path feeds `parse_active_provider`
+        // and caches/publishes whatever topic it returns. A buggy or
+        // compromised registry reply with a non-provider topic must be rejected
+        // here — exactly as the broadcast path rejects it in `broadcast_action`
+        // — so a forged topic is never cached and published to. Before the fix
+        // `parse_active_provider` accepted any non-empty topic, leaving the two
+        // paths asymmetric.
+        let reply = serde_json::json!({
+            "id": "some-model",
+            "request_topic": "evil.topic",
+        });
+        assert!(parse_active_provider(&reply).is_none());
+
+        // A topic that merely contains the prefix but doesn't start with it is
+        // also rejected — `starts_with`, not `contains`.
+        let prefix_not_at_start = serde_json::json!({
+            "request_topic": "evil.llm.v1.request.generate.openai-compat",
+        });
+        assert!(parse_active_provider(&prefix_not_at_start).is_none());
+
+        // The valid provider prefix still parses — the check rejects forgeries,
+        // not legitimate provider topics.
+        let valid = serde_json::json!({
+            "request_topic": "llm.v1.request.generate.openai-compat",
+        });
+        assert!(parse_active_provider(&valid).is_some());
+    }
+
+    #[test]
+    fn broadcast_with_invalid_topic_is_rejected() {
+        // A `request_topic` that doesn't match the provider-topic prefix is
+        // rejected as defense-in-depth, leaving the cache untouched.
+        let broadcast = serde_json::json!({ "request_topic": "evil.topic" });
+        assert_eq!(
+            broadcast_action(&broadcast),
+            BroadcastAction::RejectTopic("evil.topic".to_string())
+        );
+    }
+
+    #[test]
+    fn broadcast_missing_topic_is_ignored() {
+        // A non-null payload with no string `request_topic` is ignored — it is
+        // neither a clear nor a usable selection, so the cache is left intact.
+        let broadcast = serde_json::json!({ "id": "some-model" });
+        assert_eq!(broadcast_action(&broadcast), BroadcastAction::Ignore);
+    }
 }
