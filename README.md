@@ -123,7 +123,7 @@ operator-level exemption (see below), not a retry.
 
 **Granting a local-egress exemption (operator only)**
 
-Exemptions are set in the operator's `astrid.toml`, under `[security.capsule_local_egress]`. A
+Exemptions are set in the operator's `config.toml`, under `[security.capsule_local_egress]`. A
 capsule's own `Capsule.toml` cannot set this, and a project/workspace config layer cannot widen
 it. The default is no exemptions.
 
