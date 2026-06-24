@@ -11,13 +11,36 @@ file = "astrid_capsule_session.wasm"
 type = "executable"
 
 [exports]
-"astrid:session" = "1.0.0"
+"astrid:session" = "1.1.0"
 
 [publish]
 "session.v1.response.get_messages.*" = { wit = "@unicity-astrid/wit/session/get-messages-response" }
 "session.v1.response.clear.*" = { wit = "@unicity-astrid/wit/session/clear-response" }
+"session.v1.response.list.*" = { wit = "@unicity-astrid/wit/session/list-response" }
+"session.v1.response.get_meta.*" = { wit = "@unicity-astrid/wit/session/get-meta-response" }
+"session.v1.response.update.*" = { wit = "@unicity-astrid/wit/session/update-response" }
+"session.v1.response.delete.*" = { wit = "@unicity-astrid/wit/session/delete-response" }
+"session.v1.response.search.*" = { wit = "@unicity-astrid/wit/session/search-response" }
+"session.v1.event.*" = { wit = "@unicity-astrid/wit/session/session-event" }
+"agent.v1.response" = { wit = "@unicity-astrid/wit/agent/response" }
+"tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }
+"tool.v1.response.describe.*" = { wit = "@unicity-astrid/wit/tool/describe-response" }
 
 [subscribe]
 "session.v1.append" = { wit = "@unicity-astrid/wit/session/append-request", handler = "handle_append" }
 "session.v1.request.get_messages" = { wit = "@unicity-astrid/wit/session/get-messages-request", handler = "handle_get_messages" }
 "session.v1.request.clear" = { wit = "@unicity-astrid/wit/session/clear-request", handler = "handle_clear" }
+"session.v1.request.list" = { wit = "@unicity-astrid/wit/session/list-request", handler = "handle_list" }
+"session.v1.request.get_meta" = { wit = "@unicity-astrid/wit/session/get-meta-request", handler = "handle_get_meta" }
+"session.v1.request.update" = { wit = "@unicity-astrid/wit/session/update-request", handler = "handle_update" }
+"session.v1.request.delete" = { wit = "@unicity-astrid/wit/session/delete-request", handler = "handle_delete" }
+"session.v1.request.search" = { wit = "@unicity-astrid/wit/session/search-request", handler = "handle_search" }
+"tool.v1.execute.list_threads" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_list_threads" }
+"tool.v1.execute.get_thread" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_get_thread" }
+"tool.v1.execute.search_conversations" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_search_conversations" }
+"tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }
+"cli.v1.command.execute" = { wit = "@unicity-astrid/wit/system/command-execute", handler = "handle_command" }
+
+[[command]]
+name = "session"
+description = "Manage conversation threads: list, show, rename, archive, unarchive, delete, search."
