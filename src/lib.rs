@@ -40,8 +40,8 @@ use astrid_sdk::contracts::registry::ProviderEntry;
 
 mod selection;
 use selection::{
-    ReconcileOutcome, RegistryState, authenticate_capsule, auto_select_defaults_in_place,
-    is_known_subcommand, models_result, reconcile_active_model_in_place, resolve_selection,
+    ReconcileOutcome, RegistryState, auto_select_defaults_in_place, is_known_subcommand,
+    models_result, reconcile_active_model_in_place, request_topic_qualifier, resolve_selection,
     subcommand_needs_discovery,
 };
 
@@ -57,7 +57,7 @@ const LLM_DESCRIBE_RESPONSE_TOPIC: &str = "llm.v1.response.describe";
 /// CLI run/result protocol topics (the scriptable `models` verb). The run
 /// topic is the providing capsule id; results are keyed by request id. See
 /// `astrid` `crates/astrid-cli/src/commands/capsule_verb.rs`.
-const CLI_RUN_TOPIC: &str = "cli.v1.command.run.registry";
+const CLI_RUN_TOPIC: &str = "cli.v1.command.run.astrid-capsule-registry";
 const CLI_RESULT_TOPIC_PREFIX: &str = "cli.v1.command.result.";
 
 /// Maximum accepted length of an incoming `req_id`. The CLI sends a 32-char
@@ -90,9 +90,9 @@ pub(crate) fn is_valid_req_id(req_id: &str) -> bool {
 }
 
 /// The only `command` this capsule's CLI run topic implements. The run topic
-/// `cli.v1.command.run.registry` is per-capsule, not per-verb, so the payload's
-/// `command` field must be validated against this before its args are treated
-/// as a `models` subcommand.
+/// suffix is the package id returned as `provider_capsule` by GetCommands. It
+/// is per-capsule, not per-verb, so the payload's `command` field must be
+/// validated against this before its args are treated as a `models` subcommand.
 const CLI_RUN_COMMAND: &str = "models";
 
 /// Whether a CLI run payload's `command` field names the verb this capsule
@@ -201,11 +201,11 @@ fn discover_providers() -> Vec<ProviderEntry> {
         let step = remaining.min(100);
         match response_sub.recv(step) {
             Ok(result) => {
-                // One message = one authenticated source. Process each
+                // One message = one kernel-stamped source. Process each
                 // message's `providers` array AS A GROUP so the source's
-                // entry[0]-first emit order is preserved, and so the
-                // `<capsule>` qualifier is authenticated against THAT
-                // message's `source_id`.
+                // entry[0]-first emit order is preserved. The route qualifier
+                // is validated as a concrete LLM generate topic, but it is not
+                // forced to equal the capsule package name.
                 for msg in &result.messages {
                     providers.extend(stamp_message_providers(&msg.payload, &msg.source_id));
                 }
@@ -223,18 +223,16 @@ fn discover_providers() -> Vec<ProviderEntry> {
 }
 
 /// Parse one describe message's `{"providers": [...]}` body and return its
-/// entries with canonical `"<capsule>:<model>"` ids in the provider's emit
-/// order (entry[0] = that capsule's default hint). Each entry is authenticated
-/// INDIVIDUALLY: its own `request_topic` suffix is the `<capsule>` candidate,
-/// which must stamp (UUIDv5) to the message's kernel-stamped `source_id`. There
-/// is no separate per-message candidate — a provider may not smuggle in entries
-/// routed to a capsule it does not own.
+/// entries with canonical `"<provider>:<model>"` ids in the provider's emit
+/// order (entry[0] = that provider's default hint). Each entry must name a
+/// concrete `llm.v1.request.generate.<provider>` route; the trailing provider
+/// qualifier is a routing alias, not a package identity assertion.
 ///
 /// A malformed payload, or one with no `providers` array, returns empty
 /// SILENTLY (no warning) — it is treated as "this message carried no
-/// providers". Only a PER-ENTRY authentication failure is dropped WITH a
-/// warning (anti-shadowing). An entry whose JSON does not deserialize into a
-/// `ProviderEntry` is skipped silently.
+/// providers". Only a per-entry invalid route is dropped WITH a warning. An
+/// entry whose JSON does not deserialize into a `ProviderEntry` is skipped
+/// silently.
 ///
 /// The `<model>` half of the canonical id is the provider-reported entry
 /// `id`. Against today's single-entry providers that is the bare provider
@@ -253,13 +251,12 @@ fn stamp_message_providers(payload: &str, source_id: &str) -> Vec<ProviderEntry>
         let Ok(mut p) = serde_json::from_value::<ProviderEntry>(entry.clone()) else {
             continue;
         };
-        // Authenticate this entry's self-reported routing against the
-        // message's kernel-stamped source. Each entry carries its own
-        // `request_topic`; require its suffix to authenticate so a provider
-        // cannot mix in entries routed to a capsule it does not own.
-        let Some(capsule) = authenticate_capsule(&p.request_topic, source_id) else {
+        // Each entry carries its own route topic. The suffix is the provider
+        // qualifier used for model selection, but it is deliberately not
+        // required to equal the package name encoded by `source_id`.
+        let Some(capsule) = request_topic_qualifier(&p.request_topic) else {
             log::warn(format!(
-                "Dropping provider entry '{}' (request_topic '{}'): source '{}' does not authenticate the claimed capsule",
+                "Dropping provider entry '{}' (request_topic '{}'): source '{}' did not provide a concrete LLM generate route",
                 p.id, p.request_topic, source_id
             ));
             continue;
@@ -584,7 +581,7 @@ fn dispatch_cli_run_messages(result: &ipc::PollResult) {
             ));
             continue;
         }
-        // The run topic `cli.v1.command.run.registry` is per-CAPSULE, not
+        // The run topic `cli.v1.command.run.<provider_capsule>` is per-CAPSULE, not
         // per-verb: every `astrid capsule <verb>` the registry declares lands
         // here. We only implement `models`, so reject any other `command` rather
         // than treating its args as a models subcommand.
@@ -882,7 +879,22 @@ mod tests {
         assert!(!is_valid_req_id("0123456789abcdefg"));
     }
 
-    /// The CLI run topic `cli.v1.command.run.registry` is per-capsule, not
+    #[test]
+    fn cli_run_topic_uses_provider_capsule_package_id() {
+        // The CLI publishes to cli.v1.command.run.<provider_capsule>, where
+        // provider_capsule comes from GetCommands and is the package id.
+        assert_eq!(CLI_RUN_TOPIC, "cli.v1.command.run.astrid-capsule-registry");
+
+        // Ensure Capsule.toml subscription matches CLI_RUN_TOPIC to prevent drift.
+        let capsule_toml = include_str!("../Capsule.toml");
+        assert!(
+            capsule_toml.contains(&format!("\"{}\"", CLI_RUN_TOPIC)),
+            "Capsule.toml is missing subscription for {}",
+            CLI_RUN_TOPIC
+        );
+    }
+
+    /// The CLI run topic is per-capsule, not
     /// per-verb. Only a payload whose `command` is `"models"` may be dispatched
     /// as a models subcommand; any other command (or a missing/non-string
     /// field) must be rejected so unrelated verbs aren't misinterpreted as

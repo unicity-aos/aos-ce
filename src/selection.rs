@@ -1,27 +1,14 @@
-//! Pure model-selection logic: canonical id handling, source-stamp
-//! authentication, the ollama-safe resolver, and the reconcile/auto-select
-//! decisions. None of this touches the host — `lib.rs` owns IPC/KV and wraps
-//! the decisions here with persistence + event publishing. Keeping the logic
-//! host-free is what lets it carry its own `#[cfg(test)]` units (capsule test
-//! binaries run on the developer host, not in the wasm sandbox).
+//! Pure model-selection logic: canonical id handling, route-topic validation,
+//! the ollama-safe resolver, and the reconcile/auto-select decisions. None of
+//! this touches the host — `lib.rs` owns IPC/KV and wraps the decisions here
+//! with persistence + event publishing. Keeping the logic host-free is what
+//! lets it carry its own `#[cfg(test)]` units (capsule test binaries run on
+//! the developer host, not in the wasm sandbox).
 
 use astrid_sdk::contracts::registry::ProviderEntry;
 
-/// Namespace UUID the kernel uses to stamp every capsule's IPC `source_id`
-/// as a deterministic UUIDv5 of its package name. This MUST stay in lockstep
-/// with the kernel constant (`astrid` `crates/astrid-capsule/src/engine/wasm/mod.rs`,
-/// `CAPSULE_ID_NAMESPACE`), which is documented there as "must never change"
-/// because changing it would re-identify every capsule fleet-wide.
-///
-/// We duplicate it here so the registry can authenticate a provider's
-/// self-reported `<capsule>` qualifier: UUIDv5 is one-way, so we cannot
-/// decode a name from a `source_id` — instead we recompute the stamp for a
-/// candidate name and require it to equal the authenticated `source_id`.
-const CAPSULE_ID_NAMESPACE: uuid::Uuid =
-    uuid::Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
-
 /// Fixed prefix of a provider's request topic. The trailing segment after
-/// this prefix is the candidate `<capsule>` qualifier we authenticate.
+/// this prefix is the provider qualifier used in canonical model ids.
 const LLM_REQUEST_GENERATE_PREFIX: &str = "llm.v1.request.generate.";
 
 /// The `models` subcommands the registry understands. Named so the dispatcher
@@ -182,34 +169,30 @@ pub(crate) fn resolve_selection<'a>(
     })
 }
 
-/// Authenticate a provider's self-reported `<capsule>` qualifier against the
-/// kernel-stamped `source_id`.
+/// Extract a provider qualifier from a routable LLM request topic.
 ///
 /// The provider self-reports its routing as
-/// `request_topic = "llm.v1.request.generate.<capsule>"`; the trailing
-/// segment is an UNTRUSTED candidate. UUIDv5 is one-way, so we cannot decode
-/// the name from `source_id`. Instead we recompute the stamp
-/// `uuid_v5(CAPSULE_ID_NAMESPACE, candidate)` and require it to equal the
-/// authenticated `source_id`. Only then is the candidate trusted as the
-/// qualifier — this is the anti-shadowing guard: a capsule's `source_id` is
-/// fixed by the kernel from its own package name, so it cannot forge another
-/// capsule's qualifier.
+/// `request_topic = "llm.v1.request.generate.<provider>"`. The registry uses
+/// that trailing segment as the human-facing qualifier in canonical ids, but
+/// it must not force the qualifier to equal the capsule package name. Topics
+/// are routing contracts, not capsule identity envelopes; provider provenance
+/// belongs in the kernel-stamped message envelope.
 ///
-/// Returns the trusted `<capsule>` qualifier, or `None` when the candidate
-/// does not authenticate (caller drops + warns).
-pub(crate) fn authenticate_capsule<'a>(request_topic: &'a str, source_id: &str) -> Option<&'a str> {
+/// Returns the `<provider>` qualifier, or `None` when the topic does not name
+/// a concrete generate route.
+pub(crate) fn request_topic_qualifier(request_topic: &str) -> Option<&str> {
     let candidate = request_topic.strip_prefix(LLM_REQUEST_GENERATE_PREFIX)?;
-    if candidate.is_empty() {
+    if !is_valid_provider_qualifier(candidate) {
         return None;
     }
-    // Parse the kernel-stamped `source_id` into a `Uuid` and compare by value:
-    // this avoids the `expected.to_string()` allocation and, crucially, is
-    // hyphenation/case-insensitive, so a well-formed but differently-cased
-    // `source_id` still authenticates. A `source_id` that does not parse as a
-    // UUID cannot have been stamped by the kernel — drop the candidate.
-    let actual = uuid::Uuid::parse_str(source_id).ok()?;
-    let expected = uuid::Uuid::new_v5(&CAPSULE_ID_NAMESPACE, candidate.as_bytes());
-    (expected == actual).then_some(candidate)
+    Some(candidate)
+}
+
+fn is_valid_provider_qualifier(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 /// What a reconcile decided to do with a stored `active_model_id`. Returned by
@@ -474,38 +457,26 @@ mod tests {
     }
 
     #[test]
-    fn source_stamp_authenticates_qualifier() {
-        // Reference stamp for "openai-compat" under the kernel namespace.
-        let source_id = "24838f4a-8175-5206-8b2d-81da2c6a8122";
-        let topic = "llm.v1.request.generate.openai-compat";
-
-        // Matching source authenticates the candidate.
+    fn request_topic_qualifier_accepts_provider_alias() {
         assert_eq!(
-            authenticate_capsule(topic, source_id),
+            request_topic_qualifier("llm.v1.request.generate.openai-compat"),
             Some("openai-compat")
         );
-
-        // The same UUID in upper-case still authenticates: we compare parsed
-        // `Uuid` values, not raw strings, so case/hyphenation differences in a
-        // well-formed source_id do not spuriously reject it.
         assert_eq!(
-            authenticate_capsule(topic, &source_id.to_uppercase()),
-            Some("openai-compat")
+            request_topic_qualifier("llm.v1.request.generate.astrid-capsule-openai-compat"),
+            Some("astrid-capsule-openai-compat")
         );
-
-        // A message CLAIMING the openai-compat suffix but stamped with any
-        // other source_id is rejected (anti-shadowing).
+        assert_eq!(request_topic_qualifier("llm.v1.request.generate."), None);
+        assert_eq!(request_topic_qualifier("llm.v1.request.generate.*"), None);
         assert_eq!(
-            authenticate_capsule(topic, "deadbeef-0000-0000-0000-000000000000"),
+            request_topic_qualifier("llm.v1.request.generate.openai.compat"),
             None
         );
-
-        // A source_id that is not a parseable UUID cannot have been stamped by
-        // the kernel — reject rather than risk a string-shaped bypass.
-        assert_eq!(authenticate_capsule(topic, "not-a-uuid"), None);
-
-        // A topic without the fixed prefix yields no candidate at all.
-        assert_eq!(authenticate_capsule("some.other.topic", source_id), None);
+        assert_eq!(
+            request_topic_qualifier("llm.v1.request.generate.openai compat"),
+            None
+        );
+        assert_eq!(request_topic_qualifier("some.other.topic"), None);
     }
 
     #[test]
