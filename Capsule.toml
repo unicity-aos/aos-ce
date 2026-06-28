@@ -14,7 +14,7 @@ type = "executable"
 "astrid:llm" = "^1.0"
 "astrid:session" = "^1.0"
 "astrid:spark" = "^1.0"
-"astrid:context" = "^1.0"
+"astrid:context" = { version = "^1.0", optional = true }
 
 [publish]
 "spark.v1.request.build" = { wit = "@unicity-astrid/wit/spark/build-request" }
