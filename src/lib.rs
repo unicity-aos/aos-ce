@@ -132,13 +132,37 @@ pub struct IdentityBuilder {
     onboarded: bool,
 }
 
-#[capsule]
+#[capsule(state)]
 impl IdentityBuilder {
     /// Builds the system prompt from the spark identity.
     #[astrid::interceptor("handle_build_request")]
     pub fn build_system_prompt(&mut self, req: BuildRequest) -> Result<(), SysError> {
         let workspace_root = req.workspace_root.trim_end_matches('/');
+        let prompt = self.build_prompt_text(workspace_root);
 
+        let response = BuildResponse {
+            prompt,
+            session_id: req.session_id,
+        };
+        ipc::publish_json("spark.v1.response.ready", &response)?;
+
+        Ok(())
+    }
+
+    fn build_prompt_text(&mut self, workspace_root: &str) -> String {
+        self.build_prompt_text_with_spark_loader(workspace_root, || {
+            fs::read_to_string(SPARK_CONFIG_PATH).ok()
+        })
+    }
+
+    fn build_prompt_text_with_spark_loader<F>(
+        &mut self,
+        workspace_root: &str,
+        load_spark: F,
+    ) -> String
+    where
+        F: FnOnce() -> Option<String>,
+    {
         // TODO: Move to a new capsule which handles env details. Time would be good too.
         let mut prompt = format!(
             "# Environment\n\
@@ -151,7 +175,7 @@ impl IdentityBuilder {
         // parses successfully we treat the user as onboarded without requiring
         // an explicit `identity-import`.
         if !self.onboarded
-            && let Ok(content) = fs::read_to_string(SPARK_CONFIG_PATH)
+            && let Some(content) = load_spark()
         {
             // Parse directly instead of going through parse_spark_toml (which
             // falls back to a default with a non-empty callsign on error).
@@ -179,13 +203,7 @@ impl IdentityBuilder {
             prompt.push_str(ONBOARDING_PROMPT);
         }
 
-        let response = BuildResponse {
-            prompt,
-            session_id: req.session_id,
-        };
-        ipc::publish_json("spark.v1.response.ready", &response)?;
-
-        Ok(())
+        prompt
     }
 
     /// Handles `/identity-export` and `/identity-import` CLI commands.
@@ -261,4 +279,60 @@ fn parse_spark_toml(content: &str) -> SparkConfig {
         log::warn(format!("Failed to parse spark.toml, using defaults: {e}"));
         SparkConfig::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configured_identity() -> SparkConfig {
+        SparkConfig {
+            callsign: "Lyra".into(),
+            class: "a precise concierge agent".into(),
+            aura: "Calm, direct, and context aware.".into(),
+            signal: "Use short answers unless detail is needed.".into(),
+            core: "Preserve user boundaries.".into(),
+        }
+    }
+
+    #[test]
+    fn prompt_requests_onboarding_until_identity_is_saved() {
+        let mut builder = IdentityBuilder::default();
+
+        let prompt = builder.build_prompt_text_with_spark_loader("/tmp/workspace", || None);
+
+        assert!(prompt.contains("# Important: Identity Setup Required"));
+        assert!(prompt.contains("- Current working directory: /tmp/workspace"));
+        assert!(!prompt.contains("You are Lyra"));
+    }
+
+    #[test]
+    fn saved_identity_is_used_without_repeating_onboarding() {
+        let mut builder = IdentityBuilder {
+            spark: configured_identity(),
+            onboarded: true,
+        };
+
+        let prompt = builder.build_prompt_text_with_spark_loader("/tmp/workspace", || None);
+
+        assert!(prompt.contains("You are Lyra, a precise concierge agent."));
+        assert!(prompt.contains("# Personality\nCalm, direct, and context aware."));
+        assert!(
+            prompt.contains("# Communication Style\nUse short answers unless detail is needed.")
+        );
+        assert!(prompt.contains("# Core Directives\nPreserve user boundaries."));
+        assert!(!prompt.contains("# Important: Identity Setup Required"));
+    }
+
+    #[test]
+    fn spark_file_loader_restores_identity_when_state_is_empty() {
+        let mut builder = IdentityBuilder::default();
+        let spark_toml = configured_identity().to_toml();
+
+        let prompt =
+            builder.build_prompt_text_with_spark_loader("/tmp/workspace", || Some(spark_toml));
+
+        assert!(prompt.contains("You are Lyra, a precise concierge agent."));
+        assert!(!prompt.contains("# Important: Identity Setup Required"));
+    }
 }
