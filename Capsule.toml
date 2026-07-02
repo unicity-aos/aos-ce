@@ -1,6 +1,6 @@
 [package]
 name = "astrid-capsule-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Native Unix Socket bridge for the Astrid CLI frontend."
 
 [[component]]
