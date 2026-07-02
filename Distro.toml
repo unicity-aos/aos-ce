@@ -3,10 +3,10 @@ schema-version = 1
 [distro]
 id = "astralis"
 name = "Astralis"
-pretty-name = "Astralis 0.2.0 (Genesis)"
-version = "0.2.0"
+pretty-name = "Astralis 0.2.1 (Genesis)"
+version = "0.2.1"
 codename = "genesis"
-release-date = "2026-07-02"
+release-date = "2026-07-03"
 description = "The complete Astrid AI assistant experience"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 maintainers = ["Joshua J. Bouw <jjb@unicity-labs.com>"]
@@ -15,7 +15,7 @@ support = "https://github.com/unicity-astrid/astrid/discussions"
 bug-tracker = "https://github.com/unicity-astrid/astralis/issues"
 repository = "https://github.com/unicity-astrid/astralis"
 license = "MIT OR Apache-2.0"
-astrid-version = ">=0.9.0"  # distro floor enforcement + per-principal provisioning landed in 0.9.0
+astrid-version = ">=0.9.1"  # 0.9.0 shipped a broken astrid:process@1.0.0 host ABI (capsules like shell fail to instantiate); fixed in 0.9.1
 
 [distro.requires.astrid]
 llm = "^1.0"
