@@ -1995,35 +1995,70 @@ impl ReactLoop {
 
             let poll_result = sub.recv(DEFAULT_COMPACT_TIMEOUT_MS).ok()?;
 
-            // Navigate PollResult: first message's payload -> data
+            // The context engine replies with the compaction response object
+            // directly: `IpcPayload::to_guest_bytes` strips the `Custom { data }`
+            // envelope before delivery, so the fields sit at the payload root
+            // with no `data` wrapper (same as the registry active-model read).
             let first_msg = poll_result.messages.first()?;
             let payload: serde_json::Value = serde_json::from_str(&first_msg.payload).ok()?;
-            let data = payload.get("data")?;
+            let parsed = parse_compaction_response(&payload)?;
 
-            let compacted_msgs: Vec<serde_json::Value> =
-                serde_json::from_value(data.get("messages")?.clone()).ok()?;
-
-            let result: Vec<Message> = compacted_msgs
-                .into_iter()
-                .filter_map(|v| serde_json::from_value(v).ok())
-                .collect();
-
-            if let Some(true) = data.get("compacted").and_then(|v| v.as_bool()) {
-                let removed = data
-                    .get("messages_removed")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+            if parsed.compacted {
+                let removed = parsed.messages_removed;
                 log::info(format!(
                     "Context compaction: removed {removed} messages \
                          (budget: {max_tokens} tokens, target: {target_tokens})"
                 ));
             }
 
-            Some(result)
+            Some(parsed.messages)
         })();
 
         result.unwrap_or(messages)
     }
+}
+
+/// A parsed context-engine compaction reply: the compacted message set plus
+/// the bookkeeping the caller needs to log the outcome.
+struct CompactionResponse {
+    messages: Vec<Message>,
+    compacted: bool,
+    messages_removed: u64,
+}
+
+/// Parse a context-engine compaction reply into its compacted message set.
+///
+/// The reply arrives UNWRAPPED: `IpcPayload::to_guest_bytes` strips the
+/// `Custom { data }` envelope before the payload reaches the guest, so
+/// `messages` / `compacted` / `messages_removed` sit at the payload root —
+/// there is no `data` key to descend into (the sibling registry active-model
+/// read reads the same way). Returns `None` when `messages` is absent or not
+/// an array, which drives the caller's fallback to the original, uncompacted
+/// history. `compacted` and `messages_removed` are bookkeeping for the log
+/// line only and default to `false` / `0` when absent.
+fn parse_compaction_response(payload: &serde_json::Value) -> Option<CompactionResponse> {
+    let compacted_msgs: Vec<serde_json::Value> =
+        serde_json::from_value(payload.get("messages")?.clone()).ok()?;
+
+    let messages: Vec<Message> = compacted_msgs
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
+
+    let compacted = payload
+        .get("compacted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let messages_removed = payload
+        .get("messages_removed")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    Some(CompactionResponse {
+        messages,
+        compacted,
+        messages_removed,
+    })
 }
 
 /// Parse a JSON array field from a payload, deserializing each element.
@@ -2481,5 +2516,86 @@ mod tests {
         // neither a clear nor a usable selection, so the cache is left intact.
         let broadcast = serde_json::json!({ "id": "some-model" });
         assert_eq!(broadcast_action(&broadcast), BroadcastAction::Ignore);
+    }
+
+    #[test]
+    fn compaction_response_reads_unwrapped_payload() {
+        // Regression: the context engine's compaction reply reaches the guest
+        // UNWRAPPED — `IpcPayload::to_guest_bytes` strips the `Custom { data }`
+        // envelope, so `messages` / `compacted` / `messages_removed` sit at the
+        // payload root. The old read descended through a non-existent `data`
+        // key, so `payload.get("data")` was always `None`; the closure
+        // short-circuited and `result.unwrap_or(messages)` silently returned
+        // the ORIGINAL, uncompacted history — compaction was a permanent no-op.
+        // The messages are serialized the same way `compact_messages` sends
+        // them (`serde_json::to_value`), which is the shape the engine echoes.
+        let compacted = vec![
+            serde_json::to_value(Message {
+                role: MessageRole::User,
+                content: MessageContent::Text("hello".to_string()),
+            })
+            .unwrap(),
+            serde_json::to_value(Message::assistant("summary")).unwrap(),
+        ];
+        let payload = serde_json::json!({
+            "messages": compacted,
+            "compacted": true,
+            "messages_removed": 2,
+        });
+
+        let parsed = parse_compaction_response(&payload)
+            .expect("an unwrapped compaction payload with a `messages` array must parse");
+        assert_eq!(parsed.messages.len(), 2, "both compacted messages survive");
+        assert!(parsed.compacted);
+        assert_eq!(parsed.messages_removed, 2);
+        // The compacted set is what the caller substitutes for the original
+        // history; assert it round-trips to the summarized pair, not the input.
+        assert!(matches!(
+            &parsed.messages[1].content,
+            MessageContent::Text(t) if t == "summary"
+        ));
+    }
+
+    #[test]
+    fn compaction_response_rejects_data_wrapper() {
+        // The OLD `{"data": {...}}` envelope is exactly what the guest does NOT
+        // receive. A payload wrapped that way has no top-level `messages`, so it
+        // parses to `None` — the caller then keeps the original history. This
+        // pins that the fix reads the root, not a `data` wrapper: were the read
+        // to descend through `data` again, this shape would parse and the
+        // unwrapped one above would not.
+        let wrapped = serde_json::json!({
+            "data": {
+                "messages": [],
+                "compacted": true,
+                "messages_removed": 1,
+            }
+        });
+        assert!(
+            parse_compaction_response(&wrapped).is_none(),
+            "a `data`-wrapped payload has no root `messages` and must not parse",
+        );
+    }
+
+    #[test]
+    fn compaction_response_without_messages_is_none() {
+        // Absent or non-array `messages` yields `None`, which is the caller's
+        // signal to fall back to the original, uncompacted history.
+        assert!(parse_compaction_response(&serde_json::json!({ "compacted": true })).is_none());
+        assert!(
+            parse_compaction_response(&serde_json::json!({ "messages": "not-an-array" })).is_none()
+        );
+    }
+
+    #[test]
+    fn compaction_response_defaults_bookkeeping() {
+        // `compacted` / `messages_removed` are optional bookkeeping; a reply
+        // carrying only `messages` still parses, with the flag `false` and the
+        // count `0` (no log line is emitted, but the compacted set is applied).
+        let parsed = parse_compaction_response(&serde_json::json!({ "messages": [] }))
+            .expect("messages present => parses");
+        assert!(!parsed.compacted);
+        assert_eq!(parsed.messages_removed, 0);
+        assert!(parsed.messages.is_empty());
     }
 }
