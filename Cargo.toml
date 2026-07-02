@@ -1,6 +1,6 @@
 [package]
 name = "astrid-capsule-skills"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Skills Loader for the Astrid OS"
 publish = false

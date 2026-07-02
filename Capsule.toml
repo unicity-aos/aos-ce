@@ -1,6 +1,6 @@
 [package]
 name = "astrid-capsule-skills"
-version = "0.1.0"
+version = "0.2.0"
 description = "Skills Loader - Reads and loads Agent Skills via VFS"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 astrid-version = ">=0.1.0"
