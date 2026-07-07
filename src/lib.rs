@@ -632,11 +632,43 @@ impl ReactLoop {
     #[astrid::interceptor("handle_bus_lag")]
     pub fn handle_bus_lag(&self) -> Result<(), SysError> {
         for session_id in load_active_sessions() {
-            let state = TurnState::load(&session_id);
-            if state.phase == Phase::AwaitingTools {
+            let mut state = TurnState::load(&session_id);
+            // A lag means the broadcast buffer overran react's subscriber and
+            // DROPPED events. For a session mid-turn that is fatal in a way the
+            // watchdog is too slow (and, when `clock_ms` is unavailable, unable)
+            // to catch: `Streaming` may have lost tokens or the terminal `Done`,
+            // and `AwaitingTools` may have lost a result. If the terminal event
+            // was among the dropped ones, nothing will ever revive this session
+            // and it hangs indefinitely. So abort the turn immediately with a
+            // clean, retryable error instead of waiting. (Previously this only
+            // *warned* for `AwaitingTools` and ignored `Streaming` entirely —
+            // which is the exact phase a long, fast LLM stream overruns.)
+            if matches!(state.phase, Phase::Streaming | Phase::AwaitingTools) {
                 log::warn(format!(
-                    "Event bus lagged while session '{session_id}' awaits tool results - watchdog will recover if results were lost"
+                    "Event bus lagged while session '{session_id}' was mid-turn ({:?}); aborting — dropped events cannot be recovered",
+                    state.phase
                 ));
+                let _ = ipc::publish_json(
+                    "agent.v1.response",
+                    &IpcPayload::AgentResponse {
+                        text: "Response interrupted: the event bus overflowed and stream data was lost. Please retry.".to_string(),
+                        is_final: true,
+                        session_id: state.session_id.clone(),
+                    },
+                );
+                Self::cleanup_inflight_mappings(&state);
+                state.reset_conversation_turn();
+                state.set_phase(Phase::Idle);
+                // Best-effort: the whole point of this loop is to unwind EVERY
+                // mid-turn session after a bus overrun, so a KV save failure for
+                // one session must not `?`-abort the loop and strand the rest
+                // still hung. Log and continue; the watchdog is the backstop for
+                // any session whose Idle reset failed to persist here.
+                if let Err(e) = state.save() {
+                    log::warn(format!(
+                        "Failed to persist Idle reset for session '{session_id}' after bus lag: {e}; continuing to unwind remaining sessions"
+                    ));
+                }
             }
         }
         Ok(())
