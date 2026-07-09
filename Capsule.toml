@@ -1,6 +1,6 @@
 [package]
 name = "astrid-capsule-context-engine"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pluggable context window compaction with interceptor hook support"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 astrid-version = ">=0.1.0"
