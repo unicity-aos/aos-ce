@@ -1,6 +1,6 @@
 [package]
 name = "astrid-capsule-memory"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Cross-session memory capsule for Astrid OS"
 publish = false
