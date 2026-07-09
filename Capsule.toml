@@ -1,6 +1,6 @@
 [package]
 name = "astrid-capsule-system"
-version = "0.1.0"
+version = "0.2.0"
 description = "System management tools — lets the LLM inspect and manage its own runtime"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 astrid-version = ">=0.1.0"
