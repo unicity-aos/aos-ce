@@ -1,0 +1,51 @@
+[package]
+name = "astrid-capsule-users"
+version = "0.1.0"
+description = "Within-principal user identity store — platform-to-AstridUserId mapping over IPC"
+authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
+astrid-version = ">=0.1.0"
+
+[[component]]
+id = "users-store"
+file = "astrid_capsule_users.wasm"
+type = "executable"
+# No host capabilities. The capsule's entire surface is IPC pub/sub and
+# the per-capsule KV scope (granted by default).
+capabilities = {}
+
+[exports]
+"astrid:users" = "1.0.0"
+
+[publish]
+"users.v1.resolve.response" = { wit = "@unicity-astrid/wit/users/resolve-response" }
+"users.v1.link.response" = { wit = "@unicity-astrid/wit/users/link-response" }
+"users.v1.unlink.response" = { wit = "@unicity-astrid/wit/users/unlink-response" }
+"users.v1.create.response" = { wit = "@unicity-astrid/wit/users/create-response" }
+"users.v1.set_display_name.response" = { wit = "@unicity-astrid/wit/users/set-display-name-response" }
+"users.v1.set_public_key.response" = { wit = "@unicity-astrid/wit/users/set-public-key-response" }
+"users.v1.links.response" = { wit = "@unicity-astrid/wit/users/links-response" }
+"users.v1.get.response" = { wit = "@unicity-astrid/wit/users/get-response" }
+"users.v1.delete.response" = { wit = "@unicity-astrid/wit/users/delete-response" }
+"users.v1.list.response" = { wit = "@unicity-astrid/wit/users/list-response" }
+"users.v1.context.set.response" = { wit = "@unicity-astrid/wit/users/context-set-response" }
+"users.v1.context.clear.response" = { wit = "@unicity-astrid/wit/users/context-clear-response" }
+"users.v1.context.get.response" = { wit = "@unicity-astrid/wit/users/context-get-response" }
+"users.v1.context.list_for_user.response" = { wit = "@unicity-astrid/wit/users/context-list-for-user-response" }
+"users.v1.context.list_in_context.response" = { wit = "@unicity-astrid/wit/users/context-list-in-context-response" }
+
+[subscribe]
+"users.v1.resolve.request" = { wit = "@unicity-astrid/wit/users/resolve-request", handler = "handle_resolve" }
+"users.v1.link.request" = { wit = "@unicity-astrid/wit/users/link-request", handler = "handle_link" }
+"users.v1.unlink.request" = { wit = "@unicity-astrid/wit/users/unlink-request", handler = "handle_unlink" }
+"users.v1.create.request" = { wit = "@unicity-astrid/wit/users/create-request", handler = "handle_create" }
+"users.v1.set_display_name.request" = { wit = "@unicity-astrid/wit/users/set-display-name-request", handler = "handle_set_display_name" }
+"users.v1.set_public_key.request" = { wit = "@unicity-astrid/wit/users/set-public-key-request", handler = "handle_set_public_key" }
+"users.v1.links.request" = { wit = "@unicity-astrid/wit/users/links-request", handler = "handle_links" }
+"users.v1.get.request" = { wit = "@unicity-astrid/wit/users/get-request", handler = "handle_get" }
+"users.v1.delete.request" = { wit = "@unicity-astrid/wit/users/delete-request", handler = "handle_delete" }
+"users.v1.list.request" = { wit = "@unicity-astrid/wit/users/list-request", handler = "handle_list" }
+"users.v1.context.set.request" = { wit = "@unicity-astrid/wit/users/context-set-request", handler = "handle_context_set" }
+"users.v1.context.clear.request" = { wit = "@unicity-astrid/wit/users/context-clear-request", handler = "handle_context_clear" }
+"users.v1.context.get.request" = { wit = "@unicity-astrid/wit/users/context-get-request", handler = "handle_context_get" }
+"users.v1.context.list_for_user.request" = { wit = "@unicity-astrid/wit/users/context-list-for-user-request", handler = "handle_context_list_for_user" }
+"users.v1.context.list_in_context.request" = { wit = "@unicity-astrid/wit/users/context-list-in-context-request", handler = "handle_context_list_in_context" }
