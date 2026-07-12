@@ -1,0 +1,45 @@
+[package]
+name = "astrid-capsule-openai"
+version = "0.2.0"
+description = "Native OpenAI LLM Provider"
+authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
+astrid-version = ">=0.5.0"
+
+[[component]]
+id = "openai"
+file = "astrid_capsule_openai.wasm"
+type = "executable"
+capabilities = { net = ["api.openai.com"] }
+
+[exports.astrid]
+llm = "1.0.0"
+
+[capabilities]
+net = ["api.openai.com"]
+
+# Publish ACL: the [publish] keys are the only IPC-publish declaration.
+# Exact `llm.v1.response.describe` is what registry's post-#752 fan-out
+# subscribes to (unsuffixed). The `.*` wildcard stays for any future
+# call-site that wants per-provider response correlation routing.
+[publish]
+"llm.v1.stream.openai" = { wit = "@unicity-astrid/wit/llm/stream-event" }
+"llm.v1.response.describe" = { wit = "@unicity-astrid/wit/llm/describe-response" }
+"llm.v1.response.describe.*" = { wit = "@unicity-astrid/wit/llm/describe-response" }
+
+[env]
+base_url = { type = "text", request = "Enter the OpenAI API base URL", default = "https://api.openai.com", placeholder = "https://api.openai.com" }
+api_key = { type = "secret", request = "Enter your OpenAI API key", placeholder = "sk-..." }
+model = { type = "select", request = "Default model to select (any live or catalog model is selectable later)", default = "gpt-5.5", placeholder = "gpt-5.5", options_from = { http = "{base_url}/v1/models", bearer = "{api_key}", select = "data[].id", after = ["base_url", "api_key"] } }
+temperature = { type = "string", request = "Enter the default temperature (0.0-2.0, blank = provider default)", placeholder = "0.7" }
+reasoning_effort = { type = "string", request = "Reasoning effort for o-series models (low/medium/high, blank = default)", placeholder = "" }
+service_tier = { type = "string", request = "Service tier (auto/default/flex/priority, blank = auto)", default = "auto", placeholder = "auto" }
+# context_window and max_output_tokens are resolved from the built-in model
+# registry. Set these env vars to override registry defaults.
+# context_window = { type = "integer", request = "Override context window (tokens)", placeholder = "128000" }
+# max_output_tokens = { type = "integer", request = "Override max output tokens", placeholder = "8192" }
+
+# Interceptor bindings: a [subscribe] entry's `handler` binds the topic to a
+# `#[astrid::interceptor]` export. The keys also serve as the subscribe ACL.
+[subscribe]
+"llm.v1.request.describe" = { wit = "@unicity-astrid/wit/llm/describe-request", handler = "llm_describe" }
+"llm.v1.request.generate.openai" = { wit = "@unicity-astrid/wit/llm/generate-request", handler = "handle_llm_request" }
