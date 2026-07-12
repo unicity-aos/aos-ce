@@ -1,0 +1,25 @@
+[package]
+name = "astrid-capsule-context-engine"
+version = "0.2.0"
+edition = "2024"
+description = "Context Engine capsule — pluggable compaction with interceptor hook support"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+astrid-sdk = { version = "0.7", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Local-development override: point at the in-repo sdk-rust workspace.
+# This is removed once sdk-rust 0.7.0 ships to crates.io.
+# See CAPSULE_MIGRATION_GUIDE.md for context.
