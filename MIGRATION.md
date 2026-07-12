@@ -18,6 +18,11 @@ part of an import.
 | `unicity-astrid/capsule-memory` | `capsules/capsule-memory` | `ceab000a84d252ca63d20489126852a27918b16a` | pending | pending | imported |
 | `unicity-astrid/capsule-openai` | `capsules/capsule-openai` | `9f564e92421137009f3061600c9e9fde1813e013` | pending | pending | imported |
 | `unicity-astrid/capsule-openai-compat` | `capsules/capsule-openai-compat` | `2e08879c772cb88d66772f7c0c4802ac51ed7c3b` | pending | pending | imported |
+| `unicity-astrid/capsule-prompt-builder` | `capsules/capsule-prompt-builder` | `4dace5021acd2212306988fea5bd5a9628053e38` | pending | pending | imported |
+| `unicity-astrid/capsule-react` | `capsules/capsule-react` | `a498e41633bf8214babe2f1e252dbf4ddca330f7` | pending | pending | imported |
+| `unicity-astrid/capsule-registry` | `capsules/capsule-registry` | `e1338be5c4051996c3fcdfcf1618c021d140cd1f` | pending | pending | imported |
+| `unicity-astrid/capsule-router` | `capsules/capsule-router` | `01c648490e02dbcffc8f187c55aedd6ef467132b` | pending | pending | imported |
+| `unicity-astrid/capsule-session` | `capsules/capsule-session` | `3c572ad8d6afc86ff84d07245e35a9990a03e418` | pending | pending | imported |
 | Remaining first-party `unicity-astrid/capsule-*` repositories | `capsules/<name>` | pending | pending | pending | planned |
 
 Copied or local-only capsule directories require a source, license, and
