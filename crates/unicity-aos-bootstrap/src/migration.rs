@@ -152,6 +152,7 @@ fn legacy_distros(runtime_home: &Path) -> io::Result<Vec<LegacyDistro>> {
             });
         }
     }
+    distros.sort_by(|left, right| left.principal.cmp(&right.principal));
     Ok(distros)
 }
 
@@ -499,6 +500,91 @@ mod tests {
         assert_eq!(
             fs::read(product.runtime_home().join("var/state.db")).unwrap(),
             b"existing-state"
+        );
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn records_legacy_distro_locks_without_rewriting_them() {
+        let root = fixture_root("legacy-distros");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+        write(&source, "keys/runtime.key", b"runtime-key");
+        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        let astralis = b"[distro]\nid = \"astralis\"\nversion = \"0.2.2\"\n";
+        let aos_ce = b"[distro]\nid = \"aos-ce\"\nversion = \"2026.1.0\"\n";
+        write(&source, "home/alice/.config/distro.lock", astralis);
+        write(&source, "home/bob/.config/distro.lock", aos_ce);
+        write(
+            &source,
+            "home/carol/.config/distro.lock",
+            b"[distro]\nid = \"unicity-ce\"\nversion = \"2026.1.0\"\n",
+        );
+        write(&source, "home/dan/.config/distro.lock", b"not toml");
+
+        migrate_runtime(&product, &source).expect("migration succeeds");
+        assert_eq!(
+            product.imported_legacy_distros().expect("read receipt"),
+            vec![
+                super::LegacyDistro {
+                    principal: "alice".into(),
+                    id: "astralis".into(),
+                    version: "0.2.2".into()
+                },
+                super::LegacyDistro {
+                    principal: "bob".into(),
+                    id: "aos-ce".into(),
+                    version: "2026.1.0".into()
+                },
+            ]
+        );
+        assert_eq!(
+            fs::read(
+                product
+                    .runtime_home()
+                    .join("home/alice/.config/distro.lock")
+            )
+            .unwrap(),
+            astralis
+        );
+        assert_eq!(
+            fs::read(product.runtime_home().join("home/bob/.config/distro.lock")).unwrap(),
+            aos_ce
+        );
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn accepts_a_receipt_written_before_legacy_distro_tracking() {
+        let root = fixture_root("legacy-receipt");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+        write(&source, "keys/runtime.key", b"runtime-key");
+        write(&product.runtime_home(), "keys/runtime.key", b"runtime-key");
+
+        let source = source.canonicalize().expect("canonical source");
+        let receipt = serde_json::json!({
+            "source": source,
+            "entries": [{ "path": "keys/runtime.key", "bytes": 11 }],
+        });
+        let receipt_path = product.migration_receipt();
+        fs::create_dir_all(receipt_path.parent().expect("receipt parent"))
+            .expect("create receipt parent");
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec(&receipt).expect("serialize legacy receipt"),
+        )
+        .expect("write legacy receipt");
+
+        assert_eq!(
+            migrate_runtime(&product, &source).expect("legacy receipt remains idempotent"),
+            MigrationOutcome::AlreadyMigrated
+        );
+        assert!(
+            product
+                .imported_legacy_distros()
+                .expect("read legacy receipt")
+                .is_empty()
         );
         fs::remove_dir_all(root).expect("remove fixture root");
     }
