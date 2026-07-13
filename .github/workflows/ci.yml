@@ -28,8 +28,8 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  astrid-wasm:
-    name: Astrid WASM
+  community-wasm:
+    name: Community WASM
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
