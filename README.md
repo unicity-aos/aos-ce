@@ -1,12 +1,11 @@
 # AOS Community Edition
 
-AOS Community Edition is the open agent operating system built on
-[Astrid](https://github.com/astrid-runtime/astrid).
+AOS Community Edition is the open agent operating system for people who want
+an inspectable, composable environment for agents.
 
 It owns the Community Edition product surface: the `unicity` CLI, HTTP API,
 distributions, first-party capsules, provider and model experience, and
-Unicity Audit. Astrid remains the portable capability-secure substrate beneath
-it.
+Unicity Audit.
 
 ## Workspace layout
 
