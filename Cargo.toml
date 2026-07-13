@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/unicity-aos-bootstrap",
     "capsules/capsule-agents",
     "capsules/capsule-cli",
     "capsules/capsule-context-engine",
