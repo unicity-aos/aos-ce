@@ -216,8 +216,12 @@ fn handle_migrate_command(args: &[OsString]) -> ExitCode {
 }
 
 fn print_legacy_distro_handoff(home: &AosHome) {
-    let Ok(distros) = home.imported_legacy_distros() else {
-        return;
+    let distros = match home.imported_legacy_distros() {
+        Ok(distros) => distros,
+        Err(error) => {
+            eprintln!("aos: migrated runtime, but could not read the migration receipt: {error}");
+            return;
+        }
     };
     if !distros.is_empty() {
         println!(
