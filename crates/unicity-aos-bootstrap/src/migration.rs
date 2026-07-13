@@ -18,10 +18,19 @@ pub enum MigrationOutcome {
     AlreadyMigrated,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyDistro {
+    pub principal: String,
+    pub id: String,
+    pub version: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Receipt {
     source: PathBuf,
     entries: Vec<Entry>,
+    #[serde(default)]
+    legacy_distros: Vec<LegacyDistro>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,6 +93,7 @@ pub(crate) fn migrate_runtime(home: &AosHome, source: &Path) -> io::Result<Migra
         let receipt = Receipt {
             source: source.clone(),
             entries,
+            legacy_distros: legacy_distros(&staging)?,
         };
         if !receipt_matches(&staging, &receipt)? {
             return invalid("staged runtime did not validate against its import manifest");
@@ -102,6 +112,47 @@ pub(crate) fn migrate_runtime(home: &AosHome, source: &Path) -> io::Result<Migra
         let _ = fs::remove_dir_all(&staging);
     }
     result.map(|()| MigrationOutcome::Migrated)
+}
+
+pub(crate) fn imported_legacy_distros(home: &AosHome) -> io::Result<Vec<LegacyDistro>> {
+    let receipt = read_receipt(&home.migration_receipt())?;
+    Ok(receipt.legacy_distros)
+}
+
+fn legacy_distros(runtime_home: &Path) -> io::Result<Vec<LegacyDistro>> {
+    let homes = runtime_home.join("home");
+    if !homes.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut distros = Vec::new();
+    for entry in fs::read_dir(homes)? {
+        let entry = entry?;
+        let principal = entry.file_name().to_string_lossy().into_owned();
+        let lock = entry.path().join(".config/distro.lock");
+        let Ok(contents) = fs::read_to_string(lock) else {
+            continue;
+        };
+        let Ok(value) = contents.parse::<toml::Value>() else {
+            continue;
+        };
+        let Some(distro) = value.get("distro") else {
+            continue;
+        };
+        let (Some(id), Some(version)) = (
+            distro.get("id").and_then(toml::Value::as_str),
+            distro.get("version").and_then(toml::Value::as_str),
+        ) else {
+            continue;
+        };
+        if matches!(id, "astralis" | "aos-ce") {
+            distros.push(LegacyDistro {
+                principal,
+                id: id.to_owned(),
+                version: version.to_owned(),
+            });
+        }
+    }
+    Ok(distros)
 }
 
 fn checked_root(path: &Path, description: &str) -> io::Result<PathBuf> {
