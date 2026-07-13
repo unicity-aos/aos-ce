@@ -1,9 +1,9 @@
 schema-version = 1
 
 [distro]
-id = "aos-ce"
-name = "AOS Community Edition"
-pretty-name = "AOS Community Edition 0.2.2 (Genesis)"
+id = "unicity-ce"
+name = "Unicity CE"
+pretty-name = "Unicity CE 0.2.2 (Genesis)"
 version = "0.2.2"
 codename = "genesis"
 release-date = "2026-07-10"
