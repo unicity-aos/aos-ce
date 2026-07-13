@@ -1,11 +1,11 @@
-# Astralis
+# AOS Community Edition
 
 The flagship Unicity AOS Community Edition distribution — a curated bundle of
 capsules for the complete agent operating system experience.
 
 ## What is this?
 
-Astralis is a **distro manifest** — a `Distro.toml` file that declares which
+AOS Community Edition is a **distro manifest** — a `Distro.toml` file that declares which
 capsules to install, their versions, and how they connect. It is not code. It is
 product metadata that `unicity init` reads to set up a working environment.
 
