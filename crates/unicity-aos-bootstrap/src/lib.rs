@@ -153,6 +153,10 @@ impl AosHome {
     }
 
     /// Legacy product distro locks preserved by the last runtime import.
+    ///
+    /// # Errors
+    /// Returns an error when no migration receipt exists or the receipt cannot be
+    /// read or decoded.
     pub fn imported_legacy_distros(&self) -> io::Result<Vec<LegacyDistro>> {
         migration::imported_legacy_distros(self)
     }
@@ -445,5 +449,16 @@ mod tests {
             Some(env!("CARGO_PKG_VERSION")),
             "the product binary and bundled Unicity CE manifest must release together"
         );
+    }
+
+    #[test]
+    fn missing_migration_receipt_is_reported_to_callers() {
+        let root = temporary_home();
+        let home = AosHome::from_root(&root);
+
+        let error = home
+            .imported_legacy_distros()
+            .expect_err("missing receipt must not look like an empty import");
+        assert_eq!(error.kind(), ErrorKind::NotFound);
     }
 }
