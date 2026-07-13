@@ -1,0 +1,28 @@
+[package]
+name = "astrid-capsule-agents"
+version = "0.2.0"
+description = "Injects project instructions from AGENTS.md into the system prompt"
+authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
+astrid-version = ">=0.1.0"
+
+[[component]]
+id = "agents"
+file = "astrid_capsule_agents.wasm"
+type = "executable"
+capabilities = { fs_read = ["cwd://"] }
+
+[capabilities]
+allow_prompt_injection = true
+
+# Publish ACL: the [publish] keys are the only IPC-publish declaration.
+[publish]
+"prompt_builder.v1.hook_response.*" = { wit = "@unicity-astrid/wit/prompt/before-build-hook-response" }
+
+[env]
+# Project folder name — set by the distro, not prompted during onboarding.
+cwd_dir = { type = "string", request = "Project folder name", default = ".astrid" }
+
+# Interceptor binding: a [subscribe] entry's `handler` binds the topic to a
+# `#[astrid::interceptor]` export. The key also serves as the subscribe ACL.
+[subscribe]
+"prompt_builder.v1.hook.before_build" = { wit = "@unicity-astrid/wit/prompt/before-build-hook", handler = "on_before_prompt_build" }

@@ -1,0 +1,3 @@
+/target
+*.wasm
+Cargo.lock

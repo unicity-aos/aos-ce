@@ -1,0 +1,35 @@
+[package]
+name = "astrid-capsule-identity"
+version = "0.2.0"
+description = "Agent identity capsule — owns spark config, builds system prompt"
+authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
+astrid-version = ">=0.1.0"
+
+[[component]]
+id = "identity-builder"
+file = "astrid_capsule_identity.wasm"
+type = "executable"
+capabilities = { fs_read = ["home://"], fs_write = ["home://"] }
+
+[exports]
+"astrid:spark" = "1.0.0"
+
+[publish]
+"spark.v1.response.ready" = { wit = "@unicity-astrid/wit/spark/build-response" }
+"agent.v1.response" = { wit = "@unicity-astrid/wit/agent/response" }
+"tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }
+"tool.v1.response.describe.*" = { wit = "@unicity-astrid/wit/tool/describe-response" }
+
+[subscribe]
+"tool.v1.execute.save_identity" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_save_identity" }
+"tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }
+"spark.v1.request.build" = { wit = "@unicity-astrid/wit/spark/build-request", handler = "handle_build_request" }
+"cli.v1.command.execute" = { wit = "@unicity-astrid/wit/system/command-execute", handler = "handle_command" }
+
+[[command]]
+name = "identity-export"
+description = "Export agent identity (spark config) to home://.config/spark.toml"
+
+[[command]]
+name = "identity-import"
+description = "Import agent identity from home://.config/spark.toml into KV store"
