@@ -40,8 +40,21 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo metadata --locked --format-version 1 --no-deps
-      - run: cargo check --locked --workspace --exclude astrid-capsule-telegram --target wasm32-unknown-unknown
-      - run: cargo clippy --locked --workspace --exclude astrid-capsule-telegram --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo check --locked --workspace --exclude astrid-capsule-telegram --exclude unicity-aos-bootstrap --target wasm32-unknown-unknown
+      - run: cargo clippy --locked --workspace --exclude astrid-capsule-telegram --exclude unicity-aos-bootstrap --target wasm32-unknown-unknown -- -D warnings
+
+  product-native:
+    name: Product native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p unicity-aos-bootstrap
+      - run: cargo clippy --locked -p unicity-aos-bootstrap -- -D warnings
 
   telegram-wasi:
     name: Telegram WASI
