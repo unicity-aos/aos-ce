@@ -3,7 +3,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![MSRV: 1.94](https://img.shields.io/badge/MSRV-1.94-blue)](https://www.rust-lang.org)
 
-**Within-principal user identity store for [Astrid OS](https://github.com/unicity-astrid/astrid).**
+**Within-principal user identity store for [Unicity AOS](https://github.com/unicity-aos/aos-ce).**
 
 This capsule owns the cross-platform user-identity surface that used to live inside the kernel (`astrid-core::identity`, `astrid-storage::identity`, the `identity` host fn). It maps platform-specific IDs (Discord, Telegram, Nostr, web passkeys, …) onto canonical `AstridUserId`s — without making the kernel grow new types every time a frontend lands.
 

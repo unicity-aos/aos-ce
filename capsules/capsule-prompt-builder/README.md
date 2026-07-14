@@ -3,7 +3,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![MSRV: 1.94](https://img.shields.io/badge/MSRV-1.94-blue)](https://www.rust-lang.org)
 
-**The prompt assembly pipeline for [Astrid OS](https://github.com/unicity-astrid/astrid).**
+**The prompt assembly pipeline for [Unicity AOS](https://github.com/unicity-aos/aos-ce).**
 
 In the OS model, this capsule is the linker. It takes contributions from multiple plugin capsules and merges them into a single, final prompt that the LLM actually sees.
 
