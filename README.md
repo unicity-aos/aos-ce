@@ -16,6 +16,21 @@ distros/      Community distribution manifests and release metadata
 docs/         Product and operator documentation
 ```
 
+## Install
+
+The supported installer installs both the `aos` product command and its pinned
+Astrid Runtime under the product-owned `~/.unicity-os` root:
+
+```sh
+curl -fsSL https://aos.unicity.ai/install.sh | sh
+aos init
+```
+
+Re-running the installer performs a coordinated product upgrade without
+rewriting a standalone `~/.astrid` installation. Every release publishes
+checksums, Sigstore bundles, GitHub build-provenance attestations, and
+`runtime-compatibility.toml`, which pins the exact Astrid release and WIT commit.
+
 ## Import an existing runtime
 
 The `aos` CLI can deliberately copy compatible state from a standalone Astrid

@@ -5,8 +5,16 @@
 //! bundled runtime, scoped to this installation's private `ASTRID_HOME`.
 
 use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
-use std::process::ExitCode;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::path::Path;
+use std::process::{Command, ExitCode};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use unicity_aos_bootstrap::AosHome;
 
@@ -85,12 +93,7 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
             println!("Unicity AOS {}", env!("CARGO_PKG_VERSION"));
             Some(ExitCode::SUCCESS)
         }
-        Some("self-update" | "self_update") => {
-            eprintln!(
-                "aos: runtime self-update is disabled; update Unicity AOS through its product updater"
-            );
-            Some(ExitCode::FAILURE)
-        }
+        Some("self-update" | "self_update") => Some(handle_self_update(&args[1..])),
         Some("migrate") => Some(handle_migrate_command(&args[1..])),
         Some("serve-health") => Some(handle_health_service()),
         Some("init") if has_distro_override(&args[1..]) => {
@@ -102,6 +105,92 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
             Some(ExitCode::SUCCESS)
         }
         Some(_) => None,
+    }
+}
+
+fn handle_self_update(args: &[OsString]) -> ExitCode {
+    if !args.is_empty() {
+        eprintln!("Usage: aos self-update");
+        return ExitCode::FAILURE;
+    }
+
+    if std::env::var_os("UNICITY_AOS_INSTALL_METHOD").as_deref() == Some(OsStr::new("homebrew")) {
+        return command_exit_code(
+            Command::new("brew")
+                .args(["upgrade", "unicity-aos/tap/aos"])
+                .status(),
+            "run Homebrew upgrade",
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        let installer = std::env::temp_dir().join(format!(
+            "unicity-aos-update-{}-{}.sh",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let create = create_private_update_file(&installer);
+        if let Err(error) = create {
+            eprintln!("aos: failed to stage product updater: {error}");
+            return ExitCode::FAILURE;
+        }
+
+        let url = "https://aos.unicity.ai/install.sh";
+        let download = Command::new("curl")
+            .args(["--proto", "=https", "--tlsv1.2", "-fsSL", url, "-o"])
+            .arg(&installer)
+            .status();
+        let download_code = command_exit_code(download, "download the product updater");
+        if download_code != ExitCode::SUCCESS {
+            let _ = std::fs::remove_file(&installer);
+            return download_code;
+        }
+
+        let mut update = Command::new("sh");
+        update
+            .arg(&installer)
+            .args(["--yes", "--no-migrate-prompt"])
+            .env_remove("AOS_VERSION");
+        if let Ok(executable) = std::env::current_exe()
+            && let Some(bin_dir) = executable.parent()
+        {
+            update.env("AOS_BIN_DIR", bin_dir);
+        }
+        let status = update.status();
+        let _ = std::fs::remove_file(&installer);
+        command_exit_code(status, "run the product updater")
+    }
+
+    #[cfg(not(unix))]
+    {
+        eprintln!(
+            "aos: automatic product updates are not available on this platform; install the latest AOS package"
+        );
+        ExitCode::FAILURE
+    }
+}
+
+#[cfg(unix)]
+fn create_private_update_file(path: &Path) -> io::Result<std::fs::File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+fn command_exit_code(status: io::Result<std::process::ExitStatus>, operation: &str) -> ExitCode {
+    match status {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1).clamp(1, i32::from(u8::MAX)) as u8),
+        Err(error) => {
+            eprintln!("aos: failed to {operation}: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -268,7 +357,7 @@ fn print_legacy_distro_handoff(home: &AosHome) {
 
 fn print_help() {
     println!(
-        "Unicity AOS\n\nUsage:\n  aos init [--yes] [--offline] [--allow-unsigned] [--accept-new-key] [--var KEY=VALUE]\n  aos migrate runtime --from <absolute-legacy-home>\n  aos serve-health\n  aos <runtime command> [arguments...]\n\n`aos init` installs the Unicity CE manifest bundled with this product release. `aos serve-health` binds only 127.0.0.1:8765 and exposes GET /v1/runtime/health. Unicity delegates runtime and operator commands to its bundled Astrid Runtime. The runtime state is scoped to ~/.unicity-os/runtime (or UNICITY_AOS_HOME).\n\n`aos self-update` is intentionally disabled; AOS updates use the product updater."
+        "Unicity AOS\n\nUsage:\n  aos init [--yes] [--offline] [--allow-unsigned] [--accept-new-key] [--var KEY=VALUE]\n  aos migrate runtime --from <absolute-legacy-home>\n  aos self-update\n  aos serve-health\n  aos <runtime command> [arguments...]\n\n`aos init` installs the Unicity CE manifest bundled with this product release. `aos self-update` updates the coordinated AOS and bundled Astrid executable set. `aos serve-health` binds only 127.0.0.1:8765 and exposes GET /v1/runtime/health. Unicity delegates runtime and operator commands to its bundled Astrid Runtime. The runtime state is scoped to ~/.unicity-os/runtime (or UNICITY_AOS_HOME)."
     );
 }
 
@@ -282,8 +371,12 @@ fn print_init_help() {
 mod tests {
     use std::ffi::OsString;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(unix)]
+    use super::create_private_update_file;
     use super::{has_distro_override, product_runtime_args};
     use unicity_aos_bootstrap::AosHome;
 
@@ -332,5 +425,20 @@ mod tests {
         ]));
         assert!(has_distro_override(&[OsString::from("--distro=other")]));
         assert!(!has_distro_override(&[OsString::from("--yes")]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn product_updater_is_staged_privately() {
+        let path = temporary_home();
+        let file = create_private_update_file(&path).expect("create private updater");
+        drop(file);
+        let mode = fs::metadata(&path)
+            .expect("read updater metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        fs::remove_file(path).expect("remove updater");
     }
 }
