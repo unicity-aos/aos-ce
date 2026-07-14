@@ -119,10 +119,13 @@ impl AosHome {
         if fs::read(&path).ok().as_deref() == Some(UNICITY_CE_MANIFEST.as_bytes()) {
             return Ok(path);
         }
+        self.ensure_layout()?;
+        create_private_dir(&self.root.join("distributions"))?;
         let parent = path.parent().expect("manifest path has a parent");
-        fs::create_dir_all(parent)?;
+        create_private_dir(parent)?;
         let temporary = path.with_extension("toml.tmp");
         fs::write(&temporary, UNICITY_CE_MANIFEST)?;
+        set_private_file_permissions(&temporary)?;
         fs::rename(&temporary, &path)?;
         Ok(path)
     }
@@ -138,6 +141,18 @@ impl AosHome {
     /// The installed bundled-runtime executable.
     #[must_use]
     pub fn runtime_binary(&self) -> PathBuf {
+        self.runtime_binary_with(|name| std::env::var_os(name))
+    }
+
+    fn runtime_binary_with<F>(&self, get: F) -> PathBuf
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        if let Some(path) = get("UNICITY_AOS_RUNTIME_BIN").map(PathBuf::from)
+            && path.is_absolute()
+        {
+            return path;
+        }
         self.runtime_home().join("bin").join(runtime_binary_name())
     }
 
@@ -170,7 +185,9 @@ impl AosHome {
     /// # Errors
     /// Returns an error when the directories cannot be created.
     pub fn ensure_layout(&self) -> io::Result<()> {
-        fs::create_dir_all(self.runtime_home())
+        create_private_dir(&self.root)?;
+        create_private_dir(&self.runtime_home())?;
+        create_private_dir(&self.runtime_home().join("bin"))
     }
 
     /// Build a command for the bundled runtime with a process-local home.
@@ -275,6 +292,27 @@ impl AosHome {
     }
 }
 
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn set_private_file_permissions(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 #[cfg(windows)]
 fn default_home<F>(get: &F) -> io::Result<OsString>
 where
@@ -361,6 +399,19 @@ mod tests {
     }
 
     #[test]
+    fn packaged_runtime_override_must_be_absolute() {
+        let home = AosHome::from_root("/tmp/unicity-aos-test");
+        assert_eq!(
+            home.runtime_binary_with(|_| Some(OsString::from("runtime/astrid"))),
+            home.runtime_home().join("bin").join(runtime_binary_name())
+        );
+        assert_eq!(
+            home.runtime_binary_with(|_| Some(OsString::from("/opt/aos/runtime/bin/astrid"))),
+            PathBuf::from("/opt/aos/runtime/bin/astrid")
+        );
+    }
+
+    #[test]
     fn runtime_command_scopes_astrid_home_to_the_child() {
         let home = AosHome::from_root("/tmp/unicity-aos-test");
         let command = home.runtime_command();
@@ -438,6 +489,44 @@ mod tests {
             fs::read_to_string(path)
                 .expect("read restored manifest")
                 .contains("id = \"unicity-ce\"")
+        );
+        fs::remove_dir_all(root).expect("remove temporary product home");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn product_layout_and_manifest_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_home();
+        let home = AosHome::from_root(&root);
+        let manifest = home
+            .ensure_unicity_ce_manifest()
+            .expect("write private product manifest");
+
+        for directory in [
+            &root,
+            &home.runtime_home(),
+            &home.runtime_home().join("bin"),
+            &root.join("distributions"),
+            &root.join("distributions/unicity-ce"),
+        ] {
+            assert_eq!(
+                fs::metadata(directory)
+                    .expect("read directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(
+            fs::metadata(manifest)
+                .expect("read manifest metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
         fs::remove_dir_all(root).expect("remove temporary product home");
     }

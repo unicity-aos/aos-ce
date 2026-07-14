@@ -26,9 +26,9 @@ members = [
 resolver = "3"
 
 [workspace.dependencies]
-astrid-sdk = { version = "0.7.1", features = ["derive"] }
-astrid-core = "0.9.4"
-astrid-uplink = "0.9.4"
+astrid-sdk = { version = "=0.7.1", features = ["derive"] }
+astrid-core = "=0.9.4"
+astrid-uplink = "=0.9.4"
 axum = "0.8"
 fs2 = "0.4"
 serde = { version = "1.0", features = ["derive"] }
