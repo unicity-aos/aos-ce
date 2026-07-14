@@ -133,6 +133,20 @@ test -f "$fixture/cosign-called"
 mv "$fixture/cosign-linux-amd64" "$fake_bin/cosign"
 
 cp "$fixture/SHA256SUMS.txt" "$work/good-sums"
+
+# Accept checksum entries generated with a relative ./ prefix.
+awk '{
+  checksum_asset = $2
+  sub(/^\*/, "", checksum_asset)
+  print $1 "  ./" checksum_asset
+}' "$work/good-sums" > "$fixture/SHA256SUMS.txt"
+PATH="$fake_bin:$PATH" \
+HOME="$work/relative-checksum-home" \
+AOS_TEST_FIXTURE="$fixture" \
+AOS_VERSION=2026.1.0 \
+sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+test -x "$work/relative-checksum-home/.unicity-os/bin/aos"
+
 printf '%064d  unicity-aos-x86_64-unknown-linux-gnu.tar.gz\n' 1 > "$fixture/SHA256SUMS.txt"
 if PATH="$fake_bin:$PATH" HOME="$work/other-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then

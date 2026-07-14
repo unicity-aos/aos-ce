@@ -140,7 +140,17 @@ curl --proto '=https' --tlsv1.2 -fsSL "$base/$asset.sigstore.json" -o "$work/$as
   --certificate-identity-regexp '^https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/20[0-9]{2}\.[0-9]+\.[0-9]+$' \
   "$work/$asset" >/dev/null
 
-expected=$(awk -v asset="$asset" '$2 == asset || $2 == "*" asset { print $1; exit }' "$work/SHA256SUMS.txt")
+expected=$(awk -v asset="$asset" '
+  {
+    checksum_asset = $2
+    sub(/^\*/, "", checksum_asset)
+    sub(/^\.\//, "", checksum_asset)
+    if (checksum_asset == asset) {
+      print $1
+      exit
+    }
+  }
+' "$work/SHA256SUMS.txt")
 [ -n "$expected" ] || { echo "release checksum list does not contain $asset" >&2; exit 1; }
 actual=$(sha256_file "$work/$asset")
 [ "$actual" = "$expected" ] || { echo "Unicity AOS archive checksum mismatch" >&2; exit 1; }
