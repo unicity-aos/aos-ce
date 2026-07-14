@@ -1,0 +1,22 @@
+# Community Edition capsule release allowlist.
+#
+# Keep this in distro order. Published artifact identities come from each
+# capsule's Cargo.toml/Capsule.toml and remain astrid-capsule-*.
+capsule-cli
+capsule-registry
+capsule-openai-compat
+capsule-react
+capsule-session
+capsule-identity
+capsule-users
+capsule-router
+capsule-prompt-builder
+capsule-context-engine
+capsule-hook-bridge
+capsule-shell
+capsule-http
+capsule-fs
+capsule-system
+capsule-skills
+capsule-agents
+capsule-memory

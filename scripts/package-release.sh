@@ -63,21 +63,10 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/runtime-extract" "$work/$root/bin" "$work/$root/runtime/bin" "$output_dir"
 
-if tar -tzf "$runtime_archive" | awk -v root="astrid-${runtime_version}-${target}" '
-  /^\// || /(^|\/)\.\.($|\/)/ { unsafe = 1 }
-  $0 != root && index($0, root "/") != 1 { unsafe = 1 }
-  END { exit unsafe ? 0 : 1 }
-'; then
-  echo "runtime archive contains an unsafe or unexpected path" >&2
-  exit 1
-fi
-if tar -tvzf "$runtime_archive" | awk '
-  substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { unsafe = 1 }
-  END { exit unsafe ? 0 : 1 }
-'; then
-  echo "runtime archive contains a link or special file" >&2
-  exit 1
-fi
+python3 "$repo_root/scripts/validate-runtime-archive.py" \
+  "$runtime_archive" \
+  "astrid-${runtime_version}-${target}" \
+  astrid astrid-daemon astrid-build astrid-emit
 tar -xzf "$runtime_archive" -C "$work/runtime-extract"
 
 runtime_root="$work/runtime-extract/astrid-${runtime_version}-${target}"

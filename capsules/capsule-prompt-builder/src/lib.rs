@@ -25,6 +25,31 @@
 use astrid_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_arch = "wasm32")]
+use astrid_sdk::log as runtime_log;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod host_log {
+    pub(super) fn debug(message: impl AsRef<str>) {
+        eprintln!("DEBUG: {}", message.as_ref());
+    }
+
+    pub(super) fn info(message: impl AsRef<str>) {
+        eprintln!("INFO: {}", message.as_ref());
+    }
+
+    pub(super) fn warn(message: impl AsRef<str>) {
+        eprintln!("WARN: {}", message.as_ref());
+    }
+
+    pub(super) fn error(message: impl AsRef<str>) {
+        eprintln!("ERROR: {}", message.as_ref());
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+use host_log as runtime_log;
+
 /// Runtime configuration loaded from capsule config at startup.
 struct Config {
     /// Maximum time (in milliseconds) to wait for plugin hook responses — the
@@ -223,7 +248,7 @@ fn filter_by_permission(
                     || s.response.prepend_system_context.is_some()
                     || s.response.append_system_context.is_some()
                 {
-                    log::warn(format!(
+                    runtime_log::warn(format!(
                         "Stripped prompt-mutating fields from capsule {:?} \
                          (missing allow_prompt_injection capability)",
                         s.source_id
@@ -316,7 +341,7 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
     let sub = match ipc::subscribe(&response_topic) {
         Ok(h) => h,
         Err(e) => {
-            log::error(format!("Failed to subscribe to hook response topic: {e}"));
+            runtime_log::error(format!("Failed to subscribe to hook response topic: {e}"));
             return Vec::new();
         }
     };
@@ -331,7 +356,7 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
     };
 
     if let Err(e) = ipc::publish_json("prompt_builder.v1.hook.before_build", &payload) {
-        log::error(format!(
+        runtime_log::error(format!(
             "Failed to publish prompt_builder.v1.hook.before_build event: {e}"
         ));
         // sub dropped on return — kernel-side resource released automatically.
@@ -391,7 +416,7 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
 
     // sub drops here, releasing the kernel-side subscription.
 
-    log::info(format!(
+    runtime_log::info(format!(
         "Collected {} hook responses for request {}",
         sourced_responses.len(),
         request.request_id
@@ -407,7 +432,7 @@ fn fire_before_prompt_build(request: &AssembleRequest, config: &Config) -> Vec<H
         *cache.entry(uuid.to_owned()).or_insert_with(|| {
             capabilities::check(uuid, "allow_prompt_injection")
                 .inspect_err(|e| {
-                    log::warn(format!("capability check failed for {uuid}: {e}, denying"));
+                    runtime_log::warn(format!("capability check failed for {uuid}: {e}, denying"));
                 })
                 .unwrap_or(false)
         })
@@ -419,7 +444,7 @@ fn parse_hook_message(msg: &ipc::Message) -> Option<Vec<SourcedHookResponse>> {
     let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
         Ok(v) => v,
         Err(e) => {
-            log::warn(format!("failed to deserialize hook response payload: {e}"));
+            runtime_log::warn(format!("failed to deserialize hook response payload: {e}"));
             return None;
         }
     };
@@ -462,7 +487,7 @@ fn parse_hook_responses(poll_bytes: &[u8]) -> Option<Vec<SourcedHookResponse>> {
     let envelope: serde_json::Value = match serde_json::from_slice(poll_bytes) {
         Ok(v) => v,
         Err(e) => {
-            log::warn(format!("failed to deserialize hook response envelope: {e}"));
+            runtime_log::warn(format!("failed to deserialize hook response envelope: {e}"));
             return None;
         }
     };
@@ -528,7 +553,7 @@ const TOOL_SCHEMA_CACHE_KEY: &str = "__tool_schema_cache";
 /// serving a stale (KV-persisted, restart-surviving) list.
 fn invalidate_tool_cache() {
     let _ = kv::delete(TOOL_SCHEMA_CACHE_KEY);
-    log::info("Tool schema cache invalidated");
+    runtime_log::info("Tool schema cache invalidated");
 }
 
 /// Timeout (ms) for fetching session messages from the session capsule.
@@ -558,7 +583,7 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
     if let Ok(cached) = kv::get_json::<Vec<serde_json::Value>>(TOOL_SCHEMA_CACHE_KEY)
         && !cached.is_empty()
     {
-        log::debug(format!("Returning {} cached tool schemas", cached.len()));
+        runtime_log::debug(format!("Returning {} cached tool schemas", cached.len()));
         return cached;
     }
 
@@ -566,7 +591,7 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
     let sub = match ipc::subscribe("tool.v1.response.describe.*") {
         Ok(s) => s,
         Err(e) => {
-            log::error(format!(
+            runtime_log::error(format!(
                 "Failed to subscribe to tool.v1.response.describe.*: {e}"
             ));
             return Vec::new();
@@ -576,7 +601,7 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
     // Fire the fan-out request. Empty payload — every responder publishes its
     // own tool schema set onto `tool.v1.response.describe.<source_id>`.
     if let Err(e) = ipc::publish("tool.v1.request.describe", "{}") {
-        log::error(format!("Failed to publish tool.v1.request.describe: {e}"));
+        runtime_log::error(format!("Failed to publish tool.v1.request.describe: {e}"));
         return Vec::new();
     }
 
@@ -622,14 +647,14 @@ fn collect_tool_schemas() -> Vec<serde_json::Value> {
         }
     });
 
-    log::info(format!(
+    runtime_log::info(format!(
         "Collected {} tool schemas via tool.v1.request.describe fan-out",
         all_tools.len()
     ));
 
     // Cache the result for subsequent calls.
     if let Err(e) = kv::set_json(TOOL_SCHEMA_CACHE_KEY, &all_tools) {
-        log::warn(format!("Failed to cache tool schemas in KV: {e}"));
+        runtime_log::warn(format!("Failed to cache tool schemas in KV: {e}"));
     }
 
     all_tools
@@ -669,7 +694,7 @@ fn fetch_session_messages(session_id: &str) -> Vec<serde_json::Value> {
     ) {
         Ok(v) => v,
         Err(e) => {
-            log::warn(format!(
+            runtime_log::warn(format!(
                 "session.v1.request.get_messages failed (timeout={SESSION_FETCH_TIMEOUT_MS}ms): {e}"
             ));
             return Vec::new();
@@ -684,16 +709,16 @@ fn fetch_session_messages(session_id: &str) -> Vec<serde_json::Value> {
     let result = match messages_value {
         Some(messages) => serde_json::from_value::<Vec<serde_json::Value>>(messages.clone())
             .unwrap_or_else(|e| {
-                log::warn(format!("Failed to parse session messages array: {e}"));
+                runtime_log::warn(format!("Failed to parse session messages array: {e}"));
                 Vec::new()
             }),
         None => {
-            log::warn("Session response missing `messages` field");
+            runtime_log::warn("Session response missing `messages` field");
             Vec::new()
         }
     };
 
-    log::debug(format!(
+    runtime_log::debug(format!(
         "Fetched {} session messages for session {session_id}",
         result.len()
     ));
@@ -709,7 +734,7 @@ fn assemble(payload: &serde_json::Value, config: &Config) {
     let request: AssembleRequest = match serde_json::from_value(request_value.clone()) {
         Ok(r) => r,
         Err(e) => {
-            log::error(format!("Failed to parse assemble request: {e}"));
+            runtime_log::error(format!("Failed to parse assemble request: {e}"));
             let _ = ipc::publish_json(
                 "prompt_builder.v1.response.assemble",
                 &serde_json::json!({"error": format!("invalid request: {e}")}),

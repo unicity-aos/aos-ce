@@ -33,10 +33,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
       - run: sh -n install.sh
       - run: python3 scripts/validate-release-contract.py
       - run: bash scripts/test-package-release.sh
       - run: bash scripts/test-install.sh
+      - run: python3 scripts/capsule_release.py
+      - run: python3 scripts/test_capsule_release.py
+      - run: python3 scripts/test_validate_runtime_archive.py
+      - run: bash scripts/test-extract-runtime-tool.sh
 
   community-wasm:
     name: Community WASM
@@ -65,6 +72,18 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test --locked -p unicity-aos-bootstrap
       - run: cargo clippy --locked -p unicity-aos-bootstrap -- -D warnings
+
+  capsule-tests:
+    name: Capsule host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo test --locked --workspace --exclude astrid-capsule-telegram --exclude unicity-aos-bootstrap --target x86_64-unknown-linux-gnu
 
   telegram-wasi:
     name: Telegram WASI

@@ -13,7 +13,7 @@ for binary in astrid astrid-daemon astrid-build astrid-emit; do
   printf '#!/bin/sh\nexit 0\n' > "$runtime_root/$binary"
   chmod 755 "$runtime_root/$binary"
 done
-tar -czf "$work/runtime.tar.gz" -C "$work" "$(basename "$runtime_root")"
+COPYFILE_DISABLE=1 tar -czf "$work/runtime.tar.gz" -C "$work" "$(basename "$runtime_root")"
 printf '#!/bin/sh\nexit 0\n' > "$work/aos"
 chmod 755 "$work/aos"
 
@@ -56,7 +56,7 @@ for binary in astrid-daemon astrid-build astrid-emit; do
   printf '#!/bin/sh\nexit 0\n' > "$unsafe_root/astrid-0.9.4-$target/$binary"
   chmod 755 "$unsafe_root/astrid-0.9.4-$target/$binary"
 done
-tar -czf "$work/unsafe-runtime.tar.gz" -C "$unsafe_root" "astrid-0.9.4-$target"
+COPYFILE_DISABLE=1 tar -czf "$work/unsafe-runtime.tar.gz" -C "$unsafe_root" "astrid-0.9.4-$target"
 if "$repo_root/scripts/package-release.sh" \
   "$target" \
   "$work/aos" \
@@ -64,5 +64,39 @@ if "$repo_root/scripts/package-release.sh" \
   0000000000000000000000000000000000000000000000000000000000000000 \
   "$work/output" >/dev/null 2>&1; then
   echo "release composer accepted a symlinked runtime binary" >&2
+  exit 1
+fi
+
+python3 - "$work/duplicate-runtime.tar.gz" "$target" <<'PY'
+import io
+import sys
+import tarfile
+
+archive_path, target = sys.argv[1:]
+root = f"astrid-0.9.4-{target}"
+
+def add(archive, name, data=b"#!/bin/sh\nexit 0\n"):
+    member = tarfile.TarInfo(name)
+    member.mode = 0o755
+    member.size = len(data)
+    archive.addfile(member, io.BytesIO(data))
+
+with tarfile.open(archive_path, "w:gz") as archive:
+    directory = tarfile.TarInfo(root)
+    directory.type = tarfile.DIRTYPE
+    directory.mode = 0o755
+    archive.addfile(directory)
+    for binary in ("astrid", "astrid-daemon", "astrid-build", "astrid-emit"):
+        add(archive, f"{root}/{binary}")
+    add(archive, f"{root}/astrid", b"#!/bin/sh\nexit 99\n")
+PY
+
+if "$repo_root/scripts/package-release.sh" \
+  "$target" \
+  "$work/aos" \
+  "$work/duplicate-runtime.tar.gz" \
+  0000000000000000000000000000000000000000000000000000000000000000 \
+  "$work/output" >/dev/null 2>&1; then
+  echo "release composer accepted a duplicate runtime binary" >&2
   exit 1
 fi
