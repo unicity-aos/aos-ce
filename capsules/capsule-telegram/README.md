@@ -1,6 +1,6 @@
 # capsule-telegram
 
-Telegram Bot uplink capsule for [Astrid OS](https://github.com/unicity-astrid/astrid) — bridges the Telegram Bot API to the kernel IPC bus, giving your Astrid agent a Telegram chat interface.
+Telegram Bot uplink capsule for [Unicity AOS](https://github.com/unicity-aos/aos-ce) — bridges the Telegram Bot API to the kernel IPC bus, giving your Unicity AOS agent a Telegram chat interface.
 
 ## Features
 
