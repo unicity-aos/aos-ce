@@ -453,6 +453,25 @@ mod tests {
     }
 
     #[test]
+    fn bundled_distro_uses_product_project_state() {
+        let manifest: toml::Value = UNICITY_CE_MANIFEST.parse().expect("parse bundled manifest");
+        let capsules = manifest["capsule"]
+            .as_array()
+            .expect("manifest capsule array");
+        let cwd_dirs: Vec<_> = capsules
+            .iter()
+            .filter_map(|capsule| capsule.get("env"))
+            .filter_map(|env| env.get("cwd_dir"))
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert!(!cwd_dirs.is_empty(), "fixture must exercise project state");
+        assert!(
+            cwd_dirs.iter().all(|path| *path == ".unicity-os"),
+            "product capsules must not create Astrid-branded project state"
+        );
+    }
+
+    #[test]
     fn missing_migration_receipt_is_reported_to_callers() {
         let root = temporary_home();
         let home = AosHome::from_root(&root);

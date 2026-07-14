@@ -13,11 +13,12 @@ Unicity Audit.
 crates/       Product CLI, HTTP API, control client, and shared product code
 capsules/     First-party production capsules
 distros/      Community distribution manifests and release metadata
-docs/         Product and migration documentation
+docs/         Product and operator documentation
 ```
 
-## Migration status
+## Import an existing runtime
 
-This repository is the destination for the existing first-party capsule and
-distribution repositories. Each import must retain its source URL, final commit,
-release tags, license, and artifact digest in [MIGRATION.md](MIGRATION.md).
+The `aos` CLI can deliberately copy compatible state from a standalone Astrid
+Runtime installation without changing the source. See
+[Importing standalone runtime state](docs/runtime-migration.md) for the exact
+allowlist, integrity checks, recovery behavior, and command.
