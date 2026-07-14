@@ -181,7 +181,7 @@ for file in bin/aos runtime/bin/astrid runtime/bin/astrid-daemon runtime/bin/ast
   [ -f "$bundle/$file" ] || { echo "release archive is missing $file" >&2; exit 1; }
 done
 
-staged_version=$("$bundle/bin/aos" --version | awk '{print $3}')
+staged_version=$("$bundle/bin/aos" --version | awk '{print $NF}')
 if ! printf '%s\n' "$staged_version" | grep -Eq '^20[0-9]{2}\.[0-9]+\.[0-9]+$'; then
   echo "staged AOS binary reported an invalid product version" >&2
   exit 1
