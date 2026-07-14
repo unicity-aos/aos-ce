@@ -128,6 +128,26 @@ test ! -e "$fixture/path-cosign-called"
 test "$(stat -c '%a' "$work/home/.unicity-os" 2>/dev/null || stat -f '%Lp' "$work/home/.unicity-os")" = 700
 test "$(stat -c '%a' "$work/home/.unicity-os/releases/2026.1.0.json" 2>/dev/null || stat -f '%Lp' "$work/home/.unicity-os/releases/2026.1.0.json")" = 600
 
+cat > "$work/home/.unicity-os/bin/aos" <<'EOF'
+#!/bin/sh
+set -eu
+if [ "${1:-}" = stop ]; then
+  : > "$AOS_STOP_MARKER"
+fi
+echo existing-unicity-aos
+EOF
+chmod 755 "$work/home/.unicity-os/bin/aos"
+cp "$work/home/.unicity-os/bin/aos" "$work/aos-before-unattended-upgrade"
+if PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
+  AOS_STOP_MARKER="$work/unattended-stop-called" \
+  sh "$repo_root/install.sh" --no-migrate-prompt </dev/null >"$work/unattended-upgrade.log" 2>&1; then
+  echo "installer replaced an existing installation without confirmation" >&2
+  exit 1
+fi
+cmp "$work/aos-before-unattended-upgrade" "$work/home/.unicity-os/bin/aos"
+test ! -e "$work/unattended-stop-called"
+grep -F 'rerun with --yes to replace it without a prompt' "$work/unattended-upgrade.log" >/dev/null
+
 rm -f "$fixture/cosign-called"
 if PATH="$fake_bin:$PATH" HOME="$work/bad-verifier-home" AOS_TEST_FIXTURE="$fixture" \
   AOS_TEST_BAD_COSIGN_DIGEST=1 AOS_VERSION=2026.1.0 \
@@ -188,11 +208,12 @@ ln -s "$custom_bin_target" "$custom_bin_link"
 if PATH="$fake_bin:$PATH" HOME="$custom_bin_home" AOS_BIN_DIR="$custom_bin_link" \
   AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   AOS_SYMLINK_MARKER="$work/custom-bin-symlink-executed" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >"$work/custom-bin-symlink.log" 2>&1; then
   echo "installer accepted a symlinked custom binary directory" >&2
   exit 1
 fi
 test ! -e "$work/custom-bin-symlink-executed"
+grep -F "refusing symlinked binary directory: $custom_bin_link" "$work/custom-bin-symlink.log" >/dev/null
 
 managed_symlink_home="$work/managed-symlink-home"
 mkdir -p "$managed_symlink_home" "$work/managed-symlink-target/bin"

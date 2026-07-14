@@ -51,6 +51,20 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "required command not found: 
 need curl
 need tar
 
+has_interactive_tty() {
+  { [ -t 1 ] || [ -t 2 ]; } && : 2>/dev/null </dev/tty && : 2>/dev/null >/dev/tty
+}
+
+prompt_from_tty() {
+  prompt=$1
+  if ! printf '%s' "$prompt" 2>/dev/null >/dev/tty; then
+    return 1
+  fi
+  if ! IFS= read -r answer 2>/dev/null </dev/tty; then
+    return 1
+  fi
+}
+
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -205,7 +219,7 @@ for managed in "$AOS_HOME" "$AOS_HOME/runtime" "$AOS_HOME/runtime/bin" "$AOS_HOM
   [ ! -L "$managed" ] || { echo "refusing symlinked managed path: $managed" >&2; exit 1; }
 done
 if [ -L "$AOS_BIN_DIR" ]; then
-  echo "refusing symlinked managed path: $AOS_BIN_DIR" >&2
+  echo "refusing symlinked binary directory: $AOS_BIN_DIR" >&2
   exit 1
 fi
 if [ -L "$AOS_BIN_DIR/aos" ] || { [ -e "$AOS_BIN_DIR/aos" ] && [ ! -f "$AOS_BIN_DIR/aos" ]; }; then
@@ -213,9 +227,12 @@ if [ -L "$AOS_BIN_DIR/aos" ] || { [ -e "$AOS_BIN_DIR/aos" ] && [ ! -f "$AOS_BIN_
   exit 1
 fi
 
-if [ -x "$AOS_BIN_DIR/aos" ] && [ "$ASSUME_YES" -ne 1 ] && [ -t 0 ]; then
-  printf 'Replace the existing Unicity AOS installation? [y/N] '
-  read -r answer
+if [ -x "$AOS_BIN_DIR/aos" ] && [ "$ASSUME_YES" -ne 1 ]; then
+  answer=
+  if ! has_interactive_tty || ! prompt_from_tty 'Replace the existing Unicity AOS installation? [y/N] '; then
+    echo "an existing Unicity AOS installation was found; rerun with --yes to replace it without a prompt" >&2
+    exit 1
+  fi
   case "$answer" in y|Y|yes|YES) ;; *) echo "Installation cancelled."; exit 0 ;; esac
 fi
 
@@ -290,8 +307,8 @@ case ":$PATH:" in
     ;;
 esac
 
-if [ "$SKIP_MIGRATION_PROMPT" -ne 1 ] && [ -t 0 ]; then
-  "$AOS_BIN_DIR/aos" || true
+if [ "$SKIP_MIGRATION_PROMPT" -ne 1 ] && has_interactive_tty; then
+  "$AOS_BIN_DIR/aos" </dev/tty >/dev/tty 2>/dev/tty || true
 else
   echo "Run: $init_command"
 fi
