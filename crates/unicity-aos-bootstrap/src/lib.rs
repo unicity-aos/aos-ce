@@ -13,6 +13,7 @@ use std::process::{Child, Command, ExitStatus};
 
 pub mod health;
 mod migration;
+pub mod status;
 pub use migration::{LegacyDistro, MigrationOutcome};
 
 const UNICITY_CE_MANIFEST: &str = include_str!("../../../distros/community/unicity-ce/Distro.toml");
@@ -225,11 +226,9 @@ impl AosHome {
         self.spawn_runtime_with_args(std::iter::empty::<&OsStr>())
     }
 
-    /// Spawn the bundled runtime with product CLI arguments.
+    /// Spawn the bundled runtime with explicit runtime CLI arguments.
     ///
-    /// Unicity AOS is a trusted distribution built on Astrid Runtime, so this
-    /// path uses the runtime's normal local operator credentials. The runtime
-    /// home remains scoped to this AOS installation.
+    /// The runtime home remains scoped to this AOS installation.
     ///
     /// # Errors
     /// Returns an error when the bundled executable is absent or cannot start.
@@ -261,10 +260,10 @@ impl AosHome {
         Err(self.runtime_command_with_args(args).exec())
     }
 
-    /// Run an Astrid Runtime command as an AOS product command.
+    /// Run an explicit bundled-runtime command.
     ///
     /// The runtime remains the authority for socket authentication and local
-    /// credentials. Unicity provides only product-owned installation state and
+    /// credentials. AOS provides only product-owned installation state and
     /// preserves the runtime's exit status for scripts and service managers.
     ///
     /// # Errors

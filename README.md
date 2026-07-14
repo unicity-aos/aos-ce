@@ -19,7 +19,7 @@ docs/         Product and operator documentation
 ## Install
 
 The supported installer installs both the `aos` product command and its pinned
-Astrid Runtime under the product-owned `~/.unicity-os` root:
+runtime under the product-owned `~/.unicity-os` root:
 
 ```sh
 curl -fsSL https://aos.unicity.ai/install.sh | sh
@@ -27,13 +27,32 @@ aos init
 ```
 
 Re-running the installer performs a coordinated product upgrade without
-rewriting a standalone `~/.astrid` installation. Every release publishes
+rewriting a standalone runtime installation. Every release publishes
 checksums, Sigstore bundles, GitHub build-provenance attestations, and
-`runtime-compatibility.toml`, which pins the exact Astrid release and WIT commit.
+`runtime-compatibility.toml`, which pins the exact runtime release and WIT commit.
+
+## Command boundary
+
+The `aos` root accepts only AOS product commands. Unknown commands fail instead
+of falling through to another CLI:
+
+```sh
+aos status
+aos status --json
+```
+
+Operator and capsule-author commands remain available through the explicit
+runtime escape hatch. Its arguments, exit code, and signals pass directly to
+the bundled Astrid Runtime:
+
+```sh
+aos runtime doctor
+aos runtime capsule build
+```
 
 ## Import an existing runtime
 
-The `aos` CLI can deliberately copy compatible state from a standalone Astrid
-Runtime installation without changing the source. See
+The `aos` CLI can deliberately copy compatible state from a standalone runtime
+installation without changing the source. See
 [Importing standalone runtime state](docs/runtime-migration.md) for the exact
 allowlist, integrity checks, recovery behavior, and command.
