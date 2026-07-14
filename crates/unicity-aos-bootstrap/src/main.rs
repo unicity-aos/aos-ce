@@ -110,12 +110,9 @@ fn handle_init(args: &[OsString]) -> ExitCode {
 }
 
 fn handle_runtime_passthrough(args: &[OsString]) -> ExitCode {
-    let home = match AosHome::resolve() {
+    let home = match resolve_home() {
         Ok(home) => home,
-        Err(error) => {
-            eprintln!("aos: failed to resolve product home: {error}");
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     run_runtime(&home, args.iter())
 }
@@ -334,7 +331,8 @@ fn handle_status(args: &[OsString]) -> ExitCode {
 }
 
 fn set_runtime_environment(home: &AosHome) {
-    // The single-threaded client resolves its local socket from this process-only override.
+    // Safety: this runs before the current-thread client runtime starts and before this
+    // dedicated CLI process creates any other threads.
     unsafe {
         std::env::set_var("ASTRID_HOME", home.runtime_home());
         std::env::set_var("ASTRID_WORKSPACE_STATE_DIR", AOS_WORKSPACE_STATE_DIR);
