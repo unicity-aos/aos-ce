@@ -33,8 +33,8 @@ checksums, Sigstore bundles, GitHub build-provenance attestations, and
 
 ## Command boundary
 
-AOS owns its product roots, including `init`, `status`, migration, updates, and
-health:
+AOS owns its product roots, including `init`, `status`, `migrate`,
+`self-update`, and `serve-health`:
 
 ```sh
 aos status

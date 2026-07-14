@@ -43,12 +43,12 @@ pub async fn read() -> Result<AosStatus, String> {
     )
     .await
     .map_err(|_| "connection timed out".to_owned())?
-    .map_err(|_| "could not connect to the local runtime".to_owned())?;
+    .map_err(|error| format!("could not connect to the local runtime: {error}"))?;
 
     let response = tokio::time::timeout(STATUS_TIMEOUT, client.request(KernelRequest::GetStatus))
         .await
         .map_err(|_| "status request timed out".to_owned())?
-        .map_err(|_| "status request failed".to_owned())?;
+        .map_err(|error| format!("status request failed: {error}"))?;
 
     match response {
         KernelResponse::Status(status) => Ok(status.into()),

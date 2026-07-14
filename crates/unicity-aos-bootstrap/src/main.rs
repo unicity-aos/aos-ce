@@ -17,7 +17,7 @@ use std::process::{Command, ExitCode};
 #[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use unicity_aos_bootstrap::AosHome;
+use unicity_aos_bootstrap::{AOS_WORKSPACE_STATE_DIR, AosHome};
 
 fn main() -> ExitCode {
     run()
@@ -259,7 +259,7 @@ fn handle_health_service(args: &[OsString]) -> ExitCode {
         }
     };
 
-    set_runtime_home(&home);
+    set_runtime_environment(&home);
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -294,7 +294,7 @@ fn handle_status(args: &[OsString]) -> ExitCode {
         Ok(home) => home,
         Err(code) => return code,
     };
-    set_runtime_home(&home);
+    set_runtime_environment(&home);
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -333,10 +333,11 @@ fn handle_status(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn set_runtime_home(home: &AosHome) {
+fn set_runtime_environment(home: &AosHome) {
     // The single-threaded client resolves its local socket from this process-only override.
     unsafe {
         std::env::set_var("ASTRID_HOME", home.runtime_home());
+        std::env::set_var("ASTRID_WORKSPACE_STATE_DIR", AOS_WORKSPACE_STATE_DIR);
     }
 }
 

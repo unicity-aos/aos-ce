@@ -17,7 +17,9 @@ pub mod status;
 pub use migration::{LegacyDistro, MigrationOutcome};
 
 const UNICITY_CE_MANIFEST: &str = include_str!("../../../distros/community/unicity-ce/Distro.toml");
-const AOS_WORKSPACE_STATE_DIR: &str = ".unicity-os";
+
+/// Product-owned per-project state directory selected for bundled runtime commands.
+pub const AOS_WORKSPACE_STATE_DIR: &str = ".unicity-os";
 
 /// Product state owned by one Unicity AOS installation.
 #[derive(Debug, Clone, PartialEq, Eq)]

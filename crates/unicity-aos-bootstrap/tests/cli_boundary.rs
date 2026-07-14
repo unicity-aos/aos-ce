@@ -170,19 +170,21 @@ fn native_status_does_not_invoke_the_runtime_cli() {
     let fixture = Fixture::new("status");
     fixture.install_runtime(RECORDING_RUNTIME);
 
-    let output = fixture
-        .command()
-        .arg("status")
-        .output()
-        .expect("run aos status");
+    for args in [vec!["status"], vec!["status", "--json"]] {
+        let output = fixture
+            .command()
+            .args(args)
+            .output()
+            .expect("run aos status");
 
-    assert!(!output.status.success());
-    assert!(!fixture.args.exists());
-    assert!(
-        String::from_utf8(output.stderr)
-            .expect("utf8 stderr")
-            .contains("aos: runtime status unavailable")
-    );
+        assert!(!output.status.success());
+        assert!(!fixture.args.exists());
+        assert!(
+            String::from_utf8(output.stderr)
+                .expect("utf8 stderr")
+                .contains("aos: runtime status unavailable")
+        );
+    }
 }
 
 #[test]
@@ -190,7 +192,7 @@ fn unix_passthrough_preserves_signal_termination() {
     let fixture = Fixture::new("signal");
     let ready = fixture.root.join("ready");
     fixture.install_runtime(&format!(
-        "#!/bin/sh\nprintf ready > '{}'\nexec sleep 30\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nexec sleep 30\n",
         shell_literal_path(&ready)
     ));
 
@@ -206,6 +208,15 @@ fn unix_passthrough_preserves_signal_termination() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(ready.exists(), "runtime must replace the aos process");
+    assert_eq!(
+        fs::read_to_string(&ready)
+            .expect("read runtime pid")
+            .trim()
+            .parse::<u32>()
+            .expect("parse runtime pid"),
+        child.id(),
+        "the runtime script must retain the aos process id"
+    );
 
     child.kill().expect("terminate delegated runtime");
     let status = child.wait().expect("wait for delegated runtime");
