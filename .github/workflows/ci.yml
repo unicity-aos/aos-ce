@@ -40,6 +40,7 @@ jobs:
       - run: sh -n install.sh
       - run: python3 scripts/validate-release-contract.py
       - run: python3 scripts/test_validate_release_contract.py
+      - run: python3 scripts/test_create_astrid_094_fixture.py
       - run: bash scripts/test-package-release.sh
       - run: bash scripts/test-install.sh
       - run: python3 scripts/capsule_release.py
@@ -76,6 +77,7 @@ jobs:
       - run: cargo test --locked -p unicity-aos-bootstrap
       - run: cargo clippy --locked -p unicity-aos-bootstrap -- -D warnings
       - run: bash scripts/test-upgrade-self-heal.sh
+      - run: bash scripts/test-final-runtime-boot-harness.sh
 
   capsule-tests:
     name: Capsule host tests

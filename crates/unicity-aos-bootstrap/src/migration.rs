@@ -144,6 +144,56 @@ struct MigrationLock {
     _file: File,
 }
 
+struct SourceRuntimeLock {
+    _file: File,
+}
+
+impl SourceRuntimeLock {
+    fn acquire(source: &Path) -> io::Result<Self> {
+        let path = source.join("run/system.lock");
+        let path_metadata = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "standalone runtime has no existing system lock; refusing an unlocked migration",
+                )
+            } else {
+                error
+            }
+        })?;
+        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+            return invalid("standalone runtime system lock must be a real regular file");
+        }
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let file_metadata = file.metadata()?;
+        if !file_metadata.is_file() || !same_file(&path_metadata, &file_metadata) {
+            return invalid("standalone runtime system lock changed while it was opened");
+        }
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "standalone runtime is active; stop it before migration",
+                )
+            } else {
+                error
+            }
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    true
+}
+
 impl MigrationLock {
     fn acquire(home: &AosHome) -> io::Result<Self> {
         let path = home.root().join("migrations").join(LOCK_FILE);
@@ -177,14 +227,13 @@ pub(crate) fn migrate_runtime(home: &AosHome, source: &Path) -> io::Result<Migra
     if source == target || source.starts_with(&target) || target.starts_with(&source) {
         return invalid("legacy runtime home and product runtime home must not overlap");
     }
-    if source.join("run/system.sock").exists() {
-        return invalid("stop the standalone runtime before migration");
-    }
+    let source_lock = SourceRuntimeLock::acquire(&source)?;
+    validate_stopped_source(&source)?;
 
     create_private_dir(&home.root().join("migrations"))?;
     let _migration_lock = MigrationLock::acquire(home)?;
     let receipt_path = home.migration_receipt();
-    recover_interrupted_transaction(home, &target, &source, &receipt_path)?;
+    recover_interrupted_transaction(home, &target, &receipt_path, &source_lock)?;
     if receipt_path.is_file() {
         let receipt: Receipt = read_receipt(&receipt_path)?;
         if receipt.source == source && receipt_matches(&target, &receipt)? {
@@ -245,6 +294,31 @@ pub(crate) fn migrate_runtime(home: &AosHome, source: &Path) -> io::Result<Migra
         let _ = remove_path(&staging);
     }
     result.map(|()| MigrationOutcome::Migrated)
+}
+
+fn validate_stopped_source(source: &Path) -> io::Result<()> {
+    let socket = source.join("run/system.sock");
+    match fs::symlink_metadata(&socket) {
+        Ok(_) => return invalid("stop the standalone runtime before migration"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let pid = source.join("run/system.pid");
+    match fs::symlink_metadata(&pid) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return invalid("standalone runtime PID state must be a real regular file");
+            }
+            // A stale or reused PID does not prove that the daemon is alive. The
+            // singleton lock is authoritative; reading the PID only verifies that
+            // an existing coordination entry is safe and does not redirect reads.
+            let _ = fs::read(&pid)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
 }
 
 fn checked_target_path(path: &Path) -> io::Result<PathBuf> {
@@ -652,8 +726,8 @@ fn remove_backup(backup: &Path) -> io::Result<()> {
 fn recover_interrupted_transaction(
     home: &AosHome,
     target: &Path,
-    source: &Path,
     receipt_path: &Path,
+    _source_lock: &SourceRuntimeLock,
 ) -> io::Result<()> {
     let backup = target_backup(target);
     let staging = home.root().join(STAGING_DIR);
@@ -679,16 +753,9 @@ fn recover_interrupted_transaction(
         return Ok(());
     }
 
-    let can_complete = read_receipt(&staged_receipt)
-        .ok()
-        .filter(|receipt| receipt.source == source)
-        .is_some_and(|receipt| receipt_matches(target, &receipt).unwrap_or(false));
-    if can_complete {
-        finalize_receipt(&staged_receipt, receipt_path)?;
-        remove_backup(&backup)?;
-        return Ok(());
-    }
-
+    // An unreceipted target is never authoritative. Even a valid staged receipt
+    // describes an earlier source snapshot; restore the bundled runtime and copy
+    // the source again while its singleton lock is held.
     rollback_target(target, &backup)?;
     remove_path(&staging)?;
     remove_path(&staged_receipt)
@@ -869,15 +936,15 @@ fn invalid<T>(message: &str) -> io::Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::path::{Component, Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         Blake3Digest, MIGRATION_VERSION, MigrationLock, MigrationOutcome, RECEIPT_SCHEMA_VERSION,
-        create_private_dir, migrate_runtime, recover_interrupted_transaction,
+        SourceRuntimeLock, create_private_dir, migrate_runtime, recover_interrupted_transaction,
     };
     use crate::AosHome;
 
@@ -890,6 +957,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).expect("create fixture root");
+        write(&root.join("legacy"), "run/system.lock", b"");
         root
     }
 
@@ -900,23 +968,45 @@ mod tests {
     }
 
     fn install_product_runtime(product: &AosHome) {
+        install_runtime_at(&product.runtime_home());
+    }
+
+    fn install_runtime_at(runtime: &Path) {
         for name in crate::RUNTIME_EXECUTABLE_NAMES {
             let relative = format!("bin/{name}");
-            write(
-                &product.runtime_home(),
-                &relative,
-                format!("bundled-{name}").as_bytes(),
-            );
+            write(runtime, &relative, format!("bundled-{name}").as_bytes());
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(
-                    product.runtime_home().join(relative),
-                    fs::Permissions::from_mode(0o755),
-                )
-                .expect("make bundled executable executable");
+                fs::set_permissions(runtime.join(relative), fs::Permissions::from_mode(0o755))
+                    .expect("make bundled executable executable");
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn file_mode_snapshot(root: &Path) -> BTreeMap<PathBuf, u32> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn visit(root: &Path, path: &Path, modes: &mut BTreeMap<PathBuf, u32>) {
+            for entry in fs::read_dir(path).expect("read mode snapshot directory") {
+                let entry = entry.expect("read mode snapshot entry");
+                let metadata = fs::symlink_metadata(entry.path()).expect("read mode metadata");
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .expect("mode path is beneath root")
+                    .to_path_buf();
+                modes.insert(relative, metadata.permissions().mode() & 0o777);
+                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    visit(root, &entry.path(), modes);
+                }
+            }
+        }
+
+        let mut modes = BTreeMap::new();
+        visit(root, root, &mut modes);
+        modes
     }
 
     fn file_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -1214,32 +1304,34 @@ mod tests {
         install_product_runtime(&product);
 
         let source_before = file_snapshot(&source);
+        let frozen_shape: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../scripts/astrid-094-frozen-shape.json"
+        ))
+        .expect("parse frozen structural manifest");
         assert_eq!(
             source_before.len(),
-            483,
+            frozen_shape["total_regular_files"].as_u64().unwrap() as usize,
             "fixture tracks the frozen 2026-07-15 Astrid 0.9.4 home shape"
         );
-        let expected_counts = [
-            ("bin", 63),
-            ("etc", 9),
-            ("home", 370),
-            ("keys", 8),
-            ("log", 7),
-            ("run", 5),
-            ("secrets", 1),
-            ("var", 9),
-            ("wit", 11),
-        ];
+        let expected_counts = frozen_shape["top_level_counts"].as_object().unwrap();
         for (top_level, expected) in expected_counts {
             assert_eq!(
                 source_before
                     .keys()
-                    .filter(|path| path.starts_with(top_level))
+                    .filter(|path| path.starts_with(top_level.as_str()))
                     .count(),
-                expected,
+                expected.as_u64().unwrap() as usize,
                 "frozen fixture count changed for {top_level}"
             );
         }
+        assert_eq!(
+            fs::read_dir(&source)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<BTreeSet<_>>(),
+            expected_counts.keys().cloned().collect::<BTreeSet<_>>(),
+            "frozen top-level topology changed"
+        );
         assert_eq!(
             source_before
                 .keys()
@@ -1255,6 +1347,34 @@ mod tests {
                     .extension()
                     .is_some_and(|extension| extension == "wasm")),
             "the installed 0.9.4 bin shape contains WASM components only"
+        );
+        assert_eq!(
+            source_before
+                .keys()
+                .filter(|path| path.starts_with("etc"))
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<BTreeSet<_>>(),
+            frozen_shape["etc_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|path| path.as_str().unwrap().to_owned())
+                .collect::<BTreeSet<_>>(),
+            "frozen etc topology changed"
+        );
+        assert_eq!(
+            source_before
+                .keys()
+                .filter(|path| path.starts_with("run"))
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<BTreeSet<_>>(),
+            frozen_shape["exact_files"]["run"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|path| path.as_str().unwrap().to_owned())
+                .collect::<BTreeSet<_>>(),
+            "frozen run coordination names changed"
         );
         for name in crate::RUNTIME_EXECUTABLE_NAMES {
             assert!(
@@ -1276,6 +1396,17 @@ mod tests {
                 .next()
                 .is_none()
         );
+        for (top_level, encoded_mode) in frozen_shape["top_level_modes"].as_object().unwrap() {
+            assert_eq!(
+                fs::metadata(source.join(top_level))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                u32::from_str_radix(encoded_mode.as_str().unwrap(), 8).unwrap(),
+                "frozen source mode changed for {top_level}"
+            );
+        }
 
         assert_eq!(
             migrate_runtime(&product, &source).expect("production-shaped migration succeeds"),
@@ -1731,36 +1862,127 @@ mod tests {
         fs::remove_dir_all(root).expect("remove fixture root");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn completes_an_interrupted_validated_cutover() {
-        let root = fixture_root("runtime-cutover-complete");
+    fn held_source_singleton_blocks_without_mutation_and_stale_pid_does_not() {
+        use fs2::FileExt as _;
+
+        let root = fixture_root("runtime-source-singleton");
         let source = root.join("legacy");
         let product = AosHome::from_root(root.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
+        write(&source, "run/system.pid", b"424242\n");
+        install_product_runtime(&product);
+        let source_before = file_snapshot(&source);
+        let source_modes_before = file_mode_snapshot(&source);
+        let target_before = file_snapshot(&product.runtime_home());
+
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(source.join("run/system.lock"))
+            .expect("open source singleton lock");
+        held.try_lock_exclusive()
+            .expect("hold source singleton lock");
+
+        let error = migrate_runtime(&product, &source)
+            .expect_err("a held source singleton lock must block migration");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(file_snapshot(&source), source_before);
+        assert_eq!(file_mode_snapshot(&source), source_modes_before);
+        assert_eq!(file_snapshot(&product.runtime_home()), target_before);
+        assert!(!product.root().join("migrations").exists());
+        assert!(!product.root().join(".runtime-import").exists());
+        assert!(!product.migration_receipt().exists());
+
+        fs2::FileExt::unlock(&held).expect("unlock stopped source");
+        drop(held);
+        assert_eq!(
+            migrate_runtime(&product, &source)
+                .expect("an unlocked source with a stale PID is stopped"),
+            MigrationOutcome::Migrated
+        );
+        assert_eq!(file_snapshot(&source), source_before);
+        assert_eq!(file_mode_snapshot(&source), source_modes_before);
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_singleton_must_exist_as_a_real_regular_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = fixture_root("runtime-source-singleton-shape");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+        write(&source, "keys/runtime.key", b"runtime-key");
+        install_product_runtime(&product);
+        let target_before = file_snapshot(&product.runtime_home());
+        let lock = source.join("run/system.lock");
+        fs::remove_file(&lock).expect("remove source singleton lock");
+
+        let missing = migrate_runtime(&product, &source)
+            .expect_err("migration without an existing source lock must fail closed");
+        assert_eq!(missing.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!product.root().join("migrations").exists());
+
+        write(&root, "outside-lock", b"");
+        symlink(root.join("outside-lock"), &lock).expect("symlink source singleton lock");
+        let linked = migrate_runtime(&product, &source)
+            .expect_err("a symlinked source singleton lock must fail closed");
+        assert_eq!(linked.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(file_snapshot(&product.runtime_home()), target_before);
+        assert!(!product.root().join("migrations").exists());
+        assert!(!product.root().join(".runtime-import").exists());
+        assert!(!product.migration_receipt().exists());
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn interrupted_validated_cutover_rolls_back_and_recopies_current_source() {
+        let root = fixture_root("runtime-cutover-complete");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+        write(&source, "keys/runtime.key", b"old-runtime-key");
         install_product_runtime(&product);
         migrate_runtime(&product, &source).expect("migration succeeds");
 
         let receipt = product.migration_receipt();
         let staged_receipt = receipt.with_extension("tmp");
         fs::rename(&receipt, &staged_receipt).expect("stage committed receipt");
+        install_runtime_at(&product.root().join("runtime.pre-migration"));
+        write(&source, "keys/runtime.key", b"current-runtime-key");
+        write(&source, "var/new-state", b"current-source-state");
         write(
-            product.root(),
-            "runtime.pre-migration/bin/astrid",
-            b"bundled-astrid",
+            &product.runtime_home(),
+            "keys/unexpected-target-addition",
+            b"must-not-be-blessed",
         );
+        let source_before = file_snapshot(&source);
         let canonical_source = source.canonicalize().expect("canonical source");
 
         assert_eq!(
             migrate_runtime(&product, &canonical_source).expect("recover valid cutover"),
-            MigrationOutcome::AlreadyMigrated
+            MigrationOutcome::Migrated
         );
         assert!(receipt.is_file());
         assert!(!staged_receipt.exists());
         assert!(!product.root().join("runtime.pre-migration").exists());
         assert_eq!(
             fs::read(product.runtime_home().join("keys/runtime.key")).unwrap(),
-            b"runtime-key"
+            b"current-runtime-key"
         );
+        assert_eq!(
+            fs::read(product.runtime_home().join("var/new-state")).unwrap(),
+            b"current-source-state"
+        );
+        assert!(
+            !product
+                .runtime_home()
+                .join("keys/unexpected-target-addition")
+                .exists()
+        );
+        assert_eq!(file_snapshot(&source), source_before);
         fs::remove_dir_all(root).expect("remove fixture root");
     }
 
@@ -1780,13 +2002,13 @@ mod tests {
             "migrations/astrid-home-v1.tmp",
             b"invalid receipt",
         );
-        let canonical_source = source.canonicalize().expect("canonical source");
+        let source_lock = SourceRuntimeLock::acquire(&source).expect("lock stopped source");
 
         recover_interrupted_transaction(
             &product,
             &target,
-            &canonical_source,
             &product.migration_receipt(),
+            &source_lock,
         )
         .expect("roll back invalid cutover");
 

@@ -73,6 +73,10 @@ Keep the standalone runtime stopped throughout the import. The importer refuses
 to proceed while its system socket is present, when either root is a symlink,
 when the source and product roots overlap, when the AOS runtime home already
 contains user state, or when any source file would require following a symlink.
+It nonblockingly holds the standalone runtime's existing `run/system.lock`
+through validation, copying, receipt creation, and cutover without creating or
+rewriting source state. A stale PID file alone does not prove the daemon is
+running; the singleton lock is authoritative.
 
 Only one import may run for an AOS home at a time. Concurrent attempts fail
 before staging or replacing runtime state, and a process crash releases the

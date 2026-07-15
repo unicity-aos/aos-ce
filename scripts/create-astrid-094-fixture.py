@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import stat
 from collections import Counter
 from pathlib import Path
 
 
-EXPECTED_COUNTS = {
+CONSTRUCTED_COUNTS = {
     "bin": 63,
     "etc": 9,
     "home": 370,
@@ -22,6 +23,7 @@ EXPECTED_COUNTS = {
     "wit": 11,
 }
 RUNTIME_EXECUTABLES = {"astrid", "astrid-daemon", "astrid-build", "astrid-emit"}
+SHAPE_PATH = Path(__file__).with_name("astrid-094-frozen-shape.json")
 
 
 def write(root: Path, relative: str, content: str) -> None:
@@ -108,41 +110,112 @@ def create(root: Path) -> None:
             f"package fixture:contract{index};\n",
         )
 
-    for directory in EXPECTED_COUNTS:
+    for directory in CONSTRUCTED_COUNTS:
         os.chmod(root / directory, 0o700)
     os.chmod(root, 0o700)
     os.chmod(root / "secrets", 0o755)
+    for path in root.rglob("*"):
+        if path.is_file():
+            os.chmod(path, 0o644)
     os.chmod(root / "home/alice/.local/state/item-000", 0o755)
     validate(root)
 
 
 def validate(root: Path) -> None:
+    shape = json.loads(SHAPE_PATH.read_text(encoding="utf-8"))
+    expected_files = expected_file_paths(shape)
+    expected_directories = expected_directory_paths(expected_files, shape["empty_directories"])
     counts: Counter[str] = Counter()
-    files: list[Path] = []
+    files: set[str] = set()
+    directories: set[str] = set()
     for path in root.rglob("*"):
         metadata = path.lstat()
+        relative = path.relative_to(root).as_posix()
         if stat.S_ISLNK(metadata.st_mode):
             raise ValueError(f"fixture contains a symlink: {path}")
         if path.is_file():
-            relative = path.relative_to(root)
-            counts[relative.parts[0]] += 1
-            files.append(relative)
-        elif not path.is_dir():
+            counts[Path(relative).parts[0]] += 1
+            files.add(relative)
+        elif path.is_dir():
+            directories.add(relative)
+        else:
             raise ValueError(f"fixture contains a special file: {path}")
 
-    if dict(counts) != EXPECTED_COUNTS:
-        raise ValueError(f"fixture counts differ: expected {EXPECTED_COUNTS}, found {dict(counts)}")
-    if len(files) != 483:
-        raise ValueError(f"fixture must contain 483 regular files, found {len(files)}")
+    expected_counts = shape["top_level_counts"]
+    if dict(counts) != expected_counts:
+        raise ValueError(
+            f"fixture counts differ: expected {expected_counts}, found {dict(counts)}"
+        )
+    if len(files) != shape["total_regular_files"]:
+        raise ValueError(
+            f"fixture must contain {shape['total_regular_files']} regular files, found {len(files)}"
+        )
+    if files != expected_files:
+        missing = sorted(expected_files - files)
+        unexpected = sorted(files - expected_files)
+        raise ValueError(f"fixture file topology differs: missing={missing}, unexpected={unexpected}")
+    if directories != expected_directories:
+        missing = sorted(expected_directories - directories)
+        unexpected = sorted(directories - expected_directories)
+        raise ValueError(
+            f"fixture directory topology differs: missing={missing}, unexpected={unexpected}"
+        )
 
-    bin_entries = [path for path in files if path.parts[0] == "bin"]
-    if not all(path.suffix == ".wasm" for path in bin_entries):
+    root_mode = stat.S_IMODE(root.lstat().st_mode)
+    if root_mode != int(shape["root_mode"], 8):
+        raise ValueError(f"fixture root mode is {root_mode:04o}, expected {shape['root_mode']}")
+    for top_level, encoded_mode in shape["top_level_modes"].items():
+        path = root / top_level
+        mode = stat.S_IMODE(path.lstat().st_mode)
+        if mode != int(encoded_mode, 8):
+            raise ValueError(
+                f"fixture top-level mode for {top_level} is {mode:04o}, expected {encoded_mode}"
+            )
+    for relative, encoded_mode in shape["representative_file_modes"].items():
+        mode = stat.S_IMODE((root / relative).lstat().st_mode)
+        if mode != int(encoded_mode, 8):
+            raise ValueError(
+                f"fixture representative mode for {relative} is {mode:04o}, expected {encoded_mode}"
+            )
+
+    bin_entries = [Path(path) for path in files if Path(path).parts[0] == "bin"]
+    if len(bin_entries) != shape["bin"]["count"] or not all(
+        path.suffix == ".wasm" for path in bin_entries
+    ):
         raise ValueError("every frozen bin entry must be a WASM component")
-    if any((root / "bin" / name).exists() for name in RUNTIME_EXECUTABLES):
+    if set(shape["bin"]["forbidden"]) != RUNTIME_EXECUTABLES:
+        raise ValueError("frozen manifest runtime executable exclusions changed")
+    if any((root / "bin" / name).exists() for name in shape["bin"]["forbidden"]):
         raise ValueError("the frozen home must not contain managed runtime executables")
     hooks = root / "etc/hooks"
     if not hooks.is_dir() or any(hooks.iterdir()):
         raise ValueError("the frozen etc/hooks directory must be empty")
+
+
+def expected_file_paths(shape: dict[str, object]) -> set[str]:
+    files = set(shape["etc_files"])
+    bin_shape = shape["bin"]
+    files.update(
+        f"bin/{bin_shape['pattern'].format(index=index)}"
+        for index in range(bin_shape["count"])
+    )
+    home = shape["home_files"]
+    files.update(home["exact"])
+    for entry in home["patterns"]:
+        files.update(entry["pattern"].format(index=index) for index in range(entry["count"]))
+    for entries in shape["exact_files"].values():
+        files.update(entries)
+    return files
+
+
+def expected_directory_paths(files: set[str], empty_directories: list[str]) -> set[str]:
+    directories = set(empty_directories)
+    for relative in files:
+        parent = Path(relative).parent
+        while parent != Path("."):
+            directories.add(parent.as_posix())
+            parent = parent.parent
+    return directories
 
 
 def main() -> int:
