@@ -9,6 +9,8 @@ COSIGN_VERSION=v3.1.1
 ASSUME_YES=0
 SKIP_MIGRATION_PROMPT=0
 installation_started=0
+release_committed=0
+release_backup=
 rollback=
 
 usage() {
@@ -50,6 +52,11 @@ esac
 need() { command -v "$1" >/dev/null 2>&1 || { echo "required command not found: $1" >&2; exit 1; }; }
 need curl
 need tar
+need awk
+need find
+need grep
+need install
+need tr
 
 has_interactive_tty() {
   { [ -t 1 ] || [ -t 2 ]; } && : 2>/dev/null </dev/tty && : 2>/dev/null >/dev/tty
@@ -119,6 +126,8 @@ cleanup() {
   trap - EXIT HUP INT TERM
   if [ "$installation_started" -eq 1 ]; then
     restore || status=1
+  elif [ "$release_committed" -eq 1 ] && [ -n "$release_backup" ]; then
+    rm -rf "$release_backup" || status=1
   fi
   rm -rf "$work"
   exit "$status"
@@ -181,9 +190,27 @@ bundle_name=$(tar -tzf "$work/$asset" | awk 'NR == 1 { sub(/\/.*/, "", $0); prin
 bundle="$work/unpack/$bundle_name"
 [ -d "$bundle" ] || { echo "release archive has no Unicity AOS bundle" >&2; exit 1; }
 
-for file in bin/aos runtime/bin/astrid runtime/bin/astrid-daemon runtime/bin/astrid-build runtime/bin/astrid-emit release-manifest.json; do
+for file in bin/aos runtime/bin/astrid runtime/bin/astrid-daemon runtime/bin/astrid-build runtime/bin/astrid-emit release-manifest.json Distro.toml capsule-assets.txt; do
   [ -f "$bundle/$file" ] || { echo "release archive is missing $file" >&2; exit 1; }
 done
+[ -d "$bundle/capsules" ] || { echo "release archive has no capsule directory" >&2; exit 1; }
+if ! awk '
+  !/^astrid-capsule-[a-z0-9-]+\.capsule$/ { invalid = 1 }
+  seen[$0]++ { duplicate = 1 }
+  END { exit invalid || duplicate || NR != 18 }
+' "$bundle/capsule-assets.txt"; then
+  echo "release archive has an invalid capsule asset manifest" >&2
+  exit 1
+fi
+capsule_count=$(find "$bundle/capsules" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')
+[ "$capsule_count" -eq 18 ] || { echo "release archive capsule set is incomplete" >&2; exit 1; }
+while IFS= read -r capsule; do
+  capsule_path="$bundle/capsules/$capsule"
+  [ -f "$capsule_path" ] && [ ! -L "$capsule_path" ] || {
+    echo "release archive contains a missing or non-regular capsule asset: $capsule" >&2
+    exit 1
+  }
+done < "$bundle/capsule-assets.txt"
 
 staged_version=$("$bundle/bin/aos" --version | awk '{print $NF}')
 if ! printf '%s\n' "$staged_version" | grep -Eq '^20[0-9]{2}\.[0-9]+\.[0-9]+$'; then
@@ -199,9 +226,20 @@ if [ "$bundle_name" != "unicity-aos-${staged_version}-${target}" ]; then
   exit 1
 fi
 
-for managed in "$AOS_HOME" "$AOS_HOME/runtime" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases"; do
+release_dir="$AOS_HOME/releases/$staged_version"
+release_stage="$AOS_HOME/releases/.${staged_version}.new.$$"
+release_backup="$AOS_HOME/releases/.${staged_version}.rollback.$$"
+for managed in "$AOS_HOME" "$AOS_HOME/runtime" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases" "$release_dir" "$release_dir/capsules"; do
   [ ! -L "$managed" ] || { echo "refusing symlinked managed path: $managed" >&2; exit 1; }
 done
+if [ -e "$release_dir" ] && [ ! -d "$release_dir" ]; then
+  echo "refusing non-directory release destination: $release_dir" >&2
+  exit 1
+fi
+if [ -e "$release_stage" ] || [ -e "$release_backup" ]; then
+  echo "refusing stale release transaction state for $staged_version" >&2
+  exit 1
+fi
 if [ -L "$AOS_BIN_DIR" ]; then
   echo "refusing symlinked binary directory: $AOS_BIN_DIR" >&2
   exit 1
@@ -253,10 +291,16 @@ install_one() {
 
 restore() {
   result=0
-  for name in aos astrid astrid-daemon astrid-build astrid-emit release-manifest; do
+  rm -rf "$release_stage"
+  if [ -d "$release_backup" ]; then
+    rm -rf "$release_dir"
+    mv "$release_backup" "$release_dir" || result=1
+  elif [ -f "$rollback/release.touched" ]; then
+    rm -rf "$release_dir" || result=1
+  fi
+  for name in aos astrid astrid-daemon astrid-build astrid-emit; do
     case "$name" in
       aos) destination="$AOS_BIN_DIR/aos" ;;
-      release-manifest) destination="$AOS_HOME/releases/${staged_version}.json" ;;
       *) destination="$AOS_HOME/runtime/bin/$name" ;;
     esac
     rm -f "${destination}.new.$$" "${destination}.restore.$$"
@@ -279,8 +323,26 @@ if ! install_one "$bundle/bin/aos" "$AOS_BIN_DIR/aos" aos 755; then exit 1; fi
 for name in astrid astrid-daemon astrid-build astrid-emit; do
   if ! install_one "$bundle/runtime/bin/$name" "$AOS_HOME/runtime/bin/$name" "$name" 755; then exit 1; fi
 done
-if ! install_one "$bundle/release-manifest.json" "$AOS_HOME/releases/${staged_version}.json" release-manifest 600; then exit 1; fi
+mkdir "$release_stage"
+chmod 700 "$release_stage"
+mkdir "$release_stage/capsules"
+chmod 700 "$release_stage/capsules"
+install -m 0600 "$bundle/release-manifest.json" "$release_stage/release-manifest.json"
+install -m 0600 "$bundle/Distro.toml" "$release_stage/Distro.toml"
+install -m 0600 "$bundle/capsule-assets.txt" "$release_stage/capsule-assets.txt"
+while IFS= read -r capsule; do
+  install -m 0600 "$bundle/capsules/$capsule" "$release_stage/capsules/$capsule"
+done < "$bundle/capsule-assets.txt"
+if [ -d "$release_dir" ]; then
+  mv "$release_dir" "$release_backup"
+fi
+: > "$rollback/release.touched"
+if ! mv "$release_stage" "$release_dir"; then
+  exit 1
+fi
+release_committed=1
 installation_started=0
+rm -rf "$release_backup"
 
 echo "Installed Unicity AOS $staged_version."
 case ":$PATH:" in

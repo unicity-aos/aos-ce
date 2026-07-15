@@ -6,7 +6,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 fixture="$work/fixture"
 fake_bin="$work/fake-bin"
-mkdir -p "$fixture" "$fake_bin" "$work/home"
+mkdir -p "$fixture" "$fake_bin" "$work/home" "$work/capsules"
 mkdir -p "$work/home/.astrid"
 printf 'standalone-runtime-state\n' > "$work/home/.astrid/sentinel"
 
@@ -20,6 +20,18 @@ exit 0
 EOF
 chmod 755 "$work/aos"
 
+PYTHONPATH="$repo_root/scripts" python3 - "$work/capsules" <<'PY'
+import pathlib
+import sys
+
+from capsule_release import source_contract
+from test_capsule_release import write_fixture
+
+output = pathlib.Path(sys.argv[1])
+for spec in source_contract():
+    write_fixture(output / spec.asset, spec)
+PY
+
 runtime_root="$work/astrid-0.9.4-x86_64-unknown-linux-gnu"
 mkdir -p "$runtime_root"
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
@@ -32,6 +44,7 @@ bash "$repo_root/scripts/package-release.sh" \
   "$work/aos" \
   "$work/runtime.tar.gz" \
   0000000000000000000000000000000000000000000000000000000000000000 \
+  "$work/capsules" \
   "$fixture" >/dev/null
 asset="$fixture/unicity-aos-x86_64-unknown-linux-gnu.tar.gz"
 bundle="$asset.sigstore.json"
@@ -121,13 +134,26 @@ sh "$repo_root/install.sh" --yes --no-migrate-prompt
 
 test -x "$work/home/.unicity-os/bin/aos"
 test -x "$work/home/.unicity-os/runtime/bin/astrid-daemon"
-test -f "$work/home/.unicity-os/releases/2026.1.0.json"
+release_dir="$work/home/.unicity-os/releases/2026.1.0"
+test -f "$release_dir/release-manifest.json"
+test -f "$release_dir/Distro.toml"
+test -f "$release_dir/capsule-assets.txt"
+test "$(find "$release_dir/capsules" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 18
+while IFS= read -r capsule; do
+  cmp "$work/capsules/$capsule" "$release_dir/capsules/$capsule"
+done < "$release_dir/capsule-assets.txt"
 test "$("$work/home/.unicity-os/bin/aos" --version)" = 'Unicity AOS 2026.1.0'
 test "$(cat "$work/home/.astrid/sentinel")" = 'standalone-runtime-state'
 test -f "$fixture/cosign-called"
 test ! -e "$fixture/path-cosign-called"
 test "$(stat -c '%a' "$work/home/.unicity-os" 2>/dev/null || stat -f '%Lp' "$work/home/.unicity-os")" = 700
-test "$(stat -c '%a' "$work/home/.unicity-os/releases/2026.1.0.json" 2>/dev/null || stat -f '%Lp' "$work/home/.unicity-os/releases/2026.1.0.json")" = 600
+test "$(stat -c '%a' "$release_dir/release-manifest.json" 2>/dev/null || stat -f '%Lp' "$release_dir/release-manifest.json")" = 600
+test "$(stat -c '%a' "$release_dir/capsules" 2>/dev/null || stat -f '%Lp' "$release_dir/capsules")" = 700
+
+printf 'tampered capsule\n' > "$release_dir/capsules/astrid-capsule-cli.capsule"
+PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+cmp "$work/capsules/astrid-capsule-cli.capsule" "$release_dir/capsules/astrid-capsule-cli.capsule"
 
 cat > "$work/home/.unicity-os/bin/aos" <<'EOF'
 #!/bin/sh
@@ -249,7 +275,7 @@ for binary in aos astrid astrid-daemon astrid-build astrid-emit; do
   printf '#!/bin/sh\necho old-%s\n' "$binary" > "$destination"
   chmod 755 "$destination"
 done
-printf 'old-release-manifest\n' > "$work/home/.unicity-os/releases/2026.1.0.json"
+printf 'old-release-manifest\n' > "$release_dir/release-manifest.json"
 
 fail_bin="$work/fail-bin"
 mkdir "$fail_bin"
@@ -258,14 +284,10 @@ cat > "$fail_bin/mv" <<'EOF'
 set -eu
 last=
 for argument in "$@"; do last=$argument; done
-case "$last" in
-  */runtime/bin/astrid-daemon)
-    if [ ! -f "$MV_FAILED" ]; then
-      : > "$MV_FAILED"
-      exit 1
-    fi
-    ;;
-esac
+if [ "$last" = "$MV_FAIL_DESTINATION" ] && [ ! -f "$MV_FAILED" ]; then
+  : > "$MV_FAILED"
+  exit 1
+fi
 exec "$REAL_MV" "$@"
 EOF
 chmod 755 "$fail_bin/mv"
@@ -276,6 +298,7 @@ if PATH="$fail_bin:$fake_bin:$PATH" \
   AOS_VERSION=2026.1.0 \
   REAL_MV="$real_mv" \
   MV_FAILED="$work/mv-failed" \
+  MV_FAIL_DESTINATION="$release_dir" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer ignored a mid-install failure" >&2
   exit 1
@@ -287,7 +310,11 @@ for binary in aos astrid astrid-daemon astrid-build astrid-emit; do
   esac
   test "$("$destination")" = "old-$binary"
 done
-test "$(cat "$work/home/.unicity-os/releases/2026.1.0.json")" = old-release-manifest
+test "$(cat "$release_dir/release-manifest.json")" = old-release-manifest
+test "$(find "$release_dir/capsules" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 18
+while IFS= read -r capsule; do
+  cmp "$work/capsules/$capsule" "$release_dir/capsules/$capsule"
+done < "$release_dir/capsule-assets.txt"
 test "$(cat "$work/home/.astrid/sentinel")" = standalone-runtime-state
 
 cat > "$work/aos-mismatch" <<'EOF'
@@ -302,6 +329,7 @@ bash "$repo_root/scripts/package-release.sh" \
   "$work/aos-mismatch" \
   "$work/runtime.tar.gz" \
   0000000000000000000000000000000000000000000000000000000000000000 \
+  "$work/capsules" \
   "$fixture" >/dev/null
 cp "$asset" "$signed_asset"
 if PATH="$fake_bin:$PATH" HOME="$work/mismatch-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \

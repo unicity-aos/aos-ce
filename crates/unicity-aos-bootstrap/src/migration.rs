@@ -1,6 +1,7 @@
 //! Explicit, staged import of a standalone Astrid Runtime home.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -10,7 +11,7 @@ use fs2::FileExt;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
-use crate::{AosHome, runtime_binary_name};
+use crate::{AosHome, RUNTIME_EXECUTABLE_NAMES};
 
 const MIGRATION_VERSION: u32 = 1;
 const RECEIPT_SCHEMA_VERSION: u32 = 3;
@@ -27,8 +28,9 @@ const PERSISTENT_TOP_LEVEL: &[&str] = &[
     "trust",
     "capsules",
     "history",
+    "log",
 ];
-const EPHEMERAL_TOP_LEVEL: &[&str] = &["run", "log", "cow"];
+const EPHEMERAL_TOP_LEVEL: &[&str] = &["run", "cow"];
 const ETC_ALLOWLIST: &[&str] = &[
     "config.toml",
     "servers.toml",
@@ -205,7 +207,7 @@ pub(crate) fn migrate_runtime(home: &AosHome, source: &Path) -> io::Result<Migra
 
     let result = (|| {
         create_private_dir(&staging)?;
-        let mut entries = vec![copy_product_binary(&target, &staging)?];
+        let mut entries = copy_product_binaries(&target, &staging)?;
         copy_etc_state(&source, &staging, &mut entries)?;
         for name in PERSISTENT_TOP_LEVEL {
             copy_if_present(
@@ -337,29 +339,43 @@ fn validate_target(target: &Path) -> io::Result<()> {
     if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
         return invalid("bundled product runtime must be a real directory");
     }
-    let allowed = target.join("bin").join(runtime_binary_name());
-    let metadata = fs::symlink_metadata(&allowed).map_err(|_| {
+    let bin = target.join("bin");
+    let bin_metadata = fs::symlink_metadata(&bin).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "bundled product runtime executable is not installed",
+            "bundled product runtime executable set is not installed",
         )
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return invalid("bundled product runtime executable is not installed");
+    if bin_metadata.file_type().is_symlink() || !bin_metadata.is_dir() {
+        return invalid("bundled product runtime bin must be a real directory");
+    }
+    let expected: HashSet<_> = RUNTIME_EXECUTABLE_NAMES.iter().copied().collect();
+    let mut actual = HashSet::new();
+    for entry in fs::read_dir(&bin)? {
+        let entry = entry?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "product runtime bin contains a non-UTF-8 entry",
+            )
+        })?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !expected.contains(name.as_str())
+            || metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || !actual.insert(name)
+        {
+            return invalid("product runtime home contains data; migration refuses to merge state");
+        }
+    }
+    if actual.len() != expected.len() {
+        return invalid("bundled product runtime executable set is incomplete");
     }
     for entry in fs::read_dir(target)? {
         let entry = entry?;
         let path = entry.path();
-        if path == target.join("bin") {
-            for nested in fs::read_dir(&path)? {
-                let nested = nested?;
-                if nested.path() != allowed {
-                    return invalid(
-                        "product runtime home contains data; migration refuses to merge state",
-                    );
-                }
-            }
-        } else {
+        let metadata = fs::symlink_metadata(&path)?;
+        if path != bin || metadata.file_type().is_symlink() || !metadata.is_dir() {
             return invalid("product runtime home contains data; migration refuses to merge state");
         }
     }
@@ -418,11 +434,16 @@ fn copy_etc_state(source_root: &Path, staging: &Path, entries: &mut Vec<Entry>) 
     Ok(())
 }
 
-fn copy_product_binary(target: &Path, staging: &Path) -> io::Result<Entry> {
-    let source = target.join("bin").join(runtime_binary_name());
-    let relative = PathBuf::from("bin").join(runtime_binary_name());
-    let destination = staging.join(&relative);
-    copy_executable(&source, &destination, &relative)
+fn copy_product_binaries(target: &Path, staging: &Path) -> io::Result<Vec<Entry>> {
+    RUNTIME_EXECUTABLE_NAMES
+        .iter()
+        .map(|name| {
+            let source = target.join("bin").join(name);
+            let relative = PathBuf::from("bin").join(name);
+            let destination = staging.join(&relative);
+            copy_executable(&source, &destination, &relative)
+        })
+        .collect()
 }
 
 fn copy_if_present(
@@ -452,13 +473,24 @@ fn copy_wasm_blobs(source: &Path, destination: &Path, entries: &mut Vec<Entry>) 
         let entry = entry?;
         let name = entry.file_name();
         let path = entry.path();
-        if path.is_file()
-            && Path::new(&name)
-                .extension()
-                .is_some_and(|ext| ext == "wasm")
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return invalid("legacy runtime bin contains a non-regular entry");
+        }
+        if Path::new(&name)
+            .extension()
+            .is_some_and(|ext| ext == "wasm")
         {
             let relative = PathBuf::from("bin").join(&name);
             entries.push(copy_file(&path, &destination.join(&name), &relative)?);
+        } else if !RUNTIME_EXECUTABLE_NAMES
+            .iter()
+            .any(|runtime| name == OsStr::new(runtime))
+        {
+            return invalid(&format!(
+                "legacy runtime bin contains unsupported state `{}`; migration refuses to omit it",
+                name.to_string_lossy()
+            ));
         }
     }
     Ok(())
@@ -525,7 +557,7 @@ fn copy_file(source: &Path, destination: &Path, relative: &Path) -> io::Result<E
             .checked_add(read as u64)
             .ok_or_else(|| io::Error::other("migration byte count overflow"))?;
     }
-    set_private_permissions(destination, false)?;
+    set_private_copied_file_permissions(destination, &metadata)?;
     output.sync_all()?;
     sync_parent(destination)?;
     Ok(Entry {
@@ -533,6 +565,22 @@ fn copy_file(source: &Path, destination: &Path, relative: &Path) -> io::Result<E
         bytes,
         digest: Blake3Digest::from_hash(hasher.finalize()),
     })
+}
+
+#[cfg(unix)]
+fn set_private_copied_file_permissions(path: &Path, source: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = source.permissions().mode() & 0o111 != 0;
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(if executable { 0o700 } else { 0o600 }),
+    )
+}
+
+#[cfg(not(unix))]
+fn set_private_copied_file_permissions(_path: &Path, _source: &fs::Metadata) -> io::Result<()> {
+    Ok(())
 }
 
 fn copy_executable(source: &Path, destination: &Path, relative: &Path) -> io::Result<Entry> {
@@ -714,6 +762,10 @@ fn finalize_receipt(temporary: &Path, path: &Path) -> io::Result<()> {
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return invalid("runtime migration managed paths must be real directories");
+    }
     set_private_permissions(path, true)?;
     sync_directory(path)?;
     sync_parent(path)
@@ -817,8 +869,10 @@ fn invalid<T>(message: &str) -> io::Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::OsStr;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -843,6 +897,56 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture parent");
         fs::write(path, content).expect("write fixture file");
+    }
+
+    fn install_product_runtime(product: &AosHome) {
+        for name in crate::RUNTIME_EXECUTABLE_NAMES {
+            let relative = format!("bin/{name}");
+            write(
+                &product.runtime_home(),
+                &relative,
+                format!("bundled-{name}").as_bytes(),
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    product.runtime_home().join(relative),
+                    fs::Permissions::from_mode(0o755),
+                )
+                .expect("make bundled executable executable");
+            }
+        }
+    }
+
+    fn file_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(path).expect("read snapshot directory") {
+                let entry = entry.expect("read snapshot entry");
+                let metadata = fs::symlink_metadata(entry.path()).expect("read snapshot metadata");
+                assert!(
+                    !metadata.file_type().is_symlink(),
+                    "fixture has no symlinks"
+                );
+                if metadata.is_dir() {
+                    visit(root, &entry.path(), files);
+                } else {
+                    assert!(metadata.is_file(), "fixture has only regular files");
+                    files.insert(
+                        entry
+                            .path()
+                            .strip_prefix(root)
+                            .expect("snapshot path is beneath root")
+                            .to_path_buf(),
+                        fs::read(entry.path()).expect("read snapshot file"),
+                    );
+                }
+            }
+        }
+
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
     }
 
     #[test]
@@ -901,7 +1005,7 @@ mod tests {
         write(&source, "bin/astrid", b"legacy-binary");
         write(&source, "run/ready", b"live-state");
         write(&source, "log/daemon.log", b"log");
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
 
         assert_eq!(
             migrate_runtime(&product, &source).expect("migration succeeds"),
@@ -936,10 +1040,17 @@ mod tests {
         );
         assert_eq!(
             fs::read(runtime.join("bin/astrid")).unwrap(),
-            b"bundled-binary"
+            b"bundled-astrid"
         );
+        for name in crate::RUNTIME_EXECUTABLE_NAMES {
+            assert_eq!(
+                fs::read(runtime.join("bin").join(name)).unwrap(),
+                format!("bundled-{name}").as_bytes(),
+                "the supported product installer executable set must survive migration"
+            );
+        }
         assert!(!runtime.join("run").exists());
-        assert!(!runtime.join("log").exists());
+        assert_eq!(fs::read(runtime.join("log/daemon.log")).unwrap(), b"log");
         assert_eq!(
             fs::read(source.join("keys/runtime.key")).unwrap(),
             b"runtime-key"
@@ -974,13 +1085,325 @@ mod tests {
         fs::remove_dir_all(root).expect("remove fixture root");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn imports_a_production_shaped_094_home_without_loss_and_self_heals_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = fixture_root("runtime-production-shape");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+
+        for name in crate::RUNTIME_EXECUTABLE_NAMES {
+            write(
+                &source,
+                &format!("bin/{name}"),
+                format!("legacy-{name}").as_bytes(),
+            );
+        }
+        for index in 0..59 {
+            write(
+                &source,
+                &format!("bin/component-{index:02}.wasm"),
+                format!("wasm-{index:02}").as_bytes(),
+            );
+        }
+        for (path, bytes) in [
+            ("etc/config.toml", b"[runtime]\n".as_slice()),
+            ("etc/servers.toml", b"[servers]\n".as_slice()),
+            ("etc/gateway.toml", b"[gateway]\n".as_slice()),
+            ("etc/gateway-http.toml", b"enabled = false\n".as_slice()),
+            ("etc/layout-version", b"1".as_slice()),
+            ("etc/groups.toml", b"[groups]\n".as_slice()),
+            ("etc/invites.toml", b"[invites]\n".as_slice()),
+            ("etc/profiles/alice.toml", b"enabled = true\n".as_slice()),
+            ("etc/hooks/audit.toml", b"enabled = true\n".as_slice()),
+        ] {
+            write(&source, path, bytes);
+        }
+        write(
+            &source,
+            "home/alice/.config/distro.lock",
+            b"[distro]\nid = \"astralis\"\nversion = \"0.2.2\"\n",
+        );
+        write(
+            &source,
+            "home/bob/.config/distro.lock",
+            b"[distro]\nid = \"aos-ce\"\nversion = \"2026.1.0\"\n",
+        );
+        write(
+            &source,
+            "home/carol/.config/distro.lock",
+            b"[distro]\nid = \"unicity-ce\"\nversion = \"2026.1.0\"\n",
+        );
+        write(
+            &source,
+            "home/dan/.config/distro.lock",
+            b"[distro]\nid = \"other\"\nversion = \"1.0.0\"\n",
+        );
+        for index in 0..140 {
+            write(
+                &source,
+                &format!("home/alice/.local/capsules/asset-{index:03}"),
+                format!("capsule-payload-or-meta-{index:03}").as_bytes(),
+            );
+        }
+        for index in 0..4 {
+            write(
+                &source,
+                &format!("home/alice/.local/audit/record-{index:03}"),
+                format!("audit-{index:03}").as_bytes(),
+            );
+        }
+        for index in 0..26 {
+            write(
+                &source,
+                &format!("home/alice/.config/env/override-{index:03}"),
+                format!("ENV_{index:03}=preserved").as_bytes(),
+            );
+        }
+        for index in 0..194 {
+            write(
+                &source,
+                &format!("home/alice/.local/state/item-{index:03}"),
+                format!("principal-state-{index:03}").as_bytes(),
+            );
+        }
+        write(&source, "keys/runtime.key", b"runtime-key-material");
+        for index in 0..7 {
+            write(
+                &source,
+                &format!("keys/device-{index}.key"),
+                format!("device-key-material-{index}").as_bytes(),
+            );
+        }
+        write(&source, "secrets/providers.toml", b"token = \"secret\"\n");
+        for index in 0..9 {
+            write(
+                &source,
+                &format!("var/state-{index}"),
+                format!("state-{index}").as_bytes(),
+            );
+        }
+        for index in 0..11 {
+            write(
+                &source,
+                &format!("wit/contract-{index}.wit"),
+                format!("package fixture:contract{index};\n").as_bytes(),
+            );
+        }
+        for index in 0..7 {
+            write(
+                &source,
+                &format!("log/runtime-{index}.log"),
+                format!("log-{index}").as_bytes(),
+            );
+        }
+        for (path, bytes) in [
+            ("run/.hud-health", b"stale HUD health".as_slice()),
+            ("run/session.principal", b"transient-principal".as_slice()),
+            ("run/system.lock", b"daemon-lock".as_slice()),
+            ("run/system.pid", b"12345".as_slice()),
+            ("run/system.token", b"ephemeral-credential".as_slice()),
+        ] {
+            write(&source, path, bytes);
+        }
+        for directory in ["bin", "etc", "home", "keys", "log", "run", "var", "wit"] {
+            fs::set_permissions(source.join(directory), fs::Permissions::from_mode(0o700))
+                .expect("set private source directory mode");
+        }
+        fs::set_permissions(source.join("secrets"), fs::Permissions::from_mode(0o755))
+            .expect("model the legacy permissive secrets mode");
+        fs::set_permissions(
+            source.join("home/alice/.local/state/item-000"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("model an executable private helper");
+        install_product_runtime(&product);
+
+        let source_before = file_snapshot(&source);
+        assert_eq!(
+            source_before.len(),
+            481,
+            "fixture tracks the installed 0.9.4 shape"
+        );
+        assert_eq!(
+            source_before
+                .keys()
+                .filter(|path| path.starts_with("bin"))
+                .count(),
+            63
+        );
+
+        assert_eq!(
+            migrate_runtime(&product, &source).expect("production-shaped migration succeeds"),
+            MigrationOutcome::Migrated
+        );
+        assert_eq!(
+            file_snapshot(&source),
+            source_before,
+            "migration never mutates its source"
+        );
+
+        let runtime = product.runtime_home();
+        for (relative, bytes) in &source_before {
+            let persistent = matches!(
+                relative.components().next(),
+                Some(Component::Normal(name))
+                    if ["etc", "home", "keys", "secrets", "var", "wit", "log"]
+                        .iter()
+                        .any(|expected| name == OsStr::new(expected))
+            );
+            let wasm = relative.starts_with("bin")
+                && relative
+                    .extension()
+                    .is_some_and(|extension| extension == "wasm");
+            if persistent || wasm {
+                assert_eq!(
+                    fs::read(runtime.join(relative)).expect("read migrated persistent file"),
+                    *bytes,
+                    "migrated bytes differ for {}",
+                    relative.display()
+                );
+            }
+        }
+        assert!(!runtime.join("run").exists());
+        for transient in [
+            ".hud-health",
+            "session.principal",
+            "system.lock",
+            "system.pid",
+            "system.token",
+        ] {
+            assert!(source.join("run").join(transient).is_file());
+            assert!(!runtime.join("run").join(transient).exists());
+        }
+        for representative in [
+            "keys/runtime.key",
+            "home/alice/.config/distro.lock",
+            "home/dan/.config/distro.lock",
+            "home/alice/.local/capsules/asset-139",
+            "home/alice/.local/audit/record-003",
+            "home/alice/.config/env/override-025",
+            "var/state-8",
+            "wit/contract-10.wit",
+            "etc/profiles/alice.toml",
+            "log/runtime-6.log",
+        ] {
+            assert_eq!(
+                fs::read(runtime.join(representative)).unwrap(),
+                fs::read(source.join(representative)).unwrap(),
+                "representative live state was not preserved: {representative}"
+            );
+        }
+        for name in crate::RUNTIME_EXECUTABLE_NAMES {
+            let path = runtime.join("bin").join(name);
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                format!("bundled-{name}").as_bytes()
+            );
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        for directory in ["etc", "home", "keys", "secrets", "var", "wit", "log"] {
+            assert_eq!(
+                fs::metadata(runtime.join(directory))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "private directory mode was not tightened for {directory}"
+            );
+        }
+        assert_eq!(
+            fs::metadata(source.join("home/alice/.local/state/item-000"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "migration must not mutate the source mode"
+        );
+        assert_eq!(
+            fs::metadata(runtime.join("home/alice/.local/state/item-000"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "private executability must survive without group or world access"
+        );
+        let receipt_before = fs::read(product.migration_receipt()).expect("read receipt");
+        let runtime_before = file_snapshot(&runtime);
+        assert!(!product.migration_receipt().with_extension("tmp").exists());
+        assert!(!product.root().join(".runtime-import").exists());
+        assert_eq!(
+            migrate_runtime(&product, &source).expect("idempotent migration succeeds"),
+            MigrationOutcome::AlreadyMigrated
+        );
+        assert_eq!(file_snapshot(&runtime), runtime_before);
+        assert_eq!(
+            fs::read(product.migration_receipt()).unwrap(),
+            receipt_before
+        );
+        assert_eq!(file_snapshot(&source), source_before);
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn excludes_stale_readiness_and_deferred_coordination_from_a_stopped_runtime() {
+        let root = fixture_root("stale-runtime-coordination");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+        write(&source, "keys/runtime.key", b"runtime-key");
+        write(&source, "run/system.ready", b"stale-ready");
+        write(&source, "run/deferred-requests.json", b"[\"stale\"]");
+        install_product_runtime(&product);
+        let source_before = file_snapshot(&source);
+
+        assert_eq!(
+            migrate_runtime(&product, &source).expect("stale coordination is self-healed"),
+            MigrationOutcome::Migrated
+        );
+        assert_eq!(file_snapshot(&source), source_before);
+        assert!(!product.runtime_home().join("run").exists());
+        assert_eq!(
+            fs::read(product.runtime_home().join("keys/runtime.key")).unwrap(),
+            b"runtime-key"
+        );
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn refuses_import_while_the_standalone_system_socket_is_present() {
+        let root = fixture_root("live-runtime-socket");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+        write(&source, "keys/runtime.key", b"runtime-key");
+        write(&source, "run/system.sock", b"live-socket-placeholder");
+        install_product_runtime(&product);
+        let source_before = file_snapshot(&source);
+
+        let error = migrate_runtime(&product, &source)
+            .expect_err("a present system socket must require an explicit runtime stop");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("stop the standalone runtime"));
+        assert_eq!(file_snapshot(&source), source_before);
+        assert!(!product.migration_receipt().exists());
+        assert!(!product.runtime_home().join("keys/runtime.key").exists());
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
     #[test]
     fn refuses_to_merge_into_existing_runtime_state() {
         let root = fixture_root("runtime-existing-target");
         let source = root.join("legacy");
         let product = AosHome::from_root(root.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
         write(&product.runtime_home(), "var/state.db", b"existing-state");
 
         let error =
@@ -999,7 +1422,7 @@ mod tests {
         let source = root.join("legacy");
         let product = AosHome::from_root(root.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
         let astralis = b"[distro]\nid = \"astralis\"\nversion = \"0.2.2\"\n";
         let aos_ce = b"[distro]\nid = \"aos-ce\"\nversion = \"2026.1.0\"\n";
         write(&source, "home/alice/.config/distro.lock", astralis);
@@ -1120,7 +1543,7 @@ mod tests {
         let product = AosHome::from_root(root.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
         write(&source, "etc/future-policy.toml", b"deny = true\n");
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
 
         let error = migrate_runtime(&product, &source)
             .expect_err("unknown authorization state must stop migration");
@@ -1137,7 +1560,7 @@ mod tests {
         let product = AosHome::from_root(root.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
         write(&source, "future-store/state", b"important");
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
 
         let error = migrate_runtime(&product, &source)
             .expect_err("unknown persistent state must stop migration");
@@ -1147,12 +1570,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_bin_state_instead_of_silently_dropping_it() {
+        let root = fixture_root("unknown-runtime-bin-state");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+        write(&source, "keys/runtime.key", b"runtime-key");
+        write(&source, "bin/future-index", b"durable-index");
+        install_product_runtime(&product);
+
+        let error = migrate_runtime(&product, &source)
+            .expect_err("unknown bin state must stop migration instead of being omitted");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("bin contains unsupported state"));
+        assert_eq!(
+            fs::read(source.join("bin/future-index")).unwrap(),
+            b"durable-index"
+        );
+        assert!(!product.runtime_home().join("keys/runtime.key").exists());
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
     fn detects_same_length_content_tampering() {
         let root = fixture_root("runtime-content-tamper");
         let source = root.join("legacy");
         let product = AosHome::from_root(root.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
         migrate_runtime(&product, &source).expect("migration succeeds");
 
         write(&product.runtime_home(), "keys/runtime.key", b"tampered-ke");
@@ -1168,7 +1612,7 @@ mod tests {
         let source = root.join("legacy");
         let product = AosHome::from_root(root.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
         migrate_runtime(&product, &source).expect("migration succeeds");
 
         write(&product.runtime_home(), "bin/astrid", b"tamperd-binary");
@@ -1183,7 +1627,7 @@ mod tests {
         let root = fixture_root("runtime-source-alias");
         fs::create_dir_all(root.join("alias")).expect("create alias path component");
         let product = AosHome::from_root(root.join("alias/../product"));
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
         let source = root.join("product/runtime");
 
         let error = migrate_runtime(&product, &source)
@@ -1191,7 +1635,7 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(
             fs::read(source.join("bin/astrid")).unwrap(),
-            b"bundled-binary"
+            b"bundled-astrid"
         );
         assert!(!product.migration_receipt().exists());
         fs::remove_dir_all(root).expect("remove fixture root");
@@ -1203,7 +1647,7 @@ mod tests {
         let source = root.join("legacy");
         let product = AosHome::from_root(source.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
 
         let error = migrate_runtime(&product, &source)
             .expect_err("product state must not be created beneath the source");
@@ -1223,7 +1667,7 @@ mod tests {
         let source = root.join("legacy");
         let product = AosHome::from_root(root.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
         create_private_dir(&product.root().join("migrations")).expect("create migrations dir");
         let held = MigrationLock::acquire(&product).expect("hold migration lock");
 
@@ -1234,7 +1678,7 @@ mod tests {
         assert!(!product.migration_receipt().exists());
         assert_eq!(
             fs::read(product.runtime_home().join("bin/astrid")).unwrap(),
-            b"bundled-binary"
+            b"bundled-astrid"
         );
         drop(held);
         fs::remove_dir_all(root).expect("remove fixture root");
@@ -1246,7 +1690,7 @@ mod tests {
         let source = root.join("legacy");
         let product = AosHome::from_root(root.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
         migrate_runtime(&product, &source).expect("migration succeeds");
 
         let receipt = product.migration_receipt();
@@ -1255,7 +1699,7 @@ mod tests {
         write(
             product.root(),
             "runtime.pre-migration/bin/astrid",
-            b"bundled-binary",
+            b"bundled-astrid",
         );
         let canonical_source = source.canonicalize().expect("canonical source");
 
@@ -1279,7 +1723,7 @@ mod tests {
         let source = root.join("legacy");
         let product = AosHome::from_root(root.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
         let target = product.runtime_home();
         let backup = product.root().join("runtime.pre-migration");
         fs::rename(&target, &backup).expect("move original to transaction backup");
@@ -1301,9 +1745,93 @@ mod tests {
 
         assert_eq!(
             fs::read(target.join("bin/astrid")).unwrap(),
-            b"bundled-binary"
+            b"bundled-astrid"
         );
         assert!(!backup.exists());
+        assert!(!product.migration_receipt().with_extension("tmp").exists());
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn migration_retry_recovers_a_partial_target_and_finishes_atomically() {
+        let root = fixture_root("runtime-partial-target-retry");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+        write(&source, "keys/runtime.key", b"runtime-key");
+        write(&source, "secrets/provider", b"provider-secret");
+        install_product_runtime(&product);
+        let source_before = file_snapshot(&source);
+
+        let target = product.runtime_home();
+        let backup = product.root().join("runtime.pre-migration");
+        fs::rename(&target, &backup).expect("move product runtime into transaction backup");
+        write(&target, "bin/astrid", b"partial-cutover");
+        write(
+            product.root(),
+            "migrations/astrid-home-v1.tmp",
+            b"interrupted receipt",
+        );
+
+        assert_eq!(
+            migrate_runtime(&product, &source).expect("retry self-heals and completes"),
+            MigrationOutcome::Migrated
+        );
+        assert_eq!(file_snapshot(&source), source_before);
+        assert_eq!(
+            fs::read(product.runtime_home().join("keys/runtime.key")).unwrap(),
+            b"runtime-key"
+        );
+        assert_eq!(
+            fs::read(product.runtime_home().join("secrets/provider")).unwrap(),
+            b"provider-secret"
+        );
+        for name in crate::RUNTIME_EXECUTABLE_NAMES {
+            assert_eq!(
+                fs::read(product.runtime_home().join("bin").join(name)).unwrap(),
+                format!("bundled-{name}").as_bytes()
+            );
+        }
+        assert!(product.migration_receipt().is_file());
+        assert!(!product.migration_receipt().with_extension("tmp").exists());
+        assert!(!backup.exists());
+        assert!(!product.root().join("runtime.failed-migration").exists());
+        assert_eq!(
+            migrate_runtime(&product, &source).expect("recovered migration is idempotent"),
+            MigrationOutcome::AlreadyMigrated
+        );
+        assert_eq!(file_snapshot(&source), source_before);
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn migration_retry_discards_uncommitted_staging_without_duplication() {
+        let root = fixture_root("runtime-staging-retry");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+        write(&source, "keys/runtime.key", b"runtime-key");
+        install_product_runtime(&product);
+        let source_before = file_snapshot(&source);
+        write(
+            product.root(),
+            ".runtime-import/keys/runtime.key",
+            b"partial-copy",
+        );
+        write(
+            product.root(),
+            "migrations/astrid-home-v1.tmp",
+            b"partial-receipt",
+        );
+
+        assert_eq!(
+            migrate_runtime(&product, &source).expect("retry replaces uncommitted staging"),
+            MigrationOutcome::Migrated
+        );
+        assert_eq!(file_snapshot(&source), source_before);
+        assert_eq!(
+            fs::read(product.runtime_home().join("keys/runtime.key")).unwrap(),
+            b"runtime-key"
+        );
+        assert!(!product.root().join(".runtime-import").exists());
         assert!(!product.migration_receipt().with_extension("tmp").exists());
         fs::remove_dir_all(root).expect("remove fixture root");
     }
@@ -1320,14 +1848,14 @@ mod tests {
         fs::create_dir_all(source.join("keys")).expect("create keys directory");
         symlink(source.join("outside-key"), source.join("keys/runtime.key"))
             .expect("create legacy symlink");
-        write(&product.runtime_home(), "bin/astrid", b"bundled-binary");
+        install_product_runtime(&product);
 
         let error = migrate_runtime(&product, &source).expect_err("symlink must be rejected");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(!product.runtime_home().join("keys/runtime.key").exists());
         assert_eq!(
             fs::read(product.runtime_home().join("bin/astrid")).unwrap(),
-            b"bundled-binary"
+            b"bundled-astrid"
         );
         fs::remove_dir_all(root).expect("remove fixture root");
     }
@@ -1341,13 +1869,12 @@ mod tests {
         let source = root.join("legacy");
         let product = AosHome::from_root(root.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
-        write(
-            &product.runtime_home(),
-            "bin/runtime-target",
-            b"bundled-binary",
-        );
+        install_product_runtime(&product);
+        fs::remove_file(product.runtime_home().join("bin/astrid"))
+            .expect("remove regular executable");
+        write(&root, "runtime-target", b"bundled-astrid");
         symlink(
-            product.runtime_home().join("bin/runtime-target"),
+            root.join("runtime-target"),
             product.runtime_home().join("bin/astrid"),
         )
         .expect("create bundled binary symlink");

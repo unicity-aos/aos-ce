@@ -95,8 +95,8 @@ Unknown live ids not covered by the catalog fall back to conservative defaults (
 
 ## Configuration
 
-These fields are prompted during `aos init` or when the capsule is selected during
-`aos distro apply <source>`. The `model` field is populated live from OpenAI's `/v1/models` once
+These fields are prompted during `aos init`. In a standalone Astrid Runtime installation,
+the equivalent distribution-managed flow is `astrid distro apply <source>`. The `model` field is populated live from OpenAI's `/v1/models` once
 `base_url` and `api_key` are entered.
 
 | Variable | Type | Default | Description |

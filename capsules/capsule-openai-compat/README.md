@@ -62,8 +62,8 @@ preserved in the id and is selectable as-is.
 
 ## Configuration
 
-These fields are prompted during `aos init` or when the capsule is selected during
-`aos distro apply <source>`. Every field except `api_key` has a default or can be left blank.
+These fields are prompted during `aos init`. In a standalone Astrid Runtime installation,
+the equivalent distribution-managed flow is `astrid distro apply <source>`. Every field except `api_key` has a default or can be left blank.
 
 | Variable | Type | Default | Description |
 |---|---|---|---|

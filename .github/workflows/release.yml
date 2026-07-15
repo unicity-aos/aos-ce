@@ -40,7 +40,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
-    needs: validate-release
+    needs: [validate-release, capsules]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -111,13 +111,19 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "$RUNTIME_IDENTITY" \
             "$RUNTIME_ASSET"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: capsule-artifacts
+          name: aos-community-capsules
       - name: Compose product bundle
         run: |
+          python3 scripts/capsule_release.py --artifacts capsule-artifacts
           scripts/package-release.sh \
             "${{ matrix.target }}" \
             "target/${{ matrix.target }}/release/aos" \
             "$RUNTIME_ASSET" \
             "$RUNTIME_BLAKE3" \
+            capsule-artifacts \
             artifacts
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

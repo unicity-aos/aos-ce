@@ -15,8 +15,10 @@ product metadata that `aos init` reads to set up a working environment.
 aos init
 ```
 
-`aos init` fetches this manifest, prompts you to select providers (for example,
-which LLM backend), and installs everything.
+`aos init` uses the manifest and capsule assets embedded in the installed AOS
+release, prompts you to select providers (for example, which LLM backend), and
+installs everything without following a mutable repository source. The same
+local bundle supports `aos init --offline`.
 
 ## What's included
 
@@ -24,15 +26,16 @@ which LLM backend), and installs everything.
 |----------|----------|
 | **Uplinks** | cli, registry |
 | **LLM providers** | openai-compat (select during init) |
-| **Core** | react, session, identity, router, prompt-builder, context-engine, hook-bridge |
-| **Tools** | shell, http, fs |
-| **Extensions** | skills, memory |
+| **Core** | react, session, identity, users, router, prompt-builder, context-engine, hook-bridge |
+| **Tools** | shell, http, fs, system |
+| **Extensions** | skills, agents, memory |
 
 ## Customising
 
-Edit `Distro.toml` to add or remove capsules, change versions, or add new LLM
-providers. The format follows semver constraints; the product release documents the
-supported runtime compatibility range.
+Changes to `Distro.toml` define the next source-built Community Edition bundle.
+The release contract requires a one-to-one mapping between every selected
+capsule and the installable `.capsule` artifact included in each product
+archive. A live AOS installation does not accept distribution replacement.
 
 ## License
 

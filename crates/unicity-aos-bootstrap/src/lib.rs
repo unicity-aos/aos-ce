@@ -17,6 +17,19 @@ pub mod status;
 pub use migration::{LegacyDistro, MigrationOutcome};
 
 const UNICITY_CE_MANIFEST: &str = include_str!("../../../distros/community/unicity-ce/Distro.toml");
+const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(windows)]
+pub(crate) const RUNTIME_EXECUTABLE_NAMES: &[&str] = &[
+    "astrid.exe",
+    "astrid-daemon.exe",
+    "astrid-build.exe",
+    "astrid-emit.exe",
+];
+
+#[cfg(not(windows))]
+pub(crate) const RUNTIME_EXECUTABLE_NAMES: &[&str] =
+    &["astrid", "astrid-daemon", "astrid-build", "astrid-emit"];
 
 /// Product-owned per-project state directory selected for all AOS runtime access.
 pub const AOS_WORKSPACE_STATE_DIR: &str = ".unicity-os";
@@ -110,6 +123,32 @@ impl AosHome {
             .join("Distro.toml")
     }
 
+    /// Product-versioned capsule assets installed alongside this AOS binary.
+    ///
+    /// `UNICITY_AOS_CAPSULE_DIR` is reserved for package managers which keep
+    /// immutable product assets outside the mutable AOS home. The override must
+    /// identify an absolute, real directory containing exactly the capsule set
+    /// selected by the embedded Community Edition manifest.
+    pub fn capsule_dir(&self) -> io::Result<PathBuf> {
+        self.capsule_dir_with(|name| std::env::var_os(name))
+    }
+
+    fn capsule_dir_with<F>(&self, get: F) -> io::Result<PathBuf>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        let configured = get("UNICITY_AOS_CAPSULE_DIR");
+        let path = match configured {
+            Some(path) => Self::validated_environment_root(path, "UNICITY_AOS_CAPSULE_DIR")?,
+            None => self
+                .root
+                .join("releases")
+                .join(PRODUCT_VERSION)
+                .join("capsules"),
+        };
+        validate_capsule_dir(&path, &capsule_assets_from_manifest()?)
+    }
+
     /// Materialize the Unicity CE manifest embedded in this product binary.
     ///
     /// The product CLI hands this local path to the neutral runtime, so first-run
@@ -120,15 +159,35 @@ impl AosHome {
     /// Returns an error when the product manifest cannot be written atomically.
     pub fn ensure_unicity_ce_manifest(&self) -> io::Result<PathBuf> {
         let path = self.unicity_ce_manifest_path();
-        if fs::read(&path).ok().as_deref() == Some(UNICITY_CE_MANIFEST.as_bytes()) {
-            return Ok(path);
+        let capsule_dir = self.capsule_dir()?;
+        let manifest = materialize_manifest(&capsule_dir)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "product manifest path must be a regular file",
+                ));
+            }
+            Ok(_) if fs::read(&path)?.as_slice() == manifest.as_bytes() => return Ok(path),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         self.ensure_layout()?;
         create_private_dir(&self.root.join("distributions"))?;
         let parent = path.parent().expect("manifest path has a parent");
         create_private_dir(parent)?;
         let temporary = path.with_extension("toml.tmp");
-        fs::write(&temporary, UNICITY_CE_MANIFEST)?;
+        if let Ok(metadata) = fs::symlink_metadata(&temporary) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "temporary product manifest path must be a regular file",
+                ));
+            }
+            fs::remove_file(&temporary)?;
+        }
+        fs::write(&temporary, manifest)?;
         set_private_file_permissions(&temporary)?;
         fs::rename(&temporary, &path)?;
         Ok(path)
@@ -300,6 +359,16 @@ impl AosHome {
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "AOS managed path must be a real directory: {}",
+                path.display()
+            ),
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -360,19 +429,182 @@ const fn default_home_name() -> &'static str {
     "HOME"
 }
 
-#[cfg(windows)]
 const fn runtime_binary_name() -> &'static str {
-    "astrid.exe"
+    RUNTIME_EXECUTABLE_NAMES[0]
 }
 
-#[cfg(not(windows))]
-const fn runtime_binary_name() -> &'static str {
-    "astrid"
+fn capsule_assets_from_manifest() -> io::Result<Vec<String>> {
+    let manifest = UNICITY_CE_MANIFEST
+        .parse::<toml::Value>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let capsules = manifest
+        .get("capsule")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "embedded distro has no capsules",
+            )
+        })?;
+    let mut assets = Vec::with_capacity(capsules.len());
+    for capsule in capsules {
+        let package = capsule
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "embedded capsule has no name")
+            })?;
+        let source = capsule
+            .get("source")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "embedded capsule has no source")
+            })?;
+        let relative = Path::new(source);
+        let mut components = relative.components();
+        if components.next() != Some(std::path::Component::Normal(OsStr::new("capsules")))
+            || components
+                .next()
+                .and_then(|component| match component {
+                    std::path::Component::Normal(name) => Some(name),
+                    _ => None,
+                })
+                .is_none()
+            || components.next().is_some()
+            || relative.extension() != Some(OsStr::new("capsule"))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("embedded capsule source is not canonical: {source}"),
+            ));
+        }
+        let asset = relative
+            .file_name()
+            .expect("validated capsule source has a filename")
+            .to_str()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "capsule asset is not UTF-8")
+            })?
+            .to_owned();
+        if asset != format!("{package}.capsule") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("embedded capsule source does not match package {package}"),
+            ));
+        }
+        if assets.contains(&asset) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("embedded distro selects duplicate capsule asset {asset}"),
+            ));
+        }
+        assets.push(asset);
+    }
+    Ok(assets)
+}
+
+fn validate_capsule_dir(path: &Path, expected: &[String]) -> io::Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "AOS capsule directory is unavailable at {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "AOS capsule directory must be a real directory: {}",
+                path.display()
+            ),
+        ));
+    }
+    let canonical = path.canonicalize()?;
+    let mut actual = Vec::new();
+    for entry in fs::read_dir(&canonical)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "AOS capsule directory contains a non-regular entry: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+        let name = entry.file_name().into_string().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AOS capsule directory contains a non-UTF-8 entry",
+            )
+        })?;
+        actual.push(name);
+    }
+    actual.sort();
+    let mut expected = expected.to_vec();
+    expected.sort();
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "AOS capsule set differs from Community Edition; expected {}, found {}",
+                expected.len(),
+                actual.len()
+            ),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn materialize_manifest(capsule_dir: &Path) -> io::Result<String> {
+    let mut manifest = UNICITY_CE_MANIFEST
+        .parse::<toml::Value>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let capsules = manifest
+        .get_mut("capsule")
+        .and_then(toml::Value::as_array_mut)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "embedded distro has no capsules",
+            )
+        })?;
+    for capsule in capsules {
+        let source = capsule
+            .get("source")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "embedded capsule has no source")
+            })?;
+        let asset = Path::new(source).file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "embedded capsule source has no asset",
+            )
+        })?;
+        let absolute = capsule_dir.join(asset);
+        let absolute = absolute.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AOS capsule directory must be valid UTF-8 for the TOML manifest",
+            )
+        })?;
+        capsule["source"] = toml::Value::String(absolute.to_owned());
+    }
+    toml::to_string_pretty(&manifest)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AosHome, UNICITY_CE_MANIFEST, runtime_binary_name};
+    use super::{
+        AosHome, UNICITY_CE_MANIFEST, capsule_assets_from_manifest, materialize_manifest,
+        runtime_binary_name,
+    };
     use std::ffi::OsString;
     use std::fs;
     use std::io::ErrorKind;
@@ -388,6 +620,18 @@ mod tests {
                 .expect("clock after epoch")
                 .as_nanos()
         ))
+    }
+
+    fn install_capsule_fixtures(root: &std::path::Path) -> PathBuf {
+        let directory = root
+            .join("releases")
+            .join(env!("CARGO_PKG_VERSION"))
+            .join("capsules");
+        fs::create_dir_all(&directory).expect("create capsule fixture directory");
+        for asset in capsule_assets_from_manifest().expect("read embedded capsule set") {
+            fs::write(directory.join(asset), b"capsule fixture").expect("write capsule fixture");
+        }
+        directory
     }
 
     #[test]
@@ -497,14 +741,19 @@ mod tests {
     fn bundled_unicity_ce_manifest_is_restored_at_its_product_path() {
         let root = temporary_home();
         let home = AosHome::from_root(&root);
+        let capsule_dir = install_capsule_fixtures(&root);
         let path = home
             .ensure_unicity_ce_manifest()
             .expect("write bundled manifest");
         assert_eq!(path, root.join("distributions/unicity-ce/Distro.toml"));
         assert!(
-            fs::read_to_string(&path)
-                .expect("read manifest")
-                .contains("id = \"unicity-ce\"")
+            fs::read_to_string(&path).expect("read manifest").contains(
+                capsule_dir
+                    .canonicalize()
+                    .expect("canonical capsule fixture")
+                    .to_str()
+                    .expect("utf8 fixture path")
+            )
         );
 
         fs::write(&path, "tampered").expect("tamper product manifest");
@@ -525,6 +774,7 @@ mod tests {
 
         let root = temporary_home();
         let home = AosHome::from_root(&root);
+        install_capsule_fixtures(&root);
         let manifest = home
             .ensure_unicity_ce_manifest()
             .expect("write private product manifest");
@@ -556,6 +806,32 @@ mod tests {
         fs::remove_dir_all(root).expect("remove temporary product home");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn product_manifest_refuses_a_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_home();
+        let home = AosHome::from_root(&root);
+        install_capsule_fixtures(&root);
+        let manifest = home.unicity_ce_manifest_path();
+        fs::create_dir_all(manifest.parent().expect("manifest parent"))
+            .expect("create manifest parent");
+        let external = root.join("outside.toml");
+        fs::write(&external, UNICITY_CE_MANIFEST).expect("write external manifest");
+        symlink(&external, &manifest).expect("symlink product manifest");
+
+        assert_eq!(
+            home.ensure_unicity_ce_manifest()
+                .expect_err("manifest symlink must fail closed")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert!(manifest.is_symlink());
+        assert_eq!(fs::read(&external).unwrap(), UNICITY_CE_MANIFEST.as_bytes());
+        fs::remove_dir_all(root).expect("remove temporary product home");
+    }
+
     #[test]
     fn bundled_distro_version_matches_the_product_release() {
         let manifest: toml::Value = UNICITY_CE_MANIFEST.parse().expect("parse bundled manifest");
@@ -583,6 +859,58 @@ mod tests {
             cwd_dirs.iter().all(|path| *path == ".unicity-os"),
             "product capsules must not create Astrid-branded project state"
         );
+    }
+
+    #[test]
+    fn capsule_override_must_be_absolute_real_and_exact() {
+        let root = temporary_home();
+        let home = AosHome::from_root(&root);
+        let valid = install_capsule_fixtures(&root);
+        assert_eq!(
+            home.capsule_dir_with(|name| {
+                (name == "UNICITY_AOS_CAPSULE_DIR").then(|| valid.clone().into_os_string())
+            })
+            .expect("valid package-manager capsule directory"),
+            valid.canonicalize().expect("canonical capsule directory")
+        );
+        for invalid in [OsString::new(), OsString::from("relative/capsules")] {
+            assert_eq!(
+                home.capsule_dir_with(|_| Some(invalid.clone()))
+                    .expect_err("invalid capsule override must fail")
+                    .kind(),
+                ErrorKind::InvalidInput
+            );
+        }
+        fs::write(valid.join("unexpected.capsule"), b"unexpected")
+            .expect("write unexpected capsule");
+        assert_eq!(
+            home.capsule_dir_with(|_| Some(valid.clone().into_os_string()))
+                .expect_err("non-exact capsule set must fail")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        fs::remove_dir_all(root).expect("remove temporary product home");
+    }
+
+    #[test]
+    fn materialized_capsule_paths_are_toml_serialized_without_text_substitution() {
+        let root = temporary_home().join("quoted-\"-capsules");
+        let capsule_dir = install_capsule_fixtures(&root)
+            .canonicalize()
+            .expect("canonical unusual capsule path");
+        let encoded = materialize_manifest(&capsule_dir).expect("materialize manifest");
+        let decoded: toml::Value = encoded.parse().expect("parse materialized TOML");
+        let capsules = decoded["capsule"].as_array().expect("capsule array");
+        assert_eq!(capsules.len(), 18);
+        assert!(capsules.iter().all(|capsule| {
+            PathBuf::from(capsule["source"].as_str().expect("absolute source")).parent()
+                == Some(capsule_dir.as_path())
+        }));
+        fs::remove_dir_all(
+            root.parent()
+                .expect("unusual fixture root has temporary parent"),
+        )
+        .expect("remove temporary product home");
     }
 
     #[test]

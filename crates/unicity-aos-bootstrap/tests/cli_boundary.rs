@@ -28,12 +28,38 @@ impl Fixture {
         let runtime = root.join("fake-runtime");
         let args = root.join("args");
         let home = root.join("runtime-home");
-        Self {
+        let fixture = Self {
             root,
             runtime,
             args,
             home,
+        };
+        fixture.install_capsules();
+        fixture
+    }
+
+    fn install_capsules(&self) {
+        let distro: toml::Value = include_str!("../../../distros/community/unicity-ce/Distro.toml")
+            .parse()
+            .expect("parse embedded distro fixture");
+        let directory = self
+            .home
+            .join("releases")
+            .join(env!("CARGO_PKG_VERSION"))
+            .join("capsules");
+        fs::create_dir_all(&directory).expect("create capsule fixture");
+        for capsule in distro["capsule"].as_array().expect("capsule entries") {
+            let source = capsule["source"].as_str().expect("capsule source");
+            let name = Path::new(source).file_name().expect("capsule filename");
+            fs::write(directory.join(name), b"fixture capsule").expect("write capsule fixture");
         }
+    }
+
+    fn default_capsule_dir(&self) -> PathBuf {
+        self.home
+            .join("releases")
+            .join(env!("CARGO_PKG_VERSION"))
+            .join("capsules")
     }
 
     fn install_runtime(&self, body: &str) {
@@ -187,6 +213,44 @@ fn runtime_is_an_inherited_root_not_a_special_alias() {
 }
 
 #[test]
+fn inherited_help_dispatches_byte_for_byte_while_product_help_stays_owned() {
+    let fixture = Fixture::new("help-inheritance");
+    fixture.install_runtime(RECORDING_RUNTIME);
+
+    for args in [
+        vec!["help", "doctor"],
+        vec!["help", "capsule"],
+        vec!["help", "daemon", "start"],
+    ] {
+        let output = fixture
+            .command()
+            .args(&args)
+            .output()
+            .expect("run inherited help");
+        assert!(output.status.success());
+        let expected = args
+            .iter()
+            .map(|argument| format!("<{argument}>\n"))
+            .collect::<String>();
+        assert_eq!(
+            fs::read_to_string(&fixture.args).expect("read delegated help"),
+            expected
+        );
+        fs::remove_file(&fixture.args).expect("reset delegated args");
+    }
+
+    for args in [vec!["help"], vec!["help", "init"], vec!["help", "status"]] {
+        let output = fixture
+            .command()
+            .args(args)
+            .output()
+            .expect("run product help");
+        assert!(output.status.success());
+        assert!(!fixture.args.exists());
+    }
+}
+
+#[test]
 fn product_default_init_delegates_grants_without_inventing_a_target() {
     let fixture = Fixture::new("init-default");
     fixture.install_runtime(RECORDING_RUNTIME);
@@ -232,6 +296,90 @@ fn product_non_default_init_delegates_principal_and_capsule_grants() {
     assert_eq!(
         fs::read_to_string(&fixture.args).expect("read non-default init args"),
         "<init>\n<--target-principal>\n<alice>\n<--yes>\n<--var>\n<model=gpt-5>\n<--grant-capsules>\n"
+    );
+}
+
+#[test]
+fn offline_init_keeps_the_runtime_offline_flag_and_uses_only_local_capsules() {
+    let fixture = Fixture::new("init-offline");
+    fixture.install_runtime(RECORDING_RUNTIME);
+
+    let status = fixture
+        .command()
+        .args(["init", "--offline"])
+        .status()
+        .expect("run offline product init");
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(&fixture.args).expect("read offline args"),
+        "<init>\n<--offline>\n<--grant-capsules>\n"
+    );
+    let manifest_path = fixture.home.join("distributions/unicity-ce/Distro.toml");
+    let manifest: toml::Value = fs::read_to_string(manifest_path)
+        .expect("read materialized manifest")
+        .parse()
+        .expect("parse materialized manifest");
+    let capsules = manifest["capsule"].as_array().expect("capsule entries");
+    assert_eq!(capsules.len(), 18);
+    let expected_root = fixture
+        .home
+        .join("releases")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("capsules")
+        .canonicalize()
+        .expect("canonical capsule root");
+    assert!(capsules.iter().all(|capsule| {
+        let source = Path::new(capsule["source"].as_str().expect("source"));
+        source.is_absolute() && source.parent() == Some(expected_root.as_path())
+    }));
+}
+
+#[test]
+fn package_manager_capsule_override_is_absolute_exact_and_enforced() {
+    let fixture = Fixture::new("capsule-override");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    let custom = fixture.root.join("homebrew/libexec/capsules");
+    fs::create_dir_all(custom.parent().expect("custom capsule parent"))
+        .expect("create custom capsule parent");
+    fs::rename(fixture.default_capsule_dir(), &custom).expect("move capsules to package prefix");
+
+    let output = fixture
+        .command()
+        .env("UNICITY_AOS_CAPSULE_DIR", &custom)
+        .arg("doctor")
+        .output()
+        .expect("run with package-manager capsule directory");
+    assert!(output.status.success());
+    let manifest: toml::Value =
+        fs::read_to_string(fixture.home.join("distributions/unicity-ce/Distro.toml"))
+            .expect("read materialized override manifest")
+            .parse()
+            .expect("parse materialized override manifest");
+    let canonical = custom.canonicalize().expect("canonical custom capsules");
+    assert!(
+        manifest["capsule"]
+            .as_array()
+            .expect("capsules")
+            .iter()
+            .all(
+                |capsule| Path::new(capsule["source"].as_str().expect("source")).parent()
+                    == Some(canonical.as_path())
+            )
+    );
+
+    fs::remove_file(&fixture.args).expect("reset delegated args");
+    let invalid = fixture
+        .command()
+        .env("UNICITY_AOS_CAPSULE_DIR", "relative/capsules")
+        .arg("doctor")
+        .output()
+        .expect("run invalid override");
+    assert!(!invalid.status.success());
+    assert!(!fixture.args.exists());
+    assert!(
+        String::from_utf8(invalid.stderr)
+            .expect("utf8 stderr")
+            .contains("UNICITY_AOS_CAPSULE_DIR must be an absolute path")
     );
 }
 
@@ -441,7 +589,7 @@ fn unix_passthrough_preserves_signal_termination() {
         .arg("wait")
         .spawn()
         .expect("spawn inherited command");
-    for _ in 0..200 {
+    for _ in 0..1_000 {
         if ready.exists() {
             break;
         }

@@ -18,15 +18,18 @@ docs/         Product and operator documentation
 
 ## Install
 
-The supported installer installs both the `aos` product command and its pinned
-runtime under the product-owned `~/.unicity-os` root:
+The supported installer installs the `aos` product command, its pinned runtime,
+and the exact 18 Community Edition capsules built from this source tree under
+the product-owned `~/.unicity-os` root:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL https://aos.unicity.ai/install.sh | sh
 aos init
 ```
 
-Re-running the installer performs a coordinated product upgrade without
+`aos init`, including `aos init --offline`, provisions from those local,
+product-versioned capsule assets. Re-running the installer performs a
+coordinated product upgrade without
 rewriting a standalone runtime installation. Every release publishes
 checksums, Sigstore bundles, GitHub build-provenance attestations, and
 `runtime-compatibility.toml`, which pins the exact runtime release and WIT commit.

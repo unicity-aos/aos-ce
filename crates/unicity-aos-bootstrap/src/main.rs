@@ -180,7 +180,8 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
     }
 
     let first = args.first()?.to_str()?;
-    let product_invocation = matches!(first, "-h" | "--help" | "-V" | "--version" | "help")
+    let product_invocation = matches!(first, "-h" | "--help" | "-V" | "--version")
+        || (first == "help" && help_targets_product(args))
         || is_owned_root(first)
         || leading_owned_root(args).is_some();
     if !product_invocation {
@@ -227,6 +228,13 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
         Some(ProductCommand::Distro(args)) => Some(refuse_distro_command(&args.arguments)),
         Some(ProductCommand::ServeHealth) => Some(handle_health_service()),
         None => Some(print_product_help()),
+    }
+}
+
+fn help_targets_product(args: &[OsString]) -> bool {
+    match args.get(1).and_then(|argument| argument.to_str()) {
+        None => true,
+        Some(root) => is_owned_root(root),
     }
 }
 
@@ -573,8 +581,8 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        ProductCli, ProductCommand, child_exit_code, handle_product_command, leading_owned_root,
-        runtime_args_for_dispatch,
+        ProductCli, ProductCommand, child_exit_code, handle_product_command, help_targets_product,
+        leading_owned_root, runtime_args_for_dispatch,
     };
 
     #[test]
@@ -696,6 +704,29 @@ mod tests {
     #[test]
     fn unowned_command_is_left_for_runtime_parser() {
         assert!(handle_product_command(&[OsString::from("doctor")]).is_none());
+    }
+
+    #[test]
+    fn help_is_owned_only_for_the_product_root_or_product_commands() {
+        assert!(help_targets_product(&[OsString::from("help")]));
+        for root in [
+            "init",
+            "status",
+            "migrate",
+            "update",
+            "distro",
+            "serve-health",
+        ] {
+            let args = [OsString::from("help"), OsString::from(root)];
+            assert!(help_targets_product(&args));
+            assert!(handle_product_command(&args).is_some());
+        }
+        for root in ["doctor", "capsule", "daemon", "completion"] {
+            let args = [OsString::from("help"), OsString::from(root)];
+            assert!(!help_targets_product(&args));
+            assert!(handle_product_command(&args).is_none());
+            assert_eq!(runtime_args_for_dispatch(args.to_vec()), args);
+        }
     }
 
     #[test]

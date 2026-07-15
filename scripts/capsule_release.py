@@ -138,10 +138,10 @@ def source_contract() -> list[CapsuleSpec]:
                 f"{DISTRO}: {cargo_name} version {distro_entry.get('version')!r} "
                 f"does not match source {cargo_version}"
             )
-        expected_source = f"@unicity-aos/{directory}"
+        expected_source = f"capsules/{cargo_name}.capsule"
         if distro_entry.get("source") != expected_source:
             raise ContractError(
-                f"{DISTRO}: {cargo_name} source must remain {expected_source!r} until source migration"
+                f"{DISTRO}: {cargo_name} source must be the bundled asset {expected_source!r}"
             )
 
         specs.append(
@@ -268,6 +268,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifacts", type=Path, help="validate the exact built .capsule set")
     parser.add_argument("--print-build-plan", action="store_true", help="print directory and package TSV")
+    parser.add_argument("--print-assets", action="store_true", help="print canonical capsule asset names")
     return parser.parse_args(argv)
 
 
@@ -280,6 +281,9 @@ def main(argv: list[str]) -> int:
         if args.print_build_plan:
             for spec in specs:
                 print(f"{spec.directory}\t{spec.package}")
+        if args.print_assets:
+            for spec in specs:
+                print(spec.asset)
     except ContractError as error:
         print(f"capsule release contract error: {error}", file=sys.stderr)
         return 1

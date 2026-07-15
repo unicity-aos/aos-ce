@@ -86,6 +86,12 @@ class CapsuleReleaseTests(unittest.TestCase):
         self.assertEqual(len(self.specs), 18)
         self.assertEqual(len({spec.asset for spec in self.specs}), 18)
         self.assertNotIn("astrid-capsule-telegram.capsule", {spec.asset for spec in self.specs})
+        distro = Path(__file__).resolve().parent.parent / "distros/community/unicity-ce/Distro.toml"
+        text = distro.read_text(encoding="utf-8")
+        self.assertNotIn("@unicity-aos/", text)
+        self.assertEqual(text.count('source = "capsules/'), 18)
+        for spec in self.specs:
+            self.assertIn(f'source = "capsules/{spec.asset}"', text)
 
     def test_accepts_exact_safe_artifact_set(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
