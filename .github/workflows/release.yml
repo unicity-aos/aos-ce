@@ -282,14 +282,3 @@ jobs:
             artifacts/runtime-compatibility.toml
             artifacts/*.sigstore.json
           body_path: release-notes.md
-      - name: Notify Homebrew tap
-        env:
-          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
-        run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "TAP_DISPATCH_TOKEN is not configured; run the tap's Update AOS formula workflow manually."
-            exit 0
-          fi
-          gh api repos/unicity-aos/homebrew-tap/dispatches \
-            -f event_type=aos-release \
-            -f "client_payload[version]=${GITHUB_REF_NAME}"

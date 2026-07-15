@@ -19,3 +19,5 @@
   archive safety validation, BLAKE3 checksums, SHA-256 compatibility checksums,
   Sigstore bundles, and provenance.
 - Host-target unit-test coverage for the capsule workspace.
+- Homebrew formula updates initiated by the tap's authenticated stable-release
+  poll, eliminating the cross-repository dispatch credential.
