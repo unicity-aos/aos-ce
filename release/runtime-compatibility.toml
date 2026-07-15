@@ -11,6 +11,10 @@ repository = "astrid-runtime/astrid"
 # daemon readiness before the grant preflight. Do not package or publish
 # 2026.1.0 until an approved, published runtime provides that neutral contract.
 release-ready = false
+# Release blocker: set true only after the exact candidate bundle passes the
+# sanitized packaged upgrade test, the final-runtime boot hook, and the private
+# frozen-home clone test without changing the preserved source.
+upgrade-self-heal-ready = false
 version = "0.9.4"
 tag = "v0.9.4"
 version-requirement = "=0.9.4"

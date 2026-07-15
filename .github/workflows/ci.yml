@@ -15,6 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  B3SUM_VERSION: 1.8.5
 
 jobs:
   format:
@@ -71,8 +72,10 @@ jobs:
           toolchain: "1.95.0"
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo install b3sum --locked --version "$B3SUM_VERSION"
       - run: cargo test --locked -p unicity-aos-bootstrap
       - run: cargo clippy --locked -p unicity-aos-bootstrap -- -D warnings
+      - run: bash scripts/test-upgrade-self-heal.sh
 
   capsule-tests:
     name: Capsule host tests

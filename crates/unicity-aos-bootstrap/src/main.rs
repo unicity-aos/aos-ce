@@ -372,7 +372,7 @@ fn handle_self_update() -> ExitCode {
     }
 
     eprintln!(
-        "aos: direct updates are not yet available: 2026.1.0 is staged and no signed stable, dev, or nightly AOS update channel has been published"
+        "aos: direct updates are not yet available: no signed stable, dev, or nightly AOS update channel has been published"
     );
     eprintln!("Install an approved signed AOS bundle when a release channel is available.");
     ExitCode::FAILURE

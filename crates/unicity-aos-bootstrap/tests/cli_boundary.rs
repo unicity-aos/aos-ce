@@ -512,7 +512,6 @@ fn direct_update_fails_closed_without_running_an_installer() {
         assert!(!output.status.success());
         assert!(!fixture.args.exists());
         let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
-        assert!(stderr.contains("2026.1.0 is staged"));
         assert!(stderr.contains("no signed stable, dev, or nightly AOS update channel"));
     }
 }

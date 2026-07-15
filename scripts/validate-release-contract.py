@@ -77,14 +77,23 @@ def validate_release_readiness(
     runtime = metadata.get("runtime")
     require(isinstance(runtime, dict), "runtime-compatibility must define [runtime]")
     release_ready = runtime.get("release-ready")
+    upgrade_self_heal_ready = runtime.get("upgrade-self-heal-ready")
     require(
         type(release_ready) is bool,
         "runtime release-ready must be a boolean",
+    )
+    require(
+        type(upgrade_self_heal_ready) is bool,
+        "runtime upgrade-self-heal-ready must be a boolean",
     )
     if require_release_ready:
         require(
             release_ready,
             "runtime release-ready is false; refusing to publish this staged product",
+        )
+        require(
+            upgrade_self_heal_ready,
+            "runtime upgrade-self-heal-ready is false; refusing to publish before the exact candidate passes upgrade, self-heal, and boot validation",
         )
     return release_ready
 

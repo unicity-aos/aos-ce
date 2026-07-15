@@ -33,7 +33,10 @@ coordinated product upgrade without
 rewriting a standalone runtime installation. Every release publishes
 checksums, Sigstore bundles, GitHub build-provenance attestations, and
 `runtime-compatibility.toml`, which pins the exact runtime release and WIT commit.
-Its machine-readable `release-ready` gate must be true before a tag can publish.
+Its machine-readable runtime-compatibility and upgrade/self-heal gates must both
+be true before a tag can publish. The latter is approved only after the exact
+candidate preserves a frozen standalone-home clone and boots with freshly
+generated runtime coordination state.
 
 ## Command boundary
 

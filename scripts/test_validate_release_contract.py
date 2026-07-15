@@ -35,7 +35,8 @@ class ReleaseReadinessTests(unittest.TestCase):
 
     def test_false_passes_staged_validation(self) -> None:
         metadata = self.parse(
-            "schema-version = 1\n[runtime]\nrelease-ready = false\n"
+            "schema-version = 1\n[runtime]\n"
+            "release-ready = false\nupgrade-self-heal-ready = false\n"
         )
         self.assertFalse(
             VALIDATOR.validate_release_readiness(
@@ -45,7 +46,8 @@ class ReleaseReadinessTests(unittest.TestCase):
 
     def test_false_fails_publication_validation(self) -> None:
         metadata = self.parse(
-            "schema-version = 1\n[runtime]\nrelease-ready = false\n"
+            "schema-version = 1\n[runtime]\n"
+            "release-ready = false\nupgrade-self-heal-ready = false\n"
         )
         with self.assertRaisesRegex(ValueError, "refusing to publish"):
             VALIDATOR.validate_release_readiness(
@@ -54,7 +56,8 @@ class ReleaseReadinessTests(unittest.TestCase):
 
     def test_true_passes_publication_validation(self) -> None:
         metadata = self.parse(
-            "schema-version = 1\n[runtime]\nrelease-ready = true\n"
+            "schema-version = 1\n[runtime]\n"
+            "release-ready = true\nupgrade-self-heal-ready = true\n"
         )
         self.assertTrue(
             VALIDATOR.validate_release_readiness(
@@ -68,6 +71,7 @@ class ReleaseReadinessTests(unittest.TestCase):
                 "schema-version = 1\n"
                 "[runtime]\n"
                 "release-ready = false\n"
+                "upgrade-self-heal-ready = false\n"
                 "release-ready = true\n"
             )
 
@@ -77,13 +81,16 @@ class ReleaseReadinessTests(unittest.TestCase):
                 "schema-version = 1\n"
                 "[runtime]\n"
                 "release-ready = false\n"
+                "upgrade-self-heal-ready = false\n"
                 "[runtime]\n"
                 "release-ready = true\n"
+                "upgrade-self-heal-ready = true\n"
             )
 
     def test_readiness_must_be_a_boolean(self) -> None:
         metadata = self.parse(
             'schema-version = 1\n[runtime]\nrelease-ready = "false"\n'
+            "upgrade-self-heal-ready = false\n"
         )
         with self.assertRaisesRegex(ValueError, "must be a boolean"):
             VALIDATOR.validate_release_readiness(
@@ -92,7 +99,8 @@ class ReleaseReadinessTests(unittest.TestCase):
 
     def test_schema_version_is_required(self) -> None:
         metadata = self.parse(
-            "schema-version = 2\n[runtime]\nrelease-ready = false\n"
+            "schema-version = 2\n[runtime]\n"
+            "release-ready = false\nupgrade-self-heal-ready = false\n"
         )
         with self.assertRaisesRegex(ValueError, "schema-version must be 1"):
             VALIDATOR.validate_release_readiness(
@@ -102,6 +110,23 @@ class ReleaseReadinessTests(unittest.TestCase):
     def test_malformed_toml_is_rejected(self) -> None:
         with self.assertRaises(VALIDATOR.tomllib.TOMLDecodeError):
             self.parse("schema-version = 1\n[runtime\nrelease-ready = false\n")
+
+    def test_upgrade_self_heal_gate_is_required(self) -> None:
+        metadata = self.parse("schema-version = 1\n[runtime]\nrelease-ready = false\n")
+        with self.assertRaisesRegex(ValueError, "upgrade-self-heal-ready"):
+            VALIDATOR.validate_release_readiness(
+                metadata, require_release_ready=False
+            )
+
+    def test_upgrade_self_heal_gate_blocks_publication(self) -> None:
+        metadata = self.parse(
+            "schema-version = 1\n[runtime]\n"
+            "release-ready = true\nupgrade-self-heal-ready = false\n"
+        )
+        with self.assertRaisesRegex(ValueError, "exact candidate"):
+            VALIDATOR.validate_release_readiness(
+                metadata, require_release_ready=True
+            )
 
     def test_main_passes_staged_and_refuses_strict_validation(self) -> None:
         self.assertEqual(VALIDATOR.main([]), 0)

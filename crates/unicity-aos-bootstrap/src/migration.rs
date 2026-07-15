@@ -1087,40 +1087,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn imports_a_production_shaped_094_home_without_loss_and_self_heals_modes() {
+    fn imports_the_frozen_2026_07_15_094_home_shape_without_loss_and_self_heals_modes() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = fixture_root("runtime-production-shape");
         let source = root.join("legacy");
         let product = AosHome::from_root(root.join("product"));
 
-        for name in crate::RUNTIME_EXECUTABLE_NAMES {
-            write(
-                &source,
-                &format!("bin/{name}"),
-                format!("legacy-{name}").as_bytes(),
-            );
-        }
-        for index in 0..59 {
+        for index in 0..63 {
             write(
                 &source,
                 &format!("bin/component-{index:02}.wasm"),
                 format!("wasm-{index:02}").as_bytes(),
             );
         }
-        for (path, bytes) in [
-            ("etc/config.toml", b"[runtime]\n".as_slice()),
-            ("etc/servers.toml", b"[servers]\n".as_slice()),
-            ("etc/gateway.toml", b"[gateway]\n".as_slice()),
-            ("etc/gateway-http.toml", b"enabled = false\n".as_slice()),
-            ("etc/layout-version", b"1".as_slice()),
-            ("etc/groups.toml", b"[groups]\n".as_slice()),
-            ("etc/invites.toml", b"[invites]\n".as_slice()),
-            ("etc/profiles/alice.toml", b"enabled = true\n".as_slice()),
-            ("etc/hooks/audit.toml", b"enabled = true\n".as_slice()),
-        ] {
-            write(&source, path, bytes);
+        write(&source, "etc/layout-version", b"1");
+        write(&source, "etc/groups.toml", b"[groups]\n");
+        for index in 0..7 {
+            write(
+                &source,
+                &format!("etc/profiles/principal-{index}.toml"),
+                format!("enabled = true\nindex = {index}\n").as_bytes(),
+            );
         }
+        fs::create_dir_all(source.join("etc/hooks")).expect("create empty hooks directory");
         write(
             &source,
             "home/alice/.config/distro.lock",
@@ -1162,7 +1152,7 @@ mod tests {
                 format!("ENV_{index:03}=preserved").as_bytes(),
             );
         }
-        for index in 0..194 {
+        for index in 0..196 {
             write(
                 &source,
                 &format!("home/alice/.local/state/item-{index:03}"),
@@ -1212,6 +1202,8 @@ mod tests {
             fs::set_permissions(source.join(directory), fs::Permissions::from_mode(0o700))
                 .expect("set private source directory mode");
         }
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700))
+            .expect("set private source root mode");
         fs::set_permissions(source.join("secrets"), fs::Permissions::from_mode(0o755))
             .expect("model the legacy permissive secrets mode");
         fs::set_permissions(
@@ -1224,15 +1216,65 @@ mod tests {
         let source_before = file_snapshot(&source);
         assert_eq!(
             source_before.len(),
-            481,
-            "fixture tracks the installed 0.9.4 shape"
+            483,
+            "fixture tracks the frozen 2026-07-15 Astrid 0.9.4 home shape"
         );
+        let expected_counts = [
+            ("bin", 63),
+            ("etc", 9),
+            ("home", 370),
+            ("keys", 8),
+            ("log", 7),
+            ("run", 5),
+            ("secrets", 1),
+            ("var", 9),
+            ("wit", 11),
+        ];
+        for (top_level, expected) in expected_counts {
+            assert_eq!(
+                source_before
+                    .keys()
+                    .filter(|path| path.starts_with(top_level))
+                    .count(),
+                expected,
+                "frozen fixture count changed for {top_level}"
+            );
+        }
         assert_eq!(
             source_before
                 .keys()
                 .filter(|path| path.starts_with("bin"))
                 .count(),
             63
+        );
+        assert!(
+            source_before
+                .keys()
+                .filter(|path| path.starts_with("bin"))
+                .all(|path| path
+                    .extension()
+                    .is_some_and(|extension| extension == "wasm")),
+            "the installed 0.9.4 bin shape contains WASM components only"
+        );
+        for name in crate::RUNTIME_EXECUTABLE_NAMES {
+            assert!(
+                !source.join("bin").join(name).exists(),
+                "the installed 0.9.4 home has no managed {name} executable"
+            );
+        }
+        assert_eq!(
+            source_before
+                .keys()
+                .filter(|path| path.starts_with("etc"))
+                .count(),
+            9
+        );
+        assert!(source.join("etc/hooks").is_dir());
+        assert!(
+            fs::read_dir(source.join("etc/hooks"))
+                .expect("read empty hooks directory")
+                .next()
+                .is_none()
         );
 
         assert_eq!(
@@ -1287,7 +1329,7 @@ mod tests {
             "home/alice/.config/env/override-025",
             "var/state-8",
             "wit/contract-10.wit",
-            "etc/profiles/alice.toml",
+            "etc/profiles/principal-6.toml",
             "log/runtime-6.log",
         ] {
             assert_eq!(
@@ -1326,6 +1368,11 @@ mod tests {
                 & 0o777,
             0o755,
             "migration must not mutate the source mode"
+        );
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the frozen standalone home root remains private"
         );
         assert_eq!(
             fs::metadata(runtime.join("home/alice/.local/state/item-000"))
