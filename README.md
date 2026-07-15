@@ -20,7 +20,7 @@ docs/         Product and operator documentation
 
 The supported installer installs the `aos` product command, its pinned runtime,
 and the exact 18 Community Edition capsules built from this source tree under
-the product-owned `~/.unicity-os` root:
+the product-owned `~/.aos` root:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL https://aos.unicity.ai/install.sh | sh

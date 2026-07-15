@@ -568,7 +568,7 @@ NAME    = { type = "text",   request = "Your name", default = "Agent" }
 
 `type` is `secret` | `text` | `select` | `array`. **`secret`** is masked at the
 install prompt and stored 0600 under
-`~/.unicity-os/runtime/secrets/<scope>/<capsule>/<key>`. The owning capsule
+`~/.aos/runtime/secrets/<scope>/<capsule>/<key>`. The owning capsule
 receives the plaintext only when it calls `env::var("API_KEY")`; it is not
 stored in ordinary env JSON. Other values land in per-principal env JSON.
 **`scope` is operator-only**
@@ -748,12 +748,12 @@ ask the LLM to call the tool    # verify behaviour
 - **There is NO hot-reload** — the watcher is dead code (issue #296). To iterate,
   rebuild and **reinstall**; each install replaces the prior version.
 - **Capsule logs** live under
-  `~/.unicity-os/runtime/home/<principal>/.local/log/<capsule>/`. System logs
-  live separately under `~/.unicity-os/runtime/log/`. A guest panic shows as
+  `~/.aos/runtime/home/<principal>/.local/log/<capsule>/`. System logs
+  live separately under `~/.aos/runtime/log/`. A guest panic shows as
   `capsule panic at src/lib.rs:NN` (the SDK installs a panic hook). ERROR-level
   guest logs also surface in the daemon log. Grep the per-capsule log when a tool
   traps or a run loop exits.
-- If `aos` isn't on PATH, it's at `~/.unicity-os/bin/aos`.
+- If `aos` isn't on PATH, it's at `~/.aos/bin/aos`.
 - Plain `cargo build --release` is useful as a compile check because
   `.cargo/config.toml` selects the target, but its raw `.wasm` is not
   installable. Use `aos capsule build` to produce `dist/*.capsule`.

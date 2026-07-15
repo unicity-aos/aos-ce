@@ -132,9 +132,9 @@ AOS_TEST_FIXTURE="$fixture" \
 AOS_VERSION=2026.1.0 \
 sh "$repo_root/install.sh" --yes --no-migrate-prompt
 
-test -x "$work/home/.unicity-os/bin/aos"
-test -x "$work/home/.unicity-os/runtime/bin/astrid-daemon"
-release_dir="$work/home/.unicity-os/releases/2026.1.0"
+test -x "$work/home/.aos/bin/aos"
+test -x "$work/home/.aos/runtime/bin/astrid-daemon"
+release_dir="$work/home/.aos/releases/2026.1.0"
 test -f "$release_dir/release-manifest.json"
 test -f "$release_dir/Distro.toml"
 test -f "$release_dir/capsule-assets.txt"
@@ -142,11 +142,11 @@ test "$(find "$release_dir/capsules" -mindepth 1 -maxdepth 1 -type f | wc -l | t
 while IFS= read -r capsule; do
   cmp "$work/capsules/$capsule" "$release_dir/capsules/$capsule"
 done < "$release_dir/capsule-assets.txt"
-test "$("$work/home/.unicity-os/bin/aos" --version)" = 'Unicity AOS 2026.1.0'
+test "$("$work/home/.aos/bin/aos" --version)" = 'Unicity AOS 2026.1.0'
 test "$(cat "$work/home/.astrid/sentinel")" = 'standalone-runtime-state'
 test -f "$fixture/cosign-called"
 test ! -e "$fixture/path-cosign-called"
-test "$(stat -c '%a' "$work/home/.unicity-os" 2>/dev/null || stat -f '%Lp' "$work/home/.unicity-os")" = 700
+test "$(stat -c '%a' "$work/home/.aos" 2>/dev/null || stat -f '%Lp' "$work/home/.aos")" = 700
 test "$(stat -c '%a' "$release_dir/release-manifest.json" 2>/dev/null || stat -f '%Lp' "$release_dir/release-manifest.json")" = 600
 test "$(stat -c '%a' "$release_dir/capsules" 2>/dev/null || stat -f '%Lp' "$release_dir/capsules")" = 700
 
@@ -155,7 +155,7 @@ PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
 cmp "$work/capsules/astrid-capsule-cli.capsule" "$release_dir/capsules/astrid-capsule-cli.capsule"
 
-cat > "$work/home/.unicity-os/bin/aos" <<'EOF'
+cat > "$work/home/.aos/bin/aos" <<'EOF'
 #!/bin/sh
 set -eu
 if [ "${1:-}" = stop ]; then
@@ -163,15 +163,15 @@ if [ "${1:-}" = stop ]; then
 fi
 echo existing-unicity-aos
 EOF
-chmod 755 "$work/home/.unicity-os/bin/aos"
-cp "$work/home/.unicity-os/bin/aos" "$work/aos-before-unattended-upgrade"
+chmod 755 "$work/home/.aos/bin/aos"
+cp "$work/home/.aos/bin/aos" "$work/aos-before-unattended-upgrade"
 if PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   AOS_STOP_MARKER="$work/unattended-stop-called" \
   sh "$repo_root/install.sh" --no-migrate-prompt </dev/null >"$work/unattended-upgrade.log" 2>&1; then
   echo "installer replaced an existing installation without confirmation" >&2
   exit 1
 fi
-cmp "$work/aos-before-unattended-upgrade" "$work/home/.unicity-os/bin/aos"
+cmp "$work/aos-before-unattended-upgrade" "$work/home/.aos/bin/aos"
 test ! -e "$work/unattended-stop-called"
 grep -F 'rerun with --yes to replace it without a prompt' "$work/unattended-upgrade.log" >/dev/null
 
@@ -183,7 +183,7 @@ if PATH="$fake_bin:$PATH" HOME="$work/bad-verifier-home" AOS_TEST_FIXTURE="$fixt
   exit 1
 fi
 test ! -e "$fixture/cosign-called"
-test ! -e "$work/bad-verifier-home/.unicity-os"
+test ! -e "$work/bad-verifier-home/.aos"
 
 printf 'invalid Sigstore fixture\n' > "$bundle"
 if PATH="$fake_bin:$PATH" HOME="$work/bad-bundle-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
@@ -191,7 +191,7 @@ if PATH="$fake_bin:$PATH" HOME="$work/bad-bundle-home" AOS_TEST_FIXTURE="$fixtur
   echo "installer accepted an invalid Sigstore bundle" >&2
   exit 1
 fi
-test ! -e "$work/bad-bundle-home/.unicity-os"
+test ! -e "$work/bad-bundle-home/.aos"
 cp "$good_bundle" "$bundle"
 
 mv "$bundle" "$work/missing-bundle"
@@ -200,7 +200,7 @@ if PATH="$fake_bin:$PATH" HOME="$work/missing-bundle-home" AOS_TEST_FIXTURE="$fi
   echo "installer accepted a release with no Sigstore bundle" >&2
   exit 1
 fi
-test ! -e "$work/missing-bundle-home/.unicity-os"
+test ! -e "$work/missing-bundle-home/.aos"
 mv "$work/missing-bundle" "$bundle"
 
 printf 'modified after signing\n' >> "$asset"
@@ -209,25 +209,25 @@ if PATH="$fake_bin:$PATH" HOME="$work/modified-asset-home" AOS_TEST_FIXTURE="$fi
   echo "installer accepted release bytes that did not match the Sigstore bundle" >&2
   exit 1
 fi
-test ! -e "$work/modified-asset-home/.unicity-os"
+test ! -e "$work/modified-asset-home/.aos"
 cp "$signed_asset" "$asset"
 
 symlink_home="$work/symlink-destination-home"
-mkdir -p "$symlink_home/.unicity-os/bin"
+mkdir -p "$symlink_home/.aos/bin"
 cat > "$work/symlink-target" <<'EOF'
 #!/bin/sh
 set -eu
 : > "$AOS_SYMLINK_MARKER"
 EOF
 chmod 755 "$work/symlink-target"
-ln -s "$work/symlink-target" "$symlink_home/.unicity-os/bin/aos"
+ln -s "$work/symlink-target" "$symlink_home/.aos/bin/aos"
 if PATH="$fake_bin:$PATH" HOME="$symlink_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   AOS_SYMLINK_MARKER="$work/symlink-executed" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer replaced a symlinked destination" >&2
   exit 1
 fi
-test -L "$symlink_home/.unicity-os/bin/aos"
+test -L "$symlink_home/.aos/bin/aos"
 test ! -e "$work/symlink-executed"
 
 custom_bin_home="$work/custom-bin-home"
@@ -248,7 +248,7 @@ grep -F "refusing symlinked binary directory: $custom_bin_link" "$work/custom-bi
 
 managed_symlink_home="$work/managed-symlink-home"
 mkdir -p "$managed_symlink_home" "$work/managed-symlink-target/bin"
-ln -s "$work/managed-symlink-target" "$managed_symlink_home/.unicity-os"
+ln -s "$work/managed-symlink-target" "$managed_symlink_home/.aos"
 ln -s "$work/symlink-target" "$work/managed-symlink-target/bin/aos"
 if PATH="$fake_bin:$PATH" HOME="$managed_symlink_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   AOS_SYMLINK_MARKER="$work/managed-symlink-executed" \
@@ -259,18 +259,18 @@ fi
 test ! -e "$work/managed-symlink-executed"
 
 directory_home="$work/directory-destination-home"
-mkdir -p "$directory_home/.unicity-os/bin/aos"
+mkdir -p "$directory_home/.aos/bin/aos"
 if PATH="$fake_bin:$PATH" HOME="$directory_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer replaced a directory destination" >&2
   exit 1
 fi
-test -d "$directory_home/.unicity-os/bin/aos"
+test -d "$directory_home/.aos/bin/aos"
 
 for binary in aos astrid astrid-daemon astrid-build astrid-emit; do
   case "$binary" in
-    aos) destination="$work/home/.unicity-os/bin/aos" ;;
-    *) destination="$work/home/.unicity-os/runtime/bin/$binary" ;;
+    aos) destination="$work/home/.aos/bin/aos" ;;
+    *) destination="$work/home/.aos/runtime/bin/$binary" ;;
   esac
   printf '#!/bin/sh\necho old-%s\n' "$binary" > "$destination"
   chmod 755 "$destination"
@@ -305,8 +305,8 @@ if PATH="$fail_bin:$fake_bin:$PATH" \
 fi
 for binary in aos astrid astrid-daemon astrid-build astrid-emit; do
   case "$binary" in
-    aos) destination="$work/home/.unicity-os/bin/aos" ;;
-    *) destination="$work/home/.unicity-os/runtime/bin/$binary" ;;
+    aos) destination="$work/home/.aos/bin/aos" ;;
+    *) destination="$work/home/.aos/runtime/bin/$binary" ;;
   esac
   test "$("$destination")" = "old-$binary"
 done
@@ -337,7 +337,7 @@ if PATH="$fake_bin:$PATH" HOME="$work/mismatch-home" AOS_TEST_FIXTURE="$fixture"
   echo "installer accepted a bundle whose binary version did not match the requested release" >&2
   exit 1
 fi
-test ! -e "$work/mismatch-home/.unicity-os"
+test ! -e "$work/mismatch-home/.aos"
 
 unsafe_root="$work/unsafe-bundle/unicity-aos-2026.1.0-x86_64-unknown-linux-gnu"
 mkdir -p "$unsafe_root/bin" "$unsafe_root/runtime/bin"
@@ -354,4 +354,4 @@ if PATH="$fake_bin:$PATH" HOME="$work/unsafe-home" AOS_TEST_FIXTURE="$fixture" A
   echo "installer accepted a symlink in the release archive" >&2
   exit 1
 fi
-test ! -e "$work/unsafe-home/.unicity-os"
+test ! -e "$work/unsafe-home/.aos"

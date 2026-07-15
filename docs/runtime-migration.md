@@ -1,6 +1,6 @@
 # Importing standalone runtime state
 
-Unicity AOS keeps its product state under `~/.unicity-os`. It does not take
+Unicity AOS keeps its product state under `~/.aos`. It does not take
 ownership of `~/.astrid`, and it never changes a standalone Astrid Runtime
 installation in place.
 
@@ -26,6 +26,14 @@ The importer copies persistent runtime state only:
 - the known `etc/` configuration surface: runtime, MCP, gateway and HTTP
   configuration; layout version; group, invite, pairing and gateway revocation
   state; principal profiles; and system hooks.
+
+Imported capsule installations are preserved without silently making an
+arbitrary standalone fleet part of the AOS distribution. For `default`, only
+packages selected by the bundled Community Edition manifest remain active.
+Non-CE capsule trees and non-default profiles are retained byte-for-byte under
+`~/.aos/runtime/imported/astrid-home-v1/` for deliberate later reactivation;
+provider configuration, principal data, runtime keys, audit data, and other
+persistent state remain at their normal runtime paths.
 
 The `etc/` list is deliberately explicit because it contains authorization and
 identity policy. If a newer runtime introduces an unknown configuration or
@@ -66,7 +74,7 @@ rejected.
 The receipt is product state at:
 
 ```text
-~/.unicity-os/migrations/astrid-home-v1.json
+~/.aos/migrations/astrid-home-v1.json
 ```
 
 Keep the standalone runtime stopped throughout the import. The importer refuses

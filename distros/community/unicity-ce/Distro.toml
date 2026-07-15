@@ -138,10 +138,10 @@ version = "0.2.0"
 name = "astrid-capsule-agents"
 source = "capsules/astrid-capsule-agents.capsule"
 version = "0.2.0"
-env = { cwd_dir = ".unicity-os" }
+env = { cwd_dir = ".aos" }
 
 [[capsule]]
 name = "astrid-capsule-memory"
 source = "capsules/astrid-capsule-memory.capsule"
 version = "0.2.0"
-env = { cwd_dir = ".unicity-os" }
+env = { cwd_dir = ".aos" }

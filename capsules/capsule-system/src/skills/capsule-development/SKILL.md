@@ -220,7 +220,7 @@ Host access is denied unless the manifest and runtime grant it.
   call time. Secrets are not ordinary env JSON and must never be cached across
   principals.
 - `log` emits structured capsule logs under
-  `~/.unicity-os/runtime/home/<principal>/.local/log/<capsule>/`.
+  `~/.aos/runtime/home/<principal>/.local/log/<capsule>/`.
 
 Ask only for the narrow paths, hosts, topics, and processes the capsule needs.
 Do not add broad authority merely to make a failing test pass.

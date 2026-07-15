@@ -1,7 +1,7 @@
 //! Product-owned runtime layout and launcher for Unicity AOS.
 //!
 //! Astrid Runtime keeps its standalone `ASTRID_HOME` and `.astrid` compatibility
-//! contract. AOS instead owns `~/.unicity-os` and passes a private runtime home
+//! contract. AOS instead owns `~/.aos` and passes a private runtime home
 //! to the bundled runtime process only; it never changes the caller's process
 //! environment or rewrites a standalone runtime installation.
 
@@ -32,7 +32,7 @@ pub(crate) const RUNTIME_EXECUTABLE_NAMES: &[&str] =
     &["astrid", "astrid-daemon", "astrid-build", "astrid-emit"];
 
 /// Product-owned per-project state directory selected for all AOS runtime access.
-pub const AOS_WORKSPACE_STATE_DIR: &str = ".unicity-os";
+pub const AOS_WORKSPACE_STATE_DIR: &str = ".aos";
 
 /// Product state owned by one Unicity AOS installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,11 +43,11 @@ pub struct AosHome {
 impl AosHome {
     /// Resolve the AOS home directory.
     ///
-    /// `UNICITY_AOS_HOME` is an explicit product override. Otherwise AOS uses
-    /// `~/.unicity-os`, independently of Astrid Runtime's standalone home.
+    /// `AOS_HOME` is an explicit product override. Otherwise AOS uses
+    /// `~/.aos`, independently of Astrid Runtime's standalone home.
     ///
     /// # Errors
-    /// Returns an error when neither `UNICITY_AOS_HOME` nor `HOME` is present.
+    /// Returns an error when neither `AOS_HOME` nor `HOME` is present.
     pub fn resolve() -> io::Result<Self> {
         Self::resolve_with(|name| std::env::var_os(name))
     }
@@ -56,13 +56,13 @@ impl AosHome {
     where
         F: Fn(&str) -> Option<OsString>,
     {
-        if let Some(root) = get("UNICITY_AOS_HOME") {
-            return Self::from_environment_root(root, "UNICITY_AOS_HOME");
+        if let Some(root) = get("AOS_HOME") {
+            return Self::from_environment_root(root, "AOS_HOME");
         }
 
         let home = default_home(&get)?;
         let home = Self::validated_environment_root(home, default_home_name())?;
-        Ok(Self::from_root(home.join(".unicity-os")))
+        Ok(Self::from_root(home.join(".aos")))
     }
 
     fn from_environment_root(root: OsString, variable: &str) -> io::Result<Self> {
@@ -86,6 +86,7 @@ impl AosHome {
                 format!("{variable} must be an absolute path"),
             ));
         }
+        validate_path_entry(&root.join("runtime/bin"), variable)?;
         Ok(root)
     }
 
@@ -258,8 +259,10 @@ impl AosHome {
     /// The `ASTRID_HOME` override is applied only to this child process. AOS
     /// therefore can bundle the neutral runtime without changing the host
     /// shell, another AOS install, or a standalone Astrid Runtime installation.
-    #[must_use]
-    pub fn runtime_command(&self) -> Command {
+    /// # Errors
+    /// Returns an error when the private runtime bin or inherited host PATH
+    /// cannot be represented safely as a child PATH.
+    pub fn runtime_command(&self) -> io::Result<Command> {
         self.runtime_command_with_args(std::iter::empty::<&OsStr>())
     }
 
@@ -268,19 +271,45 @@ impl AosHome {
     /// The command is executed directly, not through a shell. This preserves
     /// argument boundaries and leaves the runtime in charge of its established
     /// local socket, credentials, and operator protocol.
-    #[must_use]
-    pub fn runtime_command_with_args<I, S>(&self, args: I) -> Command
+    /// # Errors
+    /// Returns an error when the private runtime bin or inherited host PATH
+    /// cannot be represented safely as a child PATH.
+    pub fn runtime_command_with_args<I, S>(&self, args: I) -> io::Result<Command>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut command = Command::new(self.runtime_binary());
+        let runtime_binary = self.runtime_binary();
+        let runtime_bin = runtime_binary.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bundled runtime executable must have a parent directory",
+            )
+        })?;
+        let mut command = Command::new(&runtime_binary);
         command
             .env("ASTRID_HOME", self.runtime_home())
             .env("ASTRID_WORKSPACE_STATE_DIR", AOS_WORKSPACE_STATE_DIR)
-            .env("ASTRID_ENFORCED_DISTRO", self.unicity_ce_manifest_path());
+            .env("ASTRID_ENFORCED_DISTRO", self.unicity_ce_manifest_path())
+            .env(
+                "PATH",
+                Self::runtime_child_path(runtime_bin, std::env::var_os("PATH"))?,
+            );
         command.args(args);
-        command
+        Ok(command)
+    }
+
+    fn runtime_child_path(runtime_bin: &Path, host_path: Option<OsString>) -> io::Result<OsString> {
+        let mut child_path = vec![runtime_bin.to_path_buf()];
+        if let Some(host_path) = host_path {
+            child_path.extend(std::env::split_paths(&host_path));
+        }
+        std::env::join_paths(child_path).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot construct the bundled runtime PATH: {error}"),
+            )
+        })
     }
 
     /// Spawn the bundled runtime with its AOS-owned runtime home.
@@ -304,7 +333,7 @@ impl AosHome {
         S: AsRef<OsStr>,
     {
         self.ensure_runtime_available()?;
-        self.runtime_command_with_args(args).spawn()
+        self.runtime_command_with_args(args)?.spawn()
     }
 
     /// Replace the current Unix process with a bundled runtime command.
@@ -323,7 +352,7 @@ impl AosHome {
         use std::os::unix::process::CommandExt;
 
         self.ensure_runtime_available()?;
-        Err(self.runtime_command_with_args(args).exec())
+        Err(self.runtime_command_with_args(args)?.exec())
     }
 
     /// Run a bundled-runtime command.
@@ -377,6 +406,17 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_path_entry(path: &Path, variable: &str) -> io::Result<()> {
+    std::env::join_paths(std::iter::once(path))
+        .map(drop)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{variable} cannot contain a platform PATH separator"),
+            )
+        })
+}
+
 fn set_private_file_permissions(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -401,7 +441,7 @@ where
         (Some(drive), Some(path)) => Ok(PathBuf::from(drive).join(path).into_os_string()),
         _ => Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "UNICITY_AOS_HOME, USERPROFILE, and HOMEDRIVE/HOMEPATH are all unset",
+            "AOS_HOME, USERPROFILE, and HOMEDRIVE/HOMEPATH are all unset",
         )),
     }
 }
@@ -411,12 +451,8 @@ fn default_home<F>(get: &F) -> io::Result<OsString>
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    get("HOME").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "UNICITY_AOS_HOME and HOME are both unset",
-        )
-    })
+    get("HOME")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "AOS_HOME and HOME are both unset"))
 }
 
 #[cfg(windows)]
@@ -664,7 +700,8 @@ mod tests {
     #[test]
     fn runtime_command_scopes_global_and_project_state_to_aos() {
         let home = AosHome::from_root("/tmp/unicity-aos-test");
-        let command = home.runtime_command();
+        let caller_path = std::env::var_os("PATH");
+        let command = home.runtime_command().expect("build runtime command");
         let env_value = |target: &str| {
             command
                 .get_envs()
@@ -674,13 +711,19 @@ mod tests {
         };
 
         assert_eq!(env_value("ASTRID_HOME"), "/tmp/unicity-aos-test/runtime");
-        assert_eq!(env_value("ASTRID_WORKSPACE_STATE_DIR"), ".unicity-os");
+        assert_eq!(env_value("ASTRID_WORKSPACE_STATE_DIR"), ".aos");
+        let path_entries: Vec<_> = std::env::split_paths(env_value("PATH")).collect();
+        assert_eq!(
+            path_entries.first(),
+            Some(&PathBuf::from("/tmp/unicity-aos-test/runtime/bin"))
+        );
+        assert_eq!(std::env::var_os("PATH"), caller_path);
     }
 
     #[test]
     fn runtime_command_emplaces_the_bundled_unicity_ce_distro() {
         let home = AosHome::from_root("/tmp/unicity-aos-test");
-        let command = home.runtime_command();
+        let command = home.runtime_command().expect("build runtime command");
         let distro = command
             .get_envs()
             .find_map(|(name, value)| (name == "ASTRID_ENFORCED_DISTRO").then_some(value))
@@ -696,7 +739,9 @@ mod tests {
     #[test]
     fn runtime_command_forwards_product_cli_arguments_without_a_shell() {
         let home = AosHome::from_root("/tmp/unicity-aos-test");
-        let command = home.runtime_command_with_args(["status", "--json"]);
+        let command = home
+            .runtime_command_with_args(["status", "--json"])
+            .expect("build runtime command");
         let args: Vec<_> = command.get_args().collect();
 
         assert_eq!(args, ["status", "--json"]);
@@ -706,25 +751,67 @@ mod tests {
     #[test]
     fn explicit_home_override_wins_over_the_host_home() {
         let home = AosHome::resolve_with(|name| match name {
-            "UNICITY_AOS_HOME" => Some(OsString::from("/var/lib/unicity-aos")),
+            "AOS_HOME" => Some(OsString::from("/var/lib/aos")),
             "HOME" => Some(OsString::from("/home/operator")),
             _ => None,
         })
         .expect("absolute override resolves");
 
-        assert_eq!(home.root(), PathBuf::from("/var/lib/unicity-aos"));
+        assert_eq!(home.root(), PathBuf::from("/var/lib/aos"));
     }
 
     #[test]
     fn empty_or_relative_override_is_rejected() {
         for root in ["", "runtime"] {
             let error = AosHome::resolve_with(|name| match name {
-                "UNICITY_AOS_HOME" => Some(OsString::from(root)),
+                "AOS_HOME" => Some(OsString::from(root)),
                 _ => None,
             })
             .expect_err("unsafe override must fail");
             assert_eq!(error.kind(), ErrorKind::InvalidInput);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn product_home_with_a_path_separator_is_rejected() {
+        let error = AosHome::resolve_with(|name| match name {
+            "AOS_HOME" => Some(OsString::from("/tmp/aos:test")),
+            _ => None,
+        })
+        .expect_err("an unrepresentable runtime bin must fail closed");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+
+        let home = AosHome::from_root("/tmp/aos:test");
+        let error = home
+            .runtime_command()
+            .expect_err("explicit roots must fail at command construction too");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn child_path_preserves_host_entries_and_handles_an_absent_host_path() {
+        let home = AosHome::from_root("/tmp/unicity-aos-test");
+        let host_entries = [PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")];
+        let host_path = std::env::join_paths(&host_entries).expect("build host PATH");
+        let runtime_bin = home.runtime_home().join("bin");
+        let child_path =
+            AosHome::runtime_child_path(&runtime_bin, Some(host_path)).expect("build child PATH");
+        assert_eq!(
+            std::env::split_paths(&child_path).collect::<Vec<_>>(),
+            [
+                PathBuf::from("/tmp/unicity-aos-test/runtime/bin"),
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/usr/bin"),
+            ]
+        );
+
+        let child_path =
+            AosHome::runtime_child_path(&runtime_bin, None).expect("build private-only child PATH");
+        assert_eq!(
+            std::env::split_paths(&child_path).collect::<Vec<_>>(),
+            [PathBuf::from("/tmp/unicity-aos-test/runtime/bin")]
+        );
     }
 
     #[test]
@@ -856,7 +943,7 @@ mod tests {
             .collect();
         assert!(!cwd_dirs.is_empty(), "fixture must exercise project state");
         assert!(
-            cwd_dirs.iter().all(|path| *path == ".unicity-os"),
+            cwd_dirs.iter().all(|path| *path == ".aos"),
             "product capsules must not create Astrid-branded project state"
         );
     }

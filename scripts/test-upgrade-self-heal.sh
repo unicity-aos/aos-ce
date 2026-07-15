@@ -53,6 +53,78 @@ snapshot_durable_directories() {
   done
 }
 
+expected_imported_path() {
+  local root=$1
+  local relative=$2
+  case "$relative" in
+    etc/profiles/default.toml)
+      printf '%s\n' "$root/$relative"
+      ;;
+    etc/profiles/*)
+      printf '%s\n' "$root/imported/astrid-home-v1/$relative"
+      ;;
+    home/default/.local/capsules | home/default/.local/capsules/*)
+      printf '%s\n' "$root/$relative"
+      ;;
+    home/*/.local/capsules | home/*/.local/capsules/*)
+      printf '%s\n' "$root/imported/astrid-home-v1/$relative"
+      ;;
+    *)
+      printf '%s\n' "$root/$relative"
+      ;;
+  esac
+}
+
+assert_no_alternate_activation_path() {
+  local root=$1
+  local relative=$2
+  local expected=$3
+  local alternate
+  case "$relative" in
+    etc/profiles/*.toml | home/*/.local/capsules | home/*/.local/capsules/*)
+      case "$expected" in
+        "$root/imported/astrid-home-v1/"*) alternate=$root/$relative ;;
+        *) alternate=$root/imported/astrid-home-v1/$relative ;;
+      esac
+      test ! -e "$alternate" || {
+        echo "imported activation path exists in both locations: $relative" >&2
+        exit 1
+      }
+      ;;
+  esac
+}
+
+snapshot_imported_files() {
+  local root=$1
+  local source_snapshot=$2
+  local output=$3
+  : > "$output"
+  while IFS='|' read -r _ _ relative; do
+    local path
+    path=$(expected_imported_path "$root" "$relative")
+    test -f "$path"
+    assert_no_alternate_activation_path "$root" "$relative" "$path"
+    printf '%s|%s|%s\n' \
+      "$(b3sum -- "$path" | awk '{print $1}')" \
+      "$(mode_of "$path")" \
+      "$relative" >> "$output"
+  done < "$source_snapshot"
+}
+
+snapshot_imported_directories() {
+  local root=$1
+  local source_snapshot=$2
+  local output=$3
+  : > "$output"
+  while IFS='|' read -r _ relative; do
+    local path
+    path=$(expected_imported_path "$root" "$relative")
+    test -d "$path"
+    assert_no_alternate_activation_path "$root" "$relative" "$path"
+    printf '%s|%s\n' "$(mode_of "$path")" "$relative" >> "$output"
+  done < "$source_snapshot"
+}
+
 snapshot_shipped_assets() {
   local home=$1
   local output=$2
@@ -71,9 +143,17 @@ snapshot_shipped_assets() {
   done < "$release/capsule-assets.txt"
 }
 
+assert_imported_activation_layout() {
+  local runtime=$1
+  test "$(find "$runtime/etc/profiles" -type f 2>/dev/null | wc -l | tr -d ' ')" -eq 0
+  test "$(find "$runtime/imported/astrid-home-v1/etc/profiles" -type f | wc -l | tr -d ' ')" -eq 7
+  test ! -e "$runtime/home/alice/.local/capsules"
+  test "$(find "$runtime/imported/astrid-home-v1/home/alice/.local/capsules" -type f | wc -l | tr -d ' ')" -eq 140
+}
+
 home=$work/home
 legacy=$home/.astrid
-aos_home=$home/.unicity-os
+aos_home=$home/.aos
 fixture=$work/downloads
 fake_bin=$work/fake-bin
 capsules=$work/capsules
@@ -192,6 +272,7 @@ test -x "$aos_home/bin/aos"
 test -x "$aos_home/runtime/bin/astrid-daemon"
 HOME="$home" "$aos_home/bin/aos" migrate runtime --from "$legacy" > "$work/migrate.log"
 grep -F 'imported the standalone runtime; the source was left unchanged' "$work/migrate.log" >/dev/null
+assert_imported_activation_layout "$aos_home/runtime"
 
 source_files_after=$work/source-files-after
 source_dirs_after=$work/source-dirs-after
@@ -199,8 +280,8 @@ target_files=$work/target-files
 target_dirs=$work/target-dirs
 snapshot_durable_files "$legacy" "$source_files_after"
 snapshot_durable_directories "$legacy" "$source_dirs_after"
-snapshot_durable_files "$aos_home/runtime" "$target_files"
-snapshot_durable_directories "$aos_home/runtime" "$target_dirs"
+snapshot_imported_files "$aos_home/runtime" "$source_files_before" "$target_files"
+snapshot_imported_directories "$aos_home/runtime" "$source_dirs_before" "$target_dirs"
 diff -u "$source_files_before" "$source_files_after"
 diff -u "$source_dirs_before" "$source_dirs_after"
 diff -u \
@@ -211,7 +292,8 @@ diff -u \
   <(cut -d '|' -f 1,3 "$target_files")
 
 while IFS='|' read -r _ source_mode relative; do
-  target_mode=$(mode_of "$aos_home/runtime/$relative")
+  target_path=$(expected_imported_path "$aos_home/runtime" "$relative")
+  target_mode=$(mode_of "$target_path")
   if (( (8#$source_mode & 8#111) != 0 )); then
     expected_mode=700
   else
@@ -263,6 +345,7 @@ chmod 755 \
   "$aos_home/releases/2026.1.0/capsules"
 
 install_candidate
+assert_imported_activation_layout "$aos_home/runtime"
 snapshot_shipped_assets "$aos_home" "$shipped_after"
 diff -u "$shipped_before" "$shipped_after"
 for directory in \
@@ -278,8 +361,8 @@ done
 
 snapshot_durable_files "$legacy" "$source_files_after"
 snapshot_durable_directories "$legacy" "$source_dirs_after"
-snapshot_durable_files "$aos_home/runtime" "$target_files"
-snapshot_durable_directories "$aos_home/runtime" "$target_dirs"
+snapshot_imported_files "$aos_home/runtime" "$source_files_before" "$target_files"
+snapshot_imported_directories "$aos_home/runtime" "$source_dirs_before" "$target_dirs"
 diff -u "$source_files_before" "$source_files_after"
 diff -u "$source_dirs_before" "$source_dirs_after"
 diff -u \
@@ -289,7 +372,8 @@ diff -u \
   <(cut -d '|' -f 2 "$source_dirs_before") \
   <(cut -d '|' -f 2 "$target_dirs")
 while IFS='|' read -r _ source_mode relative; do
-  target_mode=$(mode_of "$aos_home/runtime/$relative")
+  target_path=$(expected_imported_path "$aos_home/runtime" "$relative")
+  target_mode=$(mode_of "$target_path")
   if (( (8#$source_mode & 8#111) != 0 )); then
     expected_mode=700
   else

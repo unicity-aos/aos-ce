@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 state_dir = Path(os.environ["FAKE_STATE_DIR"])
-aos_home = Path(os.environ["UNICITY_AOS_HOME"])
+aos_home = Path(os.environ["AOS_HOME"])
 run_dir = aos_home / "runtime/run"
 state_dir.mkdir(parents=True, exist_ok=True)
 run_dir.mkdir(parents=True, exist_ok=True)
@@ -138,9 +138,9 @@ EOF
 
 new_case() {
   rm -rf "$work/current"
-  mkdir -p "$work/current/home/.unicity-os/runtime/run" "$work/current/state"
-  : > "$work/current/home/.unicity-os/runtime/run/system.lock"
-  chmod 600 "$work/current/home/.unicity-os/runtime/run/system.lock"
+  mkdir -p "$work/current/home/.aos/runtime/run" "$work/current/state"
+  : > "$work/current/home/.aos/runtime/run/system.lock"
+  chmod 600 "$work/current/home/.aos/runtime/run/system.lock"
 }
 
 run_gate() {
@@ -156,7 +156,7 @@ run_gate_env() {
     FAKE_STATE_DIR="$work/current/state" \
     "$repo_root/scripts/test-final-runtime-boot.sh" \
     "$work/fake-aos.py" \
-    "$work/current/home/.unicity-os"
+    "$work/current/home/.aos"
 }
 
 expect_failure() {
@@ -193,15 +193,15 @@ expect_failure 'does not match exact pin' run_gate_env FAKE_VERSION=9.9.8
 for stale in system.sock system.ready system.token deferred.db; do
   new_case
   case "$stale" in
-    deferred.db) mkdir "$work/current/home/.unicity-os/runtime/run/$stale" ;;
-    *) : > "$work/current/home/.unicity-os/runtime/run/$stale" ;;
+    deferred.db) mkdir "$work/current/home/.aos/runtime/run/$stale" ;;
+    *) : > "$work/current/home/.aos/runtime/run/$stale" ;;
   esac
   expect_failure 'requires clean regenerated coordination state' run_gate
 done
 
 for linked in system.sock system.ready system.token; do
   new_case
-  ln -s "$work/current/outside" "$work/current/home/.unicity-os/runtime/run/$linked"
+  ln -s "$work/current/outside" "$work/current/home/.aos/runtime/run/$linked"
   expect_failure 'requires clean regenerated coordination state' run_gate
 done
 
@@ -235,7 +235,7 @@ for signal in HUP INT TERM; do
     "$signal" \
     "$repo_root/scripts/test-final-runtime-boot.sh" \
     "$work/fake-aos.py" \
-    "$work/current/home/.unicity-os" \
+    "$work/current/home/.aos" \
     "$work/current/state" \
     "$work/compatibility.toml" \
     "$work/signal.log" <<'PY'

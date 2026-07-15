@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
@@ -12,6 +13,7 @@ struct Fixture {
     runtime: PathBuf,
     args: PathBuf,
     home: PathBuf,
+    child_path: PathBuf,
 }
 
 impl Fixture {
@@ -28,11 +30,13 @@ impl Fixture {
         let runtime = root.join("fake-runtime");
         let args = root.join("args");
         let home = root.join("runtime-home");
+        let child_path = root.join("child-path");
         let fixture = Self {
             root,
             runtime,
             args,
             home,
+            child_path,
         };
         fixture.install_capsules();
         fixture
@@ -74,12 +78,13 @@ impl Fixture {
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_aos"));
         command
-            .env("UNICITY_AOS_HOME", &self.home)
+            .env("AOS_HOME", &self.home)
             .env("UNICITY_AOS_RUNTIME_BIN", &self.runtime)
             .env("AOS_TEST_ARGS", &self.args)
             .env("AOS_TEST_HOME", self.root.join("child-home"))
             .env("AOS_TEST_WORKSPACE", self.root.join("child-workspace"))
-            .env("AOS_TEST_DISTRO", self.root.join("child-distro"));
+            .env("AOS_TEST_DISTRO", self.root.join("child-distro"))
+            .env("AOS_TEST_PATH", &self.child_path);
         command
     }
 }
@@ -97,6 +102,7 @@ done > "$AOS_TEST_ARGS"
 printf '%s\n' "$ASTRID_HOME" > "$AOS_TEST_HOME"
 printf '%s\n' "$ASTRID_WORKSPACE_STATE_DIR" > "$AOS_TEST_WORKSPACE"
 printf '%s\n' "$ASTRID_ENFORCED_DISTRO" > "$AOS_TEST_DISTRO"
+printf '%s\n' "$PATH" > "$AOS_TEST_PATH"
 exit "${AOS_TEST_EXIT:-0}"
 "#;
 
@@ -123,7 +129,7 @@ fn unowned_root_passes_through_with_argv_home_and_exit_code() {
     );
     assert_eq!(
         fs::read_to_string(fixture.root.join("child-workspace")).expect("read workspace"),
-        ".unicity-os\n"
+        ".aos\n"
     );
     assert_eq!(
         fs::read_to_string(fixture.root.join("child-distro")).expect("read distro"),
@@ -134,6 +140,11 @@ fn unowned_root_passes_through_with_argv_home_and_exit_code() {
                 .join("distributions/unicity-ce/Distro.toml")
                 .display()
         )
+    );
+    let child_path = fs::read_to_string(&fixture.child_path).expect("read child PATH");
+    assert_eq!(
+        std::env::split_paths(OsStr::new(child_path.trim())).next(),
+        fixture.runtime.parent().map(Path::to_path_buf)
     );
 }
 

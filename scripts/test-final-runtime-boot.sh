@@ -63,7 +63,7 @@ done
 
 home=$(dirname "$aos_home")
 run_aos() {
-  HOME="$home" UNICITY_AOS_HOME="$aos_home" "$aos_binary" "$@"
+  HOME="$home" AOS_HOME="$aos_home" "$aos_binary" "$@"
 }
 
 assert_singleton_lock_available() {

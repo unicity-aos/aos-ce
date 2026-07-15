@@ -2,7 +2,7 @@
 set -eu
 
 AOS_RELEASE_REPO="${AOS_RELEASE_REPO:-unicity-aos/aos-ce}"
-AOS_HOME="${UNICITY_AOS_HOME:-$HOME/.unicity-os}"
+AOS_HOME="${AOS_HOME:-$HOME/.aos}"
 AOS_BIN_DIR="${AOS_BIN_DIR:-$AOS_HOME/bin}"
 AOS_VERSION="${AOS_VERSION:-latest}"
 COSIGN_VERSION=v3.1.1
@@ -42,7 +42,7 @@ done
 
 case "$AOS_HOME" in
   /*) ;;
-  *) echo "UNICITY_AOS_HOME must be an absolute path" >&2; exit 1 ;;
+  *) echo "AOS_HOME must be an absolute path" >&2; exit 1 ;;
 esac
 case "$AOS_BIN_DIR" in
   /*) ;;

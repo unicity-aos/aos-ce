@@ -17,6 +17,7 @@ const MIGRATION_VERSION: u32 = 1;
 const RECEIPT_SCHEMA_VERSION: u32 = 3;
 const STAGING_DIR: &str = ".runtime-import";
 const LOCK_FILE: &str = "astrid-home-v1.lock";
+const IMPORT_ARCHIVE_DIR: &str = "imported/astrid-home-v1";
 const PERSISTENT_TOP_LEVEL: &[&str] = &[
     "config.toml",
     "keys",
@@ -236,13 +237,12 @@ pub(crate) fn migrate_runtime(home: &AosHome, source: &Path) -> io::Result<Migra
     recover_interrupted_transaction(home, &target, &receipt_path, &source_lock)?;
     if receipt_path.is_file() {
         let receipt: Receipt = read_receipt(&receipt_path)?;
-        if receipt.source == source && receipt_matches(&target, &receipt)? {
+        if receipt.source == source {
+            validate_completed_target(&target, &receipt)?;
             remove_backup(&target_backup(&target))?;
             return Ok(MigrationOutcome::AlreadyMigrated);
         }
-        return invalid(
-            "an existing migration receipt does not match the requested source or target",
-        );
+        return invalid("an existing migration receipt belongs to a different source");
     }
 
     validate_target(&target)?;
@@ -267,16 +267,38 @@ pub(crate) fn migrate_runtime(home: &AosHome, source: &Path) -> io::Result<Migra
             )?;
         }
         copy_wasm_blobs(&source.join("bin"), &staging.join("bin"), &mut entries)?;
-        ensure_no_ephemeral_data(&staging)?;
+        archive_inactive_activation_state(&staging, &mut entries).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to preserve imported activation state: {error}"),
+            )
+        })?;
+        ensure_no_ephemeral_data(&staging).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to validate ephemeral state exclusion: {error}"),
+            )
+        })?;
         entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let legacy_distros = legacy_distros(&staging).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to inspect imported distro locks: {error}"),
+            )
+        })?;
         let receipt = Receipt {
             migration_version: MIGRATION_VERSION,
             schema_version: RECEIPT_SCHEMA_VERSION,
             source: source.clone(),
             entries,
-            legacy_distros: legacy_distros(&staging)?,
+            legacy_distros,
         };
-        if !receipt_matches(&staging, &receipt)? {
+        if !receipt_matches(&staging, &receipt).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to validate staged import receipt: {error}"),
+            )
+        })? {
             return invalid("staged runtime did not validate against its import manifest");
         }
         let staged_receipt = write_staged_receipt(&receipt_path, &receipt)?;
@@ -294,6 +316,191 @@ pub(crate) fn migrate_runtime(home: &AosHome, source: &Path) -> io::Result<Migra
         let _ = remove_path(&staging);
     }
     result.map(|()| MigrationOutcome::Migrated)
+}
+
+/// Preserve imported capsule installations and non-default profiles without
+/// activating an arbitrary standalone fleet as part of the AOS distribution.
+///
+/// The default principal keeps only capsule packages selected by the embedded
+/// Community Edition manifest. Every other imported profile and capsule tree
+/// remains byte-for-byte available under `imported/astrid-home-v1/` for a
+/// deliberate later reactivation. Runtime keys, provider configuration, audit
+/// data, principal state, and all other persistent state stay at their normal
+/// paths.
+fn archive_inactive_activation_state(staging: &Path, entries: &mut [Entry]) -> io::Result<()> {
+    let ce_capsules = unicity_ce_capsule_names()?;
+    archive_non_default_profiles(staging, entries)?;
+
+    let homes = staging.join("home");
+    let homes_metadata = match fs::symlink_metadata(&homes) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if homes_metadata.file_type().is_symlink() || !homes_metadata.is_dir() {
+        return invalid("imported principal homes must be a real directory");
+    }
+
+    let mut principal_names = Vec::new();
+    for principal in fs::read_dir(&homes)? {
+        let principal = principal?;
+        let principal_name = principal.file_name().into_string().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "imported principal home contains a non-UTF-8 name",
+            )
+        })?;
+        let metadata = fs::symlink_metadata(principal.path())?;
+        if metadata.file_type().is_symlink() {
+            return invalid("imported principal home must be a real directory");
+        }
+        if metadata.is_file() {
+            continue;
+        }
+        if !metadata.is_dir() {
+            return invalid("imported principal home contains a special file");
+        }
+        principal_names.push(principal_name);
+    }
+
+    for principal_name in principal_names {
+        let relative = PathBuf::from("home")
+            .join(&principal_name)
+            .join(".local/capsules");
+        let capsules = staging.join(&relative);
+        let capsules_metadata = match fs::symlink_metadata(&capsules) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if capsules_metadata.file_type().is_symlink() || !capsules_metadata.is_dir() {
+            return invalid("imported capsule installation root must be a real directory");
+        }
+
+        if principal_name != "default" {
+            archive_path(staging, &relative, entries)?;
+            continue;
+        }
+
+        let mut inactive_capsules = Vec::new();
+        for capsule in fs::read_dir(&capsules)? {
+            let capsule = capsule?;
+            let name = capsule.file_name().into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "imported capsule installation contains a non-UTF-8 name",
+                )
+            })?;
+            let metadata = fs::symlink_metadata(capsule.path())?;
+            if metadata.file_type().is_symlink() {
+                return invalid("imported capsule installation must not be a symlink");
+            }
+            if !metadata.is_dir() && !metadata.is_file() {
+                return invalid("imported capsule installation contains a special file");
+            }
+            let active_ce_capsule = metadata.is_dir()
+                && imported_capsule_package_name(&capsule.path()).as_deref() == Some(&name)
+                && ce_capsules.contains(&name);
+            if !active_ce_capsule {
+                inactive_capsules.push(name);
+            }
+        }
+        for name in inactive_capsules {
+            archive_path(staging, &relative.join(name), entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn imported_capsule_package_name(path: &Path) -> Option<String> {
+    let manifest = fs::read_to_string(path.join("Capsule.toml")).ok()?;
+    let value = manifest.parse::<toml::Value>().ok()?;
+    value
+        .get("package")?
+        .get("name")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn archive_non_default_profiles(staging: &Path, entries: &mut [Entry]) -> io::Result<()> {
+    let profiles = staging.join("etc/profiles");
+    let metadata = match fs::symlink_metadata(&profiles) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return invalid("imported profile root must be a real directory");
+    }
+    let mut inactive_profiles = Vec::new();
+    for profile in fs::read_dir(profiles)? {
+        let profile = profile?;
+        let name = profile.file_name();
+        let metadata = fs::symlink_metadata(profile.path())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return invalid("imported profile must be a real regular file");
+        }
+        if name != OsStr::new("default.toml") {
+            inactive_profiles.push(PathBuf::from("etc/profiles").join(name));
+        }
+    }
+    for relative in inactive_profiles {
+        archive_path(staging, &relative, entries)?;
+    }
+    Ok(())
+}
+
+fn unicity_ce_capsule_names() -> io::Result<HashSet<String>> {
+    let manifest = crate::UNICITY_CE_MANIFEST
+        .parse::<toml::Value>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let capsules = manifest
+        .get("capsule")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "embedded distro has no capsules",
+            )
+        })?;
+    capsules
+        .iter()
+        .map(|capsule| {
+            capsule
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "embedded capsule has no name")
+                })
+        })
+        .collect()
+}
+
+fn archive_path(staging: &Path, relative: &Path, entries: &mut [Entry]) -> io::Result<()> {
+    if !is_safe_relative(relative) {
+        return invalid("imported activation path is unsafe");
+    }
+    let archived = Path::new(IMPORT_ARCHIVE_DIR).join(relative);
+    let source = staging.join(relative);
+    let destination = staging.join(&archived);
+    if destination.exists() {
+        return invalid("imported activation archive contains a duplicate path");
+    }
+    create_private_dir(destination.parent().expect("archive path has a parent"))?;
+    fs::rename(&source, &destination)?;
+    sync_parent(&source)?;
+    sync_parent(&destination)?;
+    for entry in entries {
+        if let Ok(suffix) = entry.path.strip_prefix(relative) {
+            entry.path = if suffix.as_os_str().is_empty() {
+                archived.clone()
+            } else {
+                archived.join(suffix)
+            };
+        }
+    }
+    Ok(())
 }
 
 fn validate_stopped_source(source: &Path) -> io::Result<()> {
@@ -451,6 +658,44 @@ fn validate_target(target: &Path) -> io::Result<()> {
         let metadata = fs::symlink_metadata(&path)?;
         if path != bin || metadata.file_type().is_symlink() || !metadata.is_dir() {
             return invalid("product runtime home contains data; migration refuses to merge state");
+        }
+    }
+    Ok(())
+}
+
+fn validate_completed_target(target: &Path, receipt: &Receipt) -> io::Result<()> {
+    let target_metadata = fs::symlink_metadata(target).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "completed product runtime is not installed",
+        )
+    })?;
+    if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
+        return invalid("completed product runtime must be a real directory");
+    }
+    let bin = target.join("bin");
+    let bin_metadata = fs::symlink_metadata(&bin).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "completed product runtime executable set is not installed",
+        )
+    })?;
+    if bin_metadata.file_type().is_symlink() || !bin_metadata.is_dir() {
+        return invalid("completed product runtime bin must be a real directory");
+    }
+    for name in RUNTIME_EXECUTABLE_NAMES {
+        let relative = PathBuf::from("bin").join(name);
+        if !receipt.entries.iter().any(|entry| entry.path == relative) {
+            return invalid("migration receipt omits a bundled runtime executable");
+        }
+        let metadata = fs::symlink_metadata(bin.join(name)).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "completed product runtime executable set is incomplete",
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return invalid("completed product runtime executable must be a regular file");
         }
     }
     Ok(())
@@ -1039,6 +1284,30 @@ mod tests {
         files
     }
 
+    fn imported_target_path(relative: &Path) -> PathBuf {
+        let archived_profile = relative.starts_with("etc/profiles")
+            && relative.file_name() != Some(OsStr::new("default.toml"));
+        let parts: Vec<_> = relative.components().collect();
+        let archived_non_default_capsule = matches!(
+            parts.as_slice(),
+            [
+                Component::Normal(home),
+                Component::Normal(principal),
+                Component::Normal(local),
+                Component::Normal(capsules),
+                ..
+            ] if *home == OsStr::new("home")
+                && *principal != OsStr::new("default")
+                && *local == OsStr::new(".local")
+                && *capsules == OsStr::new("capsules")
+        );
+        if archived_profile || archived_non_default_capsule {
+            Path::new(super::IMPORT_ARCHIVE_DIR).join(relative)
+        } else {
+            relative.to_path_buf()
+        }
+    }
+
     #[test]
     fn blake3_digest_has_one_canonical_wire_format() {
         let digest = Blake3Digest::from_hash(blake3::hash(b"abc"));
@@ -1111,8 +1380,9 @@ mod tests {
             b"provider-secret"
         );
         assert_eq!(fs::read(runtime.join("bin/capsule.wasm")).unwrap(), b"wasm");
+        assert!(!runtime.join("etc/profiles/alice.toml").exists());
         assert_eq!(
-            fs::read(runtime.join("etc/profiles/alice.toml")).unwrap(),
+            fs::read(runtime.join("imported/astrid-home-v1/etc/profiles/alice.toml")).unwrap(),
             b"enabled = true\n"
         );
         assert_eq!(
@@ -1172,6 +1442,118 @@ mod tests {
             migrate_runtime(&product, &source).expect("matching migration is idempotent"),
             MigrationOutcome::AlreadyMigrated
         );
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn preserves_imported_capsules_without_booting_them_as_the_aos_distribution() {
+        let root = fixture_root("runtime-imported-activation");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+        write(&source, "etc/profiles/default.toml", b"enabled = true\n");
+        write(&source, "home/.DS_Store", b"preserved metadata");
+        write(
+            &source,
+            "etc/profiles/legacy-agent.toml",
+            b"enabled = true\n",
+        );
+        for (principal, capsule) in [
+            ("default", "astrid-capsule-cli"),
+            ("default", "mimir-mcp"),
+            ("default", "legacy-helper"),
+            ("legacy-agent", "astrid-capsule-cli"),
+        ] {
+            write(
+                &source,
+                &format!("home/{principal}/.local/capsules/{capsule}/Capsule.toml"),
+                format!("[package]\nname = \"{capsule}\"\nversion = \"0.1.0\"\n").as_bytes(),
+            );
+            write(
+                &source,
+                &format!("home/{principal}/.local/capsules/{capsule}/payload.wasm"),
+                format!("{principal}-{capsule}").as_bytes(),
+            );
+        }
+        install_product_runtime(&product);
+        let source_before = file_snapshot(&source);
+
+        assert_eq!(
+            migrate_runtime(&product, &source).expect("migration succeeds"),
+            MigrationOutcome::Migrated
+        );
+
+        let runtime = product.runtime_home();
+        assert_eq!(
+            fs::read(runtime.join("home/.DS_Store")).unwrap(),
+            b"preserved metadata"
+        );
+        assert!(runtime.join("etc/profiles/default.toml").is_file());
+        assert!(!runtime.join("etc/profiles/legacy-agent.toml").exists());
+        assert!(
+            runtime
+                .join("imported/astrid-home-v1/etc/profiles/legacy-agent.toml")
+                .is_file()
+        );
+        assert!(
+            runtime
+                .join("home/default/.local/capsules/astrid-capsule-cli/Capsule.toml")
+                .is_file(),
+            "a canonical capsule selected by Community Edition remains active for default"
+        );
+        assert!(
+            runtime
+                .join("imported/astrid-home-v1/home/default/.local/capsules/mimir-mcp/Capsule.toml")
+                .is_file(),
+            "a capsule outside Community Edition remains preserved but inactive"
+        );
+        assert!(
+            runtime
+                .join("imported/astrid-home-v1/home/default/.local/capsules/legacy-helper/Capsule.toml")
+                .is_file(),
+            "every inactive default-principal capsule is archived"
+        );
+        assert!(
+            runtime
+                .join(
+                    "imported/astrid-home-v1/home/legacy-agent/.local/capsules/astrid-capsule-cli/Capsule.toml"
+                )
+                .is_file(),
+            "non-default imported fleets require deliberate reactivation"
+        );
+        assert_eq!(file_snapshot(&source), source_before);
+        assert_eq!(
+            migrate_runtime(&product, &source).expect("archived migration stays idempotent"),
+            MigrationOutcome::AlreadyMigrated
+        );
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn rejects_a_non_file_default_profile_before_archiving_activation_state() {
+        let root = fixture_root("runtime-default-profile-shape");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+        write(
+            &source,
+            "etc/profiles/default.toml/nested",
+            b"not a profile file",
+        );
+        write(&source, "keys/runtime.key", b"runtime-key");
+        install_product_runtime(&product);
+
+        let error = migrate_runtime(&product, &source)
+            .expect_err("the retained default profile must be a regular file");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("imported profile must be a real regular file")
+        );
+        assert_eq!(
+            fs::read(source.join("keys/runtime.key")).unwrap(),
+            b"runtime-key"
+        );
+        assert!(!product.runtime_home().join("keys/runtime.key").exists());
         fs::remove_dir_all(root).expect("remove fixture root");
     }
 
@@ -1432,11 +1814,14 @@ mod tests {
                     .extension()
                     .is_some_and(|extension| extension == "wasm");
             if persistent || wasm {
+                let target_relative = imported_target_path(relative);
                 assert_eq!(
-                    fs::read(runtime.join(relative)).expect("read migrated persistent file"),
+                    fs::read(runtime.join(&target_relative))
+                        .expect("read migrated persistent file"),
                     *bytes,
-                    "migrated bytes differ for {}",
-                    relative.display()
+                    "migrated bytes differ for {} at {}",
+                    relative.display(),
+                    target_relative.display()
                 );
             }
         }
@@ -1463,10 +1848,12 @@ mod tests {
             "etc/profiles/principal-6.toml",
             "log/runtime-6.log",
         ] {
+            let target_relative = imported_target_path(Path::new(representative));
             assert_eq!(
-                fs::read(runtime.join(representative)).unwrap(),
+                fs::read(runtime.join(&target_relative)).unwrap(),
                 fs::read(source.join(representative)).unwrap(),
-                "representative live state was not preserved: {representative}"
+                "representative live state was not preserved: {representative} at {}",
+                target_relative.display()
             );
         }
         for name in crate::RUNTIME_EXECUTABLE_NAMES {
@@ -1769,7 +2156,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_same_length_content_tampering() {
+    fn completed_migration_allows_runtime_owned_state_to_change() {
         let root = fixture_root("runtime-content-tamper");
         let source = root.join("legacy");
         let product = AosHome::from_root(root.join("product"));
@@ -1778,14 +2165,20 @@ mod tests {
         migrate_runtime(&product, &source).expect("migration succeeds");
 
         write(&product.runtime_home(), "keys/runtime.key", b"tampered-ke");
-        let error = migrate_runtime(&product, &source)
-            .expect_err("same-length tampering must invalidate the receipt");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            migrate_runtime(&product, &source)
+                .expect("normal runtime state changes do not reopen an import"),
+            MigrationOutcome::AlreadyMigrated
+        );
+        assert_eq!(
+            fs::read(product.runtime_home().join("keys/runtime.key")).unwrap(),
+            b"tampered-ke"
+        );
         fs::remove_dir_all(root).expect("remove fixture root");
     }
 
     #[test]
-    fn detects_bundled_runtime_executable_tampering() {
+    fn completed_migration_does_not_pin_runtime_executable_bytes() {
         let root = fixture_root("runtime-binary-tamper");
         let source = root.join("legacy");
         let product = AosHome::from_root(root.join("product"));
@@ -1794,8 +2187,15 @@ mod tests {
         migrate_runtime(&product, &source).expect("migration succeeds");
 
         write(&product.runtime_home(), "bin/astrid", b"tamperd-binary");
+        assert_eq!(
+            migrate_runtime(&product, &source)
+                .expect("a later product update may replace its runtime executable"),
+            MigrationOutcome::AlreadyMigrated
+        );
+        fs::remove_file(product.runtime_home().join("bin/astrid"))
+            .expect("remove runtime executable");
         let error = migrate_runtime(&product, &source)
-            .expect_err("runtime executable tampering must invalidate the receipt");
+            .expect_err("an incomplete completed runtime must not be accepted");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         fs::remove_dir_all(root).expect("remove fixture root");
     }
