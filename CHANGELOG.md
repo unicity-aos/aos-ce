@@ -33,5 +33,7 @@
 - Keep the authenticated init operator separate from its target principal,
   prevent AOS distribution replacement, and fail closed while signed direct
   update channels remain unpublished.
+- Require an explicit machine-readable runtime-readiness approval before the
+  tag-triggered workflow can package or publish a release.
 - Present product-facing capsule copy consistently as Unicity AOS while
   preserving stable Astrid Runtime crate, WIT, topic, artifact, and ABI names.

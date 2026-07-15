@@ -3,9 +3,16 @@
 
 from __future__ import annotations
 
+import argparse
 import re
 import sys
 from pathlib import Path
+from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 and earlier use the narrow fallback below.
+    tomllib = None
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,16 +48,90 @@ def workspace_dependency(values: dict[tuple[str, str], str], name: str) -> str:
     raise ValueError(f"{name} must have an exact workspace version")
 
 
+def readiness_metadata(path: str) -> dict[str, Any]:
+    """Read the small typed subset used to gate release publication."""
+    if tomllib is not None:
+        with (ROOT / path).open("rb") as file:
+            return tomllib.load(file)
+
+    text = (ROOT / path).read_text(encoding="utf-8")
+    schema_match = re.search(
+        r"^[ \t]*schema-version[ \t]*=[ \t]*([0-9]+)[ \t]*$",
+        text,
+        re.MULTILINE,
+    )
+    runtime_match = re.search(
+        r"^[ \t]*\[runtime][ \t]*$([\s\S]*?)(?=^[ \t]*\[|\Z)",
+        text,
+        re.MULTILINE,
+    )
+    release_ready: Any = None
+    if runtime_match:
+        ready_match = re.search(
+            r"^[ \t]*release-ready[ \t]*=[ \t]*(true|false)[ \t]*$",
+            runtime_match.group(1),
+            re.MULTILINE,
+        )
+        if ready_match:
+            release_ready = ready_match.group(1) == "true"
+    return {
+        "schema-version": int(schema_match.group(1)) if schema_match else None,
+        "runtime": {"release-ready": release_ready}
+        if runtime_match
+        else None,
+    }
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
 
 
-def main() -> int:
+def validate_release_readiness(
+    metadata: dict[str, Any], *, require_release_ready: bool
+) -> bool:
+    """Validate the compatibility schema and optional publication gate."""
+    require(
+        metadata.get("schema-version") == 1,
+        "runtime-compatibility schema-version must be 1",
+    )
+    runtime = metadata.get("runtime")
+    require(isinstance(runtime, dict), "runtime-compatibility must define [runtime]")
+    release_ready = runtime.get("release-ready")
+    require(
+        type(release_ready) is bool,
+        "runtime release-ready must be a boolean",
+    )
+    if require_release_ready:
+        require(
+            release_ready,
+            "runtime release-ready is false; refusing to publish this staged product",
+        )
+    return release_ready
+
+
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Validate the Unicity AOS release compatibility contract."
+    )
+    parser.add_argument(
+        "--require-release-ready",
+        action="store_true",
+        help="fail unless the pinned runtime has been explicitly approved for publication",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     workspace = strings("Cargo.toml")
     product = strings("crates/unicity-aos-bootstrap/Cargo.toml")
     distro = strings("distros/community/unicity-ce/Distro.toml")
     compatibility = strings("release/runtime-compatibility.toml")
+    validate_release_readiness(
+        readiness_metadata("release/runtime-compatibility.toml"),
+        require_release_ready=args.require_release_ready,
+    )
 
     product_version = product[("package", "version")]
     runtime_version = compatibility[("runtime", "version")]

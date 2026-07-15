@@ -30,6 +30,7 @@ Re-running the installer performs a coordinated product upgrade without
 rewriting a standalone runtime installation. Every release publishes
 checksums, Sigstore bundles, GitHub build-provenance attestations, and
 `runtime-compatibility.toml`, which pins the exact runtime release and WIT commit.
+Its machine-readable `release-ready` gate must be true before a tag can publish.
 
 ## Command boundary
 

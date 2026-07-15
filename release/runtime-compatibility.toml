@@ -10,6 +10,7 @@ repository = "astrid-runtime/astrid"
 # and target-principal init contract required by the staged AOS CLI, including
 # daemon readiness before the grant preflight. Do not package or publish
 # 2026.1.0 until an approved, published runtime provides that neutral contract.
+release-ready = false
 version = "0.9.4"
 tag = "v0.9.4"
 version-requirement = "=0.9.4"
