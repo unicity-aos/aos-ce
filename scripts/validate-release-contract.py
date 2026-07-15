@@ -11,7 +11,7 @@ from typing import Any
 
 try:
     import tomllib
-except ModuleNotFoundError:  # Python 3.10 and earlier use the narrow fallback below.
+except ModuleNotFoundError:
     tomllib = None
 
 
@@ -48,38 +48,17 @@ def workspace_dependency(values: dict[tuple[str, str], str], name: str) -> str:
     raise ValueError(f"{name} must have an exact workspace version")
 
 
-def readiness_metadata(path: str) -> dict[str, Any]:
-    """Read the small typed subset used to gate release publication."""
-    if tomllib is not None:
-        with (ROOT / path).open("rb") as file:
-            return tomllib.load(file)
-
-    text = (ROOT / path).read_text(encoding="utf-8")
-    schema_match = re.search(
-        r"^[ \t]*schema-version[ \t]*=[ \t]*([0-9]+)[ \t]*$",
-        text,
-        re.MULTILINE,
-    )
-    runtime_match = re.search(
-        r"^[ \t]*\[runtime][ \t]*$([\s\S]*?)(?=^[ \t]*\[|\Z)",
-        text,
-        re.MULTILINE,
-    )
-    release_ready: Any = None
-    if runtime_match:
-        ready_match = re.search(
-            r"^[ \t]*release-ready[ \t]*=[ \t]*(true|false)[ \t]*$",
-            runtime_match.group(1),
-            re.MULTILINE,
+def readiness_metadata(path: str | Path) -> dict[str, Any]:
+    """Parse release metadata with the standard-library TOML implementation."""
+    if tomllib is None:
+        raise ValueError(
+            "Python 3.11 or newer with standard-library tomllib is required"
         )
-        if ready_match:
-            release_ready = ready_match.group(1) == "true"
-    return {
-        "schema-version": int(schema_match.group(1)) if schema_match else None,
-        "runtime": {"release-ready": release_ready}
-        if runtime_match
-        else None,
-    }
+    metadata_path = Path(path)
+    if not metadata_path.is_absolute():
+        metadata_path = ROOT / metadata_path
+    with metadata_path.open("rb") as file:
+        return tomllib.load(file)
 
 
 def require(condition: bool, message: str) -> None:
