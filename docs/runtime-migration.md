@@ -40,11 +40,11 @@ The source directory remains unchanged, so the standalone installation is the
 rollback path until the operator chooses to remove it.
 
 AOS builds the imported runtime in a private staging directory. Every copied
-file is recorded with its path, byte length, and SHA-256 digest in a versioned
-receipt. AOS validates the staged tree before replacing its empty bundled
-runtime home. File data, directory entries, and the receipt are flushed before
-the transaction is considered complete on platforms that support directory
-synchronization.
+file is recorded with its path, byte length, and canonical `blake3:<hex>`
+digest in a versioned receipt. AOS validates the staged tree before replacing
+its empty bundled runtime home. File data, directory entries, and the receipt
+are flushed before the transaction is considered complete on platforms that
+support directory synchronization.
 
 The product runtime's pre-import directory is retained as a transaction backup
 until the validated receipt is durable. If the process is interrupted, the next

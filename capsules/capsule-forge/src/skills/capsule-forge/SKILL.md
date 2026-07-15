@@ -476,8 +476,11 @@ One per WASM binary (a capsule usually has exactly one).
 id = "http-tools"
 file = "astrid_capsule_http.wasm"  # path relative to Capsule.toml; crate name, hyphens->underscores
 type = "executable"               # "executable" (default) or "library"
-# hash = "sha256:…"               # optional; checked against meta.json at load
 ```
+
+Do not hand-author a component digest here. Installation records the WASM's
+BLAKE3 content address in `meta.json`, and the runtime verifies those installed
+bytes before loading them.
 
 ### `[publish]` and `[subscribe]` — the IPC surface AND the ACL
 

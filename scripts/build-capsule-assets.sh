@@ -31,20 +31,13 @@ if [[ -n "$(find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
   exit 1
 fi
 
-lock_hash() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$repo_root/Cargo.lock" | awk '{print $1}'
-  else
-    shasum -a 256 "$repo_root/Cargo.lock" | awk '{print $1}'
-  fi
-}
-
 python3 "$repo_root/scripts/capsule_release.py"
-before_lock=$(lock_hash)
 before_source=$(git -C "$repo_root" status --porcelain --untracked-files=all -- \
   Cargo.lock Cargo.toml capsules distros release)
 plan=$(mktemp)
-trap 'rm -f "$plan"' EXIT
+lock_snapshot=$(mktemp)
+trap 'rm -f "$plan" "$lock_snapshot"' EXIT
+cp "$repo_root/Cargo.lock" "$lock_snapshot"
 python3 "$repo_root/scripts/capsule_release.py" --print-build-plan > "$plan"
 
 while IFS=$'\t' read -r directory package; do
@@ -55,8 +48,7 @@ while IFS=$'\t' read -r directory package; do
   test -f "$output_dir/$package.capsule"
 done < "$plan"
 
-after_lock=$(lock_hash)
-if [[ "$before_lock" != "$after_lock" ]]; then
+if ! cmp -s "$lock_snapshot" "$repo_root/Cargo.lock"; then
   echo "capsule builds changed Cargo.lock; release builds must use the committed lock" >&2
   exit 1
 fi

@@ -1,18 +1,19 @@
 //! Explicit, staged import of a standalone Astrid Runtime home.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use fs2::FileExt;
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::{AosHome, runtime_binary_name};
 
 const MIGRATION_VERSION: u32 = 1;
-const RECEIPT_SCHEMA_VERSION: u32 = 2;
+const RECEIPT_SCHEMA_VERSION: u32 = 3;
 const STAGING_DIR: &str = ".runtime-import";
 const LOCK_FILE: &str = "astrid-home-v1.lock";
 const PERSISTENT_TOP_LEVEL: &[&str] = &[
@@ -67,12 +68,74 @@ struct Receipt {
     legacy_distros: Vec<LegacyDistro>,
 }
 
+#[derive(Deserialize)]
+struct ReceiptHeader {
+    schema_version: u32,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Entry {
     path: PathBuf,
     bytes: u64,
-    #[serde(default)]
-    sha256: String,
+    digest: Blake3Digest,
+}
+
+/// Canonical BLAKE3 content digest used by the private migration receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Blake3Digest([u8; 32]);
+
+impl Blake3Digest {
+    const PREFIX: &'static str = "blake3:";
+
+    fn from_hash(hash: blake3::Hash) -> Self {
+        Self(*hash.as_bytes())
+    }
+
+    fn parse(value: &str) -> Result<Self, &'static str> {
+        let Some(hex) = value.strip_prefix(Self::PREFIX) else {
+            return Err("migration digest must use blake3:<64 lowercase hex>");
+        };
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("migration digest must use blake3:<64 lowercase hex>");
+        }
+        let hash = blake3::Hash::from_hex(hex)
+            .map_err(|_| "migration digest must use blake3:<64 lowercase hex>")?;
+        Ok(Self::from_hash(hash))
+    }
+}
+
+impl fmt::Display for Blake3Digest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}{}",
+            Self::PREFIX,
+            blake3::Hash::from_bytes(self.0).to_hex()
+        )
+    }
+}
+
+impl Serialize for Blake3Digest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Blake3Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(D::Error::custom)
+    }
 }
 
 struct MigrationLock {
@@ -448,7 +511,7 @@ fn copy_file(source: &Path, destination: &Path, relative: &Path) -> io::Result<E
     }
     let mut input = File::open(source)?;
     let mut output = File::create(destination)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     let mut bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -468,7 +531,7 @@ fn copy_file(source: &Path, destination: &Path, relative: &Path) -> io::Result<E
     Ok(Entry {
         path: relative.to_path_buf(),
         bytes,
-        sha256: format!("{:x}", hasher.finalize()),
+        digest: Blake3Digest::from_hash(hasher.finalize()),
     })
 }
 
@@ -487,7 +550,7 @@ fn copy_executable(source: &Path, destination: &Path, relative: &Path) -> io::Re
     Ok(Entry {
         path: relative.to_path_buf(),
         bytes,
-        sha256: sha256_file(destination)?,
+        digest: blake3_file(destination)?,
     })
 }
 
@@ -617,7 +680,7 @@ fn receipt_matches(root: &Path, receipt: &Receipt) -> io::Result<bool> {
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
             || metadata.len() != entry.bytes
-            || sha256_file(&path)? != entry.sha256
+            || blake3_file(&path)? != entry.digest
         {
             return Ok(false);
         }
@@ -661,7 +724,14 @@ fn read_receipt(path: &Path) -> io::Result<Receipt> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return invalid("migration receipt must be a regular file");
     }
-    let receipt = serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)?;
+    let bytes = fs::read(path)?;
+    let header: ReceiptHeader = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if header.schema_version != RECEIPT_SCHEMA_VERSION {
+        return invalid("unsupported runtime migration receipt schema");
+    }
+    let receipt = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     validate_receipt(&receipt)?;
     Ok(receipt)
 }
@@ -681,9 +751,6 @@ fn validate_receipt(receipt: &Receipt) -> io::Result<()> {
         if !paths.insert(entry.path.clone()) {
             return invalid("migration receipt contains a duplicate path");
         }
-        if entry.sha256.len() != 64 || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return invalid("migration receipt contains an invalid SHA-256 digest");
-        }
     }
     Ok(())
 }
@@ -696,9 +763,9 @@ fn is_safe_relative(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn sha256_file(path: &Path) -> io::Result<String> {
+fn blake3_file(path: &Path) -> io::Result<Blake3Digest> {
     let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
@@ -707,7 +774,7 @@ fn sha256_file(path: &Path) -> io::Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(Blake3Digest::from_hash(hasher.finalize()))
 }
 
 fn sync_parent(path: &Path) -> io::Result<()> {
@@ -755,7 +822,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        MIGRATION_VERSION, MigrationLock, MigrationOutcome, RECEIPT_SCHEMA_VERSION,
+        Blake3Digest, MIGRATION_VERSION, MigrationLock, MigrationOutcome, RECEIPT_SCHEMA_VERSION,
         create_private_dir, migrate_runtime, recover_interrupted_transaction,
     };
     use crate::AosHome;
@@ -776,6 +843,32 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture parent");
         fs::write(path, content).expect("write fixture file");
+    }
+
+    #[test]
+    fn blake3_digest_has_one_canonical_wire_format() {
+        let digest = Blake3Digest::from_hash(blake3::hash(b"abc"));
+        let encoded = serde_json::to_string(&digest).expect("encode digest");
+        assert_eq!(
+            encoded,
+            "\"blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Blake3Digest>(&encoded).expect("decode digest"),
+            digest
+        );
+        assert!(
+            serde_json::from_str::<Blake3Digest>(
+                "\"6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85\""
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Blake3Digest>(
+                "\"blake3:6437B3AC38465133FFB63B75273A8DB548C558465D79DB03FD359C6CD5BD9D85\""
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -865,9 +958,13 @@ mod tests {
         assert_eq!(receipt["schema_version"], RECEIPT_SCHEMA_VERSION);
         assert!(receipt["entries"].as_array().is_some_and(|entries| {
             entries.iter().all(|entry| {
-                entry["sha256"]
-                    .as_str()
-                    .is_some_and(|digest| digest.len() == 64)
+                entry["digest"].as_str().is_some_and(|digest| {
+                    digest.len() == 71
+                        && digest.starts_with("blake3:")
+                        && digest[7..]
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }) && entry.get("sha256").is_none()
             })
         }));
         assert_eq!(
@@ -971,6 +1068,48 @@ mod tests {
         let error = migrate_runtime(&product, &source)
             .expect_err("unversioned receipt must not bypass integrity validation");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn rejects_a_pre_release_sha256_receipt_without_blessing_the_target() {
+        let root = fixture_root("sha256-receipt");
+        let source = root.join("legacy");
+        let product = AosHome::from_root(root.join("product"));
+        write(&source, "keys/runtime.key", b"runtime-key");
+        write(
+            &product.runtime_home(),
+            "keys/runtime.key",
+            b"possibly-tampered",
+        );
+
+        let source = source.canonicalize().expect("canonical source");
+        let receipt = serde_json::json!({
+            "migration_version": MIGRATION_VERSION,
+            "schema_version": 2,
+            "source": source,
+            "entries": [{
+                "path": "keys/runtime.key",
+                "bytes": 17,
+                "sha256": "0".repeat(64),
+            }],
+        });
+        let receipt_path = product.migration_receipt();
+        fs::create_dir_all(receipt_path.parent().expect("receipt parent"))
+            .expect("create receipt parent");
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec(&receipt).expect("serialize SHA-256 receipt"),
+        )
+        .expect("write SHA-256 receipt");
+
+        let error = migrate_runtime(&product, &source)
+            .expect_err("SHA-256 receipt must be rejected before trusting its target");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            fs::read(product.runtime_home().join("keys/runtime.key")).unwrap(),
+            b"possibly-tampered"
+        );
         fs::remove_dir_all(root).expect("remove fixture root");
     }
 

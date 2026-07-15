@@ -17,7 +17,17 @@ COPYFILE_DISABLE=1 tar -czf "$work/runtime.tar.gz" -C "$work" "$(basename "$runt
 printf '#!/bin/sh\nexit 0\n' > "$work/aos"
 chmod 755 "$work/aos"
 
-"$repo_root/scripts/package-release.sh" \
+if bash "$repo_root/scripts/package-release.sh" \
+  "$target" \
+  "$work/aos" \
+  "$work/runtime.tar.gz" \
+  AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
+  "$work/output" >/dev/null 2>&1; then
+  echo "release composer accepted a non-canonical BLAKE3 digest" >&2
+  exit 1
+fi
+
+bash "$repo_root/scripts/package-release.sh" \
   "$target" \
   "$work/aos" \
   "$work/runtime.tar.gz" \
@@ -39,9 +49,11 @@ import pathlib
 import sys
 
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert manifest["schema_version"] == 2
 assert manifest["product"]["version"] == "2026.1.0"
 assert manifest["runtime"]["version"] == "0.9.4"
-assert manifest["runtime"]["sha256"] == "0" * 64
+assert manifest["runtime"]["digest"] == "blake3:" + "0" * 64
+assert "sha256" not in manifest["runtime"]
 assert manifest["runtime"]["release_workflow_identity"] == "https://github.com/unicity-astrid/astrid/.github/workflows/release.yml@refs/tags/v0.9.4"
 assert manifest["contracts"]["repository"] == "astrid-runtime/wit"
 assert manifest["contracts"]["commit"] == "278dbca3e32f327d0f2358644fc86559779ba0fd"
@@ -57,7 +69,7 @@ for binary in astrid-daemon astrid-build astrid-emit; do
   chmod 755 "$unsafe_root/astrid-0.9.4-$target/$binary"
 done
 COPYFILE_DISABLE=1 tar -czf "$work/unsafe-runtime.tar.gz" -C "$unsafe_root" "astrid-0.9.4-$target"
-if "$repo_root/scripts/package-release.sh" \
+if bash "$repo_root/scripts/package-release.sh" \
   "$target" \
   "$work/aos" \
   "$work/unsafe-runtime.tar.gz" \
@@ -91,7 +103,7 @@ with tarfile.open(archive_path, "w:gz") as archive:
     add(archive, f"{root}/astrid", b"#!/bin/sh\nexit 99\n")
 PY
 
-if "$repo_root/scripts/package-release.sh" \
+if bash "$repo_root/scripts/package-release.sh" \
   "$target" \
   "$work/aos" \
   "$work/duplicate-runtime.tar.gz" \

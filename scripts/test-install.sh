@@ -27,22 +27,19 @@ for binary in astrid astrid-daemon astrid-build astrid-emit; do
   chmod 755 "$runtime_root/$binary"
 done
 COPYFILE_DISABLE=1 tar -czf "$work/runtime.tar.gz" -C "$work" "$(basename "$runtime_root")"
-"$repo_root/scripts/package-release.sh" \
+bash "$repo_root/scripts/package-release.sh" \
   x86_64-unknown-linux-gnu \
   "$work/aos" \
   "$work/runtime.tar.gz" \
   0000000000000000000000000000000000000000000000000000000000000000 \
   "$fixture" >/dev/null
-(
-  cd "$fixture"
-  asset=unicity-aos-x86_64-unknown-linux-gnu.tar.gz
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$asset" > SHA256SUMS.txt
-  else
-    shasum -a 256 "$asset" > SHA256SUMS.txt
-  fi
-)
-: > "$fixture/unicity-aos-x86_64-unknown-linux-gnu.tar.gz.sigstore.json"
+asset="$fixture/unicity-aos-x86_64-unknown-linux-gnu.tar.gz"
+bundle="$asset.sigstore.json"
+signed_asset="$fixture/signed-asset.tar.gz"
+good_bundle="$fixture/valid.sigstore.json"
+cp "$asset" "$signed_asset"
+printf 'valid Sigstore fixture\n' > "$good_bundle"
+cp "$good_bundle" "$bundle"
 
 cat > "$fake_bin/uname" <<'EOF'
 #!/bin/sh
@@ -73,6 +70,23 @@ cat > "$fixture/cosign-linux-amd64" <<'EOF'
 #!/bin/sh
 set -eu
 [ "${1:-}" = verify-blob ]
+bundle=
+artifact=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --bundle)
+      bundle=$2
+      shift
+      ;;
+    -*) ;;
+    *) artifact=$1 ;;
+  esac
+  shift
+done
+[ -n "$bundle" ]
+[ -n "$artifact" ]
+cmp "$AOS_TEST_FIXTURE/valid.sigstore.json" "$bundle"
+cmp "$AOS_TEST_FIXTURE/signed-asset.tar.gz" "$artifact"
 : > "$AOS_TEST_FIXTURE/cosign-called"
 EOF
 cat > "$fake_bin/cosign" <<'EOF'
@@ -82,14 +96,6 @@ set -eu
 exit 99
 EOF
 
-if command -v sha256sum >/dev/null 2>&1; then
-  REAL_HASH=$(command -v sha256sum)
-  HASH_KIND=sha256sum
-else
-  REAL_HASH=$(command -v shasum)
-  HASH_KIND=shasum
-fi
-export REAL_HASH HASH_KIND
 cat > "$fake_bin/sha256sum" <<'EOF'
 #!/bin/sh
 set -eu
@@ -101,12 +107,7 @@ case "$1" in
       printf '%s  %s\n' ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc "$1"
     fi
     ;;
-  *)
-    if [ "$HASH_KIND" = shasum ]; then
-      exec "$REAL_HASH" -a 256 "$@"
-    fi
-    exec "$REAL_HASH" "$@"
-    ;;
+  *) exit 2 ;;
 esac
 EOF
 chmod 755 "$fake_bin/uname" "$fake_bin/curl" "$fake_bin/cosign" \
@@ -158,28 +159,32 @@ fi
 test ! -e "$fixture/cosign-called"
 test ! -e "$work/bad-verifier-home/.unicity-os"
 
-cp "$fixture/SHA256SUMS.txt" "$work/good-sums"
-
-# Accept checksum entries generated with a relative ./ prefix.
-awk '{
-  checksum_asset = $2
-  sub(/^\*/, "", checksum_asset)
-  print $1 "  ./" checksum_asset
-}' "$work/good-sums" > "$fixture/SHA256SUMS.txt"
-PATH="$fake_bin:$PATH" \
-HOME="$work/relative-checksum-home" \
-AOS_TEST_FIXTURE="$fixture" \
-AOS_VERSION=2026.1.0 \
-sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
-test -x "$work/relative-checksum-home/.unicity-os/bin/aos"
-
-printf '%064d  unicity-aos-x86_64-unknown-linux-gnu.tar.gz\n' 1 > "$fixture/SHA256SUMS.txt"
-if PATH="$fake_bin:$PATH" HOME="$work/other-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
+printf 'invalid Sigstore fixture\n' > "$bundle"
+if PATH="$fake_bin:$PATH" HOME="$work/bad-bundle-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
-  echo "installer accepted a bad checksum" >&2
+  echo "installer accepted an invalid Sigstore bundle" >&2
   exit 1
 fi
-cp "$work/good-sums" "$fixture/SHA256SUMS.txt"
+test ! -e "$work/bad-bundle-home/.unicity-os"
+cp "$good_bundle" "$bundle"
+
+mv "$bundle" "$work/missing-bundle"
+if PATH="$fake_bin:$PATH" HOME="$work/missing-bundle-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  echo "installer accepted a release with no Sigstore bundle" >&2
+  exit 1
+fi
+test ! -e "$work/missing-bundle-home/.unicity-os"
+mv "$work/missing-bundle" "$bundle"
+
+printf 'modified after signing\n' >> "$asset"
+if PATH="$fake_bin:$PATH" HOME="$work/modified-asset-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  echo "installer accepted release bytes that did not match the Sigstore bundle" >&2
+  exit 1
+fi
+test ! -e "$work/modified-asset-home/.unicity-os"
+cp "$signed_asset" "$asset"
 
 symlink_home="$work/symlink-destination-home"
 mkdir -p "$symlink_home/.unicity-os/bin"
@@ -292,20 +297,13 @@ if [ "${1:-}" = --version ]; then
 fi
 EOF
 chmod 755 "$work/aos-mismatch"
-"$repo_root/scripts/package-release.sh" \
+bash "$repo_root/scripts/package-release.sh" \
   x86_64-unknown-linux-gnu \
   "$work/aos-mismatch" \
   "$work/runtime.tar.gz" \
   0000000000000000000000000000000000000000000000000000000000000000 \
   "$fixture" >/dev/null
-(
-  cd "$fixture"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum unicity-aos-x86_64-unknown-linux-gnu.tar.gz > SHA256SUMS.txt
-  else
-    shasum -a 256 unicity-aos-x86_64-unknown-linux-gnu.tar.gz > SHA256SUMS.txt
-  fi
-)
+cp "$asset" "$signed_asset"
 if PATH="$fake_bin:$PATH" HOME="$work/mismatch-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted a bundle whose binary version did not match the requested release" >&2
@@ -322,14 +320,7 @@ done
 printf '{}\n' > "$unsafe_root/release-manifest.json"
 COPYFILE_DISABLE=1 tar -czf "$fixture/unicity-aos-x86_64-unknown-linux-gnu.tar.gz" \
   -C "$work/unsafe-bundle" "$(basename "$unsafe_root")"
-(
-  cd "$fixture"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum unicity-aos-x86_64-unknown-linux-gnu.tar.gz > SHA256SUMS.txt
-  else
-    shasum -a 256 unicity-aos-x86_64-unknown-linux-gnu.tar.gz > SHA256SUMS.txt
-  fi
-)
+cp "$asset" "$signed_asset"
 if PATH="$fake_bin:$PATH" HOME="$work/unsafe-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted a symlink in the release archive" >&2

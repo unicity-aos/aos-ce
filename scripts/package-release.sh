@@ -2,14 +2,14 @@
 set -euo pipefail
 
 if [[ $# -ne 5 ]]; then
-  echo "usage: $0 <target> <aos-binary> <runtime-archive> <runtime-sha256> <output-dir>" >&2
+  echo "usage: $0 <target> <aos-binary> <runtime-archive> <runtime-blake3> <output-dir>" >&2
   exit 2
 fi
 
 target=$1
 aos_binary=$2
 runtime_archive=$3
-runtime_sha256=$4
+runtime_blake3=$4
 output_dir=$5
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -54,8 +54,8 @@ if [[ ! -f "$runtime_archive" ]]; then
   echo "runtime archive is missing: $runtime_archive" >&2
   exit 1
 fi
-if [[ ! "$runtime_sha256" =~ ^[0-9a-f]{64}$ ]]; then
-  echo "runtime SHA-256 is malformed" >&2
+if [[ ! "$runtime_blake3" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "runtime BLAKE3 digest is malformed" >&2
   exit 1
 fi
 
@@ -88,14 +88,14 @@ install -m 0644 "$repo_root/release/runtime-compatibility.toml" "$work/$root/run
 install -m 0644 "$repo_root/distros/community/unicity-ce/Distro.toml" "$work/$root/Distro.toml"
 install -m 0644 "$repo_root/README.md" "$work/$root/README.md"
 
-python3 - "$work/$root/release-manifest.json" "$product_version" "$target" "$runtime_repository" "$runtime_version" "$runtime_tag" "$runtime_sha256" "$runtime_identity" "$wit_repository" "$wit_commit" "$sdk_rust_version" "$sdk_rust_commit" <<'PY'
+python3 - "$work/$root/release-manifest.json" "$product_version" "$target" "$runtime_repository" "$runtime_version" "$runtime_tag" "$runtime_blake3" "$runtime_identity" "$wit_repository" "$wit_commit" "$sdk_rust_version" "$sdk_rust_commit" <<'PY'
 import json
 import pathlib
 import sys
 
 path, product, target, runtime_repo, runtime, tag, digest, runtime_identity, wit_repo, wit_commit, sdk_version, sdk_commit = sys.argv[1:]
 manifest = {
-    "schema_version": 1,
+    "schema_version": 2,
     "product": {"name": "Unicity AOS Community Edition", "version": product},
     "target": target,
     "runtime": {
@@ -103,7 +103,7 @@ manifest = {
         "version": runtime,
         "tag": tag,
         "asset": f"astrid-{runtime}-{target}.tar.gz",
-        "sha256": digest,
+        "digest": f"blake3:{digest}",
         "release_workflow_identity": runtime_identity,
     },
     "contracts": {

@@ -142,28 +142,12 @@ chmod 700 "$COSIGN_BIN"
 
 echo "Downloading Unicity AOS for $target..."
 curl --proto '=https' --tlsv1.2 -fsSL "$base/$asset" -o "$work/$asset"
-curl --proto '=https' --tlsv1.2 -fsSL "$base/SHA256SUMS.txt" -o "$work/SHA256SUMS.txt"
 curl --proto '=https' --tlsv1.2 -fsSL "$base/$asset.sigstore.json" -o "$work/$asset.sigstore.json"
 "$COSIGN_BIN" verify-blob \
   --bundle "$work/$asset.sigstore.json" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/20[0-9]{2}\.[0-9]+\.[0-9]+$' \
   "$work/$asset" >/dev/null
-
-expected=$(awk -v asset="$asset" '
-  {
-    checksum_asset = $2
-    sub(/^\*/, "", checksum_asset)
-    sub(/^\.\//, "", checksum_asset)
-    if (checksum_asset == asset) {
-      print $1
-      exit
-    }
-  }
-' "$work/SHA256SUMS.txt")
-[ -n "$expected" ] || { echo "release checksum list does not contain $asset" >&2; exit 1; }
-actual=$(sha256_file "$work/$asset")
-[ "$actual" = "$expected" ] || { echo "Unicity AOS archive checksum mismatch" >&2; exit 1; }
 
 mkdir "$work/unpack"
 if tar -tzf "$work/$asset" | awk -v target="$target" -v version="$AOS_VERSION" '
