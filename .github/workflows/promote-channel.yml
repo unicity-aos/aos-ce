@@ -78,7 +78,19 @@ jobs:
               print(tomllib.load(file)["source-commit"])
           PY
           )
-          TAG_COMMIT=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
+          TAG_OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")
+          TAG_TYPE=$(jq -er .object.type <<< "$TAG_OBJECT")
+          TAG_COMMIT=$(jq -er .object.sha <<< "$TAG_OBJECT")
+          for _ in {1..8}; do
+            [[ "$TAG_TYPE" == tag ]] || break
+            TAG_OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_COMMIT")
+            TAG_TYPE=$(jq -er .object.type <<< "$TAG_OBJECT")
+            TAG_COMMIT=$(jq -er .object.sha <<< "$TAG_OBJECT")
+          done
+          [[ "$TAG_TYPE" == commit ]] || {
+            echo "release tag does not peel to a commit" >&2
+            exit 1
+          }
           [[ "$SOURCE_COMMIT" == "$TAG_COMMIT" ]]
           if [[ "$CHANNEL" == stable ]]; then
             gh release view "$RELEASE_TAG" \
