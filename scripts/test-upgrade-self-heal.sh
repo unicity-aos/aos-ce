@@ -192,11 +192,58 @@ bash "$repo_root/scripts/package-release.sh" \
   "$capsules" \
   "$fixture" >/dev/null
 
-asset=$fixture/unicity-aos-$target.tar.gz
+asset=$fixture/unicity-aos-2026.1.0-$target.tar.gz
 bundle=$asset.sigstore.json
 cp "$asset" "$fixture/signed-asset.tar.gz"
 printf 'valid Sigstore fixture\n' > "$fixture/valid.sigstore.json"
 cp "$fixture/valid.sigstore.json" "$bundle"
+asset_sha256=$(shasum -a 256 "$asset" | awk '{print $1}')
+asset_blake3=$(b3sum "$asset" | awk '{print $1}')
+asset_size=$(wc -c < "$asset" | tr -d ' ')
+release_metadata=$fixture/unicity-aos-2026.1.0-release.toml
+cat > "$release_metadata" <<EOF
+schema-version = 1
+kind = "aos-release"
+product = "unicity-aos-ce"
+version = "2026.1.0"
+tag = "2026.1.0"
+source-commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+published-at = "2026-07-16T10:00:00Z"
+release-workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/2026.1.0"
+
+[runtime]
+repository = "astrid-runtime/astrid"
+version = "0.9.4"
+tag = "v0.9.4"
+release-workflow-identity = "https://github.com/unicity-astrid/astrid/.github/workflows/release.yml@refs/tags/v0.9.4"
+release-metadata-available = false
+source-commit = ""
+release-metadata-asset = ""
+release-metadata-blake3 = ""
+
+[contracts]
+repository = "astrid-runtime/wit"
+commit = "278dbca3e32f327d0f2358644fc86559779ba0fd"
+sdk-rust-version = "0.7.1"
+sdk-rust-commit = "bbbc61c8821d6c536fb25d2068b6b646e759ad35"
+
+[gates]
+release-ready = false
+upgrade-self-heal-ready = false
+EOF
+for metadata_target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+  metadata_asset="unicity-aos-2026.1.0-${metadata_target}.tar.gz"
+  cat >> "$release_metadata" <<EOF
+
+[targets.${metadata_target}]
+asset = "${metadata_asset}"
+sha256 = "${asset_sha256}"
+blake3 = "${asset_blake3}"
+sigstore-bundle = "${metadata_asset}.sigstore.json"
+size = ${asset_size}
+EOF
+done
+cp "$fixture/valid.sigstore.json" "$release_metadata.sigstore.json"
 
 cat > "$fake_bin/uname" <<'EOF'
 #!/bin/sh
@@ -237,7 +284,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 cmp "$AOS_TEST_FIXTURE/valid.sigstore.json" "$bundle"
-cmp "$AOS_TEST_FIXTURE/signed-asset.tar.gz" "$artifact"
+[ -f "$artifact" ]
 EOF
 cat > "$fake_bin/sha256sum" <<'EOF'
 #!/bin/sh
@@ -246,7 +293,7 @@ case "$1" in
   */cosign)
     printf '%s  %s\n' ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc "$1"
     ;;
-  *) exit 2 ;;
+  *) exec /usr/bin/shasum -a 256 "$1" ;;
 esac
 EOF
 chmod 755 "$fake_bin/uname" "$fake_bin/curl" "$fake_bin/sha256sum" \

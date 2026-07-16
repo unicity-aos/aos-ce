@@ -73,8 +73,10 @@ aos --principal operator init --target-principal alice
 
 This AOS release fixes its distribution state to Unicity CE. Use a standalone
 `astrid` installation and runtime home to apply another distribution. Homebrew
-installations update with `aos update`; direct-install update channels remain
-disabled until signed stable, dev, or nightly channel metadata is published.
+installations update with `aos update`. Direct installs resolve the signed
+`stable` channel by default and can select `dev`, `nightly`, or an exact version;
+all remain fail-closed until their signed metadata is actually published. See
+[Signed AOS release channels](docs/release-channels.md).
 
 ## Import an existing runtime
 

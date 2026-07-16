@@ -247,6 +247,22 @@ jobs:
           b3sum -- ./*.tar.gz ./*.capsule | sed 's#  \./#  #' > BLAKE3SUMS.txt
           sha256sum -- ./*.tar.gz ./*.capsule | sed 's#  \./#  #' > SHA256SUMS.txt
           cp ../release/runtime-compatibility.toml .
+      - name: Generate immutable release metadata
+        run: |
+          PUBLISHED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          RELEASE_METADATA="artifacts/unicity-aos-${GITHUB_REF_NAME}-release.toml"
+          python3 scripts/release_metadata.py render-release \
+            --version "$GITHUB_REF_NAME" \
+            --tag "$GITHUB_REF_NAME" \
+            --source-commit "$GITHUB_SHA" \
+            --published-at "$PUBLISHED_AT" \
+            --artifacts artifacts \
+            --sha256 artifacts/SHA256SUMS.txt \
+            --blake3 artifacts/BLAKE3SUMS.txt \
+            --output "$RELEASE_METADATA"
+          python3 scripts/release_metadata.py validate-release \
+            --require-ready "$RELEASE_METADATA"
+          echo "RELEASE_METADATA=$RELEASE_METADATA" >> "$GITHUB_ENV"
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
@@ -255,14 +271,27 @@ jobs:
             artifacts/BLAKE3SUMS.txt
             artifacts/SHA256SUMS.txt
             artifacts/runtime-compatibility.toml
+            artifacts/unicity-aos-*-release.toml
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Sign release assets
         env:
           COSIGN_YES: 'true'
         run: |
           cd artifacts
-          for asset in ./*.tar.gz ./*.capsule BLAKE3SUMS.txt SHA256SUMS.txt runtime-compatibility.toml; do
+          for asset in ./*.tar.gz ./*.capsule BLAKE3SUMS.txt SHA256SUMS.txt runtime-compatibility.toml unicity-aos-*-release.toml; do
             cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
+          done
+      - name: Verify release signatures use the exact tag identity
+        run: |
+          cd artifacts
+          IDENTITY="https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+          for asset in ./*.tar.gz ./*.capsule BLAKE3SUMS.txt SHA256SUMS.txt runtime-compatibility.toml unicity-aos-*-release.toml; do
+            cosign verify-blob \
+              --bundle "${asset}.sigstore.json" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity "$IDENTITY" \
+              --use-signed-timestamps \
+              "$asset"
           done
       - name: Write release notes
         run: |
@@ -287,5 +316,6 @@ jobs:
             artifacts/BLAKE3SUMS.txt
             artifacts/SHA256SUMS.txt
             artifacts/runtime-compatibility.toml
+            artifacts/unicity-aos-*-release.toml
             artifacts/*.sigstore.json
           body_path: release-notes.md

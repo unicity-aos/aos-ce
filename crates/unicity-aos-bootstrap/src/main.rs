@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::ExitStatus;
 use std::process::{Command, ExitCode};
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use unicity_aos_bootstrap::{AOS_WORKSPACE_STATE_DIR, AosHome};
 
 // Product-owned commands are parsed here. Unknown roots bypass this parser and
@@ -49,7 +49,7 @@ enum ProductCommand {
     },
     /// Update AOS and its coordinated runtime executable set.
     #[command(name = "update", alias = "self-update", alias = "self_update")]
-    Update,
+    Update(UpdateArgs),
     /// Distribution state is fixed to Unicity CE in this AOS release.
     Distro(DistroArgs),
     /// Serve the loopback-only product health endpoint.
@@ -68,6 +68,58 @@ struct StatusArgs {
     /// Print a machine-readable JSON status object.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct UpdateArgs {
+    /// Follow the signed stable, dev, or nightly product channel.
+    #[arg(long, value_enum, conflicts_with = "version")]
+    channel: Option<UpdateChannel>,
+    /// Install an exact signed AOS calendar-semver release.
+    #[arg(long, value_parser = parse_aos_version, conflicts_with = "channel")]
+    version: Option<String>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum UpdateChannel {
+    Stable,
+    Dev,
+    Nightly,
+}
+
+impl UpdateChannel {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Dev => "dev",
+            Self::Nightly => "nightly",
+        }
+    }
+}
+
+fn parse_aos_version(value: &str) -> Result<String, String> {
+    let components = value.split('.').collect::<Vec<_>>();
+    let canonical = |component: &str| {
+        component == "0"
+            || (component.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                && !component.starts_with('0')
+                && component.bytes().all(|byte| byte.is_ascii_digit()))
+    };
+    if components.len() != 3
+        || components[0].len() != 4
+        || !components[0].bytes().all(|byte| byte.is_ascii_digit())
+        || !canonical(components[1])
+        || !canonical(components[2])
+    {
+        return Err("expected YYYY.MINOR.PATCH without leading zeroes".to_owned());
+    }
+    let year = components[0]
+        .parse::<u16>()
+        .map_err(|_| "release year is invalid".to_owned())?;
+    if !(2026..=2099).contains(&year) {
+        return Err("release year must be between 2026 and 2099".to_owned());
+    }
+    Ok(value.to_owned())
 }
 
 #[derive(Args)]
@@ -224,7 +276,7 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
         Some(ProductCommand::Migrate {
             command: MigrateCommand::Runtime { from },
         }) => Some(handle_migrate_runtime(&from)),
-        Some(ProductCommand::Update) => Some(handle_self_update()),
+        Some(ProductCommand::Update(args)) => Some(handle_self_update(&args)),
         Some(ProductCommand::Distro(args)) => Some(refuse_distro_command(&args.arguments)),
         Some(ProductCommand::ServeHealth) => Some(handle_health_service()),
         None => Some(print_product_help()),
@@ -361,8 +413,17 @@ fn leading_runtime_root_index(args: &[OsString]) -> Result<Option<usize>, ()> {
     Ok(None)
 }
 
-fn handle_self_update() -> ExitCode {
+fn handle_self_update(args: &UpdateArgs) -> ExitCode {
     if std::env::var_os("UNICITY_AOS_INSTALL_METHOD").as_deref() == Some(OsStr::new("homebrew")) {
+        if args.version.is_some()
+            || matches!(
+                args.channel,
+                Some(UpdateChannel::Dev | UpdateChannel::Nightly)
+            )
+        {
+            eprintln!("aos: Homebrew installations follow only the signed stable channel");
+            return ExitCode::from(2);
+        }
         return command_exit_code(
             Command::new("brew")
                 .args(["upgrade", "unicity-aos/tap/aos"])
@@ -371,11 +432,44 @@ fn handle_self_update() -> ExitCode {
         );
     }
 
-    eprintln!(
-        "aos: direct updates are not yet available: no signed stable, dev, or nightly AOS update channel has been published"
-    );
-    eprintln!("Install an approved signed AOS bundle when a release channel is available.");
-    ExitCode::FAILURE
+    let home = match AosHome::resolve() {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("aos: resolve product home for update: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let installer = home.root().join("libexec/install.sh");
+    match std::fs::symlink_metadata(&installer) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            eprintln!(
+                "aos: trusted installed updater is not a regular file: {}",
+                installer.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!(
+                "aos: trusted installed updater is unavailable at {}: {error}",
+                installer.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let mut command = Command::new("sh");
+    command.arg(installer);
+    if let Some(version) = &args.version {
+        command.args(["--version", version]);
+    } else {
+        command.args([
+            "--channel",
+            args.channel.unwrap_or(UpdateChannel::Stable).as_str(),
+        ]);
+    }
+    command.args(["--yes", "--no-migrate-prompt"]);
+    command_exit_code(command.status(), "run the installed signed AOS updater")
 }
 
 fn refuse_distro_command(_arguments: &[OsString]) -> ExitCode {
@@ -792,7 +886,7 @@ mod tests {
     fn update_aliases_and_status_are_product_owned() {
         for command in ["update", "self-update", "self_update"] {
             let cli = ProductCli::try_parse_from(["aos", command]).expect("parse update alias");
-            assert!(matches!(cli.command, Some(ProductCommand::Update)));
+            assert!(matches!(cli.command, Some(ProductCommand::Update(_))));
         }
         let cli =
             ProductCli::try_parse_from(["aos", "status", "--json"]).expect("parse product status");

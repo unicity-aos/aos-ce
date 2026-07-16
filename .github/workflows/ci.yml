@@ -40,6 +40,7 @@ jobs:
       - run: sh -n install.sh
       - run: python3 scripts/validate-release-contract.py
       - run: python3 scripts/test_validate_release_contract.py
+      - run: python3 scripts/test_release_metadata.py
       - run: python3 scripts/test_create_astrid_094_fixture.py
       - run: bash scripts/test-package-release.sh
       - run: bash scripts/test-install.sh

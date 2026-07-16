@@ -21,6 +21,12 @@ version-requirement = "=0.9.4"
 # v0.9.4 was signed before the repository moved to the astrid-runtime org.
 # Sigstore identities are immutable provenance and retain the original owner.
 release-workflow-identity = "https://github.com/unicity-astrid/astrid/.github/workflows/release.yml@refs/tags/v0.9.4"
+# Astrid v0.9.4 predates the signed immutable release-metadata contract. These
+# fields must remain explicitly unavailable; do not invent a commit or digest.
+release-metadata-available = false
+source-commit = ""
+release-metadata-asset = ""
+release-metadata-blake3 = ""
 
 [contracts]
 repository = "astrid-runtime/wit"

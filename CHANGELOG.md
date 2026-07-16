@@ -27,6 +27,9 @@
 - Host-target unit-test coverage for the capsule workspace.
 - Homebrew formula updates initiated by the tap's authenticated stable-release
   poll, eliminating the cross-repository dispatch credential.
+- Strict, signed stable/dev/nightly channel and immutable release metadata
+  contracts with exact workflow identities, expiry, replay-resistant generation
+  state, and fail-closed direct installer resolution.
 
 ### Changed
 

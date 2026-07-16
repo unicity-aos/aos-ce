@@ -49,10 +49,11 @@ bash "$repo_root/scripts/package-release.sh" \
   "$work/capsules" \
   "$work/output"
 
-archive="$work/output/unicity-aos-$target.tar.gz"
+archive="$work/output/unicity-aos-2026.1.0-$target.tar.gz"
 test -f "$archive"
 tar -tzf "$archive" > "$work/files"
 grep -q '/bin/aos$' "$work/files"
+grep -q '/libexec/install.sh$' "$work/files"
 grep -q '/runtime/bin/astrid-daemon$' "$work/files"
 test "$(grep -c '/capsules/astrid-capsule-.*\.capsule$' "$work/files")" -eq 18
 grep -q '/capsule-assets.txt$' "$work/files"

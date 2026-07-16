@@ -40,7 +40,7 @@ wit_repository=$(toml_value "$repo_root/release/runtime-compatibility.toml" cont
 wit_commit=$(toml_value "$repo_root/release/runtime-compatibility.toml" contracts commit)
 sdk_rust_version=$(toml_value "$repo_root/release/runtime-compatibility.toml" contracts sdk-rust-version)
 sdk_rust_commit=$(toml_value "$repo_root/release/runtime-compatibility.toml" contracts sdk-rust-commit)
-asset="unicity-aos-${target}.tar.gz"
+asset="unicity-aos-${product_version}-${target}.tar.gz"
 root="unicity-aos-${product_version}-${target}"
 
 if [[ -z "$product_version" || -z "$runtime_version" || -z "$runtime_tag" || -z "$runtime_repository" || -z "$runtime_identity" || -z "$wit_repository" || -z "$wit_commit" || -z "$sdk_rust_version" || -z "$sdk_rust_commit" ]]; then
@@ -66,6 +66,7 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p \
   "$work/runtime-extract" \
   "$work/$root/bin" \
+  "$work/$root/libexec" \
   "$work/$root/runtime/bin" \
   "$work/$root/capsules" \
   "$output_dir"
@@ -83,6 +84,7 @@ if [[ ! -d "$runtime_root" ]]; then
 fi
 
 install -m 0755 "$aos_binary" "$work/$root/bin/aos"
+install -m 0644 "$repo_root/install.sh" "$work/$root/libexec/install.sh"
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
   if [[ ! -x "$runtime_root/$binary" ]]; then
     echo "runtime archive is missing $binary" >&2
