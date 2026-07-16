@@ -37,6 +37,11 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo install b3sum --locked --version "$B3SUM_VERSION"
       - run: sh -n install.sh
       - run: python3 scripts/validate-release-contract.py
       - run: python3 scripts/test_validate_release_contract.py
