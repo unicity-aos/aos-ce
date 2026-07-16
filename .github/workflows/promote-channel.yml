@@ -100,47 +100,106 @@ jobs:
               | grep -Fx true
           fi
           echo "RELEASE_METADATA=$RELEASE_METADATA" >> "$GITHUB_ENV"
-      - name: Authenticate current channel generation
+      - name: Recover immutable transaction or authenticate generation floor
         env:
           GH_TOKEN: ${{ github.token }}
           CHANNEL: ${{ inputs.channel }}
           GENERATION: ${{ inputs.generation }}
         run: |
           CHANNEL_TAG="channel-${CHANNEL}"
-          if gh release view "$CHANNEL_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            mkdir current-channel
-            gh release download "$CHANNEL_TAG" \
+          TRANSACTION="channel-${CHANNEL}-${GENERATION}.transaction.json"
+          IDENTITY="https://github.com/unicity-aos/aos-ce/.github/workflows/promote-channel.yml@refs/heads/main"
+          REUSE_TRANSACTION=0
+          release_error="$RUNNER_TEMP/channel-release-error"
+          if gh release view "$CHANNEL_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>"$release_error"; then
+            assets=$(gh release view "$CHANNEL_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --dir current-channel \
-              --pattern channel.toml \
-              --pattern channel.toml.sigstore.json
-            IDENTITY="https://github.com/unicity-aos/aos-ce/.github/workflows/promote-channel.yml@refs/heads/main"
-            cosign verify-blob \
-              --bundle current-channel/channel.toml.sigstore.json \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              --certificate-identity "$IDENTITY" \
-              --use-signed-timestamps \
-              current-channel/channel.toml
-            python3 scripts/release_metadata.py validate-channel \
-              --channel "$CHANNEL" current-channel/channel.toml
-            CURRENT=$(python3 - current-channel/channel.toml <<'PY'
+              --json assets \
+              --jq '.assets[].name')
+            transaction_generations=$(printf '%s\n' "$assets" | sed -nE "s/^channel-${CHANNEL}-([1-9][0-9]{0,17})\\.transaction\\.json$/\\1/p")
+            transaction_floor=0
+            if [[ -n "$transaction_generations" ]]; then
+              transaction_floor=$(printf '%s\n' "$transaction_generations" | sort -n | tail -n1)
+              FLOOR_TRANSACTION="channel-${CHANNEL}-${transaction_floor}.transaction.json"
+              mkdir transaction-floor transaction-floor-pair
+              gh release download "$CHANNEL_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --dir transaction-floor \
+                --pattern "$FLOOR_TRANSACTION"
+              python3 scripts/channel_transaction.py unpack \
+                --channel "$CHANNEL" \
+                --generation "$transaction_floor" \
+                --input "transaction-floor/$FLOOR_TRANSACTION" \
+                --output-dir transaction-floor-pair
+              cosign verify-blob \
+                --bundle transaction-floor-pair/channel.toml.sigstore.json \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                --certificate-identity "$IDENTITY" \
+                --use-signed-timestamps \
+                transaction-floor-pair/channel.toml
+              python3 scripts/release_metadata.py validate-channel \
+                --channel "$CHANNEL" transaction-floor-pair/channel.toml
+              FLOOR_GENERATION=$(python3 - transaction-floor-pair/channel.toml <<'PY'
           import sys
           import tomllib
 
           with open(sys.argv[1], "rb") as file:
               print(tomllib.load(file)["generation"])
           PY
-            )
-            [[ "$GENERATION" -gt "$CURRENT" ]]
-          else
+              )
+              [[ "$FLOOR_GENERATION" == "$transaction_floor" ]]
+            fi
+            if printf '%s\n' "$assets" | grep -Fx "$TRANSACTION" >/dev/null; then
+              [[ "$GENERATION" == "$transaction_floor" ]]
+              mkdir recovered-transaction recovered-pair
+              gh release download "$CHANNEL_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --dir recovered-transaction \
+                --pattern "$TRANSACTION"
+              cp "recovered-transaction/$TRANSACTION" "$TRANSACTION"
+              python3 scripts/channel_transaction.py unpack \
+                --channel "$CHANNEL" \
+                --generation "$GENERATION" \
+                --input "$TRANSACTION" \
+                --output-dir recovered-pair
+              cp recovered-pair/channel.toml channel.toml
+              cp recovered-pair/channel.toml.sigstore.json channel.toml.sigstore.json
+              cosign verify-blob \
+                --bundle channel.toml.sigstore.json \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                --certificate-identity "$IDENTITY" \
+                --use-signed-timestamps \
+                channel.toml
+              NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              python3 scripts/release_metadata.py validate-channel-release \
+                --channel "$CHANNEL" \
+                --generation "$GENERATION" \
+                --now "$NOW" \
+                --require-ready \
+                channel.toml "$RELEASE_METADATA"
+              REUSE_TRANSACTION=1
+            elif [[ "$transaction_floor" == 0 ]]; then
+              [[ "$GENERATION" == 1 ]]
+            else
+              [[ "$GENERATION" -gt "$transaction_floor" ]]
+            fi
+          elif grep -Eqi 'release not found|HTTP 404' "$release_error"; then
             [[ "$GENERATION" == 1 ]]
+          else
+            cat "$release_error" >&2
+            exit 1
           fi
+          echo "TRANSACTION=$TRANSACTION" >> "$GITHUB_ENV"
+          echo "REUSE_TRANSACTION=$REUSE_TRANSACTION" >> "$GITHUB_ENV"
       - name: Render and sign channel pointer
         env:
           CHANNEL: ${{ inputs.channel }}
           GENERATION: ${{ inputs.generation }}
           COSIGN_YES: 'true'
         run: |
+          if [[ "$REUSE_TRANSACTION" == 1 ]]; then
+            exit 0
+          fi
           read -r PUBLISHED_AT EXPIRES_AT < <(python3 - "$CHANNEL" <<'PY'
           import datetime
           import sys
@@ -170,12 +229,25 @@ jobs:
             --certificate-identity "$IDENTITY" \
             --use-signed-timestamps \
             channel.toml
+          python3 scripts/release_metadata.py validate-channel-release \
+            --channel "$CHANNEL" \
+            --generation "$GENERATION" \
+            --now "$PUBLISHED_AT" \
+            --require-ready \
+            channel.toml "$RELEASE_METADATA"
+          python3 scripts/channel_transaction.py pack \
+            --channel "$CHANNEL" \
+            --generation "$GENERATION" \
+            --pointer channel.toml \
+            --bundle channel.toml.sigstore.json \
+            --output "$TRANSACTION"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aos-channel-${{ inputs.channel }}-${{ inputs.generation }}
           path: |
             channel.toml
             channel.toml.sigstore.json
+            ${{ env.TRANSACTION }}
             ${{ env.RELEASE_METADATA }}
 
   publish:
@@ -202,6 +274,7 @@ jobs:
         env:
           CHANNEL: ${{ inputs.channel }}
           GENERATION: ${{ inputs.generation }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           IDENTITY="https://github.com/unicity-aos/aos-ce/.github/workflows/promote-channel.yml@refs/heads/main"
           cosign verify-blob \
@@ -210,11 +283,23 @@ jobs:
             --certificate-identity "$IDENTITY" \
             --use-signed-timestamps \
             channel.toml
-          python3 scripts/release_metadata.py validate-channel \
+          RELEASE_METADATA="unicity-aos-${RELEASE_TAG}-release.toml"
+          TRANSACTION="channel-${CHANNEL}-${GENERATION}.transaction.json"
+          mkdir approved-transaction
+          python3 scripts/channel_transaction.py unpack \
             --channel "$CHANNEL" \
-            --minimum-generation "$GENERATION" \
-            channel.toml
-          [[ "$(python3 -c 'import tomllib; print(tomllib.load(open("channel.toml", "rb"))["generation"])')" == "$GENERATION" ]]
+            --generation "$GENERATION" \
+            --input "$TRANSACTION" \
+            --output-dir approved-transaction
+          cmp channel.toml approved-transaction/channel.toml
+          cmp channel.toml.sigstore.json approved-transaction/channel.toml.sigstore.json
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          python3 scripts/release_metadata.py validate-channel-release \
+            --channel "$CHANNEL" \
+            --generation "$GENERATION" \
+            --now "$NOW" \
+            --require-ready \
+            channel.toml "$RELEASE_METADATA"
       - name: Publish immutable history then current pointer
         env:
           GH_TOKEN: ${{ github.token }}
@@ -265,31 +350,96 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --json assets \
             --jq '.assets[].name')
+          TRANSACTION="channel-${CHANNEL}-${GENERATION}.transaction.json"
+          transaction_generations=$(printf '%s\n' "$assets" | sed -nE "s/^channel-${CHANNEL}-([1-9][0-9]{0,17})\\.transaction\\.json$/\\1/p")
+          transaction_floor=0
+          if [[ -n "$transaction_generations" ]]; then
+            transaction_floor=$(printf '%s\n' "$transaction_generations" | sort -n | tail -n1)
+            FLOOR_TRANSACTION="channel-${CHANNEL}-${transaction_floor}.transaction.json"
+            mkdir transaction-floor transaction-floor-pair
+            gh release download "$CHANNEL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir transaction-floor \
+              --pattern "$FLOOR_TRANSACTION"
+            python3 scripts/channel_transaction.py unpack \
+              --channel "$CHANNEL" \
+              --generation "$transaction_floor" \
+              --input "transaction-floor/$FLOOR_TRANSACTION" \
+              --output-dir transaction-floor-pair
+            verify_pointer \
+              transaction-floor-pair/channel.toml \
+              transaction-floor-pair/channel.toml.sigstore.json
+            [[ "$(generation_of transaction-floor-pair/channel.toml)" == "$transaction_floor" ]]
+          fi
+          (( GENERATION >= transaction_floor )) || {
+            echo "refusing stale channel publication below transaction generation $transaction_floor" >&2
+            exit 1
+          }
+          if printf '%s\n' "$assets" | grep -Fx "$TRANSACTION" >/dev/null; then
+            [[ "$GENERATION" == "$transaction_floor" ]]
+            mkdir existing-transaction
+            gh release download "$CHANNEL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir existing-transaction \
+              --pattern "$TRANSACTION"
+            cmp "$TRANSACTION" "existing-transaction/$TRANSACTION" || {
+              echo "channel generation $GENERATION conflicts with its immutable transaction" >&2
+              exit 1
+            }
+          else
+            (( GENERATION > transaction_floor ))
+            # This single asset is the durable recovery boundary. Every later
+            # mutation can be repaired by reusing its exact signed payload.
+            gh release upload "$CHANNEL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              "$TRANSACTION"
+            transaction_floor=$GENERATION
+            mkdir -p transaction-floor-pair
+            cp channel.toml transaction-floor-pair/channel.toml
+            cp channel.toml.sigstore.json transaction-floor-pair/channel.toml.sigstore.json
+          fi
+
           history_generations=$(printf '%s\n' "$assets" | sed -nE "s/^channel-${CHANNEL}-([1-9][0-9]{0,17})\\.toml$/\\1/p")
           history_floor=0
           if [[ -n "$history_generations" ]]; then
             history_floor=$(printf '%s\n' "$history_generations" | sort -n | tail -n1)
-            mkdir -p existing-history-floor
-            FLOOR_HISTORY="channel-${CHANNEL}-${history_floor}.toml"
-            if printf '%s\n' "$assets" | grep -Fx "$FLOOR_HISTORY.sigstore.json" >/dev/null; then
-              gh release download "$CHANNEL_TAG" \
-                --repo "$GITHUB_REPOSITORY" \
-                --dir existing-history-floor \
-                --pattern "$FLOOR_HISTORY" \
-                --pattern "$FLOOR_HISTORY.sigstore.json"
-              verify_pointer \
-                "existing-history-floor/$FLOOR_HISTORY" \
-                "existing-history-floor/$FLOOR_HISTORY.sigstore.json"
-            else
-              [[ "$history_floor" == "$GENERATION" ]]
-              gh release download "$CHANNEL_TAG" \
-                --repo "$GITHUB_REPOSITORY" \
-                --dir existing-history-floor \
-                --pattern "$FLOOR_HISTORY"
-              cmp channel.toml "existing-history-floor/$FLOOR_HISTORY"
-            fi
-            [[ "$(generation_of "existing-history-floor/$FLOOR_HISTORY")" == "$history_floor" ]]
+            (( history_floor <= transaction_floor )) || {
+              echo "history generation $history_floor has no authenticated transaction" >&2
+              exit 1
+            }
           fi
+          # The transaction is the atomic recovery boundary. Repair its
+          # immutable history pair before considering mutable current state.
+          FLOOR_HISTORY="channel-${CHANNEL}-${transaction_floor}.toml"
+          floor_history_pointer_present=0
+          floor_history_bundle_present=0
+          printf '%s\n' "$assets" | grep -Fx "$FLOOR_HISTORY" >/dev/null && floor_history_pointer_present=1
+          printf '%s\n' "$assets" | grep -Fx "$FLOOR_HISTORY.sigstore.json" >/dev/null && floor_history_bundle_present=1
+          mkdir -p existing-history-floor
+          if [[ "$floor_history_pointer_present" == 1 ]]; then
+            gh release download "$CHANNEL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir existing-history-floor \
+              --pattern "$FLOOR_HISTORY"
+            cmp transaction-floor-pair/channel.toml "existing-history-floor/$FLOOR_HISTORY"
+          fi
+          if [[ "$floor_history_bundle_present" == 1 ]]; then
+            gh release download "$CHANNEL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir existing-history-floor \
+              --pattern "$FLOOR_HISTORY.sigstore.json"
+            verify_pointer \
+              transaction-floor-pair/channel.toml \
+              "existing-history-floor/$FLOOR_HISTORY.sigstore.json"
+          fi
+          cp transaction-floor-pair/channel.toml "$FLOOR_HISTORY"
+          cp transaction-floor-pair/channel.toml.sigstore.json "$FLOOR_HISTORY.sigstore.json"
+          [[ "$floor_history_pointer_present" == 1 ]] || gh release upload "$CHANNEL_TAG" \
+            --repo "$GITHUB_REPOSITORY" "$FLOOR_HISTORY"
+          [[ "$floor_history_bundle_present" == 1 ]] || gh release upload "$CHANNEL_TAG" \
+            --repo "$GITHUB_REPOSITORY" "$FLOOR_HISTORY.sigstore.json"
+          assets="${assets}"$'\n'"${FLOOR_HISTORY}"$'\n'"${FLOOR_HISTORY}.sigstore.json"
+          history_floor=$transaction_floor
 
           current_generation=0
           current_pointer_present=0
@@ -321,12 +471,16 @@ jobs:
               "current-history/$CURRENT_HISTORY" \
               "current-history/$CURRENT_HISTORY.sigstore.json"
             cmp existing-current/channel.toml "current-history/$CURRENT_HISTORY"
-            [[ "$current_bundle_present" == 1 ]]
-            verify_pointer channel.toml existing-current/channel.toml.sigstore.json
-          elif [[ "$current_bundle_present" == 1 ]]; then
-            verify_pointer channel.toml existing-current/channel.toml.sigstore.json
+            # An interrupted bundle-first replacement can leave a valid old
+            # pointer beside a different generation's bundle. The immutable
+            # history authenticates the pointer; the approved transaction
+            # below safely replaces the unmatched bundle.
           fi
 
+          (( current_generation <= transaction_floor )) || {
+            echo "current pointer generation $current_generation has no authenticated transaction" >&2
+            exit 1
+          }
           (( GENERATION >= current_generation )) || {
             echo "refusing stale channel publication over generation $current_generation" >&2
             exit 1

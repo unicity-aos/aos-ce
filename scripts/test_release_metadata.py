@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import hashlib
 import importlib.util
 import tempfile
 import unittest
@@ -233,6 +234,47 @@ class ChannelMetadataTests(unittest.TestCase):
         fixture["release"]["metadata-sha256"] = "A" * 64
         with self.assertRaisesRegex(ValueError, "SHA-256 is malformed"):
             METADATA.validate_channel(fixture)
+
+    def test_channel_release_accepts_exact_authenticated_linkage(self) -> None:
+        release_bytes = b"authenticated release metadata"
+        channel = channel_fixture()
+        channel["release"]["metadata-sha256"] = hashlib.sha256(release_bytes).hexdigest()
+        validated, release = METADATA.validate_channel_release(
+            channel,
+            release_fixture(),
+            release_bytes,
+            expected_channel="stable",
+            expected_generation=7,
+        )
+        self.assertEqual(validated["release"]["source-commit"], release["source-commit"])
+
+    def test_channel_release_rejects_different_authenticated_release(self) -> None:
+        release_bytes = b"authenticated release metadata"
+        channel = channel_fixture()
+        channel["release"]["metadata-sha256"] = hashlib.sha256(release_bytes).hexdigest()
+        channel["release"]["source-commit"] = "e" * 40
+        with self.assertRaisesRegex(ValueError, "identify the authenticated release"):
+            METADATA.validate_channel_release(channel, release_fixture(), release_bytes)
+
+    def test_channel_release_rejects_different_targets(self) -> None:
+        release_bytes = b"authenticated release metadata"
+        channel = channel_fixture()
+        channel["release"]["metadata-sha256"] = hashlib.sha256(release_bytes).hexdigest()
+        channel["targets"]["aarch64-apple-darwin"]["size"] = 99
+        with self.assertRaisesRegex(ValueError, "targets do not match"):
+            METADATA.validate_channel_release(channel, release_fixture(), release_bytes)
+
+    def test_channel_release_rejects_wrong_exact_generation(self) -> None:
+        release_bytes = b"authenticated release metadata"
+        channel = channel_fixture()
+        channel["release"]["metadata-sha256"] = hashlib.sha256(release_bytes).hexdigest()
+        with self.assertRaisesRegex(ValueError, "must equal 8"):
+            METADATA.validate_channel_release(
+                channel,
+                release_fixture(),
+                release_bytes,
+                expected_generation=8,
+            )
 
 
 class RenderTests(unittest.TestCase):

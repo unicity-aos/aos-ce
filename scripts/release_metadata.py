@@ -288,6 +288,51 @@ def validate_channel(
     return root
 
 
+def validate_channel_release(
+    channel_metadata: Any,
+    release_metadata: Any,
+    release_bytes: bytes,
+    *,
+    expected_channel: str | None = None,
+    expected_generation: int | None = None,
+    minimum_generation: int | None = None,
+    now: dt.datetime | None = None,
+    require_ready: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    channel = validate_channel(
+        channel_metadata,
+        expected_channel=expected_channel,
+        minimum_generation=minimum_generation,
+        now=now,
+    )
+    release = validate_release(release_metadata, require_ready=require_ready)
+    if expected_generation is not None:
+        require(
+            channel["generation"] == expected_generation,
+            f"channel metadata generation must equal {expected_generation}",
+        )
+
+    version = release["version"]
+    expected_release = {
+        "repository": REPOSITORY,
+        "version": version,
+        "tag": release["tag"],
+        "source-commit": release["source-commit"],
+        "metadata-asset": f"unicity-aos-{version}-release.toml",
+        "metadata-sha256": hashlib.sha256(release_bytes).hexdigest(),
+        "release-workflow-identity": release["release-workflow-identity"],
+    }
+    require(
+        channel["release"] == expected_release,
+        "channel metadata does not identify the authenticated release metadata exactly",
+    )
+    require(
+        channel["targets"] == release["targets"],
+        "channel metadata targets do not match the authenticated release metadata",
+    )
+    return channel, release
+
+
 def load(path: Path) -> dict[str, Any]:
     with path.open("rb") as file:
         return tomllib.load(file)
@@ -446,6 +491,30 @@ def parser() -> argparse.ArgumentParser:
         )
 
     validate_channel_command.set_defaults(run=run_validate_channel)
+
+    validate_channel_release_command = commands.add_parser("validate-channel-release")
+    validate_channel_release_command.add_argument("channel_path", type=Path)
+    validate_channel_release_command.add_argument("release_path", type=Path)
+    validate_channel_release_command.add_argument("--channel", choices=CHANNELS)
+    validate_channel_release_command.add_argument("--generation", type=int)
+    validate_channel_release_command.add_argument("--minimum-generation", type=int)
+    validate_channel_release_command.add_argument("--now")
+    validate_channel_release_command.add_argument("--require-ready", action="store_true")
+
+    def run_validate_channel_release(args: argparse.Namespace) -> None:
+        now = timestamp(args.now, "--now") if args.now else None
+        validate_channel_release(
+            load(args.channel_path),
+            load(args.release_path),
+            args.release_path.read_bytes(),
+            expected_channel=args.channel,
+            expected_generation=args.generation,
+            minimum_generation=args.minimum_generation,
+            now=now,
+            require_ready=args.require_ready,
+        )
+
+    validate_channel_release_command.set_defaults(run=run_validate_channel_release)
     return root
 
 
