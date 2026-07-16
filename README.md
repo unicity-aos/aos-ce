@@ -18,22 +18,69 @@ docs/         Product and operator documentation
 
 ## Install
 
-The supported installer installs both the `aos` product command and its pinned
-Astrid Runtime under the product-owned `~/.unicity-os` root:
+The supported installer installs the `aos` product command, its pinned runtime,
+and the exact 18 Community Edition capsules built from this source tree under
+the product-owned `~/.aos` root:
 
 ```sh
-curl -fsSL https://aos.unicity.ai/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://aos.unicity.ai/install.sh | sh
 aos init
 ```
 
-Re-running the installer performs a coordinated product upgrade without
-rewriting a standalone `~/.astrid` installation. Every release publishes
+`aos init`, including `aos init --offline`, provisions from those local,
+product-versioned capsule assets. Re-running the installer performs a
+coordinated product upgrade without
+rewriting a standalone runtime installation. Every release publishes
 checksums, Sigstore bundles, GitHub build-provenance attestations, and
-`runtime-compatibility.toml`, which pins the exact Astrid release and WIT commit.
+`runtime-compatibility.toml`, which pins the exact runtime release and WIT commit.
+Its machine-readable runtime-compatibility and upgrade/self-heal gates must both
+be true before a tag can publish. The latter is approved only after the exact
+candidate preserves a frozen standalone-home clone and boots with freshly
+generated runtime coordination state.
+
+## Command boundary
+
+AOS owns its product roots, including `init`, `status`, `migrate`, `update`,
+`distro`, and `serve-health`:
+
+```sh
+aos status
+aos status --json
+```
+
+Every other root inherits the bundled Astrid CLI transparently. Arguments, exit
+codes, and signals pass through unchanged:
+
+```sh
+aos doctor
+aos capsule build
+```
+
+An AOS-owned root intentionally shadows the runtime root with the same name.
+Use the standalone runtime CLI when the raw command is required:
+
+```sh
+astrid status
+astrid init --help
+```
+
+Provisioning another principal keeps the authenticated operator separate from
+the target environment:
+
+```sh
+aos --principal operator init --target-principal alice
+```
+
+This AOS release fixes its distribution state to Unicity CE. Use a standalone
+`astrid` installation and runtime home to apply another distribution. Homebrew
+installations update with `aos update`. Direct installs resolve the signed
+`stable` channel by default and can select `dev`, `nightly`, or an exact version;
+all remain fail-closed until their signed metadata is actually published. See
+[Signed AOS release channels](docs/release-channels.md).
 
 ## Import an existing runtime
 
-The `aos` CLI can deliberately copy compatible state from a standalone Astrid
-Runtime installation without changing the source. See
+The `aos` CLI can deliberately copy compatible state from a standalone runtime
+installation without changing the source. See
 [Importing standalone runtime state](docs/runtime-migration.md) for the exact
 allowlist, integrity checks, recovery behavior, and command.

@@ -15,6 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  B3SUM_VERSION: 1.8.5
 
 jobs:
   format:
@@ -36,8 +37,20 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo install b3sum --locked --version "$B3SUM_VERSION"
       - run: sh -n install.sh
       - run: python3 scripts/validate-release-contract.py
+      - run: python3 scripts/test_validate_release_contract.py
+      - run: python3 scripts/test_release_metadata.py
+      - run: python3 scripts/test_channel_transaction.py
+      - run: python3 scripts/test_channel_publication.py
+      - run: python3 scripts/test_release_publication.py
+      - run: bash scripts/test-channel-workflow-contract.sh
+      - run: python3 scripts/test_create_astrid_094_fixture.py
       - run: bash scripts/test-package-release.sh
       - run: bash scripts/test-install.sh
       - run: python3 scripts/capsule_release.py
@@ -70,8 +83,11 @@ jobs:
           toolchain: "1.95.0"
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo install b3sum --locked --version "$B3SUM_VERSION"
       - run: cargo test --locked -p unicity-aos-bootstrap
       - run: cargo clippy --locked -p unicity-aos-bootstrap -- -D warnings
+      - run: bash scripts/test-upgrade-self-heal.sh
+      - run: bash scripts/test-final-runtime-boot-harness.sh
 
   capsule-tests:
     name: Capsule host tests

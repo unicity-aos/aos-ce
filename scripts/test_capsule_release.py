@@ -58,6 +58,8 @@ def write_fixture(path: Path, spec: CapsuleSpec, *, mutation: Optional[str] = No
             device = tarfile.TarInfo("device")
             device.type = tarfile.CHRTYPE
             archive.addfile(device)
+        if mutation == "unexpected-member":
+            add_bytes(archive, "unexpected.txt", b"not allowed")
         if mutation == "wrong-manifest":
             manifest = manifest.replace(
                 f'name = "{spec.package}"'.encode(),
@@ -86,6 +88,12 @@ class CapsuleReleaseTests(unittest.TestCase):
         self.assertEqual(len(self.specs), 18)
         self.assertEqual(len({spec.asset for spec in self.specs}), 18)
         self.assertNotIn("astrid-capsule-telegram.capsule", {spec.asset for spec in self.specs})
+        distro = Path(__file__).resolve().parent.parent / "distros/community/unicity-ce/Distro.toml"
+        text = distro.read_text(encoding="utf-8")
+        self.assertNotIn("@unicity-aos/", text)
+        self.assertEqual(text.count('source = "capsules/'), 18)
+        for spec in self.specs:
+            self.assertIn(f'source = "capsules/{spec.asset}"', text)
 
     def test_accepts_exact_safe_artifact_set(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -121,6 +129,9 @@ class CapsuleReleaseTests(unittest.TestCase):
 
     def test_rejects_device(self) -> None:
         self.assert_mutation_rejected("device")
+
+    def test_rejects_unexpected_member(self) -> None:
+        self.assert_mutation_rejected("unexpected-member")
 
     def test_rejects_wrong_embedded_identity(self) -> None:
         self.assert_mutation_rejected("wrong-manifest")

@@ -8,8 +8,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: aos-release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
+  B3SUM_VERSION: 1.8.5
 
 jobs:
   validate-release:
@@ -25,12 +30,13 @@ jobs:
           python-version: '3.12'
       - name: Match product, distro, and tag versions
         run: |
-          python3 scripts/validate-release-contract.py
+          python3 scripts/validate-release-contract.py --require-release-ready
           PRODUCT=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/unicity-aos-bootstrap/Cargo.toml | head -n1)
           printf '%s\n' "$GITHUB_REF_NAME" | grep -Eq '^20[0-9]{2}\.[0-9]+\.[0-9]+$'
           test "$PRODUCT" = "$GITHUB_REF_NAME"
       - run: bash scripts/test-package-release.sh
       - run: bash scripts/test-install.sh
+      - run: python3 scripts/test_create_astrid_094_fixture.py
       - run: python3 scripts/capsule_release.py
       - run: python3 scripts/test_capsule_release.py
       - run: python3 scripts/test_validate_runtime_archive.py
@@ -39,7 +45,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
-    needs: validate-release
+    needs: [validate-release, capsules]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -73,6 +79,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: aos-release-${{ matrix.target }}
+      - name: Install pinned BLAKE3 checksum tool
+        run: cargo install b3sum --locked --version "$B3SUM_VERSION"
       - name: Load runtime compatibility pins
         run: |
           python3 - <<'PY' >> "$GITHUB_ENV"
@@ -93,17 +101,13 @@ jobs:
           ASSET="astrid-${RUNTIME_VERSION}-${{ matrix.target }}.tar.gz"
           BASE="https://github.com/${RUNTIME_REPOSITORY}/releases/download/${RUNTIME_TAG}"
           curl --proto '=https' --tlsv1.2 -fsSLO "$BASE/$ASSET"
-          curl --proto '=https' --tlsv1.2 -fsSLO "$BASE/SHA256SUMS.txt"
+          curl --proto '=https' --tlsv1.2 -fsSLO "$BASE/BLAKE3SUMS.txt"
           curl --proto '=https' --tlsv1.2 -fsSLo "$ASSET.sigstore.json" "$BASE/$ASSET.sigstore.json"
-          EXPECTED=$(awk -v asset="$ASSET" '$2 == asset { print $1; exit }' SHA256SUMS.txt)
+          EXPECTED=$(awk -v asset="$ASSET" '$2 == asset { print $1; exit }' BLAKE3SUMS.txt)
           test -n "$EXPECTED"
-          if command -v sha256sum >/dev/null 2>&1; then
-            echo "$EXPECTED  $ASSET" | sha256sum -c -
-          else
-            echo "$EXPECTED  $ASSET" | shasum -a 256 -c -
-          fi
+          test "$(b3sum -- "$ASSET" | awk '{print $1}')" = "$EXPECTED"
           echo "RUNTIME_ASSET=$ASSET" >> "$GITHUB_ENV"
-          echo "RUNTIME_SHA256=$EXPECTED" >> "$GITHUB_ENV"
+          echo "RUNTIME_BLAKE3=$EXPECTED" >> "$GITHUB_ENV"
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Verify runtime release identity
         run: |
@@ -112,13 +116,19 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "$RUNTIME_IDENTITY" \
             "$RUNTIME_ASSET"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: capsule-artifacts
+          name: aos-community-capsules
       - name: Compose product bundle
         run: |
+          python3 scripts/capsule_release.py --artifacts capsule-artifacts
           scripts/package-release.sh \
             "${{ matrix.target }}" \
             "target/${{ matrix.target }}/release/aos" \
             "$RUNTIME_ASSET" \
-            "$RUNTIME_SHA256" \
+            "$RUNTIME_BLAKE3" \
+            capsule-artifacts \
             artifacts
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -144,6 +154,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: aos-release-capsules
+      - name: Install pinned BLAKE3 checksum tool
+        run: cargo install b3sum --locked --version "$B3SUM_VERSION"
       - name: Load runtime compatibility pins
         run: |
           python3 - <<'PY' >> "$GITHUB_ENV"
@@ -161,11 +173,11 @@ jobs:
           ASSET="astrid-${RUNTIME_VERSION}-${TARGET}.tar.gz"
           BASE="https://github.com/${RUNTIME_REPOSITORY}/releases/download/${RUNTIME_TAG}"
           curl --proto '=https' --tlsv1.2 -fsSLO "$BASE/$ASSET"
-          curl --proto '=https' --tlsv1.2 -fsSLO "$BASE/SHA256SUMS.txt"
+          curl --proto '=https' --tlsv1.2 -fsSLO "$BASE/BLAKE3SUMS.txt"
           curl --proto '=https' --tlsv1.2 -fsSLo "$ASSET.sigstore.json" "$BASE/$ASSET.sigstore.json"
-          EXPECTED=$(awk -v asset="$ASSET" '$2 == asset { print $1; exit }' SHA256SUMS.txt)
+          EXPECTED=$(awk -v asset="$ASSET" '$2 == asset { print $1; exit }' BLAKE3SUMS.txt)
           test -n "$EXPECTED"
-          echo "$EXPECTED  $ASSET" | sha256sum -c -
+          test "$(b3sum -- "$ASSET" | awk '{print $1}')" = "$EXPECTED"
           echo "RUNTIME_ASSET=$ASSET" >> "$GITHUB_ENV"
           echo "RUNTIME_TARGET=$TARGET" >> "$GITHUB_ENV"
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -204,9 +216,21 @@ jobs:
         with:
           egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Require repository immutable releases
+        env:
+          GH_TOKEN: ${{ secrets.AOS_RELEASE_ADMIN_TOKEN }}
+        run: |
+          [[ -n "$GH_TOKEN" ]]
+          gh api "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            --jq 'select(.enabled == true) | true' | grep -Fx true
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+      - name: Install pinned BLAKE3 checksum tool
+        run: cargo install b3sum --locked --version "$B3SUM_VERSION"
       - name: Load runtime compatibility pins
         run: |
           python3 - <<'PY' >> "$GITHUB_ENV"
@@ -231,23 +255,78 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
+          b3sum -- ./*.tar.gz ./*.capsule | sed 's#  \./#  #' > BLAKE3SUMS.txt
           sha256sum -- ./*.tar.gz ./*.capsule | sed 's#  \./#  #' > SHA256SUMS.txt
           cp ../release/runtime-compatibility.toml .
+      - name: Generate immutable release metadata
+        run: |
+          PUBLISHED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          RELEASE_METADATA="artifacts/unicity-aos-${GITHUB_REF_NAME}-release.toml"
+          python3 scripts/release_metadata.py render-release \
+            --version "$GITHUB_REF_NAME" \
+            --tag "$GITHUB_REF_NAME" \
+            --source-commit "$GITHUB_SHA" \
+            --published-at "$PUBLISHED_AT" \
+            --artifacts artifacts \
+            --sha256 artifacts/SHA256SUMS.txt \
+            --blake3 artifacts/BLAKE3SUMS.txt \
+            --output "$RELEASE_METADATA"
+          python3 scripts/release_metadata.py validate-release \
+            --require-ready "$RELEASE_METADATA"
+          echo "RELEASE_METADATA=$RELEASE_METADATA" >> "$GITHUB_ENV"
+      - name: Detect an interrupted never-published draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASES="$RUNNER_TEMP/releases-preflight.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --paginate --slurp > "$RELEASES"
+          MATCH_COUNT=$(jq -er --arg tag "$GITHUB_REF_NAME" \
+            '[.[][] | select(.tag_name == $tag)] | length' "$RELEASES")
+          [[ "$MATCH_COUNT" -le 1 ]]
+          if [[ "$MATCH_COUNT" == 0 ]]; then
+            echo "EXISTING_RELEASE=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          jq -e --arg tag "$GITHUB_REF_NAME" \
+            '.[][] | select(.tag_name == $tag) | select(.draft == true and .prerelease == false and .published_at == null)' \
+            "$RELEASES" >/dev/null || {
+            echo "release $GITHUB_REF_NAME already exists and is not a never-published draft" >&2
+            exit 1
+          }
+          echo "EXISTING_RELEASE=1" >> "$GITHUB_ENV"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        if: env.EXISTING_RELEASE != '1'
         with:
           subject-path: |
             artifacts/*.tar.gz
             artifacts/*.capsule
+            artifacts/BLAKE3SUMS.txt
             artifacts/SHA256SUMS.txt
             artifacts/runtime-compatibility.toml
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+            artifacts/unicity-aos-*-release.toml
       - name: Sign release assets
+        if: env.EXISTING_RELEASE != '1'
         env:
           COSIGN_YES: 'true'
         run: |
           cd artifacts
-          for asset in ./*.tar.gz ./*.capsule SHA256SUMS.txt runtime-compatibility.toml; do
+          for asset in ./*.tar.gz ./*.capsule BLAKE3SUMS.txt SHA256SUMS.txt runtime-compatibility.toml unicity-aos-*-release.toml; do
             cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
+          done
+      - name: Verify release signatures use the exact tag identity
+        if: env.EXISTING_RELEASE != '1'
+        run: |
+          cd artifacts
+          IDENTITY="https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+          for asset in ./*.tar.gz ./*.capsule BLAKE3SUMS.txt SHA256SUMS.txt runtime-compatibility.toml unicity-aos-*-release.toml; do
+            cosign verify-blob \
+              --bundle "${asset}.sigstore.json" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity "$IDENTITY" \
+              --use-signed-timestamps \
+              "$asset"
           done
       - name: Write release notes
         run: |
@@ -261,26 +340,92 @@ jobs:
           Install or upgrade:
 
           \`\`\`sh
-          curl -fsSL https://aos.unicity.ai/install.sh | sh
+          curl --proto '=https' --tlsv1.2 -fsSL https://aos.unicity.ai/install.sh | sh
           \`\`\`
           EOF
-      - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+      - name: Refuse conflicting releases or authenticate a complete draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASES="$RUNNER_TEMP/releases.json"
+          MATCHING_RELEASE="$RUNNER_TEMP/matching-release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --paginate \
+            --slurp > "$RELEASES"
+          jq --arg tag "$GITHUB_REF_NAME" \
+            '[.[][] | select(.tag_name == $tag)]' "$RELEASES" > "$MATCHING_RELEASE"
+          MATCH_COUNT=$(jq -er length "$MATCHING_RELEASE")
+          [[ "$MATCH_COUNT" -le 1 ]]
+          if [[ "$MATCH_COUNT" == 0 ]]; then
+            echo "RECOVER_DRAFT=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          jq -e '.[0] | .draft == true and .prerelease == false and .published_at == null' \
+            "$MATCHING_RELEASE" >/dev/null || {
+            echo "release $GITHUB_REF_NAME already exists and is not a never-published draft" >&2
+            echo "release assets are write-once; never clobber, delete, or retag a published version" >&2
+            exit 1
+          }
+          RELEASE_ID=$(jq -er '.[0].id' "$MATCHING_RELEASE")
+          ASSETS="$RUNNER_TEMP/release-assets.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+            --paginate --slurp > "$ASSETS"
+          jq -e '[.[][]] | all(.state == "uploaded" and .size > 0)' "$ASSETS" >/dev/null
+          jq -e '[.[][]] as $assets | ([$assets[].name] | unique | length) == ($assets | length)' \
+            "$ASSETS" >/dev/null
+
+          EXISTING_ASSETS="$RUNNER_TEMP/existing-release-assets"
+          mkdir "$EXISTING_ASSETS"
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$EXISTING_ASSETS"
+          PAYLOADS="$RUNNER_TEMP/existing-release-payloads.txt"
+          python3 scripts/release_publication.py \
+            --artifacts "$EXISTING_ASSETS" \
+            --version "$GITHUB_REF_NAME" \
+            --source-commit "$GITHUB_SHA" > "$PAYLOADS"
+          (
+            cd "$EXISTING_ASSETS"
+            b3sum --check BLAKE3SUMS.txt
+            sha256sum --check SHA256SUMS.txt
+          )
+          IDENTITY="https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+          while IFS= read -r asset; do
+            cosign verify-blob \
+              --bundle "$EXISTING_ASSETS/${asset}.sigstore.json" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity "$IDENTITY" \
+              --use-signed-timestamps \
+              "$EXISTING_ASSETS/$asset"
+          done < "$PAYLOADS"
+          echo "RECOVER_DRAFT=1" >> "$GITHUB_ENV"
+      - name: Create draft release with write-once assets
+        if: env.RECOVER_DRAFT != '1'
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
+          draft: true
+          overwrite_files: false
+          fail_on_unmatched_files: true
           files: |
             artifacts/*.tar.gz
             artifacts/*.capsule
+            artifacts/BLAKE3SUMS.txt
             artifacts/SHA256SUMS.txt
             artifacts/runtime-compatibility.toml
+            artifacts/unicity-aos-*-release.toml
             artifacts/*.sigstore.json
           body_path: release-notes.md
-      - name: Notify Homebrew tap
+      - name: Publish completed immutable release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          draft: false
+          overwrite_files: false
+          body_path: release-notes.md
+      - name: Verify published release is immutable
         env:
-          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "TAP_DISPATCH_TOKEN is not configured; run the tap's Update AOS formula workflow manually."
-            exit 0
-          fi
-          gh api repos/unicity-aos/homebrew-tap/dispatches \
-            -f event_type=aos-release \
-            -f "client_payload[version]=${GITHUB_REF_NAME}"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq 'select(.draft == false and .immutable == true) | true' \
+            | grep -Fx true

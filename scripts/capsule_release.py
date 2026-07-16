@@ -138,10 +138,10 @@ def source_contract() -> list[CapsuleSpec]:
                 f"{DISTRO}: {cargo_name} version {distro_entry.get('version')!r} "
                 f"does not match source {cargo_version}"
             )
-        expected_source = f"@unicity-aos/{directory}"
+        expected_source = f"capsules/{cargo_name}.capsule"
         if distro_entry.get("source") != expected_source:
             raise ContractError(
-                f"{DISTRO}: {cargo_name} source must remain {expected_source!r} until source migration"
+                f"{DISTRO}: {cargo_name} source must be the bundled asset {expected_source!r}"
             )
 
         specs.append(
@@ -215,6 +215,14 @@ def validate_archive(asset: Path, spec: CapsuleSpec) -> None:
             names[canonical_name] = member
             portability_names[portability_name] = canonical_name
 
+        expected_members = {"Capsule.toml", *spec.components}
+        if set(names) != expected_members:
+            raise ContractError(
+                f"{asset}: archive member set differs; "
+                f"missing={sorted(expected_members - set(names))}, "
+                f"unexpected={sorted(set(names) - expected_members)}"
+            )
+
         manifest_member = names.get("Capsule.toml")
         if manifest_member is None or not manifest_member.isfile():
             raise ContractError(f"{asset}: Capsule.toml is missing")
@@ -268,6 +276,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifacts", type=Path, help="validate the exact built .capsule set")
     parser.add_argument("--print-build-plan", action="store_true", help="print directory and package TSV")
+    parser.add_argument("--print-assets", action="store_true", help="print canonical capsule asset names")
     return parser.parse_args(argv)
 
 
@@ -280,6 +289,9 @@ def main(argv: list[str]) -> int:
         if args.print_build_plan:
             for spec in specs:
                 print(f"{spec.directory}\t{spec.package}")
+        if args.print_assets:
+            for spec in specs:
+                print(spec.asset)
     except ContractError as error:
         print(f"capsule release contract error: {error}", file=sys.stderr)
         return 1
