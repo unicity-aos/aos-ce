@@ -12,7 +12,6 @@ AOS_VERSION="$AOS_VERSION_INPUT"
 AOS_CHANNEL_BASE_URL="${AOS_CHANNEL_BASE_URL:-https://github.com/${AOS_RELEASE_REPO}/releases/download}"
 COSIGN_VERSION=v3.1.1
 ASSUME_YES=0
-SKIP_MIGRATION_PROMPT=0
 channel_explicit=0
 version_explicit=0
 installation_started=0
@@ -24,6 +23,7 @@ channel_current_path=
 channel_generation_dir=
 install_lock=
 install_lock_acquired=0
+CHECK_ONLY=0
 
 [ -z "$AOS_CHANNEL_INPUT" ] || channel_explicit=1
 if [ "$AOS_VERSION" = latest ]; then
@@ -36,18 +36,19 @@ usage() {
   cat <<'EOF'
 Install or upgrade Unicity AOS Community Edition.
 
-Usage: install.sh [--yes] [--channel CHANNEL | --version VERSION] [--no-migrate-prompt]
+Usage: install.sh [--yes] [--check] [--channel CHANNEL | --version VERSION]
 
   --yes                do not ask before replacing an existing installation
+  --check              verify the selected channel and report availability only
   --channel CHANNEL    follow the signed stable, dev, or nightly channel
   --version VERSION    install a specific calendar-semver release
-  --no-migrate-prompt  do not launch the optional Astrid state-import prompt
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -y|--yes) ASSUME_YES=1 ;;
+    --check) CHECK_ONLY=1 ;;
     --channel)
       [ "$#" -ge 2 ] || { echo "missing value for --channel" >&2; exit 2; }
       AOS_CHANNEL=$2
@@ -60,7 +61,6 @@ while [ "$#" -gt 0 ]; do
       version_explicit=1
       shift
       ;;
-    --no-migrate-prompt) SKIP_MIGRATION_PROMPT=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -139,6 +139,17 @@ utc_epoch() {
   value=$1
   date -u -d "$value" '+%s' 2>/dev/null ||
     date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$value" '+%s' 2>/dev/null
+}
+
+version_gt() {
+  awk -v left="$1" -v right="$2" 'BEGIN {
+    split(left, l, "."); split(right, r, ".")
+    for (i = 1; i <= 3; i++) {
+      if ((l[i] + 0) > (r[i] + 0)) exit 0
+      if ((l[i] + 0) < (r[i] + 0)) exit 1
+    }
+    exit 1
+  }'
 }
 
 toml_value() {
@@ -690,6 +701,19 @@ if [ -f "$work/channel.toml" ]; then
   done
 fi
 
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  validate_accepted_channel
+  [ -x "$AOS_BIN_DIR/aos" ] || {
+    echo "Unicity AOS is not installed at $AOS_BIN_DIR/aos" >&2
+    exit 1
+  }
+  installed_version=$("$AOS_BIN_DIR/aos" --version | awk 'NF { value = $NF } END { print value }')
+  if version_gt "$AOS_VERSION" "$installed_version"; then
+    echo "Update available: Unicity AOS $installed_version -> $AOS_VERSION. Run \`aos update\` to install."
+  fi
+  exit 0
+fi
+
 echo "Downloading Unicity AOS $AOS_VERSION for $target..."
 curl --proto '=https' --tlsv1.2 -fsSL "$release_base/$asset" -o "$work/$asset"
 curl --proto '=https' --tlsv1.2 -fsSL "$release_base/$asset_bundle" -o "$work/$asset_bundle"
@@ -739,7 +763,7 @@ for file in bin/aos libexec/install.sh runtime/bin/astrid runtime/bin/astrid-dae
 done
 [ -d "$bundle/capsules" ] || { echo "release archive has no capsule directory" >&2; exit 1; }
 if ! awk '
-  !/^astrid-capsule-[a-z0-9-]+\.capsule$/ { invalid = 1 }
+  !/^aos-[a-z0-9-]+\.capsule$/ { invalid = 1 }
   seen[$0]++ { duplicate = 1 }
   END { exit invalid || duplicate || NR == 0 }
 ' "$bundle/capsule-assets.txt"; then
@@ -945,6 +969,18 @@ installation_started=0
 rm -rf "$release_backup"
 release_install_lock
 
+control_capsule="$release_dir/capsules/aos-cli.capsule"
+if [ ! -f "$control_capsule" ] || [ -L "$control_capsule" ]; then
+  echo "installed release has no regular local control capsule" >&2
+  exit 1
+fi
+if ! AOS_HOME="$AOS_HOME" "$AOS_BIN_DIR/aos" --principal default \
+  capsule install "$control_capsule" >/dev/null
+then
+  echo "Unicity AOS was installed, but its local control capsule could not be provisioned" >&2
+  exit 1
+fi
+
 echo "Installed Unicity AOS $staged_version."
 case ":$PATH:" in
   *":$AOS_BIN_DIR:"*) init_command="aos init" ;;
@@ -954,8 +990,4 @@ case ":$PATH:" in
     ;;
 esac
 
-if [ "$SKIP_MIGRATION_PROMPT" -ne 1 ] && has_interactive_tty; then
-  "$AOS_BIN_DIR/aos" </dev/tty >/dev/tty 2>/dev/tty || true
-else
-  echo "Run: $init_command"
-fi
+echo "Run: $init_command"

@@ -177,7 +177,6 @@ fn product_help_version_and_usage_errors_never_delegate() {
         (vec!["init", "--help"], true),
         (vec!["init", "--grant-capsules"], false),
         (vec!["init", "--principal", "alice"], false),
-        (vec!["migrate"], false),
         (vec!["update", "unexpected"], false),
         (vec!["self-update", "unexpected"], false),
         (vec!["serve-health", "unexpected"], false),
@@ -554,7 +553,7 @@ exit 23
     assert_eq!(output.status.code(), Some(23));
     assert_eq!(
         fs::read_to_string(&fixture.args).expect("read updater args"),
-        "<--channel>\n<dev>\n<--yes>\n<--no-migrate-prompt>\n"
+        "<--channel>\n<dev>\n<--yes>\n"
     );
 
     let output = fixture
@@ -565,7 +564,18 @@ exit 23
     assert_eq!(output.status.code(), Some(23));
     assert_eq!(
         fs::read_to_string(&fixture.args).expect("read updater args"),
-        "<--version>\n<2026.13.0>\n<--yes>\n<--no-migrate-prompt>\n"
+        "<--version>\n<2026.13.0>\n<--yes>\n"
+    );
+
+    let output = fixture
+        .command()
+        .args(["update", "--check"])
+        .output()
+        .expect("run installed update check");
+    assert_eq!(output.status.code(), Some(23));
+    assert_eq!(
+        fs::read_to_string(&fixture.args).expect("read updater args"),
+        "<--channel>\n<stable>\n<--check>\n<--yes>\n"
     );
 
     for args in [

@@ -19,110 +19,19 @@ mode_of() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 
-durable_paths() {
-  local root=$1
-  (
-    cd "$root"
-    find etc home keys log secrets var wit -type f -print
-    find bin -type f -name '*.wasm' -print
-  ) | LC_ALL=C sort
-}
-
-snapshot_durable_files() {
+snapshot_tree() {
   local root=$1
   local output=$2
   : > "$output"
-  while IFS= read -r relative; do
-    printf '%s|%s|%s\n' \
-      "$(b3sum -- "$root/$relative" | awk '{print $1}')" \
-      "$(mode_of "$root/$relative")" \
-      "$relative" >> "$output"
-  done < <(durable_paths "$root")
-}
-
-snapshot_durable_directories() {
-  local root=$1
-  local output=$2
-  : > "$output"
-  for top_level in bin etc home keys log secrets var wit; do
-    while IFS= read -r directory; do
-      printf '%s|%s\n' \
-        "$(mode_of "$directory")" \
-        "${directory#"$root/"}" >> "$output"
-    done < <(find "$root/$top_level" -type d -print | LC_ALL=C sort)
-  done
-}
-
-expected_imported_path() {
-  local root=$1
-  local relative=$2
-  case "$relative" in
-    etc/profiles/default.toml)
-      printf '%s\n' "$root/$relative"
-      ;;
-    etc/profiles/*)
-      printf '%s\n' "$root/imported/astrid-home-v1/$relative"
-      ;;
-    home/default/.local/capsules | home/default/.local/capsules/*)
-      printf '%s\n' "$root/$relative"
-      ;;
-    home/*/.local/capsules | home/*/.local/capsules/*)
-      printf '%s\n' "$root/imported/astrid-home-v1/$relative"
-      ;;
-    *)
-      printf '%s\n' "$root/$relative"
-      ;;
-  esac
-}
-
-assert_no_alternate_activation_path() {
-  local root=$1
-  local relative=$2
-  local expected=$3
-  local alternate
-  case "$relative" in
-    etc/profiles/*.toml | home/*/.local/capsules | home/*/.local/capsules/*)
-      case "$expected" in
-        "$root/imported/astrid-home-v1/"*) alternate=$root/$relative ;;
-        *) alternate=$root/imported/astrid-home-v1/$relative ;;
-      esac
-      test ! -e "$alternate" || {
-        echo "imported activation path exists in both locations: $relative" >&2
-        exit 1
-      }
-      ;;
-  esac
-}
-
-snapshot_imported_files() {
-  local root=$1
-  local source_snapshot=$2
-  local output=$3
-  : > "$output"
-  while IFS='|' read -r _ _ relative; do
-    local path
-    path=$(expected_imported_path "$root" "$relative")
-    test -f "$path"
-    assert_no_alternate_activation_path "$root" "$relative" "$path"
-    printf '%s|%s|%s\n' \
-      "$(b3sum -- "$path" | awk '{print $1}')" \
+  while IFS= read -r path; do
+    printf 'd|%s|%s\n' "$(mode_of "$path")" "${path#"$root"/}" >> "$output"
+  done < <(find "$root" -type d -print | LC_ALL=C sort)
+  while IFS= read -r path; do
+    printf 'f|%s|%s|%s\n' \
       "$(mode_of "$path")" \
-      "$relative" >> "$output"
-  done < "$source_snapshot"
-}
-
-snapshot_imported_directories() {
-  local root=$1
-  local source_snapshot=$2
-  local output=$3
-  : > "$output"
-  while IFS='|' read -r _ relative; do
-    local path
-    path=$(expected_imported_path "$root" "$relative")
-    test -d "$path"
-    assert_no_alternate_activation_path "$root" "$relative" "$path"
-    printf '%s|%s\n' "$(mode_of "$path")" "$relative" >> "$output"
-  done < "$source_snapshot"
+      "$(b3sum -- "$path" | awk '{print $1}')" \
+      "${path#"$root"/}" >> "$output"
+  done < <(find "$root" -type f -print | LC_ALL=C sort)
 }
 
 snapshot_shipped_assets() {
@@ -143,12 +52,17 @@ snapshot_shipped_assets() {
   done < "$release/capsule-assets.txt"
 }
 
-assert_imported_activation_layout() {
-  local runtime=$1
-  test "$(find "$runtime/etc/profiles" -type f 2>/dev/null | wc -l | tr -d ' ')" -eq 0
-  test "$(find "$runtime/imported/astrid-home-v1/etc/profiles" -type f | wc -l | tr -d ' ')" -eq 7
-  test ! -e "$runtime/home/alice/.local/capsules"
-  test "$(find "$runtime/imported/astrid-home-v1/home/alice/.local/capsules" -type f | wc -l | tr -d ' ')" -eq 140
+assert_astrid_untouched() {
+  local expected=$1
+  local actual=$work/astrid-tree-actual
+  snapshot_tree "$legacy" "$actual"
+  diff -u "$expected" "$actual"
+  test ! -e "$aos_home/imported"
+  test ! -e "$aos_home/migrations"
+  if grep -R -F "$legacy_marker" "$aos_home" >/dev/null 2>&1; then
+    echo "standalone Astrid state was copied into the AOS installation" >&2
+    exit 1
+  fi
 }
 
 home=$work/home
@@ -157,8 +71,27 @@ aos_home=$home/.aos
 fixture=$work/downloads
 fake_bin=$work/fake-bin
 capsules=$work/capsules
-mkdir -p "$home" "$fixture" "$fake_bin" "$capsules"
-python3 "$repo_root/scripts/create-astrid-094-fixture.py" "$legacy"
+legacy_marker=standalone-astrid-state-must-remain-external
+mkdir -p \
+  "$legacy/etc/profiles" \
+  "$legacy/home/default/.config/env" \
+  "$legacy/home/default/.local/capsules/astrid-mcp" \
+  "$legacy/secrets/default/astrid-mcp" \
+  "$legacy/var" \
+  "$fixture" \
+  "$fake_bin" \
+  "$capsules"
+printf '%s\n' "$legacy_marker" > "$legacy/etc/profiles/default.toml"
+printf '{"marker":"%s"}\n' "$legacy_marker" > "$legacy/home/default/.config/env/astrid-mcp.env.json"
+printf '%s\n' "$legacy_marker" > "$legacy/home/default/.local/capsules/astrid-mcp/astrid-mcp.capsule"
+printf '%s\n' "$legacy_marker" > "$legacy/secrets/default/astrid-mcp/broker_token"
+printf '%s\n' "$legacy_marker" > "$legacy/var/state.sentinel"
+find "$legacy" -type d -exec chmod 700 {} +
+find "$legacy" -type f -exec chmod 600 {} +
+chmod 700 "$legacy/home/default/.local/capsules/astrid-mcp/astrid-mcp.capsule"
+
+astrid_before=$work/astrid-tree-before
+snapshot_tree "$legacy" "$astrid_before"
 
 cargo build --locked -p unicity-aos-bootstrap --bin aos
 product_binary=$repo_root/target/debug/aos
@@ -194,7 +127,6 @@ bash "$repo_root/scripts/package-release.sh" \
 
 asset=$fixture/unicity-aos-2026.1.0-$target.tar.gz
 bundle=$asset.sigstore.json
-cp "$asset" "$fixture/signed-asset.tar.gz"
 printf 'valid Sigstore fixture\n' > "$fixture/valid.sigstore.json"
 cp "$fixture/valid.sigstore.json" "$bundle"
 asset_sha256=$(shasum -a 256 "$asset" | awk '{print $1}')
@@ -304,69 +236,20 @@ install_candidate() {
   HOME="$home" \
   AOS_TEST_FIXTURE="$fixture" \
   AOS_VERSION=2026.1.0 \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+  sh "$repo_root/install.sh" --yes >/dev/null
 }
-
-source_files_before=$work/source-files-before
-source_dirs_before=$work/source-dirs-before
-snapshot_durable_files "$legacy" "$source_files_before"
-snapshot_durable_directories "$legacy" "$source_dirs_before"
-test "$(wc -l < "$source_files_before" | tr -d ' ')" -eq 478
-test "$(find "$legacy/run" -type f | wc -l | tr -d ' ')" -eq 5
 
 install_candidate
 test -x "$aos_home/bin/aos"
-test -x "$aos_home/runtime/bin/astrid-daemon"
-HOME="$home" "$aos_home/bin/aos" migrate runtime --from "$legacy" > "$work/migrate.log"
-grep -F 'imported the standalone runtime; the source was left unchanged' "$work/migrate.log" >/dev/null
-assert_imported_activation_layout "$aos_home/runtime"
-
-source_files_after=$work/source-files-after
-source_dirs_after=$work/source-dirs-after
-target_files=$work/target-files
-target_dirs=$work/target-dirs
-snapshot_durable_files "$legacy" "$source_files_after"
-snapshot_durable_directories "$legacy" "$source_dirs_after"
-snapshot_imported_files "$aos_home/runtime" "$source_files_before" "$target_files"
-snapshot_imported_directories "$aos_home/runtime" "$source_dirs_before" "$target_dirs"
-diff -u "$source_files_before" "$source_files_after"
-diff -u "$source_dirs_before" "$source_dirs_after"
-diff -u \
-  <(cut -d '|' -f 2 "$source_dirs_before") \
-  <(cut -d '|' -f 2 "$target_dirs")
-diff -u \
-  <(cut -d '|' -f 1,3 "$source_files_before") \
-  <(cut -d '|' -f 1,3 "$target_files")
-
-while IFS='|' read -r _ source_mode relative; do
-  target_path=$(expected_imported_path "$aos_home/runtime" "$relative")
-  target_mode=$(mode_of "$target_path")
-  if (( (8#$source_mode & 8#111) != 0 )); then
-    expected_mode=700
-  else
-    expected_mode=600
-  fi
-  test "$target_mode" = "$expected_mode"
-done < "$source_files_before"
-while IFS='|' read -r target_mode relative; do
-  test "$target_mode" = 700 || {
-    echo "target directory is not private: $relative ($target_mode)" >&2
-    exit 1
-  }
-done < "$target_dirs"
-
-for transient in .hud-health session.principal system.lock system.pid system.token; do
-  test -f "$legacy/run/$transient"
-  test ! -e "$aos_home/runtime/run/$transient"
+for name in astrid astrid-daemon astrid-build astrid-emit; do
+  test -x "$aos_home/runtime/bin/$name"
 done
-test ! -e "$aos_home/runtime/run"
+assert_astrid_untouched "$astrid_before"
 
-receipt=$aos_home/migrations/astrid-home-v1.json
-test -f "$receipt"
-receipt_before=$(b3sum -- "$receipt" | awk '{print $1}')
-HOME="$home" "$aos_home/bin/aos" migrate runtime --from "$legacy" > "$work/idempotent.log"
-grep -F 'this runtime migration is already complete' "$work/idempotent.log" >/dev/null
-test "$(b3sum -- "$receipt" | awk '{print $1}')" = "$receipt_before"
+mkdir -p "$aos_home/runtime/var"
+printf 'private AOS runtime state\n' > "$aos_home/runtime/var/state.sentinel"
+chmod 600 "$aos_home/runtime/var/state.sentinel"
+state_before=$(b3sum "$aos_home/runtime/var/state.sentinel" | awk '{print $1}')
 
 shipped_before=$work/shipped-before
 shipped_after=$work/shipped-after
@@ -392,9 +275,11 @@ chmod 755 \
   "$aos_home/releases/2026.1.0/capsules"
 
 install_candidate
-assert_imported_activation_layout "$aos_home/runtime"
 snapshot_shipped_assets "$aos_home" "$shipped_after"
 diff -u "$shipped_before" "$shipped_after"
+test "$(b3sum "$aos_home/runtime/var/state.sentinel" | awk '{print $1}')" = "$state_before"
+assert_astrid_untouched "$astrid_before"
+
 for directory in \
   "$aos_home" \
   "$aos_home/bin" \
@@ -406,39 +291,6 @@ for directory in \
   test "$(mode_of "$directory")" = 700
 done
 
-snapshot_durable_files "$legacy" "$source_files_after"
-snapshot_durable_directories "$legacy" "$source_dirs_after"
-snapshot_imported_files "$aos_home/runtime" "$source_files_before" "$target_files"
-snapshot_imported_directories "$aos_home/runtime" "$source_dirs_before" "$target_dirs"
-diff -u "$source_files_before" "$source_files_after"
-diff -u "$source_dirs_before" "$source_dirs_after"
-diff -u \
-  <(cut -d '|' -f 1,3 "$source_files_before") \
-  <(cut -d '|' -f 1,3 "$target_files")
-diff -u \
-  <(cut -d '|' -f 2 "$source_dirs_before") \
-  <(cut -d '|' -f 2 "$target_dirs")
-while IFS='|' read -r _ source_mode relative; do
-  target_path=$(expected_imported_path "$aos_home/runtime" "$relative")
-  target_mode=$(mode_of "$target_path")
-  if (( (8#$source_mode & 8#111) != 0 )); then
-    expected_mode=700
-  else
-    expected_mode=600
-  fi
-  test "$target_mode" = "$expected_mode"
-done < "$source_files_before"
-while IFS='|' read -r target_mode relative; do
-  test "$target_mode" = 700 || {
-    echo "target directory is not private after reinstall: $relative ($target_mode)" >&2
-    exit 1
-  }
-done < "$target_dirs"
-test "$(b3sum -- "$receipt" | awk '{print $1}')" = "$receipt_before"
-HOME="$home" "$aos_home/bin/aos" migrate runtime --from "$legacy" > "$work/reinstall-idempotent.log"
-grep -F 'this runtime migration is already complete' "$work/reinstall-idempotent.log" >/dev/null
-test "$(b3sum -- "$receipt" | awk '{print $1}')" = "$receipt_before"
-test ! -e "$aos_home/runtime/run"
 if bash "$repo_root/scripts/test-final-runtime-boot.sh" \
   "$aos_home/bin/aos" \
   "$aos_home" > "$work/pending-boot.log" 2>&1; then
@@ -447,4 +299,4 @@ if bash "$repo_root/scripts/test-final-runtime-boot.sh" \
 fi
 grep -F 'the exact approved runtime is not release-ready' "$work/pending-boot.log" >/dev/null
 
-echo "sanitized packaged migration, reinstall, and self-heal checks passed"
+echo "packaged clean install, reinstall, and self-heal checks passed"

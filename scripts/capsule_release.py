@@ -95,6 +95,15 @@ def source_contract() -> list[CapsuleSpec]:
         manifest = load_toml(manifest_path)
         manifest_package = manifest.get("package", {})
 
+        manifest_env = manifest.get("env", {})
+        has_cwd_dir = isinstance(manifest_env, dict) and "cwd_dir" in manifest_env
+        if has_cwd_dir:
+            cwd_dir = manifest_env["cwd_dir"]
+            if not isinstance(cwd_dir, dict) or cwd_dir.get("default") != ".aos":
+                raise ContractError(
+                    f"{manifest_path}: product project-state default must be '.aos'"
+                )
+
         cargo_name = cargo_package.get("name")
         cargo_version = cargo_package.get("version")
         manifest_name = manifest_package.get("name")
@@ -106,9 +115,14 @@ def source_contract() -> list[CapsuleSpec]:
                 f"{member}: Cargo package {cargo_name} {cargo_version} does not match "
                 f"Capsule package {manifest_name} {manifest_version}"
             )
-        if not cargo_name.startswith("astrid-capsule-"):
-            raise ContractError(f"{member}: published package identity must remain astrid-capsule-*")
-        expected_name = f"astrid-{directory}"
+        if not cargo_name.startswith("aos-"):
+            raise ContractError(f"{member}: published package identity must remain aos-*")
+        capsule_prefix = "capsule-"
+        if not directory.startswith(capsule_prefix):
+            raise ContractError(
+                f"{member}: release capsule directory must start with {capsule_prefix!r}"
+            )
+        expected_name = f"aos-{directory[len(capsule_prefix):]}"
         if cargo_name != expected_name:
             raise ContractError(
                 f"{member}: published package identity must remain {expected_name}, got {cargo_name}"
@@ -142,6 +156,13 @@ def source_contract() -> list[CapsuleSpec]:
         if distro_entry.get("source") != expected_source:
             raise ContractError(
                 f"{DISTRO}: {cargo_name} source must be the bundled asset {expected_source!r}"
+            )
+        distro_env = distro_entry.get("env", {})
+        if has_cwd_dir and (
+            not isinstance(distro_env, dict) or distro_env.get("cwd_dir") != ".aos"
+        ):
+            raise ContractError(
+                f"{DISTRO}: {cargo_name} project-state override must be '.aos'"
             )
 
         specs.append(

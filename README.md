@@ -35,12 +35,13 @@ checksums, Sigstore bundles, GitHub build-provenance attestations, and
 `runtime-compatibility.toml`, which pins the exact runtime release and WIT commit.
 Its machine-readable runtime-compatibility and upgrade/self-heal gates must both
 be true before a tag can publish. The latter is approved only after the exact
-candidate preserves a frozen standalone-home clone and boots with freshly
-generated runtime coordination state.
+candidate clean-installs and self-heals without reading or changing an existing
+standalone Astrid home, then boots with freshly generated runtime coordination
+state.
 
 ## Command boundary
 
-AOS owns its product roots, including `init`, `status`, `migrate`, `update`,
+AOS owns its product roots, including `init`, `status`, `update`,
 `distro`, and `serve-health`:
 
 ```sh
@@ -77,10 +78,3 @@ installations update with `aos update`. Direct installs resolve the signed
 `stable` channel by default and can select `dev`, `nightly`, or an exact version;
 all remain fail-closed until their signed metadata is actually published. See
 [Signed AOS release channels](docs/release-channels.md).
-
-## Import an existing runtime
-
-The `aos` CLI can deliberately copy compatible state from a standalone runtime
-installation without changing the source. See
-[Importing standalone runtime state](docs/runtime-migration.md) for the exact
-allowlist, integrity checks, recovery behavior, and command.

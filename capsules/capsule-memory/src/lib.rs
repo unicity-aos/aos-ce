@@ -28,7 +28,7 @@ use astrid_sdk::prelude::*;
 const MAX_MEMORY_BYTES: usize = 32_768;
 
 /// Default project folder name — last resort if distro did not set `cwd_dir`.
-const DEFAULT_CWD_DIR: &str = ".astrid";
+const DEFAULT_CWD_DIR: &str = ".aos";
 
 /// Cross-session memory injector capsule.
 #[derive(Default)]

@@ -19,13 +19,13 @@
 use astrid_sdk::prelude::*;
 
 /// Default project folder name — last resort if distro did not set `cwd_dir`.
-const DEFAULT_CWD_DIR: &str = ".astrid";
+const DEFAULT_CWD_DIR: &str = ".aos";
 
 /// Project instructions capsule.
 #[derive(Default)]
 pub struct AgentsInjector;
 
-/// Resolve the instructions file path, trying AGENTS.md then ASTRID.md.
+/// Resolve the instructions file path, trying AGENTS.md then AOS.md.
 ///
 /// Returns the path of the first file that exists, or `None` if neither does.
 fn instructions_path() -> Option<String> {
@@ -37,9 +37,9 @@ fn instructions_path() -> Option<String> {
         return Some(agents);
     }
 
-    let astrid = format!("cwd://{cwd_dir}/ASTRID.md");
-    if fs::exists(&astrid).unwrap_or(false) {
-        return Some(astrid);
+    let aos = format!("cwd://{cwd_dir}/AOS.md");
+    if fs::exists(&aos).unwrap_or(false) {
+        return Some(aos);
     }
 
     None
@@ -49,7 +49,7 @@ fn instructions_path() -> Option<String> {
 impl AgentsInjector {
     /// Intercepts `prompt_builder.v1.hook.before_build` events.
     ///
-    /// Reads `{cwd_dir}/AGENTS.md` (falling back to `ASTRID.md`) and injects
+    /// Reads `{cwd_dir}/AGENTS.md` (falling back to `AOS.md`) and injects
     /// the contents as project instructions in the system prompt.
     /// Silently skipped if neither file exists.
     #[astrid::interceptor("on_before_prompt_build")]

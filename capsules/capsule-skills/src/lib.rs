@@ -57,7 +57,7 @@ pub struct ReadSkillArgs {
 #[capsule]
 impl SkillsLoader {
     /// List all available skills in a directory. Scans both the workspace and
-    /// home (`~/.astrid/home/{principal}/`) directories, merging results.
+    /// principal home directories, merging results.
     /// Returns a JSON array of `{id, name, description}` objects. Workspace
     /// skills take priority over home skills with the same ID.
     #[astrid::tool("list_skills")]

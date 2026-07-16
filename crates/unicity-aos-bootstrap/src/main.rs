@@ -5,8 +5,7 @@
 //! the bundled runtime under the product-owned home and workspace layout.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::io;
 #[cfg(any(not(unix), test))]
 use std::process::ExitStatus;
 use std::process::{Command, ExitCode};
@@ -42,11 +41,6 @@ enum ProductCommand {
     Init(InitArgs),
     /// Show product status from the typed local runtime operation.
     Status(StatusArgs),
-    /// Import compatible state from a standalone runtime installation.
-    Migrate {
-        #[command(subcommand)]
-        command: MigrateCommand,
-    },
     /// Update AOS and its coordinated runtime executable set.
     #[command(name = "update", alias = "self-update", alias = "self_update")]
     Update(UpdateArgs),
@@ -72,6 +66,9 @@ struct StatusArgs {
 
 #[derive(Args)]
 struct UpdateArgs {
+    /// Verify the selected signed channel and report availability without installing.
+    #[arg(long)]
+    check: bool,
     /// Follow the signed stable, dev, or nightly product channel.
     #[arg(long, value_enum, conflicts_with = "version")]
     channel: Option<UpdateChannel>,
@@ -154,16 +151,6 @@ struct InitArgs {
     vars: Vec<String>,
 }
 
-#[derive(Subcommand)]
-enum MigrateCommand {
-    /// Copy compatible state from a standalone runtime home.
-    Runtime {
-        /// Absolute path to the standalone runtime home.
-        #[arg(long, value_name = "ABSOLUTE_LEGACY_HOME")]
-        from: std::path::PathBuf,
-    },
-}
-
 #[cfg(unix)]
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -222,7 +209,7 @@ fn resolve_home() -> Result<AosHome, ExitCode> {
 
 fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
     if args.is_empty() {
-        return offer_first_run_migration().or_else(|| Some(print_product_help()));
+        return Some(print_product_help());
     }
     if let Some(root) = ambiguous_leading_principal(args) {
         eprintln!(
@@ -273,9 +260,6 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
     match cli.command {
         Some(ProductCommand::Init(_)) => None,
         Some(ProductCommand::Status(args)) => Some(handle_status(args.json)),
-        Some(ProductCommand::Migrate {
-            command: MigrateCommand::Runtime { from },
-        }) => Some(handle_migrate_runtime(&from)),
         Some(ProductCommand::Update(args)) => Some(handle_self_update(&args)),
         Some(ProductCommand::Distro(args)) => Some(refuse_distro_command(&args.arguments)),
         Some(ProductCommand::ServeHealth) => Some(handle_health_service()),
@@ -305,14 +289,7 @@ fn runtime_args_for_dispatch(mut args: Vec<OsString>) -> Vec<OsString> {
 fn is_owned_root(value: &str) -> bool {
     matches!(
         value,
-        "init"
-            | "status"
-            | "migrate"
-            | "update"
-            | "self-update"
-            | "self_update"
-            | "distro"
-            | "serve-health"
+        "init" | "status" | "update" | "self-update" | "self_update" | "distro" | "serve-health"
     )
 }
 
@@ -424,6 +401,30 @@ fn handle_self_update(args: &UpdateArgs) -> ExitCode {
             eprintln!("aos: Homebrew installations follow only the signed stable channel");
             return ExitCode::from(2);
         }
+        if args.check {
+            return match Command::new("brew")
+                .args(["outdated", "--quiet", "--formula", "unicity-aos/tap/aos"])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    if !output.stdout.is_empty() {
+                        println!("Update available for Unicity AOS. Run `aos update` to install.");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Ok(output) => ExitCode::from(
+                    output
+                        .status
+                        .code()
+                        .and_then(|code| u8::try_from(code).ok())
+                        .unwrap_or(1),
+                ),
+                Err(error) => {
+                    eprintln!("aos: check Homebrew update: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         return command_exit_code(
             Command::new("brew")
                 .args(["upgrade", "unicity-aos/tap/aos"])
@@ -468,7 +469,10 @@ fn handle_self_update(args: &UpdateArgs) -> ExitCode {
             args.channel.unwrap_or(UpdateChannel::Stable).as_str(),
         ]);
     }
-    command.args(["--yes", "--no-migrate-prompt"]);
+    if args.check {
+        command.arg("--check");
+    }
+    command.arg("--yes");
     command_exit_code(command.status(), "run the installed signed AOS updater")
 }
 
@@ -572,94 +576,6 @@ fn set_runtime_environment(home: &AosHome) {
         std::env::set_var("ASTRID_WORKSPACE_STATE_DIR", AOS_WORKSPACE_STATE_DIR);
     }
 }
-fn offer_first_run_migration() -> Option<ExitCode> {
-    if !io::stdin().is_terminal() {
-        return None;
-    }
-    let home = AosHome::resolve().ok()?;
-    if home.migration_receipt().is_file() {
-        return None;
-    }
-    let source = AosHome::default_legacy_runtime_home().ok()?;
-    if !source.is_dir() {
-        return None;
-    }
-
-    println!("Found a standalone runtime home at {}.", source.display());
-    println!(
-        "Unicity can copy compatible runtime state into {}. The existing home will stay unchanged.",
-        home.runtime_home().display()
-    );
-    print!("Import it now? [y/N] ");
-    io::stdout().flush().ok()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer).ok()?;
-    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        println!(
-            "Skipped. You can import later with `aos migrate runtime --from {}`.",
-            source.display()
-        );
-        return Some(ExitCode::SUCCESS);
-    }
-
-    match home.migrate_runtime_from(&source) {
-        Ok(unicity_aos_bootstrap::MigrationOutcome::Migrated) => {
-            println!(
-                "Unicity AOS: imported the standalone runtime; the source was left unchanged."
-            );
-            print_legacy_distro_handoff(&home);
-            Some(ExitCode::SUCCESS)
-        }
-        Ok(unicity_aos_bootstrap::MigrationOutcome::AlreadyMigrated) => Some(ExitCode::SUCCESS),
-        Err(error) => {
-            eprintln!("aos: runtime migration failed: {error}");
-            Some(ExitCode::FAILURE)
-        }
-    }
-}
-
-fn handle_migrate_runtime(source: &Path) -> ExitCode {
-    let home = match AosHome::resolve() {
-        Ok(home) => home,
-        Err(error) => {
-            eprintln!("aos: failed to resolve product home: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match home.migrate_runtime_from(source) {
-        Ok(unicity_aos_bootstrap::MigrationOutcome::Migrated) => {
-            println!(
-                "Unicity AOS: imported the standalone runtime; the source was left unchanged."
-            );
-            print_legacy_distro_handoff(&home);
-            ExitCode::SUCCESS
-        }
-        Ok(unicity_aos_bootstrap::MigrationOutcome::AlreadyMigrated) => {
-            println!("Unicity AOS: this runtime migration is already complete.");
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("aos: runtime migration failed: {error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn print_legacy_distro_handoff(home: &AosHome) {
-    let distros = match home.imported_legacy_distros() {
-        Ok(distros) => distros,
-        Err(error) => {
-            eprintln!("aos: migrated runtime, but could not read the migration receipt: {error}");
-            return;
-        }
-    };
-    if !distros.is_empty() {
-        println!(
-            "Imported legacy distro state was preserved. Run `aos init` to deliberately apply Unicity CE; provider configuration and imported state remain in place."
-        );
-    }
-}
-
 fn print_product_help() -> ExitCode {
     if let Err(error) = ProductCli::command().print_help() {
         eprintln!("aos: failed to print command help: {error}");
@@ -803,14 +719,7 @@ mod tests {
     #[test]
     fn help_is_owned_only_for_the_product_root_or_product_commands() {
         assert!(help_targets_product(&[OsString::from("help")]));
-        for root in [
-            "init",
-            "status",
-            "migrate",
-            "update",
-            "distro",
-            "serve-health",
-        ] {
+        for root in ["init", "status", "update", "distro", "serve-health"] {
             let args = [OsString::from("help"), OsString::from(root)];
             assert!(help_targets_product(&args));
             assert!(handle_product_command(&args).is_some());
@@ -879,7 +788,6 @@ mod tests {
     #[test]
     fn clap_rejects_extra_product_arguments() {
         assert!(ProductCli::try_parse_from(["aos", "self-update", "extra"]).is_err());
-        assert!(ProductCli::try_parse_from(["aos", "migrate", "runtime"]).is_err());
     }
 
     #[test]
@@ -888,6 +796,12 @@ mod tests {
             let cli = ProductCli::try_parse_from(["aos", command]).expect("parse update alias");
             assert!(matches!(cli.command, Some(ProductCommand::Update(_))));
         }
+        let cli =
+            ProductCli::try_parse_from(["aos", "update", "--check"]).expect("parse update check");
+        let Some(ProductCommand::Update(update)) = cli.command else {
+            panic!("expected product update command");
+        };
+        assert!(update.check);
         let cli =
             ProductCli::try_parse_from(["aos", "status", "--json"]).expect("parse product status");
         let Some(ProductCommand::Status(status)) = cli.command else {

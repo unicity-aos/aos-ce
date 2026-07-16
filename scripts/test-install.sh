@@ -12,6 +12,9 @@ printf 'standalone-runtime-state\n' > "$work/home/.astrid/sentinel"
 
 cat > "$work/aos" <<'EOF'
 #!/bin/sh
+if [ -n "${AOS_TEST_FIXTURE:-}" ]; then
+  printf '%s\n' "$*" >> "$AOS_TEST_FIXTURE/aos-calls"
+fi
 if [ "${1:-}" = --version ]; then
   echo 'Unicity AOS 2026.1.0'
   exit 0
@@ -197,10 +200,12 @@ PATH="$fake_bin:$PATH" \
 HOME="$work/home" \
 AOS_TEST_FIXTURE="$fixture" \
 AOS_VERSION=2026.1.0 \
-sh "$repo_root/install.sh" --yes --no-migrate-prompt
+sh "$repo_root/install.sh" --yes
 
 test -x "$work/home/.aos/bin/aos"
 test -x "$work/home/.aos/runtime/bin/astrid-daemon"
+grep -Fx -- "--principal default capsule install $work/home/.aos/releases/2026.1.0/capsules/aos-cli.capsule" \
+  "$fixture/aos-calls" >/dev/null
 release_dir="$work/home/.aos/releases/2026.1.0"
 test -f "$release_dir/release-manifest.json"
 test -f "$release_dir/Distro.toml"
@@ -232,7 +237,7 @@ cp "$good_bundle" "$fixture/channel.toml.sigstore.json"
 cp "$fixture/channel.toml" "$fixture/channel-good.toml"
 
 PATH="$fake_bin:$PATH" HOME="$work/channel-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+  sh "$repo_root/install.sh" --yes >/dev/null
 accepted_current="$work/channel-home/.aos/update/channels/stable/current"
 accepted_channel="$work/channel-home/.aos/update/channels/stable/generations/2/channel.toml"
 accepted_bundle="$work/channel-home/.aos/update/channels/stable/generations/2/channel.toml.sigstore.json"
@@ -245,12 +250,37 @@ grep -Fx 'https://github.com/unicity-aos/aos-ce/.github/workflows/promote-channe
 grep -Fx 'https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/2026.1.0' \
   "$fixture/cosign-identities" >/dev/null
 
+# A channel check verifies signed metadata without replacing the installed
+# product. It is silent about availability when the installed release is
+# current.
+cp "$work/channel-home/.aos/bin/aos" "$work/aos-before-update-check"
+check_output=$(PATH="$fake_bin:$PATH" HOME="$work/channel-home" \
+  AOS_TEST_FIXTURE="$fixture" sh "$repo_root/install.sh" --check)
+if printf '%s\n' "$check_output" | grep -F 'Update available:' >/dev/null; then
+  echo "current AOS release was reported as outdated" >&2
+  exit 1
+fi
+cmp "$work/aos-before-update-check" "$work/channel-home/.aos/bin/aos"
+
+# Availability is reported from verified release metadata before any archive
+# is downloaded or installation state is changed.
+sed 's/2026\.1\.0/2026.1.1/g' "$fixture/release-good.toml" \
+  > "$fixture/unicity-aos-2026.1.1-release.toml"
+cp "$good_bundle" "$fixture/unicity-aos-2026.1.1-release.toml.sigstore.json"
+check_output=$(PATH="$fake_bin:$PATH" HOME="$work/channel-home" \
+  AOS_TEST_FIXTURE="$fixture" \
+  sh "$repo_root/install.sh" --version 2026.1.1 --check)
+printf '%s\n' "$check_output" \
+  | grep -F 'Update available: Unicity AOS 2026.1.0 -> 2026.1.1.' >/dev/null
+cmp "$work/aos-before-update-check" "$work/channel-home/.aos/bin/aos"
+test ! -e "$work/channel-home/.aos/releases/2026.1.1"
+
 channel_root="$work/channel-home/.aos/update/channels/stable"
 mkdir "$channel_root/generations/3"
 cp "$accepted_channel" "$channel_root/generations/3/channel.toml"
 cp "$accepted_bundle" "$channel_root/generations/3/channel.toml.sigstore.json"
 PATH="$fake_bin:$PATH" HOME="$work/channel-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+  sh "$repo_root/install.sh" --yes >/dev/null
 test "$(cat "$accepted_current")" = 2
 
 mkdir -p "$work/channel-home/.aos/update/install.lock"
@@ -258,7 +288,7 @@ sleep 60 &
 live_lock_pid=$!
 printf '%s\n' "$live_lock_pid" > "$work/channel-home/.aos/update/install.lock/pid"
 if PATH="$fake_bin:$PATH" HOME="$work/channel-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer ignored a live installation lock" >&2
   kill "$live_lock_pid" 2>/dev/null || true
   exit 1
@@ -269,7 +299,7 @@ rm -rf "$work/channel-home/.aos/update/install.lock"
 mkdir "$work/channel-home/.aos/update/install.lock"
 printf '%s\n' 999999999 > "$work/channel-home/.aos/update/install.lock/pid"
 PATH="$fake_bin:$PATH" HOME="$work/channel-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+  sh "$repo_root/install.sh" --yes >/dev/null
 test ! -e "$work/channel-home/.aos/update/install.lock"
 
 for lexical_case in schema generation size; do
@@ -281,7 +311,7 @@ for lexical_case in schema generation size; do
   esac
   rm "$fixture/channel.toml.bak"
   if PATH="$fake_bin:$PATH" HOME="$work/quoted-${lexical_case}-home" AOS_TEST_FIXTURE="$fixture" \
-    sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+    sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
     echo "installer accepted a quoted TOML $lexical_case field" >&2
     exit 1
   fi
@@ -292,7 +322,7 @@ cp "$fixture/release-good.toml" "$release_metadata"
 sed -i.bak 's/release-ready = true/release-ready = "true"/' "$release_metadata"
 rm "$release_metadata.bak"
 if PATH="$fake_bin:$PATH" HOME="$work/quoted-gate-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --version 2026.1.0 --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --version 2026.1.0 --yes >/dev/null 2>&1; then
   echo "installer accepted a quoted TOML readiness gate" >&2
   exit 1
 fi
@@ -304,7 +334,7 @@ cp "$fixture/channel-good.toml" "$fixture/channel.toml"
 sed -i.bak 's/published-at = "2026-07-16T10:00:00Z"/published-at = "not-a-time"/' "$fixture/channel.toml"
 rm "$fixture/channel.toml.bak"
 if PATH="$fake_bin:$PATH" HOME="$work/bad-channel-time-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted one valid and one malformed channel timestamp" >&2
   exit 1
 fi
@@ -314,7 +344,7 @@ cp "$fixture/channel-good.toml" "$fixture/channel.toml"
 sed -i.bak 's/expires-at = "2026-08-15T10:00:00Z"/expires-at = "2026-08-15T10:00:01Z"/' "$fixture/channel.toml"
 rm "$fixture/channel.toml.bak"
 if PATH="$fake_bin:$PATH" HOME="$work/excessive-channel-lifetime-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted a channel lifetime beyond its channel maximum" >&2
   exit 1
 fi
@@ -324,7 +354,7 @@ cp "$fixture/channel-good.toml" "$fixture/channel.toml"
 sed -i.bak 's/published-at = "2026-07-16T10:00:00Z"/published-at = "2026-07-16T10:05:01Z"/' "$fixture/channel.toml"
 rm "$fixture/channel.toml.bak"
 if PATH="$fake_bin:$PATH" HOME="$work/future-channel-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted an unreasonably future channel publication" >&2
   exit 1
 fi
@@ -334,7 +364,7 @@ cp "$fixture/channel-good.toml" "$fixture/channel.toml"
 sed -i.bak 's/blake3 = "[0-9a-f]*"/blake3 = "BAD"/' "$fixture/channel.toml"
 rm "$fixture/channel.toml.bak"
 if PATH="$fake_bin:$PATH" HOME="$work/bad-channel-digest-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted one valid and one malformed channel target digest" >&2
   exit 1
 fi
@@ -344,7 +374,7 @@ cp "$fixture/channel-good.toml" "$fixture/channel.toml"
 sed -i.bak 's/generation = 2/generation = 1000000000000000000/' "$fixture/channel.toml"
 rm "$fixture/channel.toml.bak"
 if PATH="$fake_bin:$PATH" HOME="$work/oversized-generation-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted a channel generation outside its comparison range" >&2
   exit 1
 fi
@@ -354,7 +384,7 @@ cp "$fixture/channel-good.toml" "$fixture/channel.toml"
 sed -i.bak 's/generation = 2/generation = 1/' "$fixture/channel.toml"
 rm "$fixture/channel.toml.bak"
 if PATH="$fake_bin:$PATH" HOME="$work/channel-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted a signed channel generation downgrade" >&2
   exit 1
 fi
@@ -364,7 +394,7 @@ cp "$fixture/channel-good.toml" "$fixture/channel.toml"
 sed -i.bak 's/published-at = "2026-07-16T10:00:00Z"/published-at = "2026-07-16T10:00:01Z"/' "$fixture/channel.toml"
 rm "$fixture/channel.toml.bak"
 if PATH="$fake_bin:$PATH" HOME="$work/channel-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted conflicting metadata at an accepted channel generation" >&2
   exit 1
 fi
@@ -375,24 +405,24 @@ unavailable_fixture="$work/unavailable-fixture"
 mkdir "$unavailable_fixture"
 cp "$fixture/cosign-linux-amd64" "$unavailable_fixture/"
 if PATH="$fake_bin:$PATH" HOME="$work/unavailable-channel-home" AOS_TEST_FIXTURE="$unavailable_fixture" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted an unavailable default stable channel" >&2
   exit 1
 fi
 test ! -e "$work/unavailable-channel-home/.aos"
 
 if PATH="$fake_bin:$PATH" HOME="$work/mutually-exclusive-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --channel dev --version 2026.1.0 --yes --no-migrate-prompt \
+  sh "$repo_root/install.sh" --channel dev --version 2026.1.0 --yes \
   >/dev/null 2>&1; then
   echo "installer accepted mutually exclusive channel and version selectors" >&2
   exit 1
 fi
 test ! -e "$work/mutually-exclusive-home/.aos"
 
-printf 'tampered capsule\n' > "$release_dir/capsules/astrid-capsule-cli.capsule"
+printf 'tampered capsule\n' > "$release_dir/capsules/aos-cli.capsule"
 PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
-cmp "$work/capsules/astrid-capsule-cli.capsule" "$release_dir/capsules/astrid-capsule-cli.capsule"
+  sh "$repo_root/install.sh" --yes >/dev/null
+cmp "$work/capsules/aos-cli.capsule" "$release_dir/capsules/aos-cli.capsule"
 
 cat > "$work/home/.aos/bin/aos" <<'EOF'
 #!/bin/sh
@@ -406,7 +436,7 @@ chmod 755 "$work/home/.aos/bin/aos"
 cp "$work/home/.aos/bin/aos" "$work/aos-before-unattended-upgrade"
 if PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   AOS_STOP_MARKER="$work/unattended-stop-called" \
-  sh "$repo_root/install.sh" --no-migrate-prompt </dev/null >"$work/unattended-upgrade.log" 2>&1; then
+  sh "$repo_root/install.sh" </dev/null >"$work/unattended-upgrade.log" 2>&1; then
   echo "installer replaced an existing installation without confirmation" >&2
   exit 1
 fi
@@ -417,7 +447,7 @@ grep -F 'rerun with --yes to replace it without a prompt' "$work/unattended-upgr
 rm -f "$fixture/cosign-called"
 if PATH="$fake_bin:$PATH" HOME="$work/bad-verifier-home" AOS_TEST_FIXTURE="$fixture" \
   AOS_TEST_BAD_COSIGN_DIGEST=1 AOS_VERSION=2026.1.0 \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted a Sigstore verifier with the wrong digest" >&2
   exit 1
 fi
@@ -426,7 +456,7 @@ test ! -e "$work/bad-verifier-home/.aos"
 
 printf 'invalid Sigstore fixture\n' > "$bundle"
 if PATH="$fake_bin:$PATH" HOME="$work/bad-bundle-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted an invalid Sigstore bundle" >&2
   exit 1
 fi
@@ -435,7 +465,7 @@ cp "$good_bundle" "$bundle"
 
 mv "$bundle" "$work/missing-bundle"
 if PATH="$fake_bin:$PATH" HOME="$work/missing-bundle-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted a release with no Sigstore bundle" >&2
   exit 1
 fi
@@ -444,7 +474,7 @@ mv "$work/missing-bundle" "$bundle"
 
 printf 'modified after signing\n' >> "$asset"
 if PATH="$fake_bin:$PATH" HOME="$work/modified-asset-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted release bytes that did not match the Sigstore bundle" >&2
   exit 1
 fi
@@ -462,7 +492,7 @@ chmod 755 "$work/symlink-target"
 ln -s "$work/symlink-target" "$symlink_home/.aos/bin/aos"
 if PATH="$fake_bin:$PATH" HOME="$symlink_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   AOS_SYMLINK_MARKER="$work/symlink-executed" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer replaced a symlinked destination" >&2
   exit 1
 fi
@@ -478,7 +508,7 @@ ln -s "$custom_bin_target" "$custom_bin_link"
 if PATH="$fake_bin:$PATH" HOME="$custom_bin_home" AOS_BIN_DIR="$custom_bin_link" \
   AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   AOS_SYMLINK_MARKER="$work/custom-bin-symlink-executed" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >"$work/custom-bin-symlink.log" 2>&1; then
+  sh "$repo_root/install.sh" --yes >"$work/custom-bin-symlink.log" 2>&1; then
   echo "installer accepted a symlinked custom binary directory" >&2
   exit 1
 fi
@@ -491,7 +521,7 @@ ln -s "$work/managed-symlink-target" "$managed_symlink_home/.aos"
 ln -s "$work/symlink-target" "$work/managed-symlink-target/bin/aos"
 if PATH="$fake_bin:$PATH" HOME="$managed_symlink_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
   AOS_SYMLINK_MARKER="$work/managed-symlink-executed" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted a symlinked managed installation root" >&2
   exit 1
 fi
@@ -500,7 +530,7 @@ test ! -e "$work/managed-symlink-executed"
 directory_home="$work/directory-destination-home"
 mkdir -p "$directory_home/.aos/bin/aos"
 if PATH="$fake_bin:$PATH" HOME="$directory_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer replaced a directory destination" >&2
   exit 1
 fi
@@ -538,7 +568,7 @@ if PATH="$fail_bin:$fake_bin:$PATH" \
   REAL_MV="$real_mv" \
   MV_FAILED="$work/mv-failed" \
   MV_FAIL_DESTINATION="$release_dir" \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer ignored a mid-install failure" >&2
   exit 1
 fi
@@ -572,7 +602,7 @@ bash "$repo_root/scripts/package-release.sh" \
   "$fixture" >/dev/null
 cp "$asset" "$signed_asset"
 if PATH="$fake_bin:$PATH" HOME="$work/mismatch-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted a bundle whose binary version did not match the requested release" >&2
   exit 1
 fi
@@ -589,7 +619,7 @@ COPYFILE_DISABLE=1 tar -czf "$fixture/unicity-aos-2026.1.0-x86_64-unknown-linux-
   -C "$work/unsafe-bundle" "$(basename "$unsafe_root")"
 cp "$asset" "$signed_asset"
 if PATH="$fake_bin:$PATH" HOME="$work/unsafe-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.0 \
-  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --yes >/dev/null 2>&1; then
   echo "installer accepted a symlink in the release archive" >&2
   exit 1
 fi

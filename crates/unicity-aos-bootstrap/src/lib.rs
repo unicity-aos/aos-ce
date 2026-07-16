@@ -12,12 +12,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 
 pub mod health;
-mod migration;
 pub mod status;
-pub use migration::{LegacyDistro, MigrationOutcome};
 
 const UNICITY_CE_MANIFEST: &str = include_str!("../../../distros/community/unicity-ce/Distro.toml");
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const PRODUCT_CAPSULE_VAR_PREFIX: &str = "AOS_VAR_";
+const RUNTIME_CAPSULE_VAR_PREFIX: &str = "ASTRID_VAR_";
 
 #[cfg(windows)]
 pub(crate) const RUNTIME_EXECUTABLE_NAMES: &[&str] = &[
@@ -108,12 +108,6 @@ impl AosHome {
         self.root.join("runtime")
     }
 
-    /// The receipt written only after a successful standalone-runtime import.
-    #[must_use]
-    pub fn migration_receipt(&self) -> PathBuf {
-        self.root.join("migrations/astrid-home-v1.json")
-    }
-
     /// Product-managed location for the Unicity CE manifest bundled with this AOS
     /// release.
     #[must_use]
@@ -194,14 +188,6 @@ impl AosHome {
         Ok(path)
     }
 
-    /// The conventional standalone Astrid Runtime home that first-run AOS can offer
-    /// to import. This does not inspect `ASTRID_HOME`: an override may name another
-    /// product or service installation and must be supplied explicitly by the user.
-    pub fn default_legacy_runtime_home() -> io::Result<PathBuf> {
-        let home = default_home(&|name| std::env::var_os(name))?;
-        Ok(PathBuf::from(home).join(".astrid"))
-    }
-
     /// The installed bundled-runtime executable.
     #[must_use]
     pub fn runtime_binary(&self) -> PathBuf {
@@ -218,27 +204,6 @@ impl AosHome {
             return path;
         }
         self.runtime_home().join("bin").join(runtime_binary_name())
-    }
-
-    /// Import a standalone Astrid Runtime home into this product installation.
-    ///
-    /// This is an explicit copy operation. It leaves the standalone source in
-    /// place so the operator retains a rollback path and historical provenance.
-    ///
-    /// # Errors
-    /// Returns an error for unsafe paths, a running source runtime, an
-    /// incompatible target, or a failed staging/validation operation.
-    pub fn migrate_runtime_from(&self, source: impl AsRef<Path>) -> io::Result<MigrationOutcome> {
-        migration::migrate_runtime(self, source.as_ref())
-    }
-
-    /// Legacy product distro locks preserved by the last runtime import.
-    ///
-    /// # Errors
-    /// Returns an error when no migration receipt exists or the receipt cannot be
-    /// read or decoded.
-    pub fn imported_legacy_distros(&self) -> io::Result<Vec<LegacyDistro>> {
-        migration::imported_legacy_distros(self)
     }
 
     /// Create the product and bundled-runtime state directories.
@@ -295,6 +260,7 @@ impl AosHome {
                 "PATH",
                 Self::runtime_child_path(runtime_bin, std::env::var_os("PATH"))?,
             );
+        forward_product_capsule_variables(&mut command, std::env::vars_os());
         command.args(args);
         Ok(command)
     }
@@ -383,6 +349,45 @@ impl AosHome {
             ));
         }
         self.ensure_unicity_ce_manifest().map(drop)
+    }
+}
+
+fn forward_product_capsule_variables<I, K, V>(command: &mut Command, variables: I)
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let variables = variables
+        .into_iter()
+        .map(|(name, value)| (name.as_ref().to_owned(), value.as_ref().to_owned()))
+        .collect::<Vec<_>>();
+
+    // A fresh AOS process never inherits standalone Astrid configuration.
+    // Strip both namespaces first so iteration order cannot let a legacy
+    // ASTRID_VAR_* value override its AOS_VAR_* counterpart.
+    for (name, _) in &variables {
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.starts_with(PRODUCT_CAPSULE_VAR_PREFIX)
+            || name_str.starts_with(RUNTIME_CAPSULE_VAR_PREFIX)
+        {
+            command.env_remove(name);
+        }
+    }
+
+    for (name, value) in &variables {
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(key) = name_str.strip_prefix(PRODUCT_CAPSULE_VAR_PREFIX) else {
+            continue;
+        };
+        if key.is_empty() {
+            continue;
+        }
+        command.env(format!("{RUNTIME_CAPSULE_VAR_PREFIX}{key}"), value);
     }
 }
 
@@ -638,13 +643,14 @@ fn materialize_manifest(capsule_dir: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AosHome, UNICITY_CE_MANIFEST, capsule_assets_from_manifest, materialize_manifest,
-        runtime_binary_name,
+        AosHome, UNICITY_CE_MANIFEST, capsule_assets_from_manifest,
+        forward_product_capsule_variables, materialize_manifest, runtime_binary_name,
     };
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io::ErrorKind;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_home() -> PathBuf {
@@ -718,6 +724,46 @@ mod tests {
             Some(&PathBuf::from("/tmp/unicity-aos-test/runtime/bin"))
         );
         assert_eq!(std::env::var_os("PATH"), caller_path);
+    }
+
+    #[test]
+    fn product_capsule_variables_are_translated_only_for_the_runtime_child() {
+        let parent_before = std::env::var_os("AOS_VAR_AOS_TEST_TRANSLATION_SENTINEL");
+        let mut command = Command::new("runtime-fixture");
+        forward_product_capsule_variables(
+            &mut command,
+            [
+                ("AOS_VAR_MODEL", "gpt-test"),
+                ("AOS_VAR_ENDPOINT", "https://example.invalid"),
+                ("ASTRID_VAR_MODEL", "legacy-model"),
+                ("ASTRID_VAR_LEGACY_ONLY", "must-not-cross"),
+                ("AOS_VAR_", "ignored"),
+                ("UNRELATED", "ignored"),
+            ],
+        );
+        let env = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(env.get(OsStr::new("AOS_VAR_MODEL")), Some(&None));
+        assert_eq!(env.get(OsStr::new("AOS_VAR_ENDPOINT")), Some(&None));
+        assert_eq!(
+            env.get(OsStr::new("ASTRID_VAR_MODEL")).copied().flatten(),
+            Some(OsStr::new("gpt-test"))
+        );
+        assert_eq!(
+            env.get(OsStr::new("ASTRID_VAR_ENDPOINT"))
+                .copied()
+                .flatten(),
+            Some(OsStr::new("https://example.invalid"))
+        );
+        assert!(!env.contains_key(OsStr::new("ASTRID_VAR_")));
+        assert_eq!(env.get(OsStr::new("ASTRID_VAR_LEGACY_ONLY")), Some(&None));
+        assert!(!env.contains_key(OsStr::new("UNRELATED")));
+        assert_eq!(
+            std::env::var_os("AOS_VAR_AOS_TEST_TRANSLATION_SENTINEL"),
+            parent_before
+        );
     }
 
     #[test]
@@ -998,16 +1044,5 @@ mod tests {
                 .expect("unusual fixture root has temporary parent"),
         )
         .expect("remove temporary product home");
-    }
-
-    #[test]
-    fn missing_migration_receipt_is_reported_to_callers() {
-        let root = temporary_home();
-        let home = AosHome::from_root(&root);
-
-        let error = home
-            .imported_legacy_distros()
-            .expect_err("missing receipt must not look like an empty import");
-        assert_eq!(error.kind(), ErrorKind::NotFound);
     }
 }
