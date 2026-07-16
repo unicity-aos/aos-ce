@@ -47,9 +47,22 @@ grep -Fq "repos/\$GITHUB_REPOSITORY/immutable-releases" "$bootstrap_workflow"
 grep -Fq '.immutable == false' "$bootstrap_workflow"
 grep -Fq 'environment: release' "$bootstrap_workflow"
 
-transaction_upload=$(grep -nF "\"\$TRANSACTION\"" "$workflow" | tail -n1 | cut -d: -f1)
-history_upload=$(grep -nF "\"\$HISTORY\"" "$workflow" | tail -n1 | cut -d: -f1)
-[[ "$transaction_upload" -lt "$history_upload" ]]
+python3 - "$workflow" <<'PY'
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+transaction_upload = text.index(
+    'gh release upload "$CHANNEL_TAG" \\\n'
+    '              --repo "$GITHUB_REPOSITORY" \\\n'
+    '              "$TRANSACTION"'
+)
+history_upload = text.index(
+    '[[ "$history_pointer_present" == 1 ]] || gh release upload'
+)
+if transaction_upload >= history_upload:
+    raise SystemExit("channel transaction must be uploaded before history assets")
+PY
 
 if grep -Fq "repos/\$GITHUB_REPOSITORY/commits/\$RELEASE_TAG" "$workflow"; then
   echo "channel promotion resolves an ambiguous branch-or-tag revision" >&2
