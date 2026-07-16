@@ -738,9 +738,6 @@ for file in bin/aos libexec/install.sh runtime/bin/astrid runtime/bin/astrid-dae
   [ -f "$bundle/$file" ] || { echo "release archive is missing $file" >&2; exit 1; }
 done
 [ -d "$bundle/capsules" ] || { echo "release archive has no capsule directory" >&2; exit 1; }
-# Validate that capsule-assets.txt is non-empty, contains only well-formed names,
-# and has no duplicates. The exact count is checked dynamically below against the
-# actual capsule directory, so no hardcoded count is maintained here.
 if ! awk '
   !/^astrid-capsule-[a-z0-9-]+\.capsule$/ { invalid = 1 }
   seen[$0]++ { duplicate = 1 }

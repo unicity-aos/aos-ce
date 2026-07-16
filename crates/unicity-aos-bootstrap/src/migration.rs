@@ -190,9 +190,6 @@ fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-// TOCTOU check (symlink-swap between stat and open) is not available on non-Unix
-// platforms: returning `false` conservatively blocks migration since the inode
-// equivalence test cannot be performed safely.
 #[cfg(not(unix))]
 fn same_file(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
     false
