@@ -177,26 +177,45 @@ for spec in source_contract():
 PY
 
 target=x86_64-unknown-linux-gnu
-runtime_value() {
-  local key=$1
-  awk -v key="$key" '
-    $0 == "[runtime]" { in_runtime = 1; next }
-    in_runtime && /^\[/ { exit }
-    in_runtime && $1 == key && $2 == "=" {
-      value = $0
-      sub(/^[^=]*=[[:space:]]*"/, "", value)
-      sub(/".*$/, "", value)
-      print value
-      exit
-    }
-  ' "$repo_root/release/runtime-compatibility.toml"
-}
-runtime_version=$(runtime_value version)
-runtime_tag=$(runtime_value tag)
-runtime_identity=$(runtime_value release-workflow-identity)
-test -n "$runtime_version"
-test -n "$runtime_tag"
-test -n "$runtime_identity"
+if ! read -r \
+  runtime_version \
+  runtime_tag \
+  runtime_identity \
+  runtime_metadata_available \
+  runtime_source_commit \
+  runtime_metadata_asset \
+  runtime_metadata_blake3 < <(
+  python3 - "$repo_root/release/runtime-compatibility.toml" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+with pathlib.Path(sys.argv[1]).open("rb") as file:
+    runtime = tomllib.load(file)["runtime"]
+print(
+    runtime["version"],
+    runtime["tag"],
+    runtime["release-workflow-identity"],
+    str(runtime["release-metadata-available"]).lower(),
+    runtime["source-commit"],
+    runtime["release-metadata-asset"],
+    runtime["release-metadata-blake3"],
+)
+PY
+); then
+  echo "failed to read runtime compatibility fixture provenance" >&2
+  exit 1
+fi
+if [[ -z "$runtime_version" || -z "$runtime_tag" || -z "$runtime_identity" || \
+      -z "$runtime_source_commit" || -z "$runtime_metadata_asset" || \
+      -z "$runtime_metadata_blake3" ]]; then
+  echo "runtime compatibility fixture provenance is incomplete" >&2
+  exit 1
+fi
+if [[ "$runtime_metadata_available" != true ]]; then
+  echo "upgrade/self-heal fixture must exercise available runtime release metadata" >&2
+  exit 1
+fi
 runtime_root=$work/astrid-$runtime_version-$target
 mkdir "$runtime_root"
 for name in astrid astrid-daemon astrid-build astrid-emit; do
@@ -236,10 +255,10 @@ repository = "astrid-runtime/astrid"
 version = "${runtime_version}"
 tag = "${runtime_tag}"
 release-workflow-identity = "${runtime_identity}"
-release-metadata-available = false
-source-commit = ""
-release-metadata-asset = ""
-release-metadata-blake3 = ""
+release-metadata-available = ${runtime_metadata_available}
+source-commit = "${runtime_source_commit}"
+release-metadata-asset = "${runtime_metadata_asset}"
+release-metadata-blake3 = "${runtime_metadata_blake3}"
 
 [contracts]
 repository = "astrid-runtime/wit"
