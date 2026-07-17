@@ -13,8 +13,11 @@ id = "linux-realm"
 file = "aos_linux_realm.wasm"
 type = "executable"
 
-# Deliberately empty. In particular, this capsule has no host_process grant.
+# The realm sees only the invocation CWD, its private subtree of the caller's
+# principal home, and its principal-scoped tmp subtree. It has no host_process.
 [capabilities]
+fs_read = ["cwd://", "home://.local/share/aos-realm/", "home://.local/tmp/aos-realm/"]
+fs_write = ["cwd://", "home://.local/share/aos-realm/", "home://.local/tmp/aos-realm/"]
 
 [publish]
 "tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }
@@ -22,4 +25,5 @@ type = "executable"
 
 [subscribe]
 "tool.v1.execute.linux_realm_exec" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_linux_realm_exec" }
+"tool.v1.execute.linux_realm_status" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_linux_realm_status" }
 "tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }

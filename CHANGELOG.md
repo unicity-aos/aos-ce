@@ -25,6 +25,9 @@
   provisioning, archive safety validation, BLAKE3 checksums, SHA-256
   compatibility checksums, Sigstore bundles, and provenance.
 - Host-target unit-test coverage for the capsule workspace.
+- The installable `aos-linux-realm` seed: principal-owned durable home storage,
+  an Astrid copy-on-write workspace projection, and bounded nested-WASM `pwd`,
+  `echo`, `write-file`, and `cat` commands with no host-process authority.
 - Homebrew formula updates initiated by the tap's authenticated stable-release
   poll, eliminating the cross-repository dispatch credential.
 - Strict, signed stable/dev/nightly channel and immutable release metadata

@@ -15,6 +15,21 @@ pub const STDOUT_FD: i32 = 1;
 /// Guest file descriptor for standard error.
 pub const STDERR_FD: i32 = 2;
 
+/// First descriptor available to guest-opened files.
+pub const FIRST_FILE_FD: i32 = 3;
+
+/// Guest `open` mode for an existing read-only file.
+pub const OPEN_READ: i32 = 0;
+
+/// Guest `open` mode for a truncate-or-create writable file.
+pub const OPEN_WRITE_TRUNCATE: i32 = 1;
+
+/// Maximum UTF-8 path size admitted by the private seed ABI.
+pub const MAX_PATH_BYTES: usize = 4096;
+
+/// Maximum combined UTF-8 argument bytes admitted for one process.
+pub const MAX_ARGUMENT_BYTES: usize = 32 * 1024;
+
 /// Realm identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RealmId(u64);
@@ -81,5 +96,6 @@ mod tests {
         assert_eq!(realm.get(), process.get());
         assert_eq!(Descriptor::STDOUT.get(), STDOUT_FD);
         assert_eq!(Descriptor::STDERR.get(), STDERR_FD);
+        assert_eq!(Descriptor::new(FIRST_FILE_FD).get(), FIRST_FILE_FD);
     }
 }

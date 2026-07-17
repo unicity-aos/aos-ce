@@ -1,6 +1,6 @@
 # AOS Principal Linux Realm Capsule
 
-Status: active implementation programme; nested-process seed completed
+Status: active implementation programme; command, mount, and persistence seed live
 
 Last reviewed: 2026-07-18
 
@@ -202,6 +202,21 @@ Do not mount Astrid's entire internal home or credential directories into the
 realm. `/home/agent` is a dedicated namespace backed by principal-scoped storage.
 A workspace mount is separately granted so a destructive command in the Linux home
 cannot silently reach unrelated Astrid state.
+
+The executable seed uses the same shape with a deliberately narrower guarantee:
+
+- `/home/agent` is a direct principal-scoped durable subtree and has been verified
+  across daemon restart;
+- `/workspace` is the invocation's Astrid `cwd://` copy-on-write view. Its writes
+  remain staged until the outer Astrid workflow promotes them, and an unpromoted
+  view is discarded on daemon restart;
+- `/tmp` maps to the invoking principal's `.local/tmp` namespace and is not part of
+  the durable realm contract.
+
+That distinction is intentional. A command running inside the realm cannot silently
+commit source-tree changes merely because it can write its projected workspace.
+Promotion is an outer authority decision and must produce an audit record. The
+current seed does not yet expose a realm-side commit tool.
 
 The storage identity should be:
 
@@ -458,10 +473,16 @@ outer principal identity.
 
 ## 13. Agent and human interfaces
 
-The first capsule can use existing tool-bus conventions without creating a public
-WIT package:
+The capsule uses existing tool-bus conventions without creating a public WIT
+package. The live seed exports:
 
-- `linux_realm_exec`: structured program plus arguments, environment, cwd, limits;
+- `linux_realm_exec`: run one exact signed program with structured arguments, CWD,
+  and caller-reducible fuel/output limits;
+- `linux_realm_status`: report the guest-visible mounts, supported programs, owner
+  principal, and workspace commit policy without physical host paths.
+
+The longer contract may add:
+
 - `linux_realm_shell`: open or resume an interactive PTY session;
 - `linux_realm_read`: read bounded output;
 - `linux_realm_signal`: signal a process or job;
@@ -532,6 +553,9 @@ atomically:
 capsules/capsule-linux-realm/
   Cargo.toml             outer Astrid capsule and tool adapter
   Capsule.toml
+  src/
+    lib.rs               tool surface, command admission, result accounting
+    host.rs              mount normalization and Astrid VFS adapter
   crates/
     realm-abi/          guest syscall numbers, records, errno, executable metadata
     realm-core/         process, descriptor, scheduler, signal, namespace model
@@ -539,8 +563,10 @@ capsules/capsule-linux-realm/
     realm-runtime/      nested WASM interpreter and process instances
   guests/
     smoke-write/        one write + exit guest
-    smoke-files/        file round-trip guest
-    smoke-pipeline/     two-process pipe guest
+    pwd/                explicit CWD inspection
+    echo/               argument-vector proof
+    write-file/         truncate/create through a guest descriptor
+    cat/                bounded streaming read through a guest descriptor
   images/
     minimal/            reproducible root image recipe and manifest
   tests/
@@ -557,27 +583,33 @@ audited `astrid:*` imports. Host-target tests exercise the state machines and
 filesystems; capsule builds prove portability; an Astrid E2E harness proves
 installation and principal enforcement.
 
-## 15. First executable slice
+## 15. Executable seed
 
-The first proof deliberately avoids Bash, Debian, networking, and a large image.
+The proof deliberately avoids Bash, Debian, networking, and a large image.
 
 ### Inputs
 
 - an installable `aos-linux-realm.capsule`;
-- one embedded or content-addressed core-WASM guest;
-- a tiny internal guest ABI containing `write`, `clock`, and `exit`;
+- five embedded core-WASM command guests;
+- a private ABI containing bounded argument and CWD reads, file descriptors,
+  open/read/write/close, monotonic time, and exit;
 - Wasmi configured with fuel and memory limits;
-- a `linux_realm_exec` tool using a structured request;
+- structured `linux_realm_exec` and read-only `linux_realm_status` tools;
+- `/home/agent`, `/workspace`, and `/tmp` mount projections;
 - no `host_process` grant.
 
 ### Behavior
 
 ```text
-agent invokes linux_realm_exec(smoke-write)
+agent invokes linux_realm_exec(write-file, ["notes.txt", "hello"], /home/agent)
   -> outer capsule resolves kernel-stamped principal
-  -> realm creates process and descriptor table
+  -> realm initializes only that principal's layout
+  -> realm validates the guest CWD and exact command name
+  -> realm creates a process argument vector and descriptor table
   -> interpreter validates and instantiates guest module
-  -> guest writes through realm fd 1
+  -> guest opens and writes a realm-local descriptor
+  -> realm resolves the normalized path through the admitted mount
+  -> close commits the buffered file through Astrid's principal VFS
   -> guest exits with status 0
   -> capsule returns bounded stdout/stderr/status/accounting
 ```
@@ -594,13 +626,17 @@ agent invokes linux_realm_exec(smoke-write)
 - invalid syscall number;
 - trap during a host call;
 - forged principal in the tool payload;
+- path traversal and unmounted absolute paths;
+- shell syntax presented as a command name;
+- typed Astrid host errors mapped to stable realm I/O faults;
 - concurrent invocation state leakage.
 
 ### Exit condition
 
-An installed Astrid capsule runs one nested WASM process through an internal
-Linux-shaped syscall boundary, returns exact output and accounting, traps safely,
-and has no host-process capability.
+An installed Astrid capsule runs signed nested WASM commands through an internal
+Linux-shaped descriptor boundary, returns exact output and accounting, reads and
+writes principal-scoped storage, survives a daemon restart where promised, rejects
+cross-principal home reads, traps safely, and has no host-process capability.
 
 This proves the recursive containment model. It does not prove POSIX or Linux
 compatibility.
@@ -609,29 +645,42 @@ compatibility.
 
 - the seed is based on `unicity-aos/aos-ce` main commit
   `dfa1d71c2737a016d8d4dd169d0755ff624f6b50`;
-- thirteen focused host tests pass under both the monorepo toolchain and Rust
-  1.97.0, including the actual manifest authority test;
+- twenty-five focused host tests pass, including nested argument/CWD delivery,
+  file round trips across process instances, path confinement, stable host-error
+  mapping, the actual manifest authority test, fuel exhaustion, and memory/output
+  admission;
 - the complete non-WASI capsule workspace checks under
   `wasm32-unknown-unknown`;
 - the current stable Wasmi 1.1.0 runs with default `std` and WAT parsing disabled,
   BTree-backed collections, extra runtime checks, fuel, and store limits;
-- `astrid-build` 0.10.1 produces a 309 KiB installable
-  `aos-linux-realm.capsule`; two consecutive packages contained identical
-  component bytes with SHA-256
-  `1a8129e781f8ca7596ee13af210e2ddab84056bfb83da70f13b5950686e4f7b7`;
+- `astrid-build` 0.10.1 produced a 332 KiB final test artifact with SHA-256
+  `90650dd67170be68b5a4d329b970a1f6a71781b14603f250dbe8508e7f0f24ee`;
+  Astrid 0.10.1 loads it as a shared component with `host_process=false`;
 - the two outer archive digests differed because `astrid-build` copied the
   rebuilt component's modification time into its tar header. Reproducible outer
   `.capsule` bytes therefore remain an identified `astrid-build` defect, not a
   property established by this seed;
-- the Astrid 0.10.1 installer accepted an earlier packaged artifact with SHA-256
-  `7140e316eec481752f2dcdd2da56c3a68d21b2a1dba5a5efb72c97da693d66de` in an isolated
-  `realm_test` principal home and materialized component digest
-  `3119bd358f542bc43e38b48c3cc9972fe18fac9e343341c8276340220333c8aa`.
+- a live isolated daemon exposed both realm tools through the Astrid MCP bridge;
+  session ingress and capsule grant-on-use were explicitly elicited;
+- live `pwd` returned `/workspace`; `write-file` followed by `cat` returned exact
+  bytes from both `/workspace` and `/home/agent`;
+- after a full daemon stop/start, `/home/agent/persist.txt` retained its exact
+  contents while the unpromoted `/workspace/realm-live.txt` disappeared, matching
+  the declared outer-promotion contract;
+- a second authenticated principal, `realm_alice`, received its own tool result
+  identity and an `io-not-found` fault for the default principal's durable
+  `persist.txt`; it wrote and read `alice-only.txt`, while the default principal
+  received `io-not-found` for that same name;
+- the initial live run discovered two integration constraints rather than hiding
+  them: Astrid's component FileHandle methods are not implemented, so the adapter
+  uses bounded whole-file I/O and commits on descriptor close; `/tmp` must be
+  authorized through the dynamic principal-home scheme so the manifest gate checks
+  the resolved principal path.
 
-The generated tool handler has not yet been invoked through a live isolated
-daemon. The host test invokes the same capsule method and runtime, but the full
-seed exit condition remains open until install, load, event dispatch, response,
-and principal separation run end to end.
+The E2E run used the current `astrid-mcp` capsule as a test front door because the
+current CE distribution does not yet install an MCP broker. Adding the realm to the
+default distribution before adding its invocation front door would produce an
+installed but unreachable workbench.
 
 ## 16. Ordered implementation milestones
 
@@ -647,9 +696,12 @@ and principal separation run end to end.
 
 ### Milestone B: files and persistence
 
-- implement normalized, non-escaping path resolution;
-- mount ephemeral tmpfs and a principal-private durable home;
-- implement open/read/write/seek/stat/rename/unlink/fsync;
+- [x] implement normalized, non-escaping path resolution;
+- [x] mount a principal-private durable home, projected COW workspace, and
+  principal-private temporary namespace;
+- [x] implement bounded sequential open/read/write/close using whole-file Astrid
+  VFS calls;
+- implement seek/stat/rename/unlink and a real flush barrier;
 - add immutable base plus COW overlay generations;
 - kill the realm during writes and verify declared crash semantics;
 - restart and observe the same principal's bytes, but never another's.
@@ -714,6 +766,8 @@ The design must be tested against at least these scenarios:
 | Revocation occurs during network I/O | Connection closes and stale descriptor fails |
 | Delegated caller uses realm | Only exact delegated realm rights are available |
 | Realm is deleted | Keys/handles revoked and durable blocks become collectible |
+| Guest writes projected workspace | Change remains in Astrid COW until outer promotion |
+| Daemon restarts before promotion | Durable home remains; staged workspace is discarded |
 
 ## 18. Measurements
 
@@ -840,7 +894,19 @@ The first implementation must resolve these with executable evidence:
 - [x] test malformed modules, undeclared imports, invalid pointers, unknown
   descriptors, fuel exhaustion, output exhaustion, memory admission, and forged
   principal input;
-- [ ] add principal-scoped persistent home storage and crash-consistent generations;
+- [x] deliver structured command/argv/CWD execution for `pwd`, `echo`,
+  `write-file`, and `cat` without a host shell;
+- [x] add normalized `/home/agent`, `/workspace`, and `/tmp` projections;
+- [x] verify principal-scoped home persistence across daemon restart and reject a
+  second principal's read of those bytes;
+- [x] invoke the packaged capsule through a live Astrid 0.10.1 daemon and MCP
+  front door, including ingress consent and grant-on-use;
+- [ ] add crash-consistent realm generations, explicit flush semantics, and
+  named checkpoints; current close-time whole-file durability is not that claim;
+- [ ] add an outer workspace diff/promote workflow; realm code must not silently
+  commit its own COW projection;
+- [ ] put a supported MCP broker/invocation front door in the CE distribution
+  before selecting the realm by default;
 - [ ] add processes, pipes, waits, signals, and a small shell only after persistence;
 - [ ] define the attenuating capsule-to-realm job contract and migrate Forge as the
   first non-interactive consumer after artifact verification exists;
@@ -853,5 +919,7 @@ The first implementation must resolve these with executable evidence:
 - [ ] defer public WIT, Debian naming, arbitrary package claims, and native-kernel
     coupling until evidence requires them.
 
-The next code artifact is principal-scoped durable storage behind the realm VFS,
-not another architecture essay and not a general Linux compatibility claim.
+The next code artifact is the first multi-process substrate—process identifiers,
+spawn/wait, bounded pipes, and a tiny shell—while the storage track adds explicit
+generations and promotion. Bash and a compiler remain acceptance workloads, not
+names attached to the current five-command seed.

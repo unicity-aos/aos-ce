@@ -2,8 +2,11 @@
 
 //! Bounded execution of nested core WebAssembly processes.
 
-use aos_realm_abi::{IMPORT_MODULE_V0, STDERR_FD, STDOUT_FD};
-use std::{fmt, vec::Vec};
+use aos_realm_abi::{
+    FIRST_FILE_FD, IMPORT_MODULE_V0, MAX_ARGUMENT_BYTES, MAX_PATH_BYTES, OPEN_READ,
+    OPEN_WRITE_TRUNCATE, STDERR_FD, STDOUT_FD,
+};
+use std::{collections::BTreeMap, fmt, vec::Vec};
 use wasmi::{
     Caller, Config, Engine, Error as WasmiError, Extern, Linker, Module, Store, StoreLimits,
     StoreLimitsBuilder, TrapCode,
@@ -11,6 +14,18 @@ use wasmi::{
 
 /// Compiled smoke guest embedded into the capsule at build time.
 pub const SMOKE_WRITE_GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smoke_write.wasm"));
+
+/// Guest implementing `pwd` through the private realm ABI.
+pub const PWD_GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pwd.wasm"));
+
+/// Guest implementing one-argument `echo` through the private realm ABI.
+pub const ECHO_GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo.wasm"));
+
+/// Guest implementing truncate-or-create `write-file` through the private realm ABI.
+pub const WRITE_FILE_GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/write_file.wasm"));
+
+/// Guest implementing streaming `cat` through the private realm ABI.
+pub const CAT_GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cat.wasm"));
 
 /// Hard limits for one nested process invocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +45,108 @@ impl Default for RunLimits {
             memory_bytes: 64 * 1024,
             output_bytes: 64 * 1024,
         }
+    }
+}
+
+/// Process inputs supplied by the realm supervisor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessConfig {
+    /// Argument vector including the program name at index zero.
+    pub argv: Vec<String>,
+    /// Guest-visible absolute current working directory.
+    pub cwd: String,
+}
+
+impl Default for ProcessConfig {
+    fn default() -> Self {
+        Self {
+            argv: vec!["smoke-write".to_string()],
+            cwd: "/workspace".to_string(),
+        }
+    }
+}
+
+/// File-open operation admitted by the seed guest ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenMode {
+    /// Open an existing file for reading.
+    Read,
+    /// Create or truncate a file for writing.
+    WriteTruncate,
+}
+
+/// Stable I/O failure classes crossing the private guest boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RealmIoError {
+    /// The requested path does not exist.
+    NotFound,
+    /// The request is outside the realm's effective authority.
+    Denied,
+    /// The guest path is malformed or outside a mounted namespace.
+    InvalidPath,
+    /// A directory was requested as a file.
+    IsDirectory,
+    /// A file was requested as a directory.
+    NotDirectory,
+    /// A configured data or quota bound was exceeded.
+    TooLarge,
+    /// The operation is not implemented by this host profile.
+    Unsupported,
+    /// The backing host reported another I/O failure.
+    Io,
+}
+
+impl fmt::Display for RealmIoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "not found",
+            Self::Denied => "denied",
+            Self::InvalidPath => "invalid path",
+            Self::IsDirectory => "is a directory",
+            Self::NotDirectory => "not a directory",
+            Self::TooLarge => "resource limit exceeded",
+            Self::Unsupported => "unsupported",
+            Self::Io => "I/O failure",
+        })
+    }
+}
+
+/// One opened file owned by a nested process descriptor.
+pub trait RealmFile {
+    /// Read up to `max_bytes` from the current cursor and advance it.
+    fn read(&mut self, max_bytes: usize) -> Result<Vec<u8>, RealmIoError>;
+
+    /// Write bytes at the current cursor and advance it.
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, RealmIoError>;
+
+    /// Flush and close the guest-visible file.
+    fn close(&mut self) -> Result<(), RealmIoError> {
+        Ok(())
+    }
+}
+
+/// Outer realm service used to resolve guest file opens.
+pub trait RealmHost {
+    /// Resolve `path` beneath `cwd` and return a bounded file object.
+    fn open(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        mode: OpenMode,
+    ) -> Result<Box<dyn RealmFile>, RealmIoError>;
+}
+
+#[derive(Default)]
+struct DenyRealmHost;
+
+impl RealmHost for DenyRealmHost {
+    fn open(
+        &mut self,
+        _cwd: &str,
+        _path: &str,
+        _mode: OpenMode,
+    ) -> Result<Box<dyn RealmFile>, RealmIoError> {
+        Err(RealmIoError::Denied)
     }
 }
 
@@ -72,6 +189,8 @@ pub enum LaunchError {
     MissingStart(String),
     /// The runtime could not configure a required realm host import.
     RuntimeConfiguration(String),
+    /// Process arguments or current directory violate the private ABI contract.
+    InvalidProcess(String),
 }
 
 impl fmt::Display for LaunchError {
@@ -83,6 +202,7 @@ impl fmt::Display for LaunchError {
             Self::RuntimeConfiguration(message) => {
                 write!(f, "realm runtime configuration failed: {message}")
             }
+            Self::InvalidProcess(message) => write!(f, "invalid process: {message}"),
         }
     }
 }
@@ -100,6 +220,16 @@ pub enum HostFault {
     UnknownDescriptor(i32),
     /// The process exceeded its combined stdout/stderr budget.
     OutputLimit,
+    /// An argument index was absent from the process vector.
+    MissingArgument,
+    /// A guest-provided buffer cannot hold a process argument or CWD.
+    BufferTooSmall,
+    /// Guest bytes that must be UTF-8 were not valid UTF-8.
+    InvalidUtf8,
+    /// An unsupported flag or another ABI scalar was supplied.
+    InvalidArgument,
+    /// The realm filesystem rejected an operation.
+    Io(RealmIoError),
 }
 
 impl fmt::Display for HostFault {
@@ -109,6 +239,11 @@ impl fmt::Display for HostFault {
             Self::InvalidPointer => f.write_str("guest memory range is invalid"),
             Self::UnknownDescriptor(fd) => write!(f, "unknown guest descriptor {fd}"),
             Self::OutputLimit => f.write_str("guest output limit exceeded"),
+            Self::MissingArgument => f.write_str("guest argument is missing"),
+            Self::BufferTooSmall => f.write_str("guest buffer is too small"),
+            Self::InvalidUtf8 => f.write_str("guest string is not valid UTF-8"),
+            Self::InvalidArgument => f.write_str("guest argument is invalid"),
+            Self::Io(error) => write!(f, "realm I/O failed: {error}"),
         }
     }
 }
@@ -122,6 +257,11 @@ struct HostState {
     stderr: Vec<u8>,
     output_limit: usize,
     monotonic_ns: i64,
+    argv: Vec<String>,
+    cwd: String,
+    realm_host: Box<dyn RealmHost>,
+    files: BTreeMap<i32, Box<dyn RealmFile>>,
+    next_fd: i32,
 }
 
 impl HostState {
@@ -148,6 +288,23 @@ impl Default for RealmRuntime {
 impl RealmRuntime {
     /// Validates, instantiates, and runs one guest process.
     pub fn execute(&self, wasm: &[u8], limits: RunLimits) -> Result<ExecutionReport, LaunchError> {
+        self.execute_process(
+            wasm,
+            ProcessConfig::default(),
+            limits,
+            Box::<DenyRealmHost>::default(),
+        )
+    }
+
+    /// Runs one guest with explicit process inputs and an outer realm service.
+    pub fn execute_process(
+        &self,
+        wasm: &[u8],
+        process: ProcessConfig,
+        limits: RunLimits,
+        realm_host: Box<dyn RealmHost>,
+    ) -> Result<ExecutionReport, LaunchError> {
+        validate_process(&process)?;
         let module = Module::new(&self.engine, wasm)
             .map_err(|error| LaunchError::InvalidModule(error.to_string()))?;
         let store_limits = StoreLimitsBuilder::new()
@@ -163,6 +320,11 @@ impl RealmRuntime {
             stderr: Vec::new(),
             output_limit: limits.output_bytes,
             monotonic_ns: 0,
+            argv: process.argv,
+            cwd: process.cwd,
+            realm_host,
+            files: BTreeMap::new(),
+            next_fd: FIRST_FILE_FD,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -196,7 +358,56 @@ impl RealmRuntime {
     }
 }
 
+fn validate_process(process: &ProcessConfig) -> Result<(), LaunchError> {
+    if process.argv.is_empty() {
+        return Err(LaunchError::InvalidProcess(
+            "argv must contain a program name".to_string(),
+        ));
+    }
+    let argument_bytes = process
+        .argv
+        .iter()
+        .try_fold(0usize, |total, value| total.checked_add(value.len()))
+        .ok_or_else(|| LaunchError::InvalidProcess("argument size overflow".to_string()))?;
+    if argument_bytes > MAX_ARGUMENT_BYTES {
+        return Err(LaunchError::InvalidProcess(format!(
+            "arguments use {argument_bytes} bytes; limit is {MAX_ARGUMENT_BYTES}"
+        )));
+    }
+    if process.cwd.len() > MAX_PATH_BYTES || !process.cwd.starts_with('/') {
+        return Err(LaunchError::InvalidProcess(
+            "cwd must be an absolute guest path no larger than 4096 bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn install_realm_v0(linker: &mut Linker<HostState>) -> Result<(), LaunchError> {
+    linker
+        .func_wrap(
+            IMPORT_MODULE_V0,
+            "arg-len",
+            |caller: Caller<'_, HostState>, index: i32| realm_arg_len(&caller, index),
+        )
+        .map_err(|error| LaunchError::RuntimeConfiguration(error.to_string()))?;
+    linker
+        .func_wrap(
+            IMPORT_MODULE_V0,
+            "arg-read",
+            |mut caller: Caller<'_, HostState>, index: i32, ptr: i32, capacity: i32| {
+                realm_arg_read(&mut caller, index, ptr, capacity)
+            },
+        )
+        .map_err(|error| LaunchError::RuntimeConfiguration(error.to_string()))?;
+    linker
+        .func_wrap(
+            IMPORT_MODULE_V0,
+            "cwd-read",
+            |mut caller: Caller<'_, HostState>, ptr: i32, capacity: i32| {
+                realm_cwd_read(&mut caller, ptr, capacity)
+            },
+        )
+        .map_err(|error| LaunchError::RuntimeConfiguration(error.to_string()))?;
     linker
         .func_wrap(
             IMPORT_MODULE_V0,
@@ -204,6 +415,31 @@ fn install_realm_v0(linker: &mut Linker<HostState>) -> Result<(), LaunchError> {
             |mut caller: Caller<'_, HostState>, fd: i32, ptr: i32, len: i32| {
                 realm_write(&mut caller, fd, ptr, len)
             },
+        )
+        .map_err(|error| LaunchError::RuntimeConfiguration(error.to_string()))?;
+    linker
+        .func_wrap(
+            IMPORT_MODULE_V0,
+            "open",
+            |mut caller: Caller<'_, HostState>, ptr: i32, len: i32, mode: i32| {
+                realm_open(&mut caller, ptr, len, mode)
+            },
+        )
+        .map_err(|error| LaunchError::RuntimeConfiguration(error.to_string()))?;
+    linker
+        .func_wrap(
+            IMPORT_MODULE_V0,
+            "read",
+            |mut caller: Caller<'_, HostState>, fd: i32, ptr: i32, capacity: i32| {
+                realm_read(&mut caller, fd, ptr, capacity)
+            },
+        )
+        .map_err(|error| LaunchError::RuntimeConfiguration(error.to_string()))?;
+    linker
+        .func_wrap(
+            IMPORT_MODULE_V0,
+            "close",
+            |mut caller: Caller<'_, HostState>, fd: i32| realm_close(&mut caller, fd),
         )
         .map_err(|error| LaunchError::RuntimeConfiguration(error.to_string()))?;
     linker
@@ -225,38 +461,218 @@ fn install_realm_v0(linker: &mut Linker<HostState>) -> Result<(), LaunchError> {
     Ok(())
 }
 
+const MAX_IO_BYTES: usize = 64 * 1024;
+
+fn realm_arg_len(caller: &Caller<'_, HostState>, index: i32) -> Result<i32, WasmiError> {
+    let index = usize::try_from(index).map_err(|_| WasmiError::host(HostFault::MissingArgument))?;
+    let argument = caller
+        .data()
+        .argv
+        .get(index)
+        .ok_or_else(|| WasmiError::host(HostFault::MissingArgument))?;
+    i32::try_from(argument.len()).map_err(|_| WasmiError::host(HostFault::InvalidArgument))
+}
+
+fn realm_arg_read(
+    caller: &mut Caller<'_, HostState>,
+    index: i32,
+    ptr: i32,
+    capacity: i32,
+) -> Result<i32, WasmiError> {
+    let index = usize::try_from(index).map_err(|_| WasmiError::host(HostFault::MissingArgument))?;
+    let bytes = caller
+        .data()
+        .argv
+        .get(index)
+        .ok_or_else(|| WasmiError::host(HostFault::MissingArgument))?
+        .as_bytes()
+        .to_vec();
+    copy_process_bytes(caller, ptr, capacity, &bytes)
+}
+
+fn realm_cwd_read(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    capacity: i32,
+) -> Result<i32, WasmiError> {
+    let bytes = caller.data().cwd.as_bytes().to_vec();
+    copy_process_bytes(caller, ptr, capacity, &bytes)
+}
+
+fn copy_process_bytes(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    capacity: i32,
+    bytes: &[u8],
+) -> Result<i32, WasmiError> {
+    let capacity =
+        usize::try_from(capacity).map_err(|_| WasmiError::host(HostFault::InvalidPointer))?;
+    if bytes.len() > capacity {
+        return Err(WasmiError::host(HostFault::BufferTooSmall));
+    }
+    write_guest_bytes(caller, ptr, capacity, bytes)?;
+    i32::try_from(bytes.len()).map_err(|_| WasmiError::host(HostFault::InvalidArgument))
+}
+
+fn realm_open(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    len: i32,
+    mode: i32,
+) -> Result<i32, WasmiError> {
+    let length = usize::try_from(len).map_err(|_| WasmiError::host(HostFault::InvalidPointer))?;
+    if length == 0 || length > MAX_PATH_BYTES {
+        return Err(WasmiError::host(HostFault::InvalidArgument));
+    }
+    let bytes = read_guest_bytes(caller, ptr, length)?;
+    let path = String::from_utf8(bytes).map_err(|_| WasmiError::host(HostFault::InvalidUtf8))?;
+    let mode = match mode {
+        OPEN_READ => OpenMode::Read,
+        OPEN_WRITE_TRUNCATE => OpenMode::WriteTruncate,
+        _ => return Err(WasmiError::host(HostFault::InvalidArgument)),
+    };
+    let cwd = caller.data().cwd.clone();
+    let file = caller
+        .data_mut()
+        .realm_host
+        .open(&cwd, &path, mode)
+        .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
+    let fd = caller.data().next_fd;
+    let next_fd = fd
+        .checked_add(1)
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
+    caller.data_mut().next_fd = next_fd;
+    caller.data_mut().files.insert(fd, file);
+    Ok(fd)
+}
+
+fn realm_read(
+    caller: &mut Caller<'_, HostState>,
+    fd: i32,
+    ptr: i32,
+    capacity: i32,
+) -> Result<i32, WasmiError> {
+    let capacity =
+        usize::try_from(capacity).map_err(|_| WasmiError::host(HostFault::InvalidPointer))?;
+    if capacity > MAX_IO_BYTES {
+        return Err(WasmiError::host(HostFault::InvalidArgument));
+    }
+    validate_guest_range(caller, ptr, capacity)?;
+    let bytes = caller
+        .data_mut()
+        .files
+        .get_mut(&fd)
+        .ok_or_else(|| WasmiError::host(HostFault::UnknownDescriptor(fd)))?
+        .read(capacity)
+        .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
+    if bytes.len() > capacity {
+        return Err(WasmiError::host(HostFault::Io(RealmIoError::TooLarge)));
+    }
+    write_guest_bytes(caller, ptr, capacity, &bytes)?;
+    i32::try_from(bytes.len()).map_err(|_| WasmiError::host(HostFault::InvalidArgument))
+}
+
+fn realm_close(caller: &mut Caller<'_, HostState>, fd: i32) -> Result<i32, WasmiError> {
+    let mut file = caller
+        .data_mut()
+        .files
+        .remove(&fd)
+        .ok_or_else(|| WasmiError::host(HostFault::UnknownDescriptor(fd)))?;
+    file.close()
+        .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
+    Ok(0)
+}
+
+fn validate_guest_range(
+    caller: &Caller<'_, HostState>,
+    ptr: i32,
+    length: usize,
+) -> Result<(wasmi::Memory, usize), WasmiError> {
+    let offset = usize::try_from(ptr).map_err(|_| WasmiError::host(HostFault::InvalidPointer))?;
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidPointer))?;
+    let memory = caller
+        .get_export("memory")
+        .and_then(Extern::into_memory)
+        .ok_or_else(|| WasmiError::host(HostFault::MissingMemory))?;
+    if end > memory.data_size(caller) {
+        return Err(WasmiError::host(HostFault::InvalidPointer));
+    }
+    Ok((memory, offset))
+}
+
+fn read_guest_bytes(
+    caller: &Caller<'_, HostState>,
+    ptr: i32,
+    length: usize,
+) -> Result<Vec<u8>, WasmiError> {
+    if length > MAX_IO_BYTES {
+        return Err(WasmiError::host(HostFault::InvalidArgument));
+    }
+    let (memory, offset) = validate_guest_range(caller, ptr, length)?;
+    let mut bytes = vec![0; length];
+    memory
+        .read(caller, offset, &mut bytes)
+        .map_err(|_| WasmiError::host(HostFault::InvalidPointer))?;
+    Ok(bytes)
+}
+
+fn write_guest_bytes(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    capacity: usize,
+    bytes: &[u8],
+) -> Result<(), WasmiError> {
+    if bytes.len() > capacity || capacity > MAX_IO_BYTES {
+        return Err(WasmiError::host(HostFault::BufferTooSmall));
+    }
+    let (memory, offset) = validate_guest_range(caller, ptr, capacity)?;
+    memory
+        .write(caller, offset, bytes)
+        .map_err(|_| WasmiError::host(HostFault::InvalidPointer))
+}
+
 fn realm_write(
     caller: &mut Caller<'_, HostState>,
     fd: i32,
     ptr: i32,
     len: i32,
 ) -> Result<i32, WasmiError> {
-    let offset = usize::try_from(ptr).map_err(|_| WasmiError::host(HostFault::InvalidPointer))?;
     let length = usize::try_from(len).map_err(|_| WasmiError::host(HostFault::InvalidPointer))?;
-    let new_total = caller
-        .data()
-        .output_len()
-        .checked_add(length)
-        .ok_or_else(|| WasmiError::host(HostFault::OutputLimit))?;
-    if new_total > caller.data().output_limit {
-        return Err(WasmiError::host(HostFault::OutputLimit));
-    }
-
-    let memory = caller
-        .get_export("memory")
-        .and_then(Extern::into_memory)
-        .ok_or_else(|| WasmiError::host(HostFault::MissingMemory))?;
-    let mut bytes = vec![0; length];
-    memory
-        .read(&*caller, offset, &mut bytes)
-        .map_err(|_| WasmiError::host(HostFault::InvalidPointer))?;
-
     match fd {
-        STDOUT_FD => caller.data_mut().stdout.extend_from_slice(&bytes),
-        STDERR_FD => caller.data_mut().stderr.extend_from_slice(&bytes),
-        unknown => return Err(WasmiError::host(HostFault::UnknownDescriptor(unknown))),
+        STDOUT_FD | STDERR_FD => {
+            let new_total = caller
+                .data()
+                .output_len()
+                .checked_add(length)
+                .ok_or_else(|| WasmiError::host(HostFault::OutputLimit))?;
+            if new_total > caller.data().output_limit {
+                return Err(WasmiError::host(HostFault::OutputLimit));
+            }
+            let bytes = read_guest_bytes(caller, ptr, length)?;
+            if fd == STDOUT_FD {
+                caller.data_mut().stdout.extend_from_slice(&bytes);
+            } else {
+                caller.data_mut().stderr.extend_from_slice(&bytes);
+            }
+            Ok(len)
+        }
+        file_fd => {
+            if !caller.data().files.contains_key(&file_fd) {
+                return Err(WasmiError::host(HostFault::UnknownDescriptor(file_fd)));
+            }
+            let bytes = read_guest_bytes(caller, ptr, length)?;
+            let written = caller
+                .data_mut()
+                .files
+                .get_mut(&file_fd)
+                .expect("descriptor existence checked")
+                .write(&bytes)
+                .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
+            i32::try_from(written).map_err(|_| WasmiError::host(HostFault::InvalidArgument))
+        }
     }
-    Ok(len)
 }
 
 fn classify_process_error(error: &WasmiError) -> ProcessOutcome {
@@ -275,6 +691,84 @@ fn classify_process_error(error: &WasmiError) -> ProcessOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{cell::RefCell, rc::Rc};
+
+    #[derive(Clone, Default)]
+    struct MemoryRealmHost {
+        files: Rc<RefCell<BTreeMap<String, Vec<u8>>>>,
+    }
+
+    impl MemoryRealmHost {
+        fn contents(&self, path: &str) -> Option<Vec<u8>> {
+            self.files.borrow().get(path).cloned()
+        }
+    }
+
+    impl RealmHost for MemoryRealmHost {
+        fn open(
+            &mut self,
+            cwd: &str,
+            path: &str,
+            mode: OpenMode,
+        ) -> Result<Box<dyn RealmFile>, RealmIoError> {
+            let resolved = if path.starts_with('/') {
+                path.to_string()
+            } else {
+                format!("{}/{path}", cwd.trim_end_matches('/'))
+            };
+            if mode == OpenMode::Read && !self.files.borrow().contains_key(&resolved) {
+                return Err(RealmIoError::NotFound);
+            }
+            if mode == OpenMode::WriteTruncate {
+                self.files.borrow_mut().insert(resolved.clone(), Vec::new());
+            }
+            Ok(Box::new(MemoryRealmFile {
+                files: Rc::clone(&self.files),
+                path: resolved,
+                offset: 0,
+                mode,
+            }))
+        }
+    }
+
+    struct MemoryRealmFile {
+        files: Rc<RefCell<BTreeMap<String, Vec<u8>>>>,
+        path: String,
+        offset: usize,
+        mode: OpenMode,
+    }
+
+    impl RealmFile for MemoryRealmFile {
+        fn read(&mut self, max_bytes: usize) -> Result<Vec<u8>, RealmIoError> {
+            if self.mode != OpenMode::Read {
+                return Err(RealmIoError::Denied);
+            }
+            let files = self.files.borrow();
+            let bytes = files.get(&self.path).ok_or(RealmIoError::NotFound)?;
+            let end = self.offset.saturating_add(max_bytes).min(bytes.len());
+            let result = bytes[self.offset..end].to_vec();
+            self.offset = end;
+            Ok(result)
+        }
+
+        fn write(&mut self, bytes: &[u8]) -> Result<usize, RealmIoError> {
+            if self.mode != OpenMode::WriteTruncate {
+                return Err(RealmIoError::Denied);
+            }
+            let mut files = self.files.borrow_mut();
+            let file = files.get_mut(&self.path).ok_or(RealmIoError::NotFound)?;
+            let end = self
+                .offset
+                .checked_add(bytes.len())
+                .ok_or(RealmIoError::TooLarge)?;
+            if end > file.len() {
+                file.resize(end, 0);
+            }
+            file[self.offset..end].copy_from_slice(bytes);
+            self.offset = end;
+            Ok(bytes.len())
+        }
+    }
 
     fn compile(wat_source: &str) -> Vec<u8> {
         wat::parse_str(wat_source).expect("valid test WAT")
@@ -291,6 +785,121 @@ mod tests {
         assert!(report.stderr.is_empty());
         assert!(report.fuel_consumed > 0);
         assert_eq!(report.memory_limit_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn pwd_reads_the_guest_visible_current_directory() {
+        let report = RealmRuntime::default()
+            .execute_process(
+                PWD_GUEST,
+                ProcessConfig {
+                    argv: vec!["pwd".to_string()],
+                    cwd: "/workspace/project".to_string(),
+                },
+                RunLimits::default(),
+                Box::<MemoryRealmHost>::default(),
+            )
+            .expect("pwd guest launches");
+
+        assert_eq!(report.outcome, ProcessOutcome::Exited(0));
+        assert_eq!(report.stdout, b"/workspace/project\n");
+    }
+
+    #[test]
+    fn echo_reads_argv_through_the_guest_abi() {
+        let report = RealmRuntime::default()
+            .execute_process(
+                ECHO_GUEST,
+                ProcessConfig {
+                    argv: vec!["echo".to_string(), "hello realm".to_string()],
+                    cwd: "/workspace".to_string(),
+                },
+                RunLimits::default(),
+                Box::<MemoryRealmHost>::default(),
+            )
+            .expect("echo guest launches");
+
+        assert_eq!(report.outcome, ProcessOutcome::Exited(0));
+        assert_eq!(report.stdout, b"hello realm\n");
+    }
+
+    #[test]
+    fn write_and_cat_persist_across_process_instances() {
+        let host = MemoryRealmHost::default();
+        let runtime = RealmRuntime::default();
+        let write = runtime
+            .execute_process(
+                WRITE_FILE_GUEST,
+                ProcessConfig {
+                    argv: vec![
+                        "write-file".to_string(),
+                        "note.txt".to_string(),
+                        "durable bytes".to_string(),
+                    ],
+                    cwd: "/workspace/project".to_string(),
+                },
+                RunLimits::default(),
+                Box::new(host.clone()),
+            )
+            .expect("write guest launches");
+
+        assert_eq!(write.outcome, ProcessOutcome::Exited(0));
+        assert_eq!(
+            host.contents("/workspace/project/note.txt"),
+            Some(b"durable bytes".to_vec())
+        );
+
+        let read = runtime
+            .execute_process(
+                CAT_GUEST,
+                ProcessConfig {
+                    argv: vec!["cat".to_string(), "note.txt".to_string()],
+                    cwd: "/workspace/project".to_string(),
+                },
+                RunLimits::default(),
+                Box::new(host),
+            )
+            .expect("cat guest launches");
+
+        assert_eq!(read.outcome, ProcessOutcome::Exited(0));
+        assert_eq!(read.stdout, b"durable bytes");
+    }
+
+    #[test]
+    fn missing_command_argument_is_a_stable_host_fault() {
+        let report = RealmRuntime::default()
+            .execute_process(
+                CAT_GUEST,
+                ProcessConfig {
+                    argv: vec!["cat".to_string()],
+                    cwd: "/workspace".to_string(),
+                },
+                RunLimits::default(),
+                Box::<MemoryRealmHost>::default(),
+            )
+            .expect("guest launches before requesting absent argument");
+
+        assert_eq!(
+            report.outcome,
+            ProcessOutcome::HostFault(HostFault::MissingArgument)
+        );
+    }
+
+    #[test]
+    fn oversized_argument_vector_is_rejected_before_launch() {
+        let error = RealmRuntime::default()
+            .execute_process(
+                ECHO_GUEST,
+                ProcessConfig {
+                    argv: vec!["echo".to_string(), "x".repeat(MAX_ARGUMENT_BYTES)],
+                    cwd: "/workspace".to_string(),
+                },
+                RunLimits::default(),
+                Box::<MemoryRealmHost>::default(),
+            )
+            .expect_err("oversized arguments must fail admission");
+
+        assert!(matches!(error, LaunchError::InvalidProcess(_)));
     }
 
     #[test]

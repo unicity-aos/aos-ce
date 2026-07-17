@@ -1,0 +1,328 @@
+//! Astrid-backed mounts for the private AOS Realm guest filesystem.
+
+use aos_realm_runtime::{OpenMode, RealmFile, RealmHost, RealmIoError};
+use astrid_sdk::{SysError, fs};
+
+pub(crate) const REALM_NAME: &str = "default";
+pub(crate) const DEFAULT_CWD: &str = "/workspace";
+pub(crate) const REALM_HOME: &str = "home://.local/share/aos-realm/default/home/agent";
+pub(crate) const REALM_STATE: &str = "home://.local/share/aos-realm/default/state";
+// Astrid's principal tmp root lives at `home://.local/tmp`. Address it through
+// the dynamic home scheme so the manifest gate can resolve the invoking
+// principal before checking the path. The guest still sees only `/tmp`.
+pub(crate) const REALM_TMP: &str = "home://.local/tmp/aos-realm/default";
+const FORMAT_MARKER: &str = "home://.local/share/aos-realm/default/state/format";
+const MAX_SEED_FILE_BYTES: usize = 64 * 1024;
+
+/// Create the durable and ephemeral mount roots required by the seed realm.
+pub(crate) fn ensure_layout() -> Result<(), SysError> {
+    fs::create_dir_all(REALM_HOME)?;
+    fs::create_dir_all(REALM_STATE)?;
+    fs::create_dir_all(REALM_TMP)?;
+    if !fs::exists(FORMAT_MARKER)? {
+        fs::write(FORMAT_MARKER, b"aos-realm-format=0\n")?;
+    }
+    Ok(())
+}
+
+/// Inspect whether the realm layout exists without creating it.
+pub(crate) fn layout_initialized() -> Result<bool, SysError> {
+    fs::exists(FORMAT_MARKER)
+}
+
+/// Confirm that a guest CWD names an existing directory in one admitted mount.
+pub(crate) fn validate_cwd(cwd: &str) -> Result<(), SysError> {
+    let outer = resolve_guest_path(cwd, ".")
+        .map_err(|error| SysError::ApiError(format!("invalid realm cwd: {error}")))?;
+    let metadata = fs::metadata(&outer)?;
+    if !metadata.is_dir() {
+        return Err(SysError::ApiError(format!(
+            "realm cwd is not a directory: {cwd}"
+        )));
+    }
+    Ok(())
+}
+
+/// Map a guest path to an Astrid VFS path without revealing a host path.
+pub(crate) fn resolve_guest_path(cwd: &str, requested: &str) -> Result<String, RealmIoError> {
+    let absolute = normalize_guest_path(cwd, requested)?;
+    map_absolute_path(&absolute)
+}
+
+fn normalize_guest_path(cwd: &str, requested: &str) -> Result<String, RealmIoError> {
+    if cwd.is_empty()
+        || !cwd.starts_with('/')
+        || requested.is_empty()
+        || cwd.contains('\0')
+        || requested.contains('\0')
+        || cwd.contains('\\')
+        || requested.contains('\\')
+    {
+        return Err(RealmIoError::InvalidPath);
+    }
+
+    let joined = if requested.starts_with('/') {
+        requested.to_string()
+    } else if cwd == "/" {
+        format!("/{requested}")
+    } else {
+        format!("{}/{requested}", cwd.trim_end_matches('/'))
+    };
+    let mut components = Vec::new();
+    for component in joined.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return Err(RealmIoError::InvalidPath);
+                }
+            }
+            value if value.chars().any(char::is_control) => {
+                return Err(RealmIoError::InvalidPath);
+            }
+            value => components.push(value),
+        }
+    }
+    Ok(format!("/{}", components.join("/")))
+}
+
+fn map_absolute_path(path: &str) -> Result<String, RealmIoError> {
+    if path == "/workspace" {
+        return Ok("cwd://".to_string());
+    }
+    if let Some(relative) = path.strip_prefix("/workspace/") {
+        return Ok(format!("cwd://{relative}"));
+    }
+    if path == "/home/agent" {
+        return Ok(REALM_HOME.to_string());
+    }
+    if let Some(relative) = path.strip_prefix("/home/agent/") {
+        return Ok(format!("{REALM_HOME}/{relative}"));
+    }
+    if path == "/tmp" {
+        return Ok(REALM_TMP.to_string());
+    }
+    if let Some(relative) = path.strip_prefix("/tmp/") {
+        return Ok(format!("{REALM_TMP}/{relative}"));
+    }
+    Err(RealmIoError::InvalidPath)
+}
+
+/// Realm host adapter whose authority is exactly the outer Astrid FS imports.
+#[derive(Default)]
+pub(crate) struct AstridRealmHost;
+
+impl RealmHost for AstridRealmHost {
+    fn open(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        mode: OpenMode,
+    ) -> Result<Box<dyn RealmFile>, RealmIoError> {
+        let resolved = resolve_guest_path(cwd, path)?;
+        let backing = match mode {
+            // Astrid's current component host exposes reliable whole-file I/O;
+            // its positional FileHandle port is not live yet. Buffering here
+            // keeps that host limitation out of the private nested-WASM ABI.
+            OpenMode::Read => {
+                let bytes = fs::read(&resolved).map_err(map_sdk_error)?;
+                if bytes.len() > MAX_SEED_FILE_BYTES {
+                    return Err(RealmIoError::TooLarge);
+                }
+                AstridFileBacking::Read { bytes }
+            }
+            // Defer replacement until `close`, so a trapped guest cannot leave
+            // a partially written file behind.
+            OpenMode::WriteTruncate => AstridFileBacking::Write {
+                path: resolved,
+                bytes: Vec::new(),
+            },
+        };
+        Ok(Box::new(AstridRealmFile { backing, offset: 0 }))
+    }
+}
+
+struct AstridRealmFile {
+    backing: AstridFileBacking,
+    offset: usize,
+}
+
+enum AstridFileBacking {
+    Read { bytes: Vec<u8> },
+    Write { path: String, bytes: Vec<u8> },
+}
+
+impl RealmFile for AstridRealmFile {
+    fn read(&mut self, max_bytes: usize) -> Result<Vec<u8>, RealmIoError> {
+        let AstridFileBacking::Read { bytes } = &self.backing else {
+            return Err(RealmIoError::Unsupported);
+        };
+        let end = self
+            .offset
+            .checked_add(max_bytes)
+            .ok_or(RealmIoError::TooLarge)?
+            .min(bytes.len());
+        let chunk = bytes
+            .get(self.offset..end)
+            .ok_or(RealmIoError::InvalidPath)?
+            .to_vec();
+        self.offset = end;
+        Ok(chunk)
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<usize, RealmIoError> {
+        let AstridFileBacking::Write {
+            bytes: buffered, ..
+        } = &mut self.backing
+        else {
+            return Err(RealmIoError::Unsupported);
+        };
+        let end = self
+            .offset
+            .checked_add(bytes.len())
+            .ok_or(RealmIoError::TooLarge)?;
+        if end > MAX_SEED_FILE_BYTES {
+            return Err(RealmIoError::TooLarge);
+        }
+        if end > buffered.len() {
+            buffered.resize(end, 0);
+        }
+        buffered[self.offset..end].copy_from_slice(bytes);
+        self.offset = end;
+        Ok(bytes.len())
+    }
+
+    fn close(&mut self) -> Result<(), RealmIoError> {
+        match &self.backing {
+            AstridFileBacking::Read { .. } => Ok(()),
+            AstridFileBacking::Write { path, bytes } => {
+                fs::write(path, bytes).map_err(map_sdk_error)
+            }
+        }
+    }
+}
+
+fn map_sdk_error(error: SysError) -> RealmIoError {
+    match error {
+        // astrid-sdk intentionally preserves the typed WIT error's Debug name
+        // in HostError. Match that stable boundary instead of parsing the
+        // human-facing Display sentence.
+        SysError::HostError(code) => map_host_error_code(&code),
+        SysError::ApiError(message) if message.contains("not found") => RealmIoError::NotFound,
+        SysError::ApiError(message) if message.contains("denied") => RealmIoError::Denied,
+        _ => RealmIoError::Io,
+    }
+}
+
+fn map_host_error_code(code: &str) -> RealmIoError {
+    match code {
+        "NotFound" => RealmIoError::NotFound,
+        "CapabilityDenied" | "Access" => RealmIoError::Denied,
+        "InvalidPath" | "BoundaryEscape" => RealmIoError::InvalidPath,
+        "IsDirectory" => RealmIoError::IsDirectory,
+        "NotDirectory" => RealmIoError::NotDirectory,
+        "TooLarge" | "QuotaExceeded" => RealmIoError::TooLarge,
+        // Some current VFS backends surface their original OS error inside
+        // `Unknown(...)`. Normalize only this HostError payload so the private
+        // realm ABI still presents a stable fault class.
+        _ => {
+            let normalized: String = code
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect();
+            if normalized.contains("notfound") || normalized.contains("nosuchfileordirectory") {
+                RealmIoError::NotFound
+            } else if normalized.contains("permissiondenied")
+                || normalized.contains("capabilitydenied")
+            {
+                RealmIoError::Denied
+            } else {
+                RealmIoError::Io
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_is_an_explicit_cwd_mount() {
+        assert_eq!(
+            resolve_guest_path("/workspace/project", "src/lib.rs"),
+            Ok("cwd://project/src/lib.rs".to_string())
+        );
+        assert_eq!(
+            resolve_guest_path("/workspace/project", "../Cargo.toml"),
+            Ok("cwd://Cargo.toml".to_string())
+        );
+    }
+
+    #[test]
+    fn principal_home_maps_only_beneath_the_realm_root() {
+        assert_eq!(
+            resolve_guest_path("/home/agent", ".config/tool.toml"),
+            Ok(format!("{REALM_HOME}/.config/tool.toml"))
+        );
+        assert_eq!(
+            resolve_guest_path("/home/agent", "../../outside"),
+            Err(RealmIoError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn unmounted_guest_paths_and_scheme_injection_fail_closed() {
+        assert_eq!(
+            resolve_guest_path("/workspace", "/etc/passwd"),
+            Err(RealmIoError::InvalidPath)
+        );
+        assert_eq!(
+            resolve_guest_path("/workspace", "home://other"),
+            Ok("cwd://home:/other".to_string())
+        );
+        assert_eq!(
+            resolve_guest_path("/workspace", ".."),
+            Err(RealmIoError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn typed_sdk_errors_map_to_stable_realm_faults() {
+        assert_eq!(
+            map_sdk_error(SysError::HostError("NotFound".to_string())),
+            RealmIoError::NotFound
+        );
+        assert_eq!(
+            map_sdk_error(SysError::HostError("CapabilityDenied".to_string())),
+            RealmIoError::Denied
+        );
+        assert_eq!(
+            map_sdk_error(SysError::HostError("BoundaryEscape".to_string())),
+            RealmIoError::InvalidPath
+        );
+        assert_eq!(
+            map_sdk_error(SysError::HostError(
+                "Unknown(\"No such file or directory (os error 2)\")".to_string()
+            )),
+            RealmIoError::NotFound
+        );
+    }
+
+    #[test]
+    fn buffered_seed_files_are_bounded() {
+        let mut file = AstridRealmFile {
+            backing: AstridFileBacking::Write {
+                path: "unused".to_string(),
+                bytes: Vec::new(),
+            },
+            offset: 0,
+        };
+
+        assert_eq!(
+            file.write(&vec![0; MAX_SEED_FILE_BYTES + 1]),
+            Err(RealmIoError::TooLarge)
+        );
+    }
+}
