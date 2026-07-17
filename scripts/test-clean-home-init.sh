@@ -13,7 +13,10 @@ for required in bin/aos runtime/bin/astrid runtime/bin/astrid-daemon Distro.toml
     exit 1
   }
 done
-[[ -d "$bundle/capsules" && ! -L "$bundle/capsules" ]]
+[[ -d "$bundle/capsules" && ! -L "$bundle/capsules" ]] || {
+  echo "clean-home init bundle is missing capsules directory" >&2
+  exit 1
+}
 
 work=$(mktemp -d)
 aos_home="$work/user/.aos"
@@ -42,7 +45,7 @@ import sys
 assets_path = pathlib.Path(sys.argv[1])
 rows = json.loads(sys.argv[2])
 expected = sorted(
-    line.removesuffix(".capsule")
+    line[:-len(".capsule")] if line.endswith(".capsule") else line
     for line in assets_path.read_text(encoding="utf-8").splitlines()
     if line
 )
@@ -85,7 +88,7 @@ except ModuleNotFoundError:
 
 assets_path, lock_path, profile_path = map(pathlib.Path, sys.argv[1:])
 expected = sorted(
-    line.removesuffix(".capsule")
+    line[:-len(".capsule")] if line.endswith(".capsule") else line
     for line in assets_path.read_text(encoding="utf-8").splitlines()
     if line
 )
