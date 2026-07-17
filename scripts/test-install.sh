@@ -9,7 +9,14 @@ fake_bin="$work/fake-bin"
 mkdir -p "$fixture" "$fake_bin" "$work/home" "$work/capsules"
 mkdir -p "$work/home/.astrid"
 printf 'standalone-runtime-state\n' > "$work/home/.astrid/sentinel"
-read -r runtime_version runtime_tag runtime_identity < <(
+read -r \
+  runtime_version \
+  runtime_tag \
+  runtime_identity \
+  runtime_metadata_available \
+  runtime_source_commit \
+  runtime_metadata_asset \
+  runtime_metadata_blake3 < <(
   python3 - "$repo_root/release/runtime-compatibility.toml" <<'PY'
 import pathlib
 import sys
@@ -17,7 +24,15 @@ import tomllib
 
 with pathlib.Path(sys.argv[1]).open("rb") as file:
     runtime = tomllib.load(file)["runtime"]
-print(runtime["version"], runtime["tag"], runtime["release-workflow-identity"])
+print(
+    runtime["version"],
+    runtime["tag"],
+    runtime["release-workflow-identity"],
+    str(runtime["release-metadata-available"]).lower(),
+    runtime["source-commit"],
+    runtime["release-metadata-asset"],
+    runtime["release-metadata-blake3"],
+)
 PY
 )
 
@@ -84,10 +99,10 @@ repository = "astrid-runtime/astrid"
 version = "${runtime_version}"
 tag = "${runtime_tag}"
 release-workflow-identity = "${runtime_identity}"
-release-metadata-available = false
-source-commit = ""
-release-metadata-asset = ""
-release-metadata-blake3 = ""
+release-metadata-available = ${runtime_metadata_available}
+source-commit = "${runtime_source_commit}"
+release-metadata-asset = "${runtime_metadata_asset}"
+release-metadata-blake3 = "${runtime_metadata_blake3}"
 
 [contracts]
 repository = "astrid-runtime/wit"
