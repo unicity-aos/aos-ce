@@ -9,7 +9,7 @@ fake_bin="$work/fake-bin"
 mkdir -p "$fixture" "$fake_bin" "$work/home" "$work/capsules"
 mkdir -p "$work/home/.astrid"
 printf 'standalone-runtime-state\n' > "$work/home/.astrid/sentinel"
-read -r \
+if ! read -r \
   runtime_version \
   runtime_tag \
   runtime_identity \
@@ -34,7 +34,10 @@ print(
     runtime["release-metadata-blake3"],
 )
 PY
-)
+); then
+  echo "failed to read runtime compatibility fixture provenance" >&2
+  exit 1
+fi
 if [[ -z "$runtime_version" || -z "$runtime_tag" || -z "$runtime_identity" || \
       -z "$runtime_source_commit" || -z "$runtime_metadata_asset" || \
       -z "$runtime_metadata_blake3" ]]; then

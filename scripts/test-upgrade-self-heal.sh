@@ -177,7 +177,7 @@ for spec in source_contract():
 PY
 
 target=x86_64-unknown-linux-gnu
-read -r \
+if ! read -r \
   runtime_version \
   runtime_tag \
   runtime_identity \
@@ -202,7 +202,10 @@ print(
     runtime["release-metadata-blake3"],
 )
 PY
-)
+); then
+  echo "failed to read runtime compatibility fixture provenance" >&2
+  exit 1
+fi
 if [[ -z "$runtime_version" || -z "$runtime_tag" || -z "$runtime_identity" || \
       -z "$runtime_source_commit" || -z "$runtime_metadata_asset" || \
       -z "$runtime_metadata_blake3" ]]; then
