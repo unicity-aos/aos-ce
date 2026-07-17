@@ -2,11 +2,20 @@ use std::{env, fs, path::PathBuf};
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    let guest_source = manifest_dir.join("../../guests/smoke-write/smoke-write.wat");
-    let output = PathBuf::from(env::var_os("OUT_DIR").expect("out dir")).join("smoke_write.wasm");
+    let output_dir = PathBuf::from(env::var_os("OUT_DIR").expect("out dir"));
 
-    println!("cargo:rerun-if-changed={}", guest_source.display());
-
-    let wasm = wat::parse_file(&guest_source).expect("compile smoke-write guest WAT");
-    fs::write(output, wasm).expect("write compiled smoke-write guest");
+    for (directory, output_name) in [
+        ("smoke-write", "smoke_write.wasm"),
+        ("pwd", "pwd.wasm"),
+        ("echo", "echo.wasm"),
+        ("write-file", "write_file.wasm"),
+        ("cat", "cat.wasm"),
+    ] {
+        let guest_source = manifest_dir.join(format!("../../guests/{directory}/{directory}.wat"));
+        println!("cargo:rerun-if-changed={}", guest_source.display());
+        let wasm = wat::parse_file(&guest_source)
+            .unwrap_or_else(|error| panic!("compile {}: {error}", guest_source.display()));
+        fs::write(output_dir.join(output_name), wasm)
+            .unwrap_or_else(|error| panic!("write {output_name}: {error}"));
+    }
 }

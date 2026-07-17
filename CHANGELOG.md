@@ -37,6 +37,9 @@
   provisioning, archive safety validation, BLAKE3 checksums, SHA-256
   compatibility checksums, Sigstore bundles, and provenance.
 - Host-target unit-test coverage for the capsule workspace.
+- The installable `aos-linux-realm` seed: principal-owned durable home storage,
+  an Astrid copy-on-write workspace projection, and bounded nested-WASM `pwd`,
+  `echo`, `write-file`, and `cat` commands with no host-process authority.
 - Forge in the default Community Edition distribution, including a discoverable
   bootstrap and skill that teach fresh agents to build a user-space
   meta-harness on AOS by seeing instructions, memory, skills, harness code,
