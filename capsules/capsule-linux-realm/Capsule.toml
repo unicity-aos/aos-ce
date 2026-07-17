@@ -1,0 +1,25 @@
+[package]
+name = "aos-linux-realm"
+version = "0.1.0"
+description = "Principal-owned AOS Realm workbench"
+authors = [
+    "Joshua J. Bouw <dev@joshuajbouw.com>",
+    "Unicity Labs <info@unicity-labs.com>",
+]
+astrid-version = ">=0.10.1"
+
+[[component]]
+id = "linux-realm"
+file = "aos_linux_realm.wasm"
+type = "executable"
+
+# Deliberately empty. In particular, this capsule has no host_process grant.
+[capabilities]
+
+[publish]
+"tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }
+"tool.v1.response.describe.*" = { wit = "@unicity-astrid/wit/tool/describe-response" }
+
+[subscribe]
+"tool.v1.execute.linux_realm_exec" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_linux_realm_exec" }
+"tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }

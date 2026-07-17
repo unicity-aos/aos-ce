@@ -1,0 +1,15 @@
+[package]
+name = "aos-realm-abi"
+version = "0.1.0"
+edition = "2024"
+authors = [
+    "Joshua J. Bouw <dev@joshuajbouw.com>",
+    "Unicity Labs <info@unicity-labs.com>",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/unicity-aos/aos-ce"
+description = "Private guest ABI types for the AOS Realm distribution"
+publish = false
+
+[lib]
+path = "src/lib.rs"

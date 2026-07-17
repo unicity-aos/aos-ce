@@ -1,0 +1,8 @@
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+# Route OS-less capsule randomness through the Astrid host import if a future
+# realm dependency requests it. Wasmi itself is configured with BTree storage
+# and does not require ambient randomness.
+rustflags = ["--cfg=getrandom_backend=\"custom\""]

@@ -1,0 +1,23 @@
+[package]
+name = "aos-realm-runtime"
+version = "0.1.0"
+edition = "2024"
+authors = [
+    "Joshua J. Bouw <dev@joshuajbouw.com>",
+    "Unicity Labs <info@unicity-labs.com>",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/unicity-aos/aos-ce"
+description = "Bounded nested WebAssembly process runtime for AOS Realm"
+publish = false
+build = "build.rs"
+
+[dependencies]
+aos-realm-abi = { workspace = true }
+wasmi = { workspace = true }
+
+[build-dependencies]
+wat = { workspace = true }
+
+[dev-dependencies]
+wat = { workspace = true }
