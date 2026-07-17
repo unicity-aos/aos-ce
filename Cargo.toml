@@ -1,6 +1,9 @@
 [workspace]
 members = [
     "crates/unicity-aos-bootstrap",
+    "capsules/capsule-linux-realm",
+    "capsules/capsule-linux-realm/crates/realm-abi",
+    "capsules/capsule-linux-realm/crates/realm-runtime",
     "capsules/capsule-agents",
     "capsules/capsule-cli",
     "capsules/capsule-context-engine",
@@ -29,6 +32,8 @@ resolver = "3"
 astrid-sdk = { version = "=0.7.1", features = ["derive"] }
 astrid-core = "=0.10.1"
 astrid-uplink = "=0.10.1"
+aos-realm-abi = { path = "capsules/capsule-linux-realm/crates/realm-abi" }
+aos-realm-runtime = { path = "capsules/capsule-linux-realm/crates/realm-runtime" }
 axum = "0.8"
 blake3 = "1.8.5"
 clap = { version = "4.6", features = ["derive"] }
@@ -38,6 +43,14 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["net", "rt", "time"] }
 toml = "0.8"
 uuid = { version = "1.22", features = ["rng-getrandom", "serde", "v4"] }
+# Current stable release. Wasmi 2.0 is still a beta line and is not admitted to
+# the reference runtime without a deliberate compatibility review.
+wasmi = { version = "=1.1.0", default-features = false, features = [
+    "extra-checks",
+    "prefer-btree-collections",
+] }
+# Build-only compiler for the checked-in smoke guest source.
+wat = { version = "=1.253.0", default-features = false }
 
 [profile.release]
 opt-level = "z"
