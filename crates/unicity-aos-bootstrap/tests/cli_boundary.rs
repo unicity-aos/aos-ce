@@ -188,17 +188,29 @@ exit 1
 "#,
     );
 
+    let ready_marker = fixture.home.join("runtime/run/system.ready");
+    fs::create_dir_all(ready_marker.parent().expect("runtime run directory"))
+        .expect("create runtime run directory");
+    fs::write(&ready_marker, []).expect("create runtime ready marker");
+    let marker_to_remove = ready_marker.clone();
+    let shutdown = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        fs::remove_file(marker_to_remove).expect("remove runtime ready marker");
+    });
+
     let output = fixture
         .command()
-        .args(["--principal", "operator", "stop"])
+        .args(["--future-runtime-global", "future-value", "stop"])
         .output()
         .expect("run inherited stop");
+    shutdown.join().expect("finish runtime shutdown");
 
     assert!(output.status.success());
     assert_eq!(
         fs::read_to_string(&fixture.args).expect("read delegated stop args"),
-        "<--principal>\n<operator>\n<stop>\n"
+        "<--future-runtime-global>\n<future-value>\n<stop>\n"
     );
+    assert!(!ready_marker.exists());
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).expect("utf8 stop output"),

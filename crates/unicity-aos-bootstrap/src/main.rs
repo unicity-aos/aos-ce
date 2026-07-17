@@ -373,11 +373,56 @@ fn runtime_args_for_dispatch(mut args: Vec<OsString>) -> Vec<OsString> {
 }
 
 fn runtime_stop_requested(args: &[OsString]) -> bool {
-    leading_runtime_root_index(args)
-        .ok()
-        .flatten()
-        .and_then(|index| args.get(index))
-        .is_some_and(|root| root == "stop")
+    match leading_runtime_root_index(args) {
+        Ok(Some(index)) => args.get(index).is_some_and(|root| root == "stop"),
+        Ok(None) => false,
+        Err(()) => fallback_runtime_root(args).is_some_and(|root| root == "stop"),
+    }
+}
+
+fn fallback_runtime_root(args: &[OsString]) -> Option<&str> {
+    args.iter().filter_map(|arg| arg.to_str()).find(|arg| {
+        matches!(
+            *arg,
+            "chat"
+                | "run"
+                | "agent"
+                | "group"
+                | "caps"
+                | "quota"
+                | "invite"
+                | "keypair"
+                | "pair-device"
+                | "secret"
+                | "voucher"
+                | "trust"
+                | "audit"
+                | "budget"
+                | "session"
+                | "capsule"
+                | "mcp"
+                | "distro"
+                | "init"
+                | "config"
+                | "gc"
+                | "start"
+                | "status"
+                | "stop"
+                | "restart"
+                | "logs"
+                | "ps"
+                | "top"
+                | "who"
+                | "doctor"
+                | "setup"
+                | "version"
+                | "completions"
+                | "update"
+                | "self-update"
+                | "self_update"
+                | "help"
+        )
+    })
 }
 
 fn handle_runtime_stop(args: &[OsString]) -> ExitCode {
@@ -961,6 +1006,17 @@ mod tests {
             OsString::from("stop"),
         ]));
         assert!(!runtime_stop_requested(&[
+            OsString::from("capsule"),
+            OsString::from("stop"),
+        ]));
+        assert!(runtime_stop_requested(&[
+            OsString::from("--future-runtime-global"),
+            OsString::from("future-value"),
+            OsString::from("stop"),
+        ]));
+        assert!(!runtime_stop_requested(&[
+            OsString::from("--future-runtime-global"),
+            OsString::from("future-value"),
             OsString::from("capsule"),
             OsString::from("stop"),
         ]));
