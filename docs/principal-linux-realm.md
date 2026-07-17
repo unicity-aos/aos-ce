@@ -676,6 +676,11 @@ compatibility.
   uses bounded whole-file I/O and commits on descriptor close; `/tmp` must be
   authorized through the dynamic principal-home scheme so the manifest gate checks
   the resolved principal path.
+- the normal `astrid start` path selected an installed 0.10.0 companion daemon even
+  though the invoking CLI, builder, and realm requirement were 0.10.1; that daemon
+  correctly rejected the `astrid-version >=0.10.1` capsule. Running the locally
+  built 0.10.1 daemon proved the realm, but AOS startup must select and verify the
+  exact product-pinned runtime companion before the realm enters the default set.
 
 The E2E run used the current `astrid-mcp` capsule as a test front door because the
 current CE distribution does not yet install an MCP broker. Adding the realm to the
@@ -907,6 +912,8 @@ The first implementation must resolve these with executable evidence:
   commit its own COW projection;
 - [ ] put a supported MCP broker/invocation front door in the CE distribution
   before selecting the realm by default;
+- [ ] make product startup verify and launch the exact pinned Astrid daemon rather
+  than an older installed companion;
 - [ ] add processes, pipes, waits, signals, and a small shell only after persistence;
 - [ ] define the attenuating capsule-to-realm job contract and migrate Forge as the
   first non-interactive consumer after artifact verification exists;
