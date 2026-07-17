@@ -77,19 +77,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
-name = "arrayref"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
-
-[[package]]
-name = "arrayvec"
-version = "0.7.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
-
-[[package]]
-name = "astrid-capsule-agents"
+name = "aos-agents"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -98,7 +86,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-cli"
+name = "aos-cli"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -107,7 +95,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-context-engine"
+name = "aos-context-engine"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -116,7 +104,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-forge"
+name = "aos-forge"
 version = "0.1.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -126,7 +114,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-fs"
+name = "aos-fs"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -135,7 +123,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-hook-bridge"
+name = "aos-hook-bridge"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -144,7 +132,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-http"
+name = "aos-http"
 version = "0.1.1"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -153,7 +141,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-identity"
+name = "aos-identity"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -163,7 +151,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-memory"
+name = "aos-memory"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -173,7 +161,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-openai"
+name = "aos-openai"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -183,7 +171,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-openai-compat"
+name = "aos-openai-compat"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -193,7 +181,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-prompt-builder"
+name = "aos-prompt-builder"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -202,7 +190,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-react"
+name = "aos-react"
 version = "0.2.2"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -212,7 +200,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-registry"
+name = "aos-registry"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -221,17 +209,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-router"
-version = "0.2.0"
-dependencies = [
- "astrid-sdk 0.7.1",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "astrid-capsule-session"
+name = "aos-router"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -241,7 +219,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-shell"
+name = "aos-session"
+version = "0.2.0"
+dependencies = [
+ "astrid-sdk 0.7.1",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "aos-shell"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -250,7 +238,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-skills"
+name = "aos-skills"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -259,7 +247,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-system"
+name = "aos-system"
 version = "0.2.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -268,7 +256,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-telegram"
+name = "aos-telegram"
 version = "0.1.0"
 dependencies = [
  "astrid-sdk 0.5.3",
@@ -279,7 +267,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-capsule-users"
+name = "aos-users"
 version = "0.1.0"
 dependencies = [
  "astrid-sdk 0.7.1",
@@ -287,6 +275,18 @@ dependencies = [
  "serde_json",
  "uuid",
 ]
+
+[[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "astrid-core"

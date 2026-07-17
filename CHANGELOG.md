@@ -19,7 +19,7 @@
 - Runtime import holds the standalone daemon's existing singleton lock without
   changing the source, and interrupted unreceipted cutovers always roll back
   before recopying the current locked source.
-- A signed release path for the 18 installable `astrid-capsule-*` artifacts
+- A signed release path for the 18 installable `aos-*` artifacts
   built from this source tree and selected locally by Community Edition, with
   exact source/manifest identity checks, product-archive inclusion, offline
   provisioning, archive safety validation, BLAKE3 checksums, SHA-256
