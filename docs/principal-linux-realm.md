@@ -1,6 +1,6 @@
 # AOS Principal Linux Realm Capsule
 
-Status: active implementation programme; bounded RV64 machine probe live
+Status: active implementation programme; bounded RV64 privileged boot spine live
 
 Last reviewed: 2026-07-18
 
@@ -113,10 +113,67 @@ pass value. The result names `aos-rv64-interpreter` as its backend. Fuel exhaust
 illegal instructions, misalignment, RAM bounds, and serial-output exhaustion all
 return control to the outer Realm rather than escaping into host behavior.
 
-This is not Linux yet. The machine does not yet implement privileged CSRs, trap
-delegation, atomics, compressed instructions, Sv39 translation, CLINT, PLIC, an
-SBI/boot handoff, a generated device tree, or virtio block. Those are measurable
-boot prerequisites, not implied scaffolding.
+The second slice is pinned to the January 2026 ratified
+[RISC-V privileged release](https://docs.riscv.org/reference/isa/v20260120/priv/priv-index.html):
+Machine and Supervisor ISA 1.13 plus
+[Zicsr 2.0](https://docs.riscv.org/reference/isa/v20260120/unpriv/zicsr.html).
+It adds typed M/S CSR state and access checks, all six CSR read/modify/write
+operations with their exact read/write-intent rules, WARL handling for the
+implemented fields, M/S/U privilege state, ECALL exception selection and
+delegation, direct trap-vector entry, and `mret`/`sret`. The admitted
+`rv64-supervisor` program enters S-mode from reset, prints `S`, takes a delegated
+S-mode ECALL, prints `T` in the S-mode handler, advances `sepc`, returns to print
+`R\n`, and halts from S-mode. It consumes 31 bounded execution steps and retires
+30 instructions because ECALL is architecturally non-retiring.
+
+This is not Linux yet. Exception delivery is intentionally limited to ECALL;
+unsupported instructions and physical access/alignment faults still return an
+exact outer Realm trap. `satp` is WARL Bare, interrupt state reads zero, and the
+machine does not yet implement Sv39 translation, atomics, compressed instructions,
+CLINT, PLIC, an SBI/boot handoff, a generated device tree, or virtio block. Those
+are measurable boot prerequisites, not implied scaffolding.
+
+### 2.5 Privileged-machine component sketch and invariant ledger
+
+The implementation is deliberately decomposed by authority rather than by Linux
+subsystem names:
+
+```text
+Realm adapter (program admission, outer fuel/output ceilings)
+  -> Machine::run_slice (bounded scheduling and accounting)
+     -> instruction decode/commit (RV64I + Zicsr + xRET)
+        -> Cpu (integer registers, PC, current privilege)
+        -> CsrFile (typed implemented CSR set and WARL masks)
+        -> exception entry (delegation and xstatus stack update)
+        -> Devices (admitted RAM, UART, test finisher)
+```
+
+Exception entry is a private machine operation rather than a pluggable object:
+trap routing is architectural CPU behavior, not a device or agent policy. Sv39
+belongs between decoded virtual memory accesses and `Devices`; CLINT/PLIC belong
+inside `Devices` but only assert typed pending-interrupt lines into the CPU. The
+outer Realm remains responsible for time/fuel admission and must never appear as
+an implicit RISC-V device.
+
+| Case | Required invariant | Current executable evidence |
+|---|---|---|
+| Reset | PC is `0x80000000`, registers/CSRs clear to the profile reset state, privilege is M | image reload/reset tests and both probes |
+| CSR address | Bits 9:8 impose minimum privilege; unsupported/reserved addresses fail before mutation | M CSR write attempted from S traps without retirement |
+| CSR write intent | CSRRW[I] writes even with zero source; CSRRS/CSRRC[I] with zero source do not write and may read a read-only CSR | all six operations checked against old values; `csrr mhartid` succeeds while a write traps |
+| WARL | Only implemented fields persist; reserved MPP is coerced; `satp`, interrupt enables/pending, and delegation bits without implementations remain zero | typed CSR reads and reserved-MPP regression |
+| ECALL | Cause is selected from the originating privilege; EPC points at ECALL; ECALL does not retire | S probe records `scause=9`, exact `sepc`, 31 steps/30 retired |
+| Delegation | Only traps originating below M consult `medeleg`; the current writable mask is U/S ECALL only | S ECALL enters `stvec`; M ECALL remains in M under repeated bounded delivery |
+| S trap entry | `SPP=origin`, `SPIE=SIE`, `SIE=0`; M trap state is untouched | midpoint assertions in the S probe |
+| M trap entry | `MPP=origin`, `MPIE=MIE`, `MIE=0`; S trap state is untouched | bounded M ECALL loop assertions |
+| xRET | Target alignment is checked before commit; xIE/xPIE and xPP are popped exactly; execution below x privilege fails closed | full MRET/SRET path plus U/S privilege-rejection regressions |
+| Trap vector | Direct and vectored encodings are admitted, reserved modes coerce to Direct; synchronous exceptions use BASE | S probe direct-vector address assertion |
+| Scheduling | Every successfully interpreted step, including a non-retiring architectural trap, spends one slice unit | a self-vectoring ECALL loop yields exactly at its seven-step budget |
+| Unimplemented fault path | Unsupported opcode and physical fetch/load/store/alignment failures remain exact terminal Realm traps until general exception delivery lands | existing non-retirement and no-partial-commit regressions |
+
+The table is also the review boundary: a checkmark for privileged mode does not
+mean Linux compatibility. The next increment must replace the last row with
+architectural exception entry and add an Sv39 matrix before a kernel image is
+admitted.
 
 ## 3. The system seen from each side
 
@@ -1035,6 +1092,24 @@ compatibility.
   completed command, proving replay rather than double execution. The probe does
   not allocate a semantic Realm PID yet; replacing that diagnostic adapter with
   a normal job record is an explicit pre-workbench task;
+- the privileged-spine artifact is 420,501 bytes with outer SHA-256
+  `12d2d52d855b6f6d445e46dfc761414bed8de1f520cfcec3933331e88ef09e4b`,
+  raw built-Wasm SHA-256
+  `611271245726eb0de5780c366ea715b719d5e8c95019e8e169b3a24ed145c3a8`,
+  and installed component identity
+  `b1f229b5fd9355421011dae7547f280c7fa17b80fa500b994ea28367a3e4088a`.
+  All 609 workspace tests pass, including 103 focused Realm tests; deny-warnings
+  clippy passes across all workspace targets/features; and the linked capsule
+  checks under `wasm32-unknown-unknown`. An isolated, locally built Astrid 0.10.1
+  daemon negotiated MCP 2025-11-25 and advertised `rv64-supervisor` in the real
+  input schema. The installed component returned backend
+  `aos-rv64-interpreter`, exact virtual-UART stdout `STR\n`, exit status 0,
+  31 charged steps, and 64 KiB admitted RAM. Final status reported boot sequence
+  1, one completed command, `host_process=false`, next PID 1, and zero retained
+  process records, pipe objects, or reserved bytes. Machine-level tests separately
+  assert 30 retired instructions and the midpoint/final CSR and privilege state;
+  the tool response deliberately reports the bounded work charge rather than
+  mislabeling ECALL as retired;
 - the initial live run discovered two integration constraints rather than hiding
   them: Astrid's component FileHandle methods are not implemented, so the adapter
   uses bounded whole-file I/O and commits on descriptor close; `/tmp` must be
@@ -1048,9 +1123,12 @@ compatibility.
 
 The earlier persistence E2E run used the then-current `astrid-mcp` capsule as its
 front door. The actor E2E used the product `aos-cli` proxy and current `sage-mcp`
-broker. The Realm still must not enter the default distribution until that broker
-and invocation path are part of the supported CE set rather than test-installed
-companions.
+broker. The privileged proof used the test-installed Codex broker; its legacy
+blank manifest edges had to be normalized to explicit `wit = "opaque"` metadata
+in the isolated test artifact before Astrid 0.10.1 would admit it. No broker source
+was changed by the Realm increment. The Realm still must not enter the default
+distribution until a current broker and invocation path are part of the supported
+CE set rather than test-installed companions.
 
 ## 16. Ordered implementation milestones
 
@@ -1109,8 +1187,11 @@ companions.
   RAM/output admission and bounded execution slices;
 - [x] execute a real RV64I probe through the installable capsule command path and
   report exact backend, instruction, memory, output, and halt accounting;
-- implement the privileged ISA/CSR and trap-delegation subset exercised by a
-  current Linux boot, then Sv39 virtual memory;
+- [x] add the first privileged boot spine: typed M/S CSRs, Zicsr read/write intent,
+  M/S/U state, ECALL delegation, trap-vector entry, `mret`/`sret`, non-retirement
+  accounting, and an installable Supervisor transition probe;
+- complete architectural delivery for instruction, load, and store faults, then
+  implement Sv39 translation and `sfence.vma` against adversarial page tables;
 - add deterministic CLINT and PLIC models, boot ROM/SBI handoff, and a generated,
   versioned device tree;
 - boot signed Linux longterm 6.18.39 with a Buildroot 2026.05.1 initramfs to an
@@ -1360,6 +1441,10 @@ The first implementation must resolve these with executable evidence:
   through the real capsule adapter: 23 RV64 instructions, bounded virtual UART,
   standard finisher, explicit backend identity, fuel/output traps, no browser or
   host-process dependency, and a successful `wasm32-unknown-unknown` build;
+- [x] route `rv64-supervisor` through that adapter with ratified Zicsr and
+  privileged-ISA semantics: reset M-mode, `mret` entry to S-mode, delegated
+  S-mode ECALL, `sret`, exact `STR\n`, 31 charged steps, and 30 retired
+  instructions;
 - [ ] define the attenuating capsule-to-realm job contract and migrate Forge as the
   first non-interactive consumer after artifact verification exists;
 - [ ] replace `aos-shell` in the default distro only after interactive and
@@ -1371,13 +1456,17 @@ The first implementation must resolve these with executable evidence:
 - [ ] defer public WIT, Debian naming, arbitrary package claims, and native-kernel
     coupling until evidence requires them.
 
-The next Linux-bearing executable artifact is the privileged-machine boot spine:
-CSR/trap delegation, Sv39, deterministic timer/interrupt devices, boot handoff,
-and a generated device tree, followed by a pinned Linux 6.18.39 plus Buildroot
-2026.05.1 serial boot to `/init`. It must run in bounded slices and fail with an
-exact architectural trap before virtio block, persistence, networking, or a shell
-are added. The parallel process track still needs guest-visible executable lookup,
-the realm-wide open-file-description table, sequential spawn actions, and explicit
-foreground job records. The storage track adds named checkpoint/diff/reset and
-outer workspace promotion. Bash and a compiler remain acceptance workloads, not
-claims made by this seed.
+The next Linux-bearing executable artifact is fault-complete Sv39: instruction,
+load, store, access, alignment, and page faults must enter the correct delegated
+vector; a bounded three-level page-table walk must enforce canonical addresses,
+PTE permissions, superpage alignment, A/D behavior, SUM/MXR, and physical RAM/MMIO
+admission; `sfence.vma` must have correct semantics even if the first interpreter
+does not cache translations. Deterministic timer/interrupt devices, boot handoff,
+and a generated device tree follow, then pinned Linux 6.18.39 plus Buildroot
+2026.05.1 serial boot to `/init`. Every artifact must run in bounded slices and
+fail with an exact architectural trap before virtio block, persistence,
+networking, or a shell are added. The parallel process track still needs
+guest-visible executable lookup, the realm-wide open-file-description table,
+sequential spawn actions, and explicit foreground job records. The storage track
+adds named checkpoint/diff/reset and outer workspace promotion. Bash and a
+compiler remain acceptance workloads, not claims made by this seed.

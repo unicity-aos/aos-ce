@@ -18,8 +18,8 @@ agent -> realm tool -> signed nested WASM command -> private realm ABI
 
 ## What works
 
-`linux_realm_exec` currently admits eight signed core-WASM workloads and one
-diagnostic RV64 instruction image:
+`linux_realm_exec` currently admits eight signed core-WASM workloads and two
+diagnostic RV64 instruction images:
 
 - `pwd`
 - `echo`
@@ -31,6 +31,10 @@ diagnostic RV64 instruction image:
 - `rv64-smoke`, which runs 23 real RV64I instructions in bounded slices, writes
   `AOS RV64` through the virtual 16550 UART, and halts through the standard test
   finisher
+- `rv64-supervisor`, which starts at reset in Machine mode, enters Supervisor
+  mode with `mret`, delegates a Supervisor `ecall` through `stvec`, returns with
+  `sret`, writes `STR\n`, and halts from Supervisor mode. It charges 31 bounded
+  steps while retiring 30 instructions because `ecall` does not retire
 - `write-file`
 - `cat`
 - `smoke-write`, the original interpreter smoke test
@@ -114,16 +118,19 @@ principal-scoped boot sequence is advanced with KV compare-and-swap and makes PI
 reuse after restart explicit as `(boot sequence, PID)`.
 
 `crates/realm-machine` is the host-testable full-system backend seed. It owns only
-admitted guest CPU state, contiguous RAM, bounded serial input/output, the standard
-test finisher, and slice execution. The first interpreter surface is the RV64I
-integer subset used by the probe. It has no browser, JavaScript, JIT, host process,
-host filesystem, or network dependency and compiles for the capsule's
-`wasm32-unknown-unknown` target.
+admitted guest CPU/CSR state, contiguous RAM, bounded serial input/output, the
+standard test finisher, and slice execution. Its current surface is the RV64I
+integer subset used by the probes plus the Zicsr operations, typed M/S CSR subset,
+WARL masks, ECALL exception delivery/delegation, and `mret`/`sret` privilege-stack
+transitions defined by the ratified RISC-V Machine and Supervisor ISA 1.13. It has
+no browser, JavaScript, JIT, host process, host filesystem, or network dependency
+and compiles for the capsule's `wasm32-unknown-unknown` target.
 
-That probe is an architectural boundary test, not a Linux claim. Privileged CSRs,
-trap delegation, Sv39, atomics/compressed instructions, CLINT, PLIC, SBI/boot
-handoff, a device tree, and virtio block still have to land before a Linux kernel
-can boot.
+Those probes are architectural boundary tests, not Linux claims. General
+instruction/load/store fault delivery, Sv39, atomics/compressed instructions,
+CLINT, PLIC, SBI/boot handoff, a device tree, and virtio block still have to land
+before a Linux kernel can boot. `satp` is intentionally WARL Bare and interrupt
+CSRs are hardwired to zero until their corresponding machine components exist.
 
 The private ABI exposes bounded `pipe`, compatibility `spawn-signed`, record-based
 `spawn-signed-record`, `wait`, and `signal` operations. The record form selects an
@@ -187,6 +194,7 @@ Example tool arguments:
 {"command":"realm-sh","args":["echo","persisted by the guest shell",">","/home/agent/note.txt"]}
 {"command":"realm-sh","args":["env","ASTRID_REALM=ready"]}
 {"command":"rv64-smoke"}
+{"command":"rv64-supervisor"}
 {"command":"write-file","args":["notes.txt","durable\n"],"cwd":"/home/agent"}
 {"command":"cat","args":["notes.txt"],"cwd":"/home/agent"}
 {"command":"write-file","args":["candidate.rs","..."],"cwd":"/workspace"}

@@ -34,6 +34,32 @@ const MIN_RAM_BYTES: usize = 4096;
 const MAX_RAM_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CONSOLE_BYTES: usize = 16 * 1024 * 1024;
 
+const MSTATUS_SIE: u64 = 1 << 1;
+const MSTATUS_MIE: u64 = 1 << 3;
+const MSTATUS_SPIE: u64 = 1 << 5;
+const MSTATUS_MPIE: u64 = 1 << 7;
+const MSTATUS_SPP: u64 = 1 << 8;
+const MSTATUS_MPP_SHIFT: u32 = 11;
+const MSTATUS_MPP: u64 = 0b11 << MSTATUS_MPP_SHIFT;
+const MSTATUS_MPRV: u64 = 1 << 17;
+const MSTATUS_UXL_RV64: u64 = 0b10 << 32;
+const MSTATUS_SXL_RV64: u64 = 0b10 << 34;
+const MSTATUS_WRITABLE: u64 = MSTATUS_SIE
+    | MSTATUS_MIE
+    | MSTATUS_SPIE
+    | MSTATUS_MPIE
+    | MSTATUS_SPP
+    | MSTATUS_MPP
+    | MSTATUS_MPRV;
+const SSTATUS_VISIBLE: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_UXL_RV64;
+const SSTATUS_WRITABLE: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP;
+const MISA_RV64_ISU: u64 = (0b10 << 62) | (1 << 8) | (1 << 18) | (1 << 20);
+const MEDELEG_SUPPORTED: u64 = (1 << 8) | (1 << 9);
+
+const CAUSE_ECALL_FROM_USER: u64 = 8;
+const CAUSE_ECALL_FROM_SUPERVISOR: u64 = 9;
+const CAUSE_ECALL_FROM_MACHINE: u64 = 11;
+
 /// Explicit resource admission for one virtual machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MachineConfig {
@@ -88,14 +114,109 @@ impl fmt::Display for MachineError {
 impl std::error::Error for MachineError {}
 
 /// RISC-V privilege level retained as part of guest architectural state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
 pub enum Privilege {
     /// Unprivileged application execution.
-    User,
+    User = 0,
     /// Linux kernel execution.
-    Supervisor,
+    Supervisor = 1,
     /// Firmware and reset execution.
-    Machine,
+    Machine = 3,
+}
+
+impl Privilege {
+    const fn from_mpp(value: u64) -> Option<Self> {
+        match (value & MSTATUS_MPP) >> MSTATUS_MPP_SHIFT {
+            0 => Some(Self::User),
+            1 => Some(Self::Supervisor),
+            3 => Some(Self::Machine),
+            _ => None,
+        }
+    }
+}
+
+/// Implemented control and status registers, named rather than exposed as raw
+/// array offsets to machine users.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
+pub enum Csr {
+    /// Supervisor status view of `mstatus`.
+    Sstatus = 0x100,
+    /// Supervisor interrupt-enable view.
+    Sie = 0x104,
+    /// Supervisor trap vector.
+    Stvec = 0x105,
+    /// Supervisor scratch register.
+    Sscratch = 0x140,
+    /// Supervisor exception program counter.
+    Sepc = 0x141,
+    /// Supervisor trap cause.
+    Scause = 0x142,
+    /// Supervisor trap value.
+    Stval = 0x143,
+    /// Supervisor interrupt-pending view.
+    Sip = 0x144,
+    /// Supervisor address translation and protection register. Only Bare mode
+    /// is admitted until the Sv39 increment lands.
+    Satp = 0x180,
+    /// Machine status.
+    Mstatus = 0x300,
+    /// Machine ISA report.
+    Misa = 0x301,
+    /// Machine exception delegation.
+    Medeleg = 0x302,
+    /// Machine interrupt delegation.
+    Mideleg = 0x303,
+    /// Machine interrupt enable.
+    Mie = 0x304,
+    /// Machine trap vector.
+    Mtvec = 0x305,
+    /// Machine scratch register.
+    Mscratch = 0x340,
+    /// Machine exception program counter.
+    Mepc = 0x341,
+    /// Machine trap cause.
+    Mcause = 0x342,
+    /// Machine trap value.
+    Mtval = 0x343,
+    /// Machine interrupt pending.
+    Mip = 0x344,
+    /// Hardware-thread identifier. The first machine profile has one hart.
+    Mhartid = 0xf14,
+}
+
+impl Csr {
+    const fn from_address(address: u16) -> Option<Self> {
+        Some(match address {
+            0x100 => Self::Sstatus,
+            0x104 => Self::Sie,
+            0x105 => Self::Stvec,
+            0x140 => Self::Sscratch,
+            0x141 => Self::Sepc,
+            0x142 => Self::Scause,
+            0x143 => Self::Stval,
+            0x144 => Self::Sip,
+            0x180 => Self::Satp,
+            0x300 => Self::Mstatus,
+            0x301 => Self::Misa,
+            0x302 => Self::Medeleg,
+            0x303 => Self::Mideleg,
+            0x304 => Self::Mie,
+            0x305 => Self::Mtvec,
+            0x340 => Self::Mscratch,
+            0x341 => Self::Mepc,
+            0x342 => Self::Mcause,
+            0x343 => Self::Mtval,
+            0x344 => Self::Mip,
+            0xf14 => Self::Mhartid,
+            _ => return None,
+        })
+    }
+
+    const fn address(self) -> u16 {
+        self as u16
+    }
 }
 
 /// Stable architectural trap reported to the outer Realm scheduler.
@@ -115,8 +236,6 @@ pub enum MachineTrap {
     StoreAddressMisaligned { address: u64, bytes: u8 },
     /// A store address is outside RAM and admitted MMIO.
     StoreAccessFault { address: u64, bytes: u8 },
-    /// An environment call crossed into the outer machine boundary.
-    EnvironmentCall { privilege: Privilege },
     /// Guest execution reached an `ebreak` instruction.
     Breakpoint { pc: u64 },
     /// Serial output exceeded its admitted retained-byte ceiling.
@@ -146,9 +265,6 @@ impl fmt::Display for MachineTrap {
             }
             Self::StoreAccessFault { address, bytes } => {
                 write!(f, "{bytes}-byte store access fault at {address:#x}")
-            }
-            Self::EnvironmentCall { privilege } => {
-                write!(f, "environment call from {privilege:?} mode")
             }
             Self::Breakpoint { pc } => write!(f, "breakpoint at {pc:#x}"),
             Self::ConsoleLimit { limit } => {
@@ -185,6 +301,12 @@ pub enum SliceOutcome {
 pub struct SliceReport {
     /// Result at the end of this slice.
     pub outcome: SliceOutcome,
+    /// Successfully interpreted instruction steps charged to this scheduling
+    /// slice. Architecturally non-retiring traps such as `ecall` still consume
+    /// one bounded step.
+    pub steps_executed: u64,
+    /// Total charged instruction steps since the last image load.
+    pub total_steps_executed: u64,
     /// Instructions retired during this slice.
     pub instructions_retired: u64,
     /// Total instructions retired since the last image load.
@@ -226,6 +348,101 @@ impl Cpu {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct CsrFile {
+    mstatus: u64,
+    medeleg: u64,
+    mtvec: u64,
+    mscratch: u64,
+    mepc: u64,
+    mcause: u64,
+    mtval: u64,
+    stvec: u64,
+    sscratch: u64,
+    sepc: u64,
+    scause: u64,
+    stval: u64,
+}
+
+impl CsrFile {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn validate_access(&self, address: u16, privilege: Privilege, write: bool) -> Option<Csr> {
+        let csr = Csr::from_address(address)?;
+        let required = match (address >> 8) & 0b11 {
+            0 => Privilege::User,
+            1 => Privilege::Supervisor,
+            3 => Privilege::Machine,
+            _ => return None,
+        };
+        if privilege < required || write && ((address >> 10) & 0b11) == 0b11 {
+            return None;
+        }
+        Some(csr)
+    }
+
+    const fn read(&self, csr: Csr) -> u64 {
+        match csr {
+            Csr::Sstatus => self.mstatus & SSTATUS_VISIBLE,
+            Csr::Sie | Csr::Sip | Csr::Mideleg | Csr::Mie | Csr::Mip => 0,
+            Csr::Stvec => self.stvec,
+            Csr::Sscratch => self.sscratch,
+            Csr::Sepc => self.sepc & !0b11,
+            Csr::Scause => self.scause,
+            Csr::Stval => self.stval,
+            Csr::Satp => 0,
+            Csr::Mstatus => self.mstatus | MSTATUS_UXL_RV64 | MSTATUS_SXL_RV64,
+            Csr::Misa => MISA_RV64_ISU,
+            Csr::Medeleg => self.medeleg,
+            Csr::Mtvec => self.mtvec,
+            Csr::Mscratch => self.mscratch,
+            Csr::Mepc => self.mepc & !0b11,
+            Csr::Mcause => self.mcause,
+            Csr::Mtval => self.mtval,
+            Csr::Mhartid => 0,
+        }
+    }
+
+    fn write(&mut self, csr: Csr, value: u64) {
+        match csr {
+            Csr::Sstatus => {
+                self.mstatus = (self.mstatus & !SSTATUS_WRITABLE) | (value & SSTATUS_WRITABLE);
+            }
+            Csr::Sie | Csr::Sip | Csr::Mideleg | Csr::Mie | Csr::Mip => {}
+            Csr::Stvec => self.stvec = legal_trap_vector(value),
+            Csr::Sscratch => self.sscratch = value,
+            Csr::Sepc => self.sepc = value & !0b11,
+            Csr::Scause => self.scause = value,
+            Csr::Stval => self.stval = value,
+            Csr::Satp => {}
+            Csr::Mstatus => {
+                let mut admitted = value & MSTATUS_WRITABLE;
+                if admitted & MSTATUS_MPP == 0b10 << MSTATUS_MPP_SHIFT {
+                    admitted &= !MSTATUS_MPP;
+                }
+                self.mstatus = (self.mstatus & !MSTATUS_WRITABLE) | admitted;
+            }
+            Csr::Misa => {}
+            Csr::Medeleg => self.medeleg = value & MEDELEG_SUPPORTED,
+            Csr::Mtvec => self.mtvec = legal_trap_vector(value),
+            Csr::Mscratch => self.mscratch = value,
+            Csr::Mepc => self.mepc = value & !0b11,
+            Csr::Mcause => self.mcause = value,
+            Csr::Mtval => self.mtval = value,
+            Csr::Mhartid => {}
+        }
+    }
+}
+
+const fn legal_trap_vector(value: u64) -> u64 {
+    match value & 0b11 {
+        0 | 1 => value,
+        _ => value & !0b11,
+    }
+}
+
 #[derive(Clone, Debug)]
 enum RunState {
     Runnable,
@@ -240,6 +457,28 @@ struct Devices {
     console_output: Vec<u8>,
     console_reported: usize,
     max_console_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StepEffect {
+    halt: Option<HaltStatus>,
+    retired: bool,
+}
+
+impl StepEffect {
+    const fn retired(halt: Option<HaltStatus>) -> Self {
+        Self {
+            halt,
+            retired: true,
+        }
+    }
+
+    const fn trapped_architecturally() -> Self {
+        Self {
+            halt: None,
+            retired: false,
+        }
+    }
 }
 
 impl Devices {
@@ -367,8 +606,10 @@ impl Devices {
 pub struct Machine {
     config: MachineConfig,
     cpu: Cpu,
+    csrs: CsrFile,
     devices: Devices,
     state: RunState,
+    steps_executed: u64,
     instructions_retired: u64,
 }
 
@@ -386,8 +627,10 @@ impl Machine {
         Ok(Self {
             config,
             cpu: Cpu::new(),
+            csrs: CsrFile::default(),
             devices: Devices::new(config),
             state: RunState::Runnable,
+            steps_executed: 0,
             instructions_retired: 0,
         })
     }
@@ -401,9 +644,11 @@ impl Machine {
             });
         }
         self.cpu.reset();
+        self.csrs.reset();
         self.devices.reset();
         self.devices.load_program(program);
         self.state = RunState::Runnable;
+        self.steps_executed = 0;
         self.instructions_retired = 0;
         Ok(())
     }
@@ -431,15 +676,26 @@ impl Machine {
         self.cpu.privilege
     }
 
+    /// Read an implemented architectural CSR without bypassing the typed set.
+    #[must_use]
+    pub const fn csr(&self, csr: Csr) -> u64 {
+        self.csrs.read(csr)
+    }
+
     /// Run at most `instruction_budget` instructions and return control to the Realm.
     pub fn run_slice(&mut self, instruction_budget: u64) -> SliceReport {
+        let mut steps = 0_u64;
         let mut retired = 0_u64;
-        while retired < instruction_budget && matches!(self.state, RunState::Runnable) {
+        while steps < instruction_budget && matches!(self.state, RunState::Runnable) {
             match self.step() {
-                Ok(halt) => {
-                    retired = retired.saturating_add(1);
-                    self.instructions_retired = self.instructions_retired.saturating_add(1);
-                    if let Some(status) = halt {
+                Ok(effect) => {
+                    steps = steps.saturating_add(1);
+                    self.steps_executed = self.steps_executed.saturating_add(1);
+                    if effect.retired {
+                        retired = retired.saturating_add(1);
+                        self.instructions_retired = self.instructions_retired.saturating_add(1);
+                    }
+                    if let Some(status) = effect.halt {
                         self.state = RunState::Halted(status);
                     }
                 }
@@ -454,13 +710,15 @@ impl Machine {
         };
         SliceReport {
             outcome,
+            steps_executed: steps,
+            total_steps_executed: self.steps_executed,
             instructions_retired: retired,
             total_instructions_retired: self.instructions_retired,
             console: self.devices.take_new_console(),
         }
     }
 
-    fn step(&mut self) -> Result<Option<HaltStatus>, MachineTrap> {
+    fn step(&mut self) -> Result<StepEffect, MachineTrap> {
         let pc = self.cpu.pc;
         if pc & 3 != 0 {
             return Err(MachineTrap::InstructionAddressMisaligned { address: pc });
@@ -559,21 +817,157 @@ impl Machine {
                 self.cpu.write(rd, next_pc);
                 next_pc = target;
             }
-            0x73 => match instruction {
-                0x0000_0073 => {
-                    return Err(MachineTrap::EnvironmentCall {
-                        privilege: self.cpu.privilege,
-                    });
+            0x73 => {
+                if funct3 != 0 {
+                    self.execute_csr(instruction, rd, rs1, funct3, pc)?;
+                } else {
+                    match instruction {
+                        0x0000_0073 => {
+                            self.take_exception(ecall_cause(self.cpu.privilege), 0, pc);
+                            self.cpu.registers[0] = 0;
+                            return Ok(StepEffect::trapped_architecturally());
+                        }
+                        0x0010_0073 => return Err(MachineTrap::Breakpoint { pc }),
+                        0x1020_0073 => next_pc = self.execute_sret(pc, instruction)?,
+                        0x3020_0073 => next_pc = self.execute_mret(pc, instruction)?,
+                        _ => return Err(illegal(pc, instruction)),
+                    }
                 }
-                0x0010_0073 => return Err(MachineTrap::Breakpoint { pc }),
-                _ => return Err(illegal(pc, instruction)),
-            },
+            }
             _ => return Err(illegal(pc, instruction)),
         }
 
         self.cpu.pc = next_pc;
         self.cpu.registers[0] = 0;
-        Ok(halt)
+        Ok(StepEffect::retired(halt))
+    }
+
+    fn execute_csr(
+        &mut self,
+        instruction: u32,
+        rd: usize,
+        rs1: usize,
+        funct3: u32,
+        pc: u64,
+    ) -> Result<(), MachineTrap> {
+        let source = if funct3 & 0b100 == 0 {
+            self.cpu.read(rs1)
+        } else {
+            rs1 as u64
+        };
+        let operation = funct3 & 0b011;
+        let reads = operation != 1 || rd != 0;
+        let writes = operation == 1 || rs1 != 0;
+        if operation == 0 {
+            return Err(illegal(pc, instruction));
+        }
+
+        let address = (instruction >> 20) as u16;
+        let csr = self
+            .csrs
+            .validate_access(address, self.cpu.privilege, writes)
+            .ok_or_else(|| illegal(pc, instruction))?;
+        let old = if reads || operation != 1 {
+            self.csrs.read(csr)
+        } else {
+            0
+        };
+        if writes {
+            let value = match operation {
+                1 => source,
+                2 => old | source,
+                3 => old & !source,
+                _ => unreachable!("validated CSR operation"),
+            };
+            self.csrs.write(csr, value);
+        }
+        if reads {
+            self.cpu.write(rd, old);
+        }
+        Ok(())
+    }
+
+    fn take_exception(&mut self, cause: u64, value: u64, pc: u64) {
+        let origin = self.cpu.privilege;
+        if origin != Privilege::Machine && self.csrs.medeleg & (1 << cause) != 0 {
+            self.csrs.sepc = pc & !0b11;
+            self.csrs.scause = cause;
+            self.csrs.stval = value;
+            self.csrs.mstatus = if origin == Privilege::User {
+                self.csrs.mstatus & !MSTATUS_SPP
+            } else {
+                self.csrs.mstatus | MSTATUS_SPP
+            };
+            self.csrs.mstatus = if self.csrs.mstatus & MSTATUS_SIE == 0 {
+                self.csrs.mstatus & !MSTATUS_SPIE
+            } else {
+                self.csrs.mstatus | MSTATUS_SPIE
+            };
+            self.csrs.mstatus &= !MSTATUS_SIE;
+            self.cpu.privilege = Privilege::Supervisor;
+            self.cpu.pc = self.csrs.stvec & !0b11;
+        } else {
+            self.csrs.mepc = pc & !0b11;
+            self.csrs.mcause = cause;
+            self.csrs.mtval = value;
+            self.csrs.mstatus =
+                (self.csrs.mstatus & !MSTATUS_MPP) | ((origin as u64) << MSTATUS_MPP_SHIFT);
+            self.csrs.mstatus = if self.csrs.mstatus & MSTATUS_MIE == 0 {
+                self.csrs.mstatus & !MSTATUS_MPIE
+            } else {
+                self.csrs.mstatus | MSTATUS_MPIE
+            };
+            self.csrs.mstatus &= !MSTATUS_MIE;
+            self.cpu.privilege = Privilege::Machine;
+            self.cpu.pc = self.csrs.mtvec & !0b11;
+        }
+    }
+
+    fn execute_mret(&mut self, pc: u64, instruction: u32) -> Result<u64, MachineTrap> {
+        if self.cpu.privilege != Privilege::Machine {
+            return Err(illegal(pc, instruction));
+        }
+        let target = self.csrs.read(Csr::Mepc);
+        ensure_instruction_aligned(target)?;
+        let privilege =
+            Privilege::from_mpp(self.csrs.mstatus).ok_or_else(|| illegal(pc, instruction))?;
+        self.csrs.mstatus = if self.csrs.mstatus & MSTATUS_MPIE == 0 {
+            self.csrs.mstatus & !MSTATUS_MIE
+        } else {
+            self.csrs.mstatus | MSTATUS_MIE
+        };
+        self.csrs.mstatus |= MSTATUS_MPIE;
+        self.csrs.mstatus &= !MSTATUS_MPP;
+        if privilege != Privilege::Machine {
+            self.csrs.mstatus &= !MSTATUS_MPRV;
+        }
+        self.cpu.privilege = privilege;
+        Ok(target)
+    }
+
+    fn execute_sret(&mut self, pc: u64, instruction: u32) -> Result<u64, MachineTrap> {
+        if self.cpu.privilege < Privilege::Supervisor {
+            return Err(illegal(pc, instruction));
+        }
+        let target = self.csrs.read(Csr::Sepc);
+        ensure_instruction_aligned(target)?;
+        let privilege = if self.csrs.mstatus & MSTATUS_SPP == 0 {
+            Privilege::User
+        } else {
+            Privilege::Supervisor
+        };
+        self.csrs.mstatus = if self.csrs.mstatus & MSTATUS_SPIE == 0 {
+            self.csrs.mstatus & !MSTATUS_SIE
+        } else {
+            self.csrs.mstatus | MSTATUS_SIE
+        };
+        self.csrs.mstatus |= MSTATUS_SPIE;
+        self.csrs.mstatus &= !MSTATUS_SPP;
+        if privilege != Privilege::Machine {
+            self.csrs.mstatus &= !MSTATUS_MPRV;
+        }
+        self.cpu.privilege = privilege;
+        Ok(target)
     }
 
     fn execute_op_imm(
@@ -701,6 +1095,14 @@ fn illegal(pc: u64, instruction: u32) -> MachineTrap {
     MachineTrap::IllegalInstruction { pc, instruction }
 }
 
+const fn ecall_cause(privilege: Privilege) -> u64 {
+    match privilege {
+        Privilege::User => CAUSE_ECALL_FROM_USER,
+        Privilege::Supervisor => CAUSE_ECALL_FROM_SUPERVISOR,
+        Privilege::Machine => CAUSE_ECALL_FROM_MACHINE,
+    }
+}
+
 fn sign_extend(value: u64, bits: u32) -> u64 {
     let shift = 64 - bits;
     ((value << shift) as i64 >> shift) as u64
@@ -739,8 +1141,28 @@ const fn encode_lui(rd: u32, immediate: u32) -> u32 {
     (immediate << 12) | (rd << 7) | 0x37
 }
 
+const fn encode_auipc(rd: u32, immediate: u32) -> u32 {
+    (immediate << 12) | (rd << 7) | 0x17
+}
+
 const fn encode_addi(rd: u32, rs1: u32, immediate: u32) -> u32 {
     ((immediate & 0x0fff) << 20) | (rs1 << 15) | (rd << 7) | 0x13
+}
+
+const fn encode_slli(rd: u32, rs1: u32, shift: u32) -> u32 {
+    ((shift & 0x3f) << 20) | (rs1 << 15) | (1 << 12) | (rd << 7) | 0x13
+}
+
+const fn encode_csr(rd: u32, csr: Csr, rs1: u32, funct3: u32) -> u32 {
+    ((csr.address() as u32) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x73
+}
+
+const fn encode_csrr(rd: u32, csr: Csr) -> u32 {
+    encode_csr(rd, csr, 0, 2)
+}
+
+const fn encode_csrw(csr: Csr, rs1: u32) -> u32 {
+    encode_csr(0, csr, rs1, 1)
 }
 
 const fn encode_store(rs1: u32, rs2: u32, immediate: u32, funct3: u32) -> u32 {
@@ -811,6 +1233,65 @@ const fn words_to_smoke_bytes(words: [u32; 23]) -> [u8; 92] {
 /// finisher. It proves the ISA/device/scheduling path without claiming Linux.
 pub const RV64_SMOKE_PROGRAM: [u8; 92] = words_to_smoke_bytes(SMOKE_WORDS);
 
+const SUPERVISOR_ENTRY_OFFSET: u32 = 12 * 4;
+const SUPERVISOR_HANDLER_OFFSET: u32 = 24 * 4;
+
+// Reset firmware (words 0..12) installs the S-mode vector and ECALL delegation,
+// writes MPP=S, then enters the supervisor payload with MRET. The payload
+// (12..24) prints S, raises ECALL, resumes to print R and a newline, then halts.
+// Its delegated handler (24..31) prints T, advances sepc, and returns with SRET.
+const SUPERVISOR_WORDS: [u32; 31] = [
+    encode_auipc(5, 0),
+    encode_addi(6, 5, SUPERVISOR_HANDLER_OFFSET),
+    encode_csrw(Csr::Stvec, 6),
+    encode_addi(7, 0, 1),
+    encode_slli(7, 7, CAUSE_ECALL_FROM_SUPERVISOR as u32),
+    encode_csrw(Csr::Medeleg, 7),
+    encode_addi(28, 5, SUPERVISOR_ENTRY_OFFSET),
+    encode_csrw(Csr::Mepc, 28),
+    encode_lui(29, 1),
+    encode_addi(29, 29, 0x800),
+    encode_csrw(Csr::Mstatus, 29),
+    0x3020_0073,
+    encode_lui(5, 0x1_0000),
+    encode_addi(6, 0, b'S' as u32),
+    encode_store(5, 6, 0, 0),
+    0x0000_0073,
+    encode_addi(6, 0, b'R' as u32),
+    encode_store(5, 6, 0, 0),
+    encode_addi(6, 0, b'\n' as u32),
+    encode_store(5, 6, 0, 0),
+    encode_lui(7, 0x100),
+    encode_lui(8, 0x5),
+    encode_addi(8, 8, 0x555),
+    encode_store(7, 8, 0, 2),
+    encode_lui(5, 0x1_0000),
+    encode_addi(6, 0, b'T' as u32),
+    encode_store(5, 6, 0, 0),
+    encode_csrr(7, Csr::Sepc),
+    encode_addi(7, 7, 4),
+    encode_csrw(Csr::Sepc, 7),
+    0x1020_0073,
+];
+
+const fn words_to_supervisor_bytes(words: [u32; 31]) -> [u8; 124] {
+    let mut bytes = [0_u8; 124];
+    let mut word = 0;
+    while word < words.len() {
+        let encoded = words[word].to_le_bytes();
+        bytes[word * 4] = encoded[0];
+        bytes[word * 4 + 1] = encoded[1];
+        bytes[word * 4 + 2] = encoded[2];
+        bytes[word * 4 + 3] = encoded[3];
+        word += 1;
+    }
+    bytes
+}
+
+/// Auditable M-to-S transition probe. It takes a delegated supervisor ECALL,
+/// returns with `sret`, prints `STR\n`, and halts from Supervisor mode.
+pub const RV64_SUPERVISOR_PROGRAM: [u8; 124] = words_to_supervisor_bytes(SUPERVISOR_WORDS);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,6 +1317,7 @@ mod tests {
 
         let first = machine.run_slice(3);
         assert_eq!(first.outcome, SliceOutcome::Yielded);
+        assert_eq!(first.steps_executed, 3);
         assert_eq!(first.instructions_retired, 3);
         assert_eq!(first.console, b"A");
 
@@ -848,12 +1330,227 @@ mod tests {
             })
         );
         assert_eq!(final_report.console, b"OS RV64\n");
+        assert_eq!(final_report.total_steps_executed, 23);
         assert_eq!(final_report.total_instructions_retired, 23);
 
         let repeated = machine.run_slice(64);
         assert_eq!(repeated.outcome, final_report.outcome);
         assert_eq!(repeated.instructions_retired, 0);
         assert!(repeated.console.is_empty());
+    }
+
+    #[test]
+    fn supervisor_probe_delegates_ecall_and_returns_without_retiring_it() {
+        let mut machine = machine(64);
+        machine
+            .load_program(&RV64_SUPERVISOR_PROGRAM)
+            .expect("load supervisor program");
+
+        let trapped = machine.run_slice(16);
+        assert_eq!(trapped.outcome, SliceOutcome::Yielded);
+        assert_eq!(trapped.steps_executed, 16);
+        assert_eq!(trapped.instructions_retired, 15);
+        assert_eq!(trapped.console, b"S");
+        assert_eq!(machine.privilege(), Privilege::Supervisor);
+        assert_eq!(
+            machine.pc(),
+            DRAM_BASE + u64::from(SUPERVISOR_HANDLER_OFFSET)
+        );
+        assert_eq!(machine.csr(Csr::Scause), CAUSE_ECALL_FROM_SUPERVISOR);
+        assert_eq!(machine.csr(Csr::Sepc), DRAM_BASE + 15 * 4);
+        assert_eq!(machine.csr(Csr::Stval), 0);
+        assert_eq!(machine.csr(Csr::Medeleg), 1 << CAUSE_ECALL_FROM_SUPERVISOR);
+        assert_eq!(
+            machine.csr(Csr::Mepc),
+            DRAM_BASE + SUPERVISOR_ENTRY_OFFSET as u64
+        );
+        assert_ne!(machine.csr(Csr::Sstatus) & MSTATUS_SPP, 0);
+
+        let halted = machine.run_slice(64);
+        assert_eq!(
+            halted.outcome,
+            SliceOutcome::Halted(HaltStatus {
+                passed: true,
+                code: 0,
+            })
+        );
+        assert_eq!(halted.console, b"TR\n");
+        assert_eq!(halted.total_steps_executed, 31);
+        assert_eq!(halted.total_instructions_retired, 30);
+        assert_eq!(machine.privilege(), Privilege::Supervisor);
+        assert_eq!(machine.csr(Csr::Sepc), DRAM_BASE + 16 * 4);
+        assert_eq!(machine.csr(Csr::Sstatus) & MSTATUS_SPP, 0);
+        assert_ne!(machine.csr(Csr::Sstatus) & MSTATUS_SPIE, 0);
+    }
+
+    #[test]
+    fn csr_access_checks_privilege_and_read_only_write_intent() {
+        let mut rv = machine(8);
+        let program = words(&[encode_csrr(5, Csr::Mhartid), encode_csrw(Csr::Mhartid, 5)]);
+        rv.load_program(&program).expect("load program");
+
+        let report = rv.run_slice(2);
+        assert_eq!(rv.register(5), Some(0));
+        assert_eq!(report.instructions_retired, 1);
+        assert_eq!(
+            report.outcome,
+            SliceOutcome::Trapped(MachineTrap::IllegalInstruction {
+                pc: DRAM_BASE + 4,
+                instruction: encode_csrw(Csr::Mhartid, 5),
+            })
+        );
+
+        let mut supervisor = machine(8);
+        supervisor
+            .load_program(&RV64_SUPERVISOR_PROGRAM)
+            .expect("load supervisor program");
+        let entered = supervisor.run_slice(12);
+        assert_eq!(entered.outcome, SliceOutcome::Yielded);
+        assert_eq!(supervisor.privilege(), Privilege::Supervisor);
+        let forbidden = encode_csrw(Csr::Mstatus, 0);
+        let offset = usize::try_from(supervisor.pc() - DRAM_BASE).expect("RAM offset");
+        supervisor.devices.ram[offset..offset + 4].copy_from_slice(&forbidden.to_le_bytes());
+        let report = supervisor.run_slice(1);
+        assert_eq!(
+            report.outcome,
+            SliceOutcome::Trapped(MachineTrap::IllegalInstruction {
+                pc: DRAM_BASE + u64::from(SUPERVISOR_ENTRY_OFFSET),
+                instruction: forbidden,
+            })
+        );
+        assert_eq!(report.instructions_retired, 0);
+    }
+
+    #[test]
+    fn all_six_zicsr_operations_use_old_values_and_exact_write_intent() {
+        let mut rv = machine(8);
+        let program = words(&[
+            encode_addi(5, 0, 0x0f),
+            encode_csr(6, Csr::Mscratch, 5, 1),
+            encode_addi(7, 0, 0x30),
+            encode_csr(8, Csr::Mscratch, 7, 2),
+            encode_addi(9, 0, 0x0c),
+            encode_csr(10, Csr::Mscratch, 9, 3),
+            encode_csr(11, Csr::Mscratch, 5, 5),
+            encode_csr(12, Csr::Mscratch, 2, 6),
+            encode_csr(13, Csr::Mscratch, 1, 7),
+            encode_csrr(14, Csr::Mscratch),
+            0x0010_0073,
+        ]);
+        rv.load_program(&program).expect("load CSR program");
+
+        let report = rv.run_slice(16);
+        assert_eq!(report.instructions_retired, 10);
+        assert_eq!(rv.register(6), Some(0));
+        assert_eq!(rv.register(8), Some(0x0f));
+        assert_eq!(rv.register(10), Some(0x3f));
+        assert_eq!(rv.register(11), Some(0x33));
+        assert_eq!(rv.register(12), Some(5));
+        assert_eq!(rv.register(13), Some(7));
+        assert_eq!(rv.register(14), Some(6));
+        assert_eq!(rv.csr(Csr::Mscratch), 6);
+        assert_eq!(
+            report.outcome,
+            SliceOutcome::Trapped(MachineTrap::Breakpoint {
+                pc: DRAM_BASE + 10 * 4,
+            })
+        );
+    }
+
+    #[test]
+    fn xret_instructions_fail_closed_below_their_privilege() {
+        let mut supervisor = machine(8);
+        supervisor
+            .load_program(&RV64_SUPERVISOR_PROGRAM)
+            .expect("load supervisor program");
+        assert_eq!(supervisor.run_slice(12).outcome, SliceOutcome::Yielded);
+        let mret = 0x3020_0073_u32;
+        let offset = usize::try_from(supervisor.pc() - DRAM_BASE).expect("RAM offset");
+        supervisor.devices.ram[offset..offset + 4].copy_from_slice(&mret.to_le_bytes());
+        assert_eq!(
+            supervisor.run_slice(1).outcome,
+            SliceOutcome::Trapped(MachineTrap::IllegalInstruction {
+                pc: DRAM_BASE + u64::from(SUPERVISOR_ENTRY_OFFSET),
+                instruction: mret,
+            })
+        );
+
+        let mut user = machine(8);
+        let program = words(&[
+            encode_auipc(5, 0),
+            encode_addi(5, 5, 5 * 4),
+            encode_csrw(Csr::Mepc, 5),
+            encode_csrw(Csr::Mstatus, 0),
+            0x3020_0073,
+            0x1020_0073,
+        ]);
+        user.load_program(&program).expect("load user transition");
+        let report = user.run_slice(6);
+        assert_eq!(user.privilege(), Privilege::User);
+        assert_eq!(report.instructions_retired, 5);
+        assert_eq!(
+            report.outcome,
+            SliceOutcome::Trapped(MachineTrap::IllegalInstruction {
+                pc: DRAM_BASE + 5 * 4,
+                instruction: 0x1020_0073,
+            })
+        );
+    }
+
+    #[test]
+    fn reserved_mpp_encoding_is_warl_coerced_to_user() {
+        let mut rv = machine(8);
+        let program = words(&[
+            encode_lui(5, 1),
+            encode_csrw(Csr::Mstatus, 5),
+            encode_csrr(6, Csr::Mstatus),
+            0x0010_0073,
+        ]);
+        rv.load_program(&program).expect("load WARL program");
+        let report = rv.run_slice(4);
+
+        assert_eq!(report.instructions_retired, 3);
+        assert_eq!(rv.register(6).expect("x6") & MSTATUS_MPP, 0);
+        assert_eq!(rv.csr(Csr::Mstatus) & MSTATUS_MPP, 0);
+    }
+
+    #[test]
+    fn sret_to_lower_privilege_clears_mprv() {
+        let mut rv = machine(8);
+        let program = words(&[
+            encode_auipc(5, 0),
+            encode_addi(5, 5, 7 * 4),
+            encode_csrw(Csr::Sepc, 5),
+            encode_lui(6, 0x20),
+            encode_addi(6, 6, MSTATUS_SPP as u32),
+            encode_csrw(Csr::Mstatus, 6),
+            0x1020_0073,
+            0x0010_0073,
+        ]);
+        rv.load_program(&program).expect("load SRET program");
+        let report = rv.run_slice(8);
+
+        assert_eq!(rv.privilege(), Privilege::Supervisor);
+        assert_eq!(rv.csr(Csr::Mstatus) & MSTATUS_MPRV, 0);
+        assert_eq!(report.instructions_retired, 7);
+        assert!(matches!(report.outcome, SliceOutcome::Trapped(_)));
+    }
+
+    #[test]
+    fn repeated_architectural_traps_remain_slice_bounded() {
+        let mut machine = machine(8);
+        machine
+            .load_program(&0x0000_0073_u32.to_le_bytes())
+            .expect("load ecall loop");
+        machine.csrs.mtvec = DRAM_BASE;
+
+        let report = machine.run_slice(7);
+        assert_eq!(report.outcome, SliceOutcome::Yielded);
+        assert_eq!(report.steps_executed, 7);
+        assert_eq!(report.instructions_retired, 0);
+        assert_eq!(machine.pc(), DRAM_BASE);
+        assert_eq!(machine.csr(Csr::Mcause), CAUSE_ECALL_FROM_MACHINE);
+        assert_eq!(machine.csr(Csr::Mepc), DRAM_BASE);
     }
 
     #[test]
