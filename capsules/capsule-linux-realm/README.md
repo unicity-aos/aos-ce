@@ -5,18 +5,21 @@ agent workbench whose guest interface is Linux-shaped and whose outer authority
 is an ordinary Astrid capsule.
 
 It is useful now, but it is not Linux yet. The capsule runs signed, embedded core
-WebAssembly command modules under Wasmi. The commands receive structured `argv`
-and an explicit current directory; there is no host shell command line and the
-manifest requests no `host_process` capability.
+WebAssembly command modules under Wasmi and now contains the first bounded
+`aos-rv64-virt-v0` machine slice. Commands receive structured `argv` and an
+explicit current directory; there is no host shell command line and the manifest
+requests no `host_process` capability.
 
 ```text
-agent -> realm tool -> nested WASM command -> private realm ABI
-      -> mount and descriptor policy -> audited Astrid filesystem imports
+agent -> realm tool -> signed nested WASM command -> private realm ABI
+                  \-> admitted RV64 machine slice -> virtual hardware
+      -> realm policy and accounting -> audited Astrid imports
 ```
 
 ## What works
 
-`linux_realm_exec` currently admits exactly eight signed workloads:
+`linux_realm_exec` currently admits eight signed core-WASM workloads and one
+diagnostic RV64 instruction image:
 
 - `pwd`
 - `echo`
@@ -25,6 +28,9 @@ agent -> realm tool -> nested WASM command -> private realm ABI
   then waits for and reaps them itself
 - `realm-sh`, a guest-side shell over structured tokens. Its current grammar is
   `echo TEXT`, `env KEY=VALUE`, `echo TEXT | cat`, or `echo TEXT > PATH`
+- `rv64-smoke`, which runs 23 real RV64I instructions in bounded slices, writes
+  `AOS RV64` through the virtual 16550 UART, and halts through the standard test
+  finisher
 - `write-file`
 - `cat`
 - `smoke-write`, the original interpreter smoke test
@@ -33,8 +39,9 @@ agent -> realm tool -> nested WASM command -> private realm ABI
 exposing physical host paths. It also reports the caller's actor boot sequence,
 completed-command count, next process identifier, and live process/pipe resource
 accounting. Every execution result identifies the kernel-stamped owner principal
-and includes the nested process outcome, exit status, stdout, stderr, fuel
-consumed, memory ceiling, and process identifiers.
+and exact execution backend, and includes the outcome, exit status, stdout,
+stderr, fuel or instruction accounting, memory ceiling, and process identifiers
+where the semantic process kernel allocated them.
 
 The first execution call lazily creates this layout and its in-memory Realm
 machine for the invoking principal. Status reports `uninitialized` and an idle
@@ -106,6 +113,18 @@ to zero while their identifiers are never reused during that capsule boot. A
 principal-scoped boot sequence is advanced with KV compare-and-swap and makes PID
 reuse after restart explicit as `(boot sequence, PID)`.
 
+`crates/realm-machine` is the host-testable full-system backend seed. It owns only
+admitted guest CPU state, contiguous RAM, bounded serial input/output, the standard
+test finisher, and slice execution. The first interpreter surface is the RV64I
+integer subset used by the probe. It has no browser, JavaScript, JIT, host process,
+host filesystem, or network dependency and compiles for the capsule's
+`wasm32-unknown-unknown` target.
+
+That probe is an architectural boundary test, not a Linux claim. Privileged CSRs,
+trap delegation, Sv39, atomics/compressed instructions, CLINT, PLIC, SBI/boot
+handoff, a device tree, and virtio block still have to land before a Linux kernel
+can boot.
+
 The private ABI exposes bounded `pipe`, compatibility `spawn-signed`, record-based
 `spawn-signed-record`, `wait`, and `signal` operations. The record form selects an
 absolute path from an immutable catalog, carries up to 64 argv entries and 64
@@ -140,10 +159,10 @@ per-actor-boot guarantee, not yet a durable exactly-once receipt across crashes.
 From the `aos-ce` repository:
 
 ```sh
-cargo test -p aos-realm-abi -p aos-realm-core -p aos-realm-runtime \
+cargo test -p aos-realm-abi -p aos-realm-core -p aos-realm-machine -p aos-realm-runtime \
   -p aos-realm-vfs -p aos-linux-realm \
   --target "$(rustc -vV | sed -n 's/^host: //p')"
-cargo clippy -p aos-realm-abi -p aos-realm-core -p aos-realm-runtime \
+cargo clippy -p aos-realm-abi -p aos-realm-core -p aos-realm-machine -p aos-realm-runtime \
   -p aos-realm-vfs -p aos-linux-realm \
   --target "$(rustc -vV | sed -n 's/^host: //p')" -- -D warnings
 cargo check -p aos-linux-realm --target wasm32-unknown-unknown
@@ -167,6 +186,7 @@ Example tool arguments:
 {"command":"realm-sh","args":["echo","the shell built this pipe","|","cat"]}
 {"command":"realm-sh","args":["echo","persisted by the guest shell",">","/home/agent/note.txt"]}
 {"command":"realm-sh","args":["env","ASTRID_REALM=ready"]}
+{"command":"rv64-smoke"}
 {"command":"write-file","args":["notes.txt","durable\n"],"cwd":"/home/agent"}
 {"command":"cat","args":["notes.txt"],"cwd":"/home/agent"}
 {"command":"write-file","args":["candidate.rs","..."],"cwd":"/workspace"}
@@ -190,10 +210,10 @@ file. Durable-home closes select a content-addressed generation with a KV CAS;
 workspace and temporary files retain their outer mount semantics.
 
 This slice does not provide arbitrary executable resolution, shared or inherited
-open-file descriptions, sequential POSIX file actions, `execve`, Bash, general Linux syscalls,
-a libc, package management, networking, PTYs, background jobs, or a compiler.
-Those belong behind the same realm boundary; they must not be simulated by
-granting a host process.
+open-file descriptions, sequential POSIX file actions, `execve`, Bash, a booting
+Linux kernel, general Linux syscalls, a libc, package management, networking,
+PTYs, background jobs, or a compiler. Those belong behind the same realm boundary;
+they must not be simulated by granting a host process.
 
 ## Distribution direction
 
