@@ -3,6 +3,7 @@ members = [
     "crates/unicity-aos-bootstrap",
     "capsules/capsule-linux-realm",
     "capsules/capsule-linux-realm/crates/realm-abi",
+    "capsules/capsule-linux-realm/crates/realm-core",
     "capsules/capsule-linux-realm/crates/realm-runtime",
     "capsules/capsule-linux-realm/crates/realm-vfs",
     "capsules/capsule-agents",
@@ -34,6 +35,7 @@ astrid-sdk = { version = "=0.7.1", features = ["derive"] }
 astrid-core = "=0.10.1"
 astrid-uplink = "=0.10.1"
 aos-realm-abi = { path = "capsules/capsule-linux-realm/crates/realm-abi" }
+aos-realm-core = { path = "capsules/capsule-linux-realm/crates/realm-core" }
 aos-realm-runtime = { path = "capsules/capsule-linux-realm/crates/realm-runtime" }
 aos-realm-vfs = { path = "capsules/capsule-linux-realm/crates/realm-vfs" }
 axum = "0.8"

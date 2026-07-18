@@ -216,10 +216,19 @@ name = "aos-realm-abi"
 version = "0.1.0"
 
 [[package]]
+name = "aos-realm-core"
+version = "0.1.0"
+dependencies = [
+ "aos-realm-abi",
+]
+
+[[package]]
 name = "aos-realm-runtime"
 version = "0.1.0"
 dependencies = [
  "aos-realm-abi",
+ "aos-realm-core",
+ "blake3",
  "wasmi",
  "wat",
 ]

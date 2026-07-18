@@ -8,8 +8,9 @@
 mod host;
 
 use aos_realm_runtime::{
-    CAT_GUEST, ECHO_GUEST, HostFault, PWD_GUEST, ProcessConfig, ProcessOutcome, RealmHost,
-    RealmIoError, RealmRuntime, RunLimits, SMOKE_WRITE_GUEST, WRITE_FILE_GUEST,
+    CAT_GUEST, ECHO_GUEST, ExecutionReport, HostFault, PWD_GUEST, ProcessConfig, ProcessOutcome,
+    RealmHost, RealmIoError, RealmRuntime, RunLimits, SMOKE_WRITE_GUEST, STDIN_CAT_GUEST,
+    WRITE_FILE_GUEST,
 };
 use aos_realm_vfs::FsStatus;
 use astrid_sdk::prelude::*;
@@ -33,6 +34,7 @@ pub enum RealmProgram {
     SmokeWrite,
     Pwd,
     Echo,
+    PipeEcho,
     WriteFile,
     Cat,
 }
@@ -69,6 +71,8 @@ struct ExecResponse {
     stderr: String,
     fuel_consumed: u64,
     memory_limit_bytes: usize,
+    suspensions: u64,
+    processes: usize,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -96,7 +100,7 @@ struct StatusResponse {
     home_files: usize,
     home_manifest: Option<String>,
     mounts: Vec<MountStatus>,
-    commands: [&'static str; 5],
+    commands: [&'static str; 6],
     workspace_commit: &'static str,
     host_process: bool,
 }
@@ -104,8 +108,14 @@ struct StatusResponse {
 #[derive(Debug)]
 struct SelectedProgram {
     name: &'static str,
-    guest: &'static [u8],
+    execution: SelectedExecution,
     argv: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SelectedExecution {
+    Single(&'static [u8]),
+    EchoPipeline,
 }
 
 #[capsule]
@@ -157,17 +167,7 @@ fn run_command(
             .unwrap_or(HARD_MAX_OUTPUT_BYTES)
             .min(HARD_MAX_OUTPUT_BYTES),
     };
-    let report = RealmRuntime::default()
-        .execute_process(
-            selected.guest,
-            ProcessConfig {
-                argv: selected.argv.clone(),
-                cwd: cwd.clone(),
-            },
-            limits,
-            realm_host,
-        )
-        .map_err(|error| SysError::ApiError(error.to_string()))?;
+    let (report, processes) = execute_selected(&selected, &cwd, limits, realm_host)?;
     let (outcome, exit_status, fault) = outcome_fields(&report.outcome);
     Ok(ExecResponse {
         realm: REALM_NAME,
@@ -182,7 +182,80 @@ fn run_command(
         stderr: String::from_utf8_lossy(&report.stderr).into_owned(),
         fuel_consumed: report.fuel_consumed,
         memory_limit_bytes: report.memory_limit_bytes,
+        suspensions: report.suspensions,
+        processes,
     })
+}
+
+fn execute_selected(
+    selected: &SelectedProgram,
+    cwd: &str,
+    limits: RunLimits,
+    realm_host: Box<dyn RealmHost>,
+) -> Result<(ExecutionReport, usize), SysError> {
+    let runtime = RealmRuntime::default();
+    match selected.execution {
+        SelectedExecution::Single(guest) => runtime
+            .execute_process(
+                guest,
+                ProcessConfig {
+                    argv: selected.argv.clone(),
+                    cwd: cwd.to_string(),
+                },
+                limits,
+                realm_host,
+            )
+            .map(|report| (report, 1))
+            .map_err(|error| SysError::ApiError(error.to_string())),
+        SelectedExecution::EchoPipeline => {
+            let pipeline = runtime
+                .execute_pipeline(
+                    ECHO_GUEST,
+                    ProcessConfig {
+                        argv: selected.argv.clone(),
+                        cwd: cwd.to_string(),
+                    },
+                    STDIN_CAT_GUEST,
+                    ProcessConfig {
+                        argv: vec!["stdin-cat".to_string()],
+                        cwd: cwd.to_string(),
+                    },
+                    limits,
+                    4,
+                )
+                .map_err(|error| SysError::ApiError(error.to_string()))?;
+            Ok((combine_pipeline(pipeline), 2))
+        }
+    }
+}
+
+fn combine_pipeline(pipeline: aos_realm_runtime::PipelineReport) -> ExecutionReport {
+    let outcome = match &pipeline.producer.execution.outcome {
+        ProcessOutcome::Exited(0) => pipeline.consumer.execution.outcome.clone(),
+        other => other.clone(),
+    };
+    let mut stderr = pipeline.producer.execution.stderr;
+    stderr.extend_from_slice(&pipeline.consumer.execution.stderr);
+    ExecutionReport {
+        outcome,
+        stdout: pipeline.consumer.execution.stdout,
+        stderr,
+        fuel_consumed: pipeline
+            .producer
+            .execution
+            .fuel_consumed
+            .saturating_add(pipeline.consumer.execution.fuel_consumed),
+        memory_limit_bytes: pipeline
+            .producer
+            .execution
+            .memory_limit_bytes
+            .saturating_add(pipeline.consumer.execution.memory_limit_bytes),
+        suspensions: pipeline
+            .producer
+            .execution
+            .suspensions
+            .saturating_add(pipeline.consumer.execution.suspensions),
+    }
 }
 
 fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
@@ -198,11 +271,12 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
             "smoke-write" => RealmProgram::SmokeWrite,
             "pwd" => RealmProgram::Pwd,
             "echo" => RealmProgram::Echo,
+            "pipe-echo" => RealmProgram::PipeEcho,
             "write-file" => RealmProgram::WriteFile,
             "cat" => RealmProgram::Cat,
             _ => {
                 return Err(SysError::ApiError(format!(
-                    "unsupported realm command `{command}`; supported: pwd, echo, write-file, cat, smoke-write"
+                    "unsupported realm command `{command}`; supported: pwd, echo, pipe-echo, write-file, cat, smoke-write"
                 )));
             }
         }
@@ -210,40 +284,60 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
         RealmProgram::Pwd
     };
 
-    let (name, guest, argv) = match program {
+    let (name, execution, argv) = match program {
         RealmProgram::SmokeWrite => {
             require_arity("smoke-write", &args.args, 0)?;
             (
                 "smoke-write",
-                SMOKE_WRITE_GUEST,
+                SelectedExecution::Single(SMOKE_WRITE_GUEST),
                 vec!["smoke-write".to_string()],
             )
         }
         RealmProgram::Pwd => {
             require_arity("pwd", &args.args, 0)?;
-            ("pwd", PWD_GUEST, vec!["pwd".to_string()])
+            (
+                "pwd",
+                SelectedExecution::Single(PWD_GUEST),
+                vec!["pwd".to_string()],
+            )
         }
         RealmProgram::Echo => (
             "echo",
-            ECHO_GUEST,
+            SelectedExecution::Single(ECHO_GUEST),
             vec!["echo".to_string(), args.args.join(" ")],
         ),
+        RealmProgram::PipeEcho => {
+            require_arity("pipe-echo", &args.args, 1)?;
+            (
+                "pipe-echo",
+                SelectedExecution::EchoPipeline,
+                vec!["echo".to_string(), args.args[0].clone()],
+            )
+        }
         RealmProgram::WriteFile => {
             require_arity("write-file", &args.args, 2)?;
             let mut argv = vec!["write-file".to_string()];
             argv.extend(args.args.iter().cloned());
-            ("write-file", WRITE_FILE_GUEST, argv)
+            (
+                "write-file",
+                SelectedExecution::Single(WRITE_FILE_GUEST),
+                argv,
+            )
         }
         RealmProgram::Cat => {
             require_arity("cat", &args.args, 1)?;
             (
                 "cat",
-                CAT_GUEST,
+                SelectedExecution::Single(CAT_GUEST),
                 vec!["cat".to_string(), args.args[0].clone()],
             )
         }
     };
-    Ok(SelectedProgram { name, guest, argv })
+    Ok(SelectedProgram {
+        name,
+        execution,
+        argv,
+    })
 }
 
 fn require_arity(command: &str, args: &[String], expected: usize) -> Result<(), SysError> {
@@ -295,7 +389,14 @@ fn status_response(
                 durable: false,
             },
         ],
-        commands: ["pwd", "echo", "write-file", "cat", "smoke-write"],
+        commands: [
+            "pwd",
+            "echo",
+            "pipe-echo",
+            "write-file",
+            "cat",
+            "smoke-write",
+        ],
         workspace_commit: "outer-astrid-promotion-required",
         host_process: false,
     }
@@ -323,6 +424,7 @@ fn host_fault_name(fault: HostFault) -> String {
         HostFault::InvalidUtf8 => "invalid-utf8".to_string(),
         HostFault::InvalidArgument => "invalid-argument".to_string(),
         HostFault::Io(error) => format!("io-{}", io_error_name(error)),
+        HostFault::BrokenPipe => "broken-pipe".to_string(),
     }
 }
 
@@ -401,6 +503,45 @@ mod tests {
         .expect_err("shell syntax must not be interpreted");
 
         assert!(error.to_string().contains("unsupported realm command"));
+    }
+
+    #[test]
+    fn pipe_echo_runs_two_resumable_processes_with_exact_output() {
+        let response = run_command(
+            ExecArgs {
+                command: Some("pipe-echo".to_string()),
+                args: vec!["hello through a four-byte pipe".to_string()],
+                ..ExecArgs::default()
+            },
+            "alice".to_string(),
+            Box::<TestHost>::default(),
+        )
+        .expect("pipeline command succeeds");
+
+        assert_eq!(response.processes, 2);
+        assert_eq!(response.outcome, "exited");
+        assert_eq!(response.stdout, "hello through a four-byte pipe\n");
+        assert!(response.suspensions >= 2);
+    }
+
+    #[test]
+    fn pipe_echo_splits_the_callers_total_fuel_and_output_budgets() {
+        let response = run_command(
+            ExecArgs {
+                command: Some("pipe-echo".to_string()),
+                args: vec!["output larger than one byte".to_string()],
+                fuel: Some(1_000),
+                max_output_bytes: Some(1),
+                ..ExecArgs::default()
+            },
+            "alice".to_string(),
+            Box::<TestHost>::default(),
+        )
+        .expect("bounded pipeline returns accounting");
+
+        assert!(response.fuel_consumed <= 1_000);
+        assert!(response.stdout.len() + response.stderr.len() <= 1);
+        assert_eq!(response.processes, 2);
     }
 
     #[test]

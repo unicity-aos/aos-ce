@@ -362,6 +362,61 @@ Admission limits include:
 - child creation rate;
 - filesystem and network quotas.
 
+### 7.1 Process-table invariants
+
+The first `realm-core` model is deliberately independent of Wasmi. It is the
+semantic oracle that an interpreter scheduler or a faster backend must drive.
+Its rules are:
+
+- process identifiers are realm-local, monotonic, non-zero, and never reused;
+- `Created -> Runnable -> Running` is explicit; only a running process may issue
+  ordinary process and descriptor operations;
+- a running process may yield to `Runnable`, block in `Waiting`, exit with a
+  status, or be terminated by a typed signal;
+- a terminated child remains in the table as a waitable zombie until its direct
+  parent reaps it;
+- a parent may wait only for its direct child. Waiting for a live child parks the
+  parent; child termination wakes it to the runnable queue;
+- parent termination reparents its children to the realm supervisor rather than
+  killing them implicitly or leaving a dangling parent identifier;
+- process quotas include created, live, and zombie records. Reaping releases the
+  slot; identifier exhaustion fails without wrapping;
+- runnable selection uses a deterministic FIFO queue. This is a reference trace,
+  not yet a fairness or real-time scheduling claim.
+
+### 7.2 Descriptor and bounded-pipe invariants
+
+Descriptors are process-local typed references. Pipe endpoints may be inherited
+into exact child descriptor numbers during spawn, including standard input,
+output, and error. Spawn validates the complete mapping before allocating a PID
+or incrementing an endpoint reference, so an invalid mapping cannot create a
+partial child.
+
+Each pipe has an immutable positive capacity and contributes that capacity to an
+aggregate realm quota. Writes may be partial up to available capacity. A full pipe
+returns `WouldBlock`; a read frees capacity and wakes parked writers. An empty pipe
+returns `WouldBlock` while any writer exists, and `EOF` only after the final writer
+closes. Closing the final reader wakes writers, whose next write returns
+`BrokenPipe`. Termination closes every descriptor owned by that process. A pipe is
+removed and its reserved capacity released only after its last read and write
+endpoint close.
+
+The model does not yet claim live `spawn`, `wait`, `pipe`, signal, or PTY guest
+imports. Wiring those imports requires resumable Wasmi instances and a realm actor
+that owns one process table across invocations; constructing a new process table
+inside each one-shot tool call would produce dishonest PID and lifecycle semantics.
+
+The reference runtime now wires a deliberately smaller executable proof: one
+foreground machine creates two signed processes, maps a four-byte pipe from the
+producer's stdout to the consumer's stdin, starts the consumer first, and drives
+both independent Wasmi stores through repeated read and write suspension. The
+producer handles partial writes; the consumer observes EOF only after producer
+exit closes the last writer. The caller's fuel and captured-output budgets are
+split across the two processes, while each retains the declared per-process memory
+ceiling. Suspension counts are returned in process accounting. This proves the
+scheduler/backend junction, bounded backpressure, and resumable call stacks. It
+does not create guest-facing process syscalls or persistent background jobs.
+
 ## 8. Executable compatibility lanes
 
 There are two compatible long-term execution lanes behind the same realm API.
@@ -639,7 +694,8 @@ The proof deliberately avoids Bash, Debian, networking, and a large image.
 ### Inputs
 
 - an installable `aos-linux-realm.capsule`;
-- five embedded core-WASM command guests;
+- six embedded core-WASM command guests, including the stdin consumer used by the
+  two-process pipe proof;
 - a private ABI containing bounded argument and CWD reads, file descriptors,
   open/read/write/close, monotonic time, and exit;
 - Wasmi configured with fuel and memory limits;
@@ -697,17 +753,22 @@ compatibility.
 
 - the seed is based on `unicity-aos/aos-ce` main commit
   `dfa1d71c2737a016d8d4dd169d0755ff624f6b50`;
-- thirty-five focused host tests pass, including nested argument/CWD delivery,
+- fifty-five focused host tests pass, including nested argument/CWD delivery,
   file round trips across process instances, path confinement, stable host-error
   mapping, the actual manifest authority test, fuel exhaustion, memory/output
   admission, selected-generation restart reconstruction, competing-writer merge,
-  orphan invisibility, and corruption failure;
+  orphan invisibility, corruption failure, process lifecycle and wait/reap,
+  deterministic scheduling, descriptor inheritance, pipe EOF/backpressure,
+  endpoint wakeups, quota failure atomicity, and identifier exhaustion;
+- the reference runtime drives a signed `echo | stdin-cat` workload as two
+  isolated, resumable Wasmi stores over a four-byte pipe; both processes block and
+  resume under measured backpressure and reproduce the exact input plus newline;
 - the complete non-WASI capsule workspace checks under
   `wasm32-unknown-unknown`;
 - the current stable Wasmi 1.1.0 runs with default `std` and WAT parsing disabled,
   BTree-backed collections, extra runtime checks, fuel, and store limits;
-- `astrid-build` 0.10.1 produced a 348 KiB final test artifact with SHA-256
-  `fe8704940d1eae060d67857046ecc9449419c8b19aa77457c653b47de7fe7832`;
+- `astrid-build` 0.10.1 produced a 375 KiB final test artifact with SHA-256
+  `ee1ca8fd62343bdeed1c9115c0970462e46f1408f2a4e2e5ed5c74d25f2f0068`;
   Astrid 0.10.1 loads it as a shared component with `host_process=false`;
 - the two outer archive digests differed because `astrid-build` copied the
   rebuilt component's modification time into its tar header. Reproducible outer
@@ -729,6 +790,10 @@ compatibility.
   generation-1 manifest, the default principal's next write selected generation 2
   with two files, and both exact heads and contents survived a full daemon
   stop/start;
+- the packaged `pipe-echo` workload ran through the live Astrid MCP front door as
+  two processes with 128 KiB aggregate linear-memory ceiling, 1,198 consumed
+  interpreter fuel, 15 measured read/write suspensions over a four-byte pipe, and
+  exact stdout `live resumable realm pipeline\n`;
 - the initial live run discovered two integration constraints rather than hiding
   them: Astrid's component FileHandle methods are not implemented, so the adapter
   uses bounded whole-file I/O and commits on descriptor close; `/tmp` must be
@@ -771,8 +836,14 @@ installed but unreachable workbench.
 
 ### Milestone C: processes and shell substrate
 
-- add `exec`, `posix_spawn`, waits, pipes, signals, and PTYs;
-- add deterministic scheduling and aggregate quotas;
+- [x] define the host-testable process lifecycle, direct-child wait/reap,
+  deterministic single-runner FIFO scheduling, typed terminal signals, bounded
+  pipes, atomic descriptor inheritance, and aggregate process/pipe quotas;
+- [x] bind resumable Wasmi process slots to the kernel for a foreground
+  two-process stdout-to-stdin pipeline with measured suspension and exact output;
+- [ ] add a long-lived realm actor plus guest `exec`, `posix_spawn`, wait, pipe,
+  and signal imports;
+- [ ] add PTYs, sessions, process groups, and job-control signals;
 - run multiple guest modules with isolated memories;
 - compile and run a small shell;
 - add job control only with explicit conformance tests.
@@ -969,13 +1040,23 @@ The first implementation must resolve these with executable evidence:
   retry, corruption checks, and lazy migration from the format-0 direct home;
 - [ ] add explicit guest flush semantics, retained named checkpoints, diff/reset,
   and unreachable-blob garbage collection;
+- [x] implement `aos-realm-core` as the backend-independent process/descriptor
+  oracle, including monotonic PIDs, zombies, direct-child wait/reap, reparenting,
+  deterministic admission, bounded pipes, endpoint inheritance, wakeups, EOF,
+  broken-pipe behavior, and failure-atomic quota checks;
+- [x] run two signed guest modules with isolated memories through the core
+  scheduler, a four-byte bounded pipe, resumable read/write host calls, partial
+  producer writes, consumer EOF, and exact combined accounting;
+- [ ] add a long-lived principal realm actor and resumable Wasmi process slots,
+  then expose the tested process operations through the private guest ABI;
 - [ ] add an outer workspace diff/promote workflow; realm code must not silently
   commit its own COW projection;
 - [ ] put a supported MCP broker/invocation front door in the CE distribution
   before selecting the realm by default;
 - [ ] make product startup verify and launch the exact pinned Astrid daemon rather
   than an older installed companion;
-- [ ] add processes, pipes, waits, signals, and a small shell only after persistence;
+- [ ] add guest-created processes/pipes, waits, signals, and a small shell now
+  that persistence and the foreground resumable pipeline are established;
 - [ ] define the attenuating capsule-to-realm job contract and migrate Forge as the
   first non-interactive consumer after artifact verification exists;
 - [ ] replace `aos-shell` in the default distro only after interactive and
@@ -987,7 +1068,8 @@ The first implementation must resolve these with executable evidence:
 - [ ] defer public WIT, Debian naming, arbitrary package claims, and native-kernel
     coupling until evidence requires them.
 
-The next code artifact is the first multi-process substrate—process identifiers,
-spawn/wait, bounded pipes, and a tiny shell—while the storage track adds named
-checkpoint/diff/reset and outer workspace promotion. Bash and a compiler remain
-acceptance workloads, not names attached to the current five-command seed.
+The next executable artifact binds resumable Wasmi process slots to the new
+`realm-core` oracle inside a long-lived principal realm actor, then exposes the
+smallest honest `posix_spawn`/wait/pipe guest path. The storage track adds named
+checkpoint/diff/reset and outer workspace promotion. A tiny shell follows those
+live mechanics; Bash and a compiler remain acceptance workloads.

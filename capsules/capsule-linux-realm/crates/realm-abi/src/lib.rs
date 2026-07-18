@@ -9,6 +9,9 @@
 /// Import module used by the first realm guest ABI.
 pub const IMPORT_MODULE_V0: &str = "aos_realm_v0";
 
+/// Guest file descriptor for standard input.
+pub const STDIN_FD: i32 = 0;
+
 /// Guest file descriptor for standard output.
 pub const STDOUT_FD: i32 = 1;
 
@@ -62,11 +65,30 @@ impl ProcessId {
     }
 }
 
+/// Pipe identifier, unique within one live realm kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PipeId(u64);
+
+impl PipeId {
+    /// Creates an identifier from its realm-local representation.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the realm-local representation.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Descriptor number in a single process descriptor table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Descriptor(i32);
 
 impl Descriptor {
+    /// Standard input.
+    pub const STDIN: Self = Self(STDIN_FD);
+
     /// Standard output.
     pub const STDOUT: Self = Self(STDOUT_FD);
 
@@ -92,8 +114,11 @@ mod tests {
     fn domain_identifiers_keep_their_types() {
         let realm = RealmId::new(7);
         let process = ProcessId::new(7);
+        let pipe = PipeId::new(7);
 
         assert_eq!(realm.get(), process.get());
+        assert_eq!(process.get(), pipe.get());
+        assert_eq!(Descriptor::STDIN.get(), STDIN_FD);
         assert_eq!(Descriptor::STDOUT.get(), STDOUT_FD);
         assert_eq!(Descriptor::STDERR.get(), STDERR_FD);
         assert_eq!(Descriptor::new(FIRST_FILE_FD).get(), FIRST_FILE_FD);

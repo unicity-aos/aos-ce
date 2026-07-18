@@ -32,6 +32,13 @@
   KV head selects immutable BLAKE3-addressed file and manifest blobs, with
   concurrent-writer retry, corruption checks, daemon-restart recovery, and lazy
   migration from the original direct-home format.
+- The host-testable `aos-realm-core` semantic kernel with monotonic process and
+  pipe identities, explicit process transitions, direct-child wait/reap, typed
+  terminal signals, deterministic FIFO admission, atomic descriptor inheritance,
+  bounded pipe backpressure/EOF/broken-pipe behavior, and aggregate quotas.
+- A signed `pipe-echo` realm workload that runs two isolated Wasmi process stores
+  through the core scheduler and a four-byte stdout-to-stdin pipe, exercising
+  partial writes, read/write suspension, wakeup, EOF, and exact output accounting.
 - Homebrew formula updates initiated by the tap's authenticated stable-release
   poll, eliminating the cross-repository dispatch credential.
 - Strict, signed stable/dev/nightly channel and immutable release metadata

@@ -3,14 +3,22 @@
 //! Bounded execution of nested core WebAssembly processes.
 
 use aos_realm_abi::{
-    FIRST_FILE_FD, IMPORT_MODULE_V0, MAX_ARGUMENT_BYTES, MAX_PATH_BYTES, OPEN_READ,
-    OPEN_WRITE_TRUNCATE, STDERR_FD, STDOUT_FD,
+    Descriptor, FIRST_FILE_FD, IMPORT_MODULE_V0, MAX_ARGUMENT_BYTES, MAX_PATH_BYTES, OPEN_READ,
+    OPEN_WRITE_TRUNCATE, ProcessId, STDERR_FD, STDOUT_FD,
 };
-use std::{collections::BTreeMap, fmt, vec::Vec};
+use aos_realm_core::{
+    DescriptorBinding, DescriptorResource, ExecutableId, KernelError, ParkResult, PipeReadResult,
+    PipeWriteResult, ProcessSpec, RealmKernel, RealmLimits, Signal, Termination,
+};
+use std::{cell::RefCell, collections::BTreeMap, fmt, rc::Rc, vec::Vec};
 use wasmi::{
-    Caller, Config, Engine, Error as WasmiError, Extern, Linker, Module, Store, StoreLimits,
-    StoreLimitsBuilder, TrapCode,
+    Caller, Config, Engine, Error as WasmiError, Extern, Linker, Memory, Module, Store,
+    StoreLimits, StoreLimitsBuilder, TrapCode, TypedFunc, Val,
 };
+
+mod pipeline;
+
+pub use pipeline::{PipelineError, PipelineProcessReport, PipelineReport};
 
 /// Compiled smoke guest embedded into the capsule at build time.
 pub const SMOKE_WRITE_GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smoke_write.wasm"));
@@ -26,6 +34,9 @@ pub const WRITE_FILE_GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wr
 
 /// Guest implementing streaming `cat` through the private realm ABI.
 pub const CAT_GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cat.wasm"));
+
+/// Guest copying standard input to standard output with partial-write handling.
+pub const STDIN_CAT_GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/stdin_cat.wasm"));
 
 /// Hard limits for one nested process invocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +187,8 @@ pub struct ExecutionReport {
     pub fuel_consumed: u64,
     /// Linear-memory ceiling applied to this process.
     pub memory_limit_bytes: usize,
+    /// Host calls that parked and later resumed this process.
+    pub suspensions: u64,
 }
 
 /// Failure before a process could start executing `_start`.
@@ -230,6 +243,8 @@ pub enum HostFault {
     InvalidArgument,
     /// The realm filesystem rejected an operation.
     Io(RealmIoError),
+    /// A pipe write has no remaining reader.
+    BrokenPipe,
 }
 
 impl fmt::Display for HostFault {
@@ -244,6 +259,7 @@ impl fmt::Display for HostFault {
             Self::InvalidUtf8 => f.write_str("guest string is not valid UTF-8"),
             Self::InvalidArgument => f.write_str("guest argument is invalid"),
             Self::Io(error) => write!(f, "realm I/O failed: {error}"),
+            Self::BrokenPipe => f.write_str("realm pipe has no reader"),
         }
     }
 }
@@ -262,6 +278,10 @@ struct HostState {
     realm_host: Box<dyn RealmHost>,
     files: BTreeMap<i32, Box<dyn RealmFile>>,
     next_fd: i32,
+    process: Option<ProcessContext>,
+    memory: Option<Memory>,
+    pending_io: Option<PendingIo>,
+    suspensions: u64,
 }
 
 impl HostState {
@@ -269,6 +289,36 @@ impl HostState {
         self.stdout.len().saturating_add(self.stderr.len())
     }
 }
+
+#[derive(Clone)]
+struct ProcessContext {
+    process: ProcessId,
+    kernel: Rc<RefCell<RealmKernel>>,
+}
+
+enum PendingIo {
+    Read {
+        descriptor: Descriptor,
+        pointer: usize,
+        capacity: usize,
+    },
+    Write {
+        descriptor: Descriptor,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug)]
+struct ProcessSuspended;
+
+impl fmt::Display for ProcessSuspended {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("realm process suspended")
+    }
+}
+
+impl std::error::Error for ProcessSuspended {}
+impl wasmi::errors::HostError for ProcessSuspended {}
 
 /// Reference interpreter for the first AOS Realm guest ABI.
 pub struct RealmRuntime {
@@ -304,6 +354,22 @@ impl RealmRuntime {
         limits: RunLimits,
         realm_host: Box<dyn RealmHost>,
     ) -> Result<ExecutionReport, LaunchError> {
+        let (mut store, start) = self.prepare_process(wasm, process, limits, realm_host, None)?;
+        let outcome = match start.call(&mut store, ()) {
+            Ok(()) => ProcessOutcome::Exited(0),
+            Err(error) => classify_process_error(&error),
+        };
+        Ok(execution_report(&store, limits, outcome))
+    }
+
+    fn prepare_process(
+        &self,
+        wasm: &[u8],
+        process: ProcessConfig,
+        limits: RunLimits,
+        realm_host: Box<dyn RealmHost>,
+        process_context: Option<ProcessContext>,
+    ) -> Result<(Store<HostState>, TypedFunc<(), ()>), LaunchError> {
         validate_process(&process)?;
         let module = Module::new(&self.engine, wasm)
             .map_err(|error| LaunchError::InvalidModule(error.to_string()))?;
@@ -325,6 +391,10 @@ impl RealmRuntime {
             realm_host,
             files: BTreeMap::new(),
             next_fd: FIRST_FILE_FD,
+            process: process_context,
+            memory: None,
+            pending_io: None,
+            suspensions: 0,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -340,21 +410,25 @@ impl RealmRuntime {
         let start = instance
             .get_typed_func::<(), ()>(&store, "_start")
             .map_err(|error| LaunchError::MissingStart(error.to_string()))?;
+        store.data_mut().memory = instance.get_memory(&store, "memory");
+        Ok((store, start))
+    }
+}
 
-        let outcome = match start.call(&mut store, ()) {
-            Ok(()) => ProcessOutcome::Exited(0),
-            Err(error) => classify_process_error(&error),
-        };
-        let remaining_fuel = store.get_fuel().unwrap_or_default();
-        let state = store.data();
-
-        Ok(ExecutionReport {
-            outcome,
-            stdout: state.stdout.clone(),
-            stderr: state.stderr.clone(),
-            fuel_consumed: limits.fuel.saturating_sub(remaining_fuel),
-            memory_limit_bytes: limits.memory_bytes,
-        })
+fn execution_report(
+    store: &Store<HostState>,
+    limits: RunLimits,
+    outcome: ProcessOutcome,
+) -> ExecutionReport {
+    let remaining_fuel = store.get_fuel().unwrap_or_default();
+    let state = store.data();
+    ExecutionReport {
+        outcome,
+        stdout: state.stdout.clone(),
+        stderr: state.stderr.clone(),
+        fuel_consumed: limits.fuel.saturating_sub(remaining_fuel),
+        memory_limit_bytes: limits.memory_bytes,
+        suspensions: state.suspensions,
     }
 }
 
@@ -537,13 +611,28 @@ fn realm_open(
         .realm_host
         .open(&cwd, &path, mode)
         .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
-    let fd = caller.data().next_fd;
+    let mut fd = caller.data().next_fd;
+    while caller.data().files.contains_key(&fd) || core_descriptor_exists(caller.data(), fd) {
+        fd = fd
+            .checked_add(1)
+            .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
+    }
     let next_fd = fd
         .checked_add(1)
         .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
     caller.data_mut().next_fd = next_fd;
     caller.data_mut().files.insert(fd, file);
     Ok(fd)
+}
+
+fn core_descriptor_exists(state: &HostState, fd: i32) -> bool {
+    state.process.as_ref().is_some_and(|context| {
+        context
+            .kernel
+            .borrow()
+            .descriptor(context.process, Descriptor::new(fd))
+            .is_ok()
+    })
 }
 
 fn realm_read(
@@ -557,7 +646,44 @@ fn realm_read(
     if capacity > MAX_IO_BYTES {
         return Err(WasmiError::host(HostFault::InvalidArgument));
     }
-    validate_guest_range(caller, ptr, capacity)?;
+    let (_, pointer) = validate_guest_range(caller, ptr, capacity)?;
+    if let Some(context) = caller.data().process.clone()
+        && let Some(resource) = process_descriptor(&context, fd)?
+    {
+        let DescriptorResource::PipeRead(_) = resource else {
+            return Err(WasmiError::host(HostFault::InvalidArgument));
+        };
+        let descriptor = Descriptor::new(fd);
+        let result = context
+            .kernel
+            .borrow_mut()
+            .read_pipe(context.process, descriptor, capacity)
+            .map_err(kernel_host_error)?;
+        return match result {
+            PipeReadResult::Data(bytes) => {
+                write_guest_bytes(caller, ptr, capacity, &bytes)?;
+                i32::try_from(bytes.len()).map_err(|_| WasmiError::host(HostFault::InvalidArgument))
+            }
+            PipeReadResult::Eof => Ok(0),
+            PipeReadResult::WouldBlock => {
+                let parked = context
+                    .kernel
+                    .borrow_mut()
+                    .park_pipe_read(context.process, descriptor)
+                    .map_err(kernel_host_error)?;
+                if parked != ParkResult::Parked {
+                    return Err(WasmiError::host(HostFault::InvalidArgument));
+                }
+                caller.data_mut().pending_io = Some(PendingIo::Read {
+                    descriptor,
+                    pointer,
+                    capacity,
+                });
+                caller.data_mut().suspensions = caller.data().suspensions.saturating_add(1);
+                Err(WasmiError::host(ProcessSuspended))
+            }
+        };
+    }
     let bytes = caller
         .data_mut()
         .files
@@ -573,6 +699,16 @@ fn realm_read(
 }
 
 fn realm_close(caller: &mut Caller<'_, HostState>, fd: i32) -> Result<i32, WasmiError> {
+    if let Some(context) = caller.data().process.clone()
+        && process_descriptor(&context, fd)?.is_some()
+    {
+        context
+            .kernel
+            .borrow_mut()
+            .close_descriptor(context.process, Descriptor::new(fd))
+            .map_err(kernel_host_error)?;
+        return Ok(0);
+    }
     let mut file = caller
         .data_mut()
         .files
@@ -640,6 +776,39 @@ fn realm_write(
     len: i32,
 ) -> Result<i32, WasmiError> {
     let length = usize::try_from(len).map_err(|_| WasmiError::host(HostFault::InvalidPointer))?;
+    if let Some(context) = caller.data().process.clone()
+        && let Some(resource) = process_descriptor(&context, fd)?
+    {
+        let DescriptorResource::PipeWrite(_) = resource else {
+            return Err(WasmiError::host(HostFault::InvalidArgument));
+        };
+        let descriptor = Descriptor::new(fd);
+        let bytes = read_guest_bytes(caller, ptr, length)?;
+        let result = context
+            .kernel
+            .borrow_mut()
+            .write_pipe(context.process, descriptor, &bytes)
+            .map_err(kernel_host_error)?;
+        return match result {
+            PipeWriteResult::Written(written) => {
+                i32::try_from(written).map_err(|_| WasmiError::host(HostFault::InvalidArgument))
+            }
+            PipeWriteResult::BrokenPipe => Err(WasmiError::host(HostFault::BrokenPipe)),
+            PipeWriteResult::WouldBlock => {
+                let parked = context
+                    .kernel
+                    .borrow_mut()
+                    .park_pipe_write(context.process, descriptor)
+                    .map_err(kernel_host_error)?;
+                if parked != ParkResult::Parked {
+                    return Err(WasmiError::host(HostFault::InvalidArgument));
+                }
+                caller.data_mut().pending_io = Some(PendingIo::Write { descriptor, bytes });
+                caller.data_mut().suspensions = caller.data().suspensions.saturating_add(1);
+                Err(WasmiError::host(ProcessSuspended))
+            }
+        };
+    }
     match fd {
         STDOUT_FD | STDERR_FD => {
             let new_total = caller
@@ -673,6 +842,26 @@ fn realm_write(
             i32::try_from(written).map_err(|_| WasmiError::host(HostFault::InvalidArgument))
         }
     }
+}
+
+fn process_descriptor(
+    context: &ProcessContext,
+    fd: i32,
+) -> Result<Option<DescriptorResource>, WasmiError> {
+    let descriptor = Descriptor::new(fd);
+    match context
+        .kernel
+        .borrow()
+        .descriptor(context.process, descriptor)
+    {
+        Ok(resource) => Ok(Some(resource)),
+        Err(KernelError::DescriptorNotFound { .. }) => Ok(None),
+        Err(error) => Err(kernel_host_error(error)),
+    }
+}
+
+fn kernel_host_error(_error: KernelError) -> WasmiError {
+    WasmiError::host(HostFault::InvalidArgument)
 }
 
 fn classify_process_error(error: &WasmiError) -> ProcessOutcome {
