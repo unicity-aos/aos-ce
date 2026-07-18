@@ -1,6 +1,6 @@
 # AOS Principal Linux Realm Capsule
 
-Status: active implementation programme; persistent principal Realm actor live
+Status: active implementation programme; guest-created signed process trees live
 
 Last reviewed: 2026-07-18
 
@@ -138,6 +138,22 @@ guest program
 The guest ABI is internal to the realm implementation. It may initially be a core
 WASM import module with named functions or a bounded syscall dispatcher over guest
 memory. It is not automatically a public Astrid WIT contract.
+
+The executable seed uses named imports under `aos_realm_v0`. Its process subset is
+now precise rather than POSIX-shaped by assertion:
+
+| Seed import | Current contract | Deliberate limit |
+|---|---|---|
+| `pipe(capacity, ends_ptr)` | Create one quota-charged bounded pipe and write exact read/write descriptors | No flags or socket pairs |
+| `spawn-signed(program, arg, source_fd, target_fd, handle_ptr)` | Instantiate one immutable catalog module, pass one bounded UTF-8 argument, and inherit zero or one exact pipe descriptor | No guest module bytes, PATH lookup, environment, arbitrary file actions, or `fork` |
+| `wait(handle, status_ptr)` | Park until one direct child terminates, reap it, and write an explicit exited/signalled record | No `waitpid(-1)`, groups, or nonblocking mode |
+| `signal(handle, signal)` | Terminate one direct child with a typed Realm signal | No host signal and no cross-job PID targeting |
+
+Process handles are explicit little-endian records containing the actor boot
+generation and the monotonic Realm PID. Both fields are checked before `wait` or
+`signal`; a bare PID is never sufficient across actor restart. File and pipe
+descriptors share one allocation space even though the current implementation is
+still migrating file objects into the semantic kernel.
 
 The outer boundary remains the audited Astrid Component Model surface. For example:
 
@@ -401,26 +417,37 @@ closes. Closing the final reader wakes writers, whose next write returns
 removed and its reserved capacity released only after its last read and write
 endpoint close.
 
-The model does not yet claim live `spawn`, `wait`, `pipe`, signal, or PTY guest
-imports. The required owner now exists: the capsule is a long-lived run-loop actor
-with one `RealmMachine` and semantic kernel per kernel-verified principal. It keeps
-process identifiers monotonic across tool calls within one capsule boot, reaps
-completed foreground jobs, and exposes live process, pipe, reserved-byte, command,
-and next-PID accounting. Constructing a new process table inside each one-shot
-tool call is no longer the live path.
+The capsule is a long-lived run-loop actor with one `RealmMachine` and semantic
+kernel per kernel-verified principal. It keeps process identifiers monotonic across
+tool calls within one capsule boot, reaps completed foreground jobs, and exposes
+live process, pipe, reserved-byte, command, and next-PID accounting. Constructing a
+new process table inside each one-shot tool call is no longer the live path.
 
-The reference runtime still wires a deliberately smaller executable proof: one
-foreground request creates two signed processes, maps a four-byte pipe from the
-producer's stdout to the consumer's stdin, starts the consumer first, and drives
-both independent Wasmi stores through repeated read and write suspension. The
-producer handles partial writes; the consumer observes EOF only after producer
-exit closes the last writer. The caller's fuel and captured-output budgets are
-split across the two processes, while each retains the declared per-process memory
-ceiling. Suspension counts are returned in process accounting. This proves the
-scheduler/backend junction, bounded backpressure, resumable call stacks, and actor
-ownership. It does not create guest-facing process syscalls or persistent
-background jobs. Calls are currently serialized by one capsule run loop; fair
-cross-principal scheduling becomes mandatory before background jobs are admitted.
+There are now two executable pipeline proofs. `pipe-echo` has the outer Realm
+runtime choose and connect two signed processes. `guest-pipe-echo` instead launches
+one signed supervisor guest; that guest calls `pipe`, starts the consumer and
+producer through `spawn-signed`, closes its pipe copies, blocks in `wait`, checks
+both terminal records, and exits. The scheduler dynamically admits the prepared
+child stores when the spawn host call yields. A signalled blocked child is cancelled
+without resuming its abandoned Wasmi continuation, but still receives an exact
+accounting record and is waitable by its parent.
+
+The caller's fuel and captured-output budgets are partitioned before execution
+across the root and its maximum two descendants. The process quota is reserved
+before the root runs; a third spawn fails closed. Every process has an independent
+memory ceiling, and the combined result reports aggregate fuel, output, memory
+ceilings, suspensions, and all PIDs. Success, invalid generation, child-budget
+exhaustion, signal/reap, partial construction, file/pipe descriptor collision, and
+final zero-resource cleanup are host-tested. Calls remain serialized by one
+capsule run loop; fair cross-principal scheduling is mandatory before background
+jobs are admitted.
+
+Mutating actor requests have a bounded 64-result replay window keyed by verified
+principal and broker call ID. An identical redelivery returns the prior result;
+the same ID with different arguments is rejected. This closes the observed MCP
+reconnect retry within one actor boot without pretending to provide durable
+exactly-once execution across an actor crash. Durable job receipts remain part of
+the future service contract.
 
 Astrid's subscription host returns at most one routed message per envelope and
 installs that message's principal as the invocation context before Realm KV, file,
@@ -689,6 +716,8 @@ capsules/capsule-linux-realm/
     echo/               argument-vector proof
     write-file/         truncate/create through a guest descriptor
     cat/                bounded streaming read through a guest descriptor
+    stdin-cat/          standard-input stream primitive
+    guest-pipeline/     guest-created signed pipe/spawn/wait proof
   images/
     minimal/            reproducible root image recipe and manifest
   tests/
@@ -778,7 +807,7 @@ compatibility.
 
 - the seed is based on `unicity-aos/aos-ce` main commit
   `dfa1d71c2737a016d8d4dd169d0755ff624f6b50`;
-- sixty-three focused host tests pass, including nested argument/CWD delivery,
+- seventy-one focused host tests pass, including nested argument/CWD delivery,
   file round trips across process instances, path confinement, stable host-error
   mapping, the actual manifest authority test, fuel exhaustion, memory/output
   admission, selected-generation restart reconstruction, competing-writer merge,
@@ -827,6 +856,19 @@ compatibility.
   two-process pipeline at guest PIDs 3 and 4 (PID 2 was the reaped supervisor),
   and reported next PID 5 with zero retained process records, pipe objects, or
   reserved pipe bytes;
+- the 0.10.1-built guest-process artifact is 413,048 bytes with outer SHA-256
+  `dd3889538267a329b6694a302f857ce44afb8fecdc11f56039208d17af8e95c3` and
+  installed component hash
+  `5e374fbd8a96888d5fc7e55bf03ab73f2c57412e148f6963e2efca653dab0294`;
+  the live `guest-pipe-echo` call created root PID 1, consumer PID 2, and producer
+  PID 3 from guest code, consumed 2,517 fuel with 16 resumptions and a 192 KiB
+  aggregate memory ceiling, returned exact stdout `idempotent live pipeline\n`,
+  and left zero process records, pipes, or reserved bytes;
+- that same live call hit the MCP shim's broken-pipe publish retry. Before the
+  actor replay guard, one tool call executed twice and consumed six PIDs. With the
+  bounded principal/call-ID replay guard installed, the forced retry produced one
+  completed command and next PID 4; a regression test also rejects same-ID,
+  different-argument reuse;
 - after a full daemon restart, default returned to PID 1 under boot sequence 2.
   A normal least-privilege `realm_alice` profile, granted only the three test
   capsules, independently started at PID 1 and boot sequence 1. Each status kept
@@ -890,9 +932,13 @@ companions.
 - [x] add a long-lived principal Realm actor with per-boot PID continuity,
   restart-disambiguating boot identity, verified-principal isolation, aggregate
   admission, foreground cleanup, and live accounting;
-- [ ] add guest `exec`, `posix_spawn`, wait, pipe, and signal imports;
+- [x] add the bounded guest `pipe`, signed-child spawn, direct-child wait, and
+  direct-child signal substrate with generation-checked handles;
+- [ ] extend signed-child spawn into libc-grade `posix_spawn` argument,
+  environment, executable-resolution, and file-action semantics, then add
+  `execve` without host process authority;
 - [ ] add PTYs, sessions, process groups, and job-control signals;
-- run multiple guest modules with isolated memories;
+- [x] run multiple guest modules with isolated memories;
 - compile and run a small shell;
 - add job control only with explicit conformance tests.
 
@@ -953,6 +999,12 @@ The design must be tested against at least these scenarios:
 | Actor restarts and PID 1 is reused | Boot sequence advances; the identity tuple remains unique |
 | Principal B executes while A is warm | B receives a distinct machine, PID namespace, counters, and boot sequence |
 | Actor principal bound is exhausted | New execution fails before Realm state is initialized |
+| Guest reuses a process handle after actor restart | Generation mismatch rejects it before process-table mutation |
+| Guest exceeds its admitted descendant count | Spawn fails closed; the partial foreground tree is cancelled and reaped |
+| Guest opens a file before creating a pipe | Pipe descriptors skip the file descriptor and remain in one process-local number space |
+| Guest signals a blocked direct child | Child becomes waitable, abandoned continuation is not resumed, and all resources are released |
+| MCP reconnect redelivers one mutating call ID | Actor returns the cached result without repeating the process tree or mutation |
+| Call ID is reused with different arguments | Request fails closed rather than replaying or executing |
 
 ## 18. Measurements
 
@@ -1072,7 +1124,9 @@ The first implementation must resolve these with executable evidence:
 
 - [x] place `capsule-linux-realm` in the authoritative `unicity-aos/aos-ce`
   monorepo;
-- [x] freeze the seed guest ABI to `write`, `clock-monotonic-ns`, and `exit`;
+- [x] establish the versioned seed ABI with `write`, `clock-monotonic-ns`, and
+  `exit`, then extend that private version additively with bounded process
+  operations;
 - [x] pin the current stable Wasmi 1.1.0, WAT 1.253.0, and Astrid SDK 0.7.1;
 - [x] compile Wasmi inside the outer `wasm32-unknown-unknown` capsule;
 - [x] run the embedded smoke guest under fuel, memory, descriptor, and output
@@ -1105,16 +1159,19 @@ The first implementation must resolve these with executable evidence:
 - [x] add a long-lived principal Realm actor with isolated machine state,
   monotonic per-boot PIDs, CAS-allocated boot sequences, read-only idle status,
   a 32-principal aggregate bound, and foreground process/pipe cleanup;
-- [ ] expose the tested spawn, wait, pipe, and signal operations through the
-  private guest ABI without allowing background jobs to escape actor accounting;
+- [x] expose bounded pipe creation, signed child creation, direct-child wait, and
+  direct-child signal through the private guest ABI without allowing jobs to
+  escape foreground actor accounting;
+- [x] make same-boot mutating transport retries idempotent with a bounded
+  principal/call-ID replay window and fail closed on argument mismatch;
 - [ ] add an outer workspace diff/promote workflow; realm code must not silently
   commit its own COW projection;
 - [ ] put a supported MCP broker/invocation front door in the CE distribution
   before selecting the realm by default;
 - [ ] make product startup verify and launch the exact pinned Astrid daemon rather
   than an older installed companion;
-- [ ] add guest-created processes/pipes, waits, signals, and a small shell now
-  that persistence and the foreground resumable pipeline are established;
+- [ ] generalize the signed executable catalog and spawn record, then add a small
+  shell over the now-live guest-created process/pipe/wait/signal substrate;
 - [ ] define the attenuating capsule-to-realm job contract and migrate Forge as the
   first non-interactive consumer after artifact verification exists;
 - [ ] replace `aos-shell` in the default distro only after interactive and
@@ -1126,9 +1183,10 @@ The first implementation must resolve these with executable evidence:
 - [ ] defer public WIT, Debian naming, arbitrary package claims, and native-kernel
     coupling until evidence requires them.
 
-The next executable artifact exposes the smallest honest
-`posix_spawn`/wait/pipe path from guest code into the now-live principal actor,
-including handle generation checks, bounded background admission, cancellation,
+The next executable artifact turns `spawn-signed` into the record-oriented subset
+needed by a tiny shell: catalog/path resolution, bounded argv and environment,
+multiple close/dup descriptor actions, and explicit foreground job results. It
+must preserve the current generation checks, pre-admission budgets, cancellation,
 and deterministic cleanup. The storage track adds named checkpoint/diff/reset and
-outer workspace promotion. A tiny shell follows those live mechanics; Bash and a
-compiler remain acceptance workloads.
+outer workspace promotion. Bash and a compiler remain acceptance workloads, not
+claims made by this seed.

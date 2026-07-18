@@ -43,6 +43,11 @@
   kernel-verified principal, monotonic per-boot process identities, CAS-allocated
   boot sequences, bounded aggregate principal admission, foreground resource
   reaping, and live process/pipe accounting through the existing tool protocol.
+- A private Realm `pipe`/`spawn-signed`/`wait`/`signal` ABI and signed
+  `guest-pipe-echo` workload, with generation-checked process handles, bounded
+  descendant admission, pre-partitioned request budgets, unified file/pipe
+  descriptor allocation, deterministic foreground-tree cleanup, and bounded
+  call-ID replay protection against duplicate mutating transport delivery.
 - Homebrew formula updates initiated by the tap's authenticated stable-release
   poll, eliminating the cross-repository dispatch credential.
 - Strict, signed stable/dev/nightly channel and immutable release metadata

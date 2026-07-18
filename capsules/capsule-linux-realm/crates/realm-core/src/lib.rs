@@ -689,6 +689,17 @@ impl RealmKernel {
         owner: ProcessId,
         capacity: usize,
     ) -> Result<PipeEnds, KernelError> {
+        self.create_pipe_avoiding(owner, capacity, &[])
+    }
+
+    /// Create a pipe while excluding descriptor numbers owned by an outer
+    /// backend table during the descriptor-model migration.
+    pub fn create_pipe_avoiding(
+        &mut self,
+        owner: ProcessId,
+        capacity: usize,
+        reserved_descriptors: &[Descriptor],
+    ) -> Result<PipeEnds, KernelError> {
         self.require_state(owner, ProcessState::Running, ProcessOperation::Descriptor)?;
         if capacity == 0 {
             return Err(KernelError::InvalidPipeCapacity);
@@ -710,12 +721,25 @@ impl RealmKernel {
             .processes
             .get(&owner)
             .ok_or(KernelError::ProcessNotFound(owner))?;
-        if owner_record.descriptors.len().saturating_add(2)
+        let reserved_count = reserved_descriptors
+            .iter()
+            .copied()
+            .filter(|descriptor| {
+                descriptor.get() >= FIRST_FILE_FD
+                    && !owner_record.descriptors.contains_key(descriptor)
+            })
+            .collect::<BTreeSet<_>>()
+            .len();
+        if owner_record
+            .descriptors
+            .len()
+            .saturating_add(reserved_count)
+            .saturating_add(2)
             > self.limits.max_descriptors_per_process
         {
             return Err(KernelError::QuotaExceeded(Quota::Descriptors));
         }
-        let descriptors = available_descriptors(owner_record, 2)?;
+        let descriptors = available_descriptors(owner_record, reserved_descriptors, 2)?;
         let pipe_id = self.take_pipe_id()?;
         let ends = PipeEnds {
             read: descriptors[0],
@@ -1149,13 +1173,14 @@ fn validate_cwd(cwd: &str) -> Result<(), KernelError> {
 
 fn available_descriptors(
     record: &ProcessRecord,
+    reserved: &[Descriptor],
     count: usize,
 ) -> Result<Vec<Descriptor>, KernelError> {
     let mut result = Vec::with_capacity(count);
     let mut raw = FIRST_FILE_FD;
     while result.len() < count {
         let descriptor = Descriptor::new(raw);
-        if !record.descriptors.contains_key(&descriptor) {
+        if !record.descriptors.contains_key(&descriptor) && !reserved.contains(&descriptor) {
             result.push(descriptor);
         }
         raw = raw.checked_add(1).ok_or(KernelError::IdentifierExhausted)?;
@@ -1590,6 +1615,29 @@ mod tests {
         );
         assert_eq!(kernel.pipe_count(), 0);
         assert_eq!(kernel.reserved_pipe_bytes(), 0);
+    }
+
+    #[test]
+    fn pipe_allocation_avoids_outer_backend_descriptor_numbers() {
+        let mut kernel = RealmKernel::new(RealmLimits::default());
+        let process = running_root(&mut kernel, 1);
+        let ends = kernel
+            .create_pipe_avoiding(process, 4, &[Descriptor::new(3), Descriptor::new(5)])
+            .expect("pipe avoids reserved descriptors");
+
+        assert_eq!(ends.read, Descriptor::new(4));
+        assert_eq!(ends.write, Descriptor::new(6));
+
+        let mut bounded = RealmKernel::new(RealmLimits {
+            max_descriptors_per_process: 2,
+            ..RealmLimits::default()
+        });
+        let bounded_process = running_root(&mut bounded, 2);
+        assert_eq!(
+            bounded.create_pipe_avoiding(bounded_process, 4, &[Descriptor::new(3)]),
+            Err(KernelError::QuotaExceeded(Quota::Descriptors))
+        );
+        assert_eq!(bounded.pipe_count(), 0);
     }
 
     #[test]
