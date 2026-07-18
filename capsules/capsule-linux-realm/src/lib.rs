@@ -9,9 +9,9 @@ mod actor;
 mod host;
 
 use aos_realm_runtime::{
-    CAT_GUEST, ECHO_GUEST, ExecutionReport, HostFault, PWD_GUEST, ProcessConfig, ProcessOutcome,
-    RealmHost, RealmIoError, RealmMachine, RealmMachineStatus, RunLimits, SMOKE_WRITE_GUEST,
-    STDIN_CAT_GUEST, WRITE_FILE_GUEST,
+    CAT_GUEST, ECHO_GUEST, ExecutionReport, GUEST_PIPELINE_GUEST, HostFault, PWD_GUEST,
+    ProcessConfig, ProcessOutcome, ProcessTreeReport, RealmHost, RealmIoError, RealmMachine,
+    RealmMachineStatus, RunLimits, SMOKE_WRITE_GUEST, STDIN_CAT_GUEST, Signal, WRITE_FILE_GUEST,
 };
 use aos_realm_vfs::FsStatus;
 use astrid_sdk::prelude::*;
@@ -36,6 +36,7 @@ pub enum RealmProgram {
     Pwd,
     Echo,
     PipeEcho,
+    GuestPipeEcho,
     WriteFile,
     Cat,
 }
@@ -104,7 +105,7 @@ struct StatusResponse {
     home_files: usize,
     home_manifest: Option<String>,
     mounts: Vec<MountStatus>,
-    commands: [&'static str; 6],
+    commands: [&'static str; 7],
     workspace_commit: &'static str,
     host_process: bool,
     actor_state: &'static str,
@@ -155,6 +156,7 @@ struct SelectedProgram {
 enum SelectedExecution {
     Single(&'static [u8]),
     EchoPipeline,
+    GuestPipeline,
 }
 
 #[capsule]
@@ -296,7 +298,55 @@ fn execute_selected(
             ];
             Ok((combine_pipeline(pipeline), process_ids))
         }
+        SelectedExecution::GuestPipeline => {
+            let tree = machine
+                .execute_process_tree(
+                    GUEST_PIPELINE_GUEST,
+                    ProcessConfig {
+                        argv: selected.argv.clone(),
+                        cwd: cwd.to_string(),
+                    },
+                    limits,
+                    realm_host,
+                    2,
+                )
+                .map_err(|error| SysError::ApiError(error.to_string()))?;
+            let mut process_ids = vec![tree.root.process_id.get()];
+            process_ids.extend(tree.children.iter().map(|child| child.process_id.get()));
+            Ok((combine_process_tree(tree), process_ids))
+        }
     }
+}
+
+fn combine_process_tree(tree: ProcessTreeReport) -> ExecutionReport {
+    let mut reports = Vec::with_capacity(tree.children.len().saturating_add(1));
+    reports.push(tree.root.execution);
+    reports.extend(tree.children.into_iter().map(|child| child.execution));
+    let outcome = reports
+        .iter()
+        .find(|report| report.outcome != ProcessOutcome::Exited(0))
+        .map(|report| report.outcome.clone())
+        .unwrap_or(ProcessOutcome::Exited(0));
+    reports.into_iter().fold(
+        ExecutionReport {
+            outcome,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            fuel_consumed: 0,
+            memory_limit_bytes: 0,
+            suspensions: 0,
+        },
+        |mut combined, report| {
+            combined.stdout.extend_from_slice(&report.stdout);
+            combined.stderr.extend_from_slice(&report.stderr);
+            combined.fuel_consumed = combined.fuel_consumed.saturating_add(report.fuel_consumed);
+            combined.memory_limit_bytes = combined
+                .memory_limit_bytes
+                .saturating_add(report.memory_limit_bytes);
+            combined.suspensions = combined.suspensions.saturating_add(report.suspensions);
+            combined
+        },
+    )
 }
 
 fn combine_pipeline(pipeline: aos_realm_runtime::PipelineReport) -> ExecutionReport {
@@ -342,11 +392,12 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
             "pwd" => RealmProgram::Pwd,
             "echo" => RealmProgram::Echo,
             "pipe-echo" => RealmProgram::PipeEcho,
+            "guest-pipe-echo" => RealmProgram::GuestPipeEcho,
             "write-file" => RealmProgram::WriteFile,
             "cat" => RealmProgram::Cat,
             _ => {
                 return Err(SysError::ApiError(format!(
-                    "unsupported realm command `{command}`; supported: pwd, echo, pipe-echo, write-file, cat, smoke-write"
+                    "unsupported realm command `{command}`; supported: pwd, echo, pipe-echo, guest-pipe-echo, write-file, cat, smoke-write"
                 )));
             }
         }
@@ -382,6 +433,14 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
                 "pipe-echo",
                 SelectedExecution::EchoPipeline,
                 vec!["echo".to_string(), args.args[0].clone()],
+            )
+        }
+        RealmProgram::GuestPipeEcho => {
+            require_arity("guest-pipe-echo", &args.args, 1)?;
+            (
+                "guest-pipe-echo",
+                SelectedExecution::GuestPipeline,
+                vec!["guest-pipeline".to_string(), args.args[0].clone()],
             )
         }
         RealmProgram::WriteFile => {
@@ -464,6 +523,7 @@ fn status_response(
             "pwd",
             "echo",
             "pipe-echo",
+            "guest-pipe-echo",
             "write-file",
             "cat",
             "smoke-write",
@@ -483,12 +543,23 @@ fn status_response(
 fn outcome_fields(outcome: &ProcessOutcome) -> (&'static str, Option<i32>, Option<String>) {
     match outcome {
         ProcessOutcome::Exited(status) => ("exited", Some(*status), None),
+        ProcessOutcome::Signaled(signal) => ("signaled", None, Some(signal_name(*signal))),
         ProcessOutcome::FuelExhausted => {
             ("fuel-exhausted", None, Some("fuel exhausted".to_string()))
         }
         ProcessOutcome::HostFault(fault) => ("host-fault", None, Some(host_fault_name(*fault))),
         ProcessOutcome::Trapped(message) => ("trapped", None, Some(message.clone())),
     }
+}
+
+fn signal_name(signal: Signal) -> String {
+    match signal {
+        Signal::Interrupt => "interrupt",
+        Signal::Terminate => "terminate",
+        Signal::Kill => "kill",
+        Signal::Pipe => "pipe",
+    }
+    .to_string()
 }
 
 fn host_fault_name(fault: HostFault) -> String {
@@ -600,6 +671,27 @@ mod tests {
         assert_eq!(response.outcome, "exited");
         assert_eq!(response.stdout, "hello through a four-byte pipe\n");
         assert!(response.suspensions >= 2);
+    }
+
+    #[test]
+    fn guest_pipe_echo_creates_and_waits_for_its_own_children() {
+        let response = run_command(
+            ExecArgs {
+                command: Some("guest-pipe-echo".to_string()),
+                args: vec!["guest-selected process topology".to_string()],
+                ..ExecArgs::default()
+            },
+            "alice".to_string(),
+            Box::<TestHost>::default(),
+        )
+        .expect("guest-created pipeline succeeds");
+
+        assert_eq!(response.processes, 3);
+        assert_eq!(response.process_ids, vec![1, 2, 3]);
+        assert_eq!(response.outcome, "exited");
+        assert_eq!(response.stdout, "guest-selected process topology\n");
+        assert!(response.suspensions >= 2);
+        assert!(response.fuel_consumed <= HARD_MAX_FUEL);
     }
 
     #[test]

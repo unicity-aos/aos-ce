@@ -3,12 +3,17 @@
 //! Bounded execution of nested core WebAssembly processes.
 
 use aos_realm_abi::{
-    Descriptor, FIRST_FILE_FD, IMPORT_MODULE_V0, MAX_ARGUMENT_BYTES, MAX_PATH_BYTES, OPEN_READ,
-    OPEN_WRITE_TRUNCATE, ProcessId, STDERR_FD, STDOUT_FD,
+    Descriptor, FIRST_FILE_FD, IMPORT_MODULE_V0, MAX_ARGUMENT_BYTES, MAX_PATH_BYTES, NO_DESCRIPTOR,
+    OPEN_READ, OPEN_WRITE_TRUNCATE, PIPE_ENDS_BYTES, PROCESS_HANDLE_BYTES,
+    PROCESS_HANDLE_GENERATION_OFFSET, PROCESS_HANDLE_ID_OFFSET, ProcessHandle, ProcessId,
+    SIGNAL_INTERRUPT, SIGNAL_KILL, SIGNAL_PIPE, SIGNAL_TERMINATE, SIGNED_PROGRAM_ECHO,
+    SIGNED_PROGRAM_STDIN_CAT, STDERR_FD, STDOUT_FD, TERMINATION_BYTES, TERMINATION_EXITED,
+    TERMINATION_SIGNALED,
 };
 use aos_realm_core::{
     DescriptorBinding, DescriptorResource, ExecutableId, KernelError, ParkResult, PipeReadResult,
-    PipeWriteResult, ProcessSpec, Quota, RealmKernel, RealmLimits, Signal,
+    PipeWriteResult, ProcessSpec, ProcessState, Quota, RealmKernel, RealmLimits, Termination,
+    WaitResult,
 };
 use std::{cell::RefCell, collections::BTreeMap, fmt, rc::Rc, vec::Vec};
 use wasmi::{
@@ -18,8 +23,10 @@ use wasmi::{
 
 mod pipeline;
 
+pub use aos_realm_core::Signal;
 pub use pipeline::{
-    PipelineError, PipelineProcessReport, PipelineReport, RealmMachine, RealmMachineStatus,
+    PipelineError, PipelineProcessReport, PipelineReport, ProcessTreeReport, RealmMachine,
+    RealmMachineStatus,
 };
 
 /// Compiled smoke guest embedded into the capsule at build time.
@@ -39,6 +46,10 @@ pub const CAT_GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cat.wasm"
 
 /// Guest copying standard input to standard output with partial-write handling.
 pub const STDIN_CAT_GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/stdin_cat.wasm"));
+
+/// Guest that creates, connects, waits for, and reaps its own signed pipeline.
+pub const GUEST_PIPELINE_GUEST: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/guest_pipeline.wasm"));
 
 /// Hard limits for one nested process invocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +179,8 @@ impl RealmHost for DenyRealmHost {
 pub enum ProcessOutcome {
     /// Process called the realm `exit` import or returned from `_start`.
     Exited(i32),
+    /// Process was terminated by another process through the Realm signal ABI.
+    Signaled(Signal),
     /// Process exhausted its deterministic instruction budget.
     FuelExhausted,
     /// Process violated a realm host-call boundary.
@@ -280,6 +293,7 @@ struct HostState {
     realm_host: Box<dyn RealmHost>,
     files: BTreeMap<i32, Box<dyn RealmFile>>,
     next_fd: i32,
+    descriptor_limit: usize,
     process: Option<ProcessContext>,
     memory: Option<Memory>,
     pending_io: Option<PendingIo>,
@@ -296,6 +310,9 @@ impl HostState {
 struct ProcessContext {
     process: ProcessId,
     kernel: Rc<RefCell<RealmKernel>>,
+    generation: u64,
+    descriptor_limit: usize,
+    spawn: Option<Rc<RefCell<SpawnState>>>,
 }
 
 enum PendingIo {
@@ -308,6 +325,29 @@ enum PendingIo {
         descriptor: Descriptor,
         bytes: Vec<u8>,
     },
+    Spawn {
+        child: ProcessId,
+        handle_pointer: usize,
+    },
+    Wait {
+        child: ProcessId,
+        status_pointer: usize,
+    },
+}
+
+struct PreparedChild {
+    process: ProcessId,
+    store: Store<HostState>,
+    start: TypedFunc<(), ()>,
+    limits: RunLimits,
+}
+
+struct SpawnState {
+    runtime: RealmRuntime,
+    child_limits: RunLimits,
+    remaining_children: usize,
+    prepared: Vec<PreparedChild>,
+    reaped: Vec<(ProcessId, Termination)>,
 }
 
 #[derive(Debug)]
@@ -323,6 +363,7 @@ impl std::error::Error for ProcessSuspended {}
 impl wasmi::errors::HostError for ProcessSuspended {}
 
 /// Reference interpreter for the first AOS Realm guest ABI.
+#[derive(Clone)]
 pub struct RealmRuntime {
     engine: Engine,
 }
@@ -393,6 +434,7 @@ impl RealmRuntime {
             realm_host,
             files: BTreeMap::new(),
             next_fd: FIRST_FILE_FD,
+            descriptor_limit: 64,
             process: process_context,
             memory: None,
             pending_io: None,
@@ -458,6 +500,13 @@ fn validate_process(process: &ProcessConfig) -> Result<(), LaunchError> {
     Ok(())
 }
 
+fn process_spec(wasm: &[u8], process: &ProcessConfig) -> ProcessSpec {
+    ProcessSpec::new(
+        ExecutableId::new(*blake3::hash(wasm).as_bytes()),
+        process.cwd.clone(),
+    )
+}
+
 fn install_realm_v0(linker: &mut Linker<HostState>) -> Result<(), LaunchError> {
     linker
         .func_wrap(
@@ -516,6 +565,56 @@ fn install_realm_v0(linker: &mut Linker<HostState>) -> Result<(), LaunchError> {
             IMPORT_MODULE_V0,
             "close",
             |mut caller: Caller<'_, HostState>, fd: i32| realm_close(&mut caller, fd),
+        )
+        .map_err(|error| LaunchError::RuntimeConfiguration(error.to_string()))?;
+    linker
+        .func_wrap(
+            IMPORT_MODULE_V0,
+            "pipe",
+            |mut caller: Caller<'_, HostState>, capacity: i32, ends_ptr: i32| {
+                realm_pipe(&mut caller, capacity, ends_ptr)
+            },
+        )
+        .map_err(|error| LaunchError::RuntimeConfiguration(error.to_string()))?;
+    linker
+        .func_wrap(
+            IMPORT_MODULE_V0,
+            "spawn-signed",
+            |mut caller: Caller<'_, HostState>,
+             program: i32,
+             arg_ptr: i32,
+             arg_len: i32,
+             source_fd: i32,
+             target_fd: i32,
+             handle_ptr: i32| {
+                realm_spawn_signed(
+                    &mut caller,
+                    program,
+                    arg_ptr,
+                    arg_len,
+                    source_fd,
+                    target_fd,
+                    handle_ptr,
+                )
+            },
+        )
+        .map_err(|error| LaunchError::RuntimeConfiguration(error.to_string()))?;
+    linker
+        .func_wrap(
+            IMPORT_MODULE_V0,
+            "wait",
+            |mut caller: Caller<'_, HostState>, handle_ptr: i32, status_ptr: i32| {
+                realm_wait(&mut caller, handle_ptr, status_ptr)
+            },
+        )
+        .map_err(|error| LaunchError::RuntimeConfiguration(error.to_string()))?;
+    linker
+        .func_wrap(
+            IMPORT_MODULE_V0,
+            "signal",
+            |caller: Caller<'_, HostState>, handle_ptr: i32, signal: i32| {
+                realm_signal(&caller, handle_ptr, signal)
+            },
         )
         .map_err(|error| LaunchError::RuntimeConfiguration(error.to_string()))?;
     linker
@@ -607,6 +706,9 @@ fn realm_open(
         OPEN_WRITE_TRUNCATE => OpenMode::WriteTruncate,
         _ => return Err(WasmiError::host(HostFault::InvalidArgument)),
     };
+    if descriptor_count(caller.data()) >= caller.data().descriptor_limit {
+        return Err(WasmiError::host(HostFault::InvalidArgument));
+    }
     let cwd = caller.data().cwd.clone();
     let file = caller
         .data_mut()
@@ -635,6 +737,15 @@ fn core_descriptor_exists(state: &HostState, fd: i32) -> bool {
             .descriptor(context.process, Descriptor::new(fd))
             .is_ok()
     })
+}
+
+fn descriptor_count(state: &HostState) -> usize {
+    let core = state
+        .process
+        .as_ref()
+        .and_then(|context| context.kernel.borrow().process(context.process).ok())
+        .map_or(0, |process| process.descriptors);
+    state.files.len().saturating_add(core)
 }
 
 fn realm_read(
@@ -719,6 +830,307 @@ fn realm_close(caller: &mut Caller<'_, HostState>, fd: i32) -> Result<i32, Wasmi
     file.close()
         .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
     Ok(0)
+}
+
+fn realm_pipe(
+    caller: &mut Caller<'_, HostState>,
+    capacity: i32,
+    ends_ptr: i32,
+) -> Result<i32, WasmiError> {
+    let capacity =
+        usize::try_from(capacity).map_err(|_| WasmiError::host(HostFault::InvalidArgument))?;
+    validate_guest_range(caller, ends_ptr, PIPE_ENDS_BYTES)?;
+    let context = caller
+        .data()
+        .process
+        .clone()
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
+    if descriptor_count(caller.data()).saturating_add(2) > context.descriptor_limit {
+        return Err(WasmiError::host(HostFault::InvalidArgument));
+    }
+    let reserved = caller
+        .data()
+        .files
+        .keys()
+        .copied()
+        .map(Descriptor::new)
+        .collect::<Vec<_>>();
+    let ends = context
+        .kernel
+        .borrow_mut()
+        .create_pipe_avoiding(context.process, capacity, &reserved)
+        .map_err(kernel_host_error)?;
+    let mut encoded = [0_u8; PIPE_ENDS_BYTES];
+    encoded[..4].copy_from_slice(&ends.read.get().to_le_bytes());
+    encoded[4..].copy_from_slice(&ends.write.get().to_le_bytes());
+    write_guest_bytes(caller, ends_ptr, PIPE_ENDS_BYTES, &encoded)?;
+    Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn realm_spawn_signed(
+    caller: &mut Caller<'_, HostState>,
+    program: i32,
+    arg_ptr: i32,
+    arg_len: i32,
+    source_fd: i32,
+    target_fd: i32,
+    handle_ptr: i32,
+) -> Result<i32, WasmiError> {
+    let argument_length =
+        usize::try_from(arg_len).map_err(|_| WasmiError::host(HostFault::InvalidPointer))?;
+    if argument_length > MAX_ARGUMENT_BYTES {
+        return Err(WasmiError::host(HostFault::InvalidArgument));
+    }
+    validate_guest_range(caller, handle_ptr, PROCESS_HANDLE_BYTES)?;
+    let argument = read_guest_bytes(caller, arg_ptr, argument_length)?;
+    let argument =
+        String::from_utf8(argument).map_err(|_| WasmiError::host(HostFault::InvalidUtf8))?;
+    let context = caller
+        .data()
+        .process
+        .clone()
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
+    let spawn = context
+        .spawn
+        .clone()
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
+    let (runtime, child_limits) = {
+        let state = spawn.borrow();
+        if state.remaining_children == 0 {
+            return Err(WasmiError::host(HostFault::InvalidArgument));
+        }
+        (state.runtime.clone(), state.child_limits)
+    };
+    let (wasm, process) = signed_process(program, argument, &caller.data().cwd)?;
+    let bindings = spawn_bindings(source_fd, target_fd)?;
+
+    // Validate and instantiate the signed image before allocating a PID. The
+    // guest cannot select bytes or imports; it selects one immutable catalog
+    // entry and structured inputs.
+    let (mut child_store, child_start) = runtime
+        .prepare_process(
+            wasm,
+            process.clone(),
+            child_limits,
+            Box::<DenyRealmHost>::default(),
+            None,
+        )
+        .map_err(|_| WasmiError::host(HostFault::InvalidArgument))?;
+
+    let child = {
+        let mut kernel = context.kernel.borrow_mut();
+        let child = kernel
+            .spawn_child(context.process, process_spec(wasm, &process), &bindings)
+            .map_err(kernel_host_error)?;
+        if let Err(error) = kernel.admit(child) {
+            rollback_child(&mut kernel, context.process, child);
+            return Err(kernel_host_error(error));
+        }
+        if let Err(error) = kernel.yield_now(context.process) {
+            rollback_child(&mut kernel, context.process, child);
+            return Err(kernel_host_error(error));
+        }
+        child
+    };
+
+    child_store.data_mut().descriptor_limit = context.descriptor_limit;
+    child_store.data_mut().process = Some(ProcessContext {
+        process: child,
+        kernel: Rc::clone(&context.kernel),
+        generation: context.generation,
+        descriptor_limit: context.descriptor_limit,
+        spawn: Some(Rc::clone(&spawn)),
+    });
+    {
+        let mut state = spawn.borrow_mut();
+        state.remaining_children = state.remaining_children.saturating_sub(1);
+        state.prepared.push(PreparedChild {
+            process: child,
+            store: child_store,
+            start: child_start,
+            limits: child_limits,
+        });
+    }
+    let (_, handle_pointer) = validate_guest_range(caller, handle_ptr, PROCESS_HANDLE_BYTES)?;
+    caller.data_mut().pending_io = Some(PendingIo::Spawn {
+        child,
+        handle_pointer,
+    });
+    caller.data_mut().suspensions = caller.data().suspensions.saturating_add(1);
+    Err(WasmiError::host(ProcessSuspended))
+}
+
+fn realm_wait(
+    caller: &mut Caller<'_, HostState>,
+    handle_ptr: i32,
+    status_ptr: i32,
+) -> Result<i32, WasmiError> {
+    let (_, status_pointer) = validate_guest_range(caller, status_ptr, TERMINATION_BYTES)?;
+    let context = caller
+        .data()
+        .process
+        .clone()
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
+    let child = read_process_handle(caller, handle_ptr, context.generation)?;
+    let result = context
+        .kernel
+        .borrow_mut()
+        .wait_child(context.process, child)
+        .map_err(kernel_host_error)?;
+    match result {
+        WaitResult::Reaped(termination) => {
+            record_reaped_child(&context, child, termination);
+            write_termination_to_caller(caller, status_ptr, termination)?;
+            Ok(0)
+        }
+        WaitResult::Pending => {
+            caller.data_mut().pending_io = Some(PendingIo::Wait {
+                child,
+                status_pointer,
+            });
+            caller.data_mut().suspensions = caller.data().suspensions.saturating_add(1);
+            Err(WasmiError::host(ProcessSuspended))
+        }
+    }
+}
+
+fn record_reaped_child(context: &ProcessContext, child: ProcessId, termination: Termination) {
+    if let Some(spawn) = &context.spawn {
+        spawn.borrow_mut().reaped.push((child, termination));
+    }
+}
+
+fn realm_signal(
+    caller: &Caller<'_, HostState>,
+    handle_ptr: i32,
+    signal: i32,
+) -> Result<i32, WasmiError> {
+    let context = caller
+        .data()
+        .process
+        .clone()
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
+    let child = read_process_handle(caller, handle_ptr, context.generation)?;
+    let signal = match signal {
+        SIGNAL_INTERRUPT => Signal::Interrupt,
+        SIGNAL_TERMINATE => Signal::Terminate,
+        SIGNAL_KILL => Signal::Kill,
+        SIGNAL_PIPE => Signal::Pipe,
+        _ => return Err(WasmiError::host(HostFault::InvalidArgument)),
+    };
+    let mut kernel = context.kernel.borrow_mut();
+    let snapshot = kernel.process(child).map_err(kernel_host_error)?;
+    if snapshot.parent != Some(context.process) {
+        return Err(WasmiError::host(HostFault::InvalidArgument));
+    }
+    kernel.signal(child, signal).map_err(kernel_host_error)?;
+    Ok(0)
+}
+
+fn signed_process(
+    program: i32,
+    argument: String,
+    cwd: &str,
+) -> Result<(&'static [u8], ProcessConfig), WasmiError> {
+    match program {
+        SIGNED_PROGRAM_ECHO => Ok((
+            ECHO_GUEST,
+            ProcessConfig {
+                argv: vec!["echo".to_string(), argument],
+                cwd: cwd.to_string(),
+            },
+        )),
+        SIGNED_PROGRAM_STDIN_CAT if argument.is_empty() => Ok((
+            STDIN_CAT_GUEST,
+            ProcessConfig {
+                argv: vec!["stdin-cat".to_string()],
+                cwd: cwd.to_string(),
+            },
+        )),
+        _ => Err(WasmiError::host(HostFault::InvalidArgument)),
+    }
+}
+
+fn spawn_bindings(source_fd: i32, target_fd: i32) -> Result<Vec<DescriptorBinding>, WasmiError> {
+    match (source_fd, target_fd) {
+        (NO_DESCRIPTOR, NO_DESCRIPTOR) => Ok(Vec::new()),
+        (NO_DESCRIPTOR, _) | (_, NO_DESCRIPTOR) => {
+            Err(WasmiError::host(HostFault::InvalidArgument))
+        }
+        (source, target) => Ok(vec![DescriptorBinding {
+            source: Descriptor::new(source),
+            target: Descriptor::new(target),
+        }]),
+    }
+}
+
+fn rollback_child(kernel: &mut RealmKernel, parent: ProcessId, child: ProcessId) {
+    let _ = kernel.signal(child, Signal::Kill);
+    let _ = kernel.wait_child(parent, child);
+}
+
+fn read_process_handle(
+    caller: &Caller<'_, HostState>,
+    handle_ptr: i32,
+    expected_generation: u64,
+) -> Result<ProcessId, WasmiError> {
+    let bytes = read_guest_bytes(caller, handle_ptr, PROCESS_HANDLE_BYTES)?;
+    let generation = decode_u64(&bytes, PROCESS_HANDLE_GENERATION_OFFSET)?;
+    let process = decode_u64(&bytes, PROCESS_HANDLE_ID_OFFSET)?;
+    if generation != expected_generation || process == 0 {
+        return Err(WasmiError::host(HostFault::InvalidArgument));
+    }
+    Ok(ProcessId::new(process))
+}
+
+fn decode_u64(bytes: &[u8], offset: usize) -> Result<u64, WasmiError> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
+    let encoded: [u8; 8] = bytes
+        .get(offset..end)
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?
+        .try_into()
+        .map_err(|_| WasmiError::host(HostFault::InvalidArgument))?;
+    Ok(u64::from_le_bytes(encoded))
+}
+
+fn encode_process_handle(handle: ProcessHandle) -> [u8; PROCESS_HANDLE_BYTES] {
+    let mut bytes = [0_u8; PROCESS_HANDLE_BYTES];
+    bytes[PROCESS_HANDLE_GENERATION_OFFSET..PROCESS_HANDLE_GENERATION_OFFSET + 8]
+        .copy_from_slice(&handle.generation().to_le_bytes());
+    bytes[PROCESS_HANDLE_ID_OFFSET..PROCESS_HANDLE_ID_OFFSET + 8]
+        .copy_from_slice(&handle.process().get().to_le_bytes());
+    bytes
+}
+
+fn encode_termination(termination: Termination) -> [u8; TERMINATION_BYTES] {
+    let (kind, value) = match termination {
+        Termination::Exited(status) => (TERMINATION_EXITED, status),
+        Termination::Signaled(signal) => (
+            TERMINATION_SIGNALED,
+            match signal {
+                Signal::Interrupt => SIGNAL_INTERRUPT,
+                Signal::Terminate => SIGNAL_TERMINATE,
+                Signal::Kill => SIGNAL_KILL,
+                Signal::Pipe => SIGNAL_PIPE,
+            },
+        ),
+    };
+    let mut bytes = [0_u8; TERMINATION_BYTES];
+    bytes[..4].copy_from_slice(&kind.to_le_bytes());
+    bytes[4..].copy_from_slice(&value.to_le_bytes());
+    bytes
+}
+
+fn write_termination_to_caller(
+    caller: &mut Caller<'_, HostState>,
+    status_ptr: i32,
+    termination: Termination,
+) -> Result<(), WasmiError> {
+    let bytes = encode_termination(termination);
+    write_guest_bytes(caller, status_ptr, TERMINATION_BYTES, &bytes)
 }
 
 fn validate_guest_range(

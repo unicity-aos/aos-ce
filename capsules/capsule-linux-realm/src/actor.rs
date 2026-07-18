@@ -1,7 +1,7 @@
 //! Long-lived Astrid run-loop that owns one isolated Realm machine per principal.
 
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 const EXEC_TOPIC: &str = "tool.v1.execute.linux_realm_exec";
 const STATUS_TOPIC: &str = "tool.v1.execute.linux_realm_status";
@@ -10,6 +10,9 @@ const BOOT_SEQUENCE_KEY: &str = "realm/default/actor/boot-sequence";
 const BOOT_SEQUENCE_CAS_ATTEMPTS: usize = 8;
 const MAX_PRINCIPAL_REALMS: usize = 32;
 const ACTOR_POLL_MS: u64 = 250;
+const MAX_REPLAY_RESULTS: usize = 64;
+const MAX_CALL_ID_BYTES: usize = 256;
+const MAX_REPLAY_ARGUMENT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct ToolRequest {
@@ -29,7 +32,7 @@ impl PrincipalRealm {
         Self {
             boot_sequence,
             commands_completed: 0,
-            machine: RealmMachine::default(),
+            machine: RealmMachine::with_generation(boot_sequence),
         }
     }
 
@@ -43,9 +46,25 @@ impl PrincipalRealm {
     }
 }
 
-#[derive(Default)]
 struct RealmActor {
     principals: BTreeMap<String, PrincipalRealm>,
+    replay: VecDeque<ReplayEntry>,
+}
+
+impl Default for RealmActor {
+    fn default() -> Self {
+        Self {
+            principals: BTreeMap::new(),
+            replay: VecDeque::with_capacity(MAX_REPLAY_RESULTS),
+        }
+    }
+}
+
+struct ReplayEntry {
+    principal: String,
+    call_id: String,
+    arguments: String,
+    result: Result<String, String>,
 }
 
 impl RealmActor {
@@ -126,6 +145,47 @@ impl RealmActor {
         serde_json::to_string(&response).map_err(|error| SysError::ApiError(error.to_string()))
     }
 
+    fn execute_replay_safe(
+        &mut self,
+        principal: &str,
+        call_id: &str,
+        arguments: serde_json::Value,
+        execute: impl FnOnce(&mut Self, ExecArgs) -> Result<String, String>,
+    ) -> Result<String, String> {
+        if call_id.is_empty() || call_id.len() > MAX_CALL_ID_BYTES {
+            return Err("Realm tool call_id is empty or too large".to_string());
+        }
+        let arguments = serde_json::to_string(&arguments)
+            .map_err(|error| format!("failed to encode tool arguments: {error}"))?;
+        if arguments.len() > MAX_REPLAY_ARGUMENT_BYTES {
+            return Err("Realm tool arguments exceed the replay-safe bound".to_string());
+        }
+        if let Some(entry) = self
+            .replay
+            .iter()
+            .find(|entry| entry.principal == principal && entry.call_id == call_id)
+        {
+            if entry.arguments != arguments {
+                return Err("Realm tool call_id was reused with different arguments".to_string());
+            }
+            return entry.result.clone();
+        }
+
+        let result = serde_json::from_str::<ExecArgs>(&arguments)
+            .map_err(|error| format!("failed to parse tool arguments: {error}"))
+            .and_then(|args| execute(self, args));
+        if self.replay.len() == MAX_REPLAY_RESULTS {
+            self.replay.pop_front();
+        }
+        self.replay.push_back(ReplayEntry {
+            principal: principal.to_string(),
+            call_id: call_id.to_string(),
+            arguments,
+            result: result.clone(),
+        });
+        result
+    }
+
     fn status(&mut self, principal: &str, _args: StatusArgs) -> Result<String, SysError> {
         let layout = layout_state()?;
         let filesystem = home_status()?;
@@ -194,13 +254,16 @@ fn handle_tool_message(
         .verified()
         .ok_or_else(|| "AOS Realm requires a kernel-verified principal".to_string())?;
     match expected_tool {
-        "linux_realm_exec" => {
-            let args = serde_json::from_value::<ExecArgs>(request.arguments)
-                .map_err(|error| format!("failed to parse tool arguments: {error}"))?;
-            actor
-                .execute(principal, args)
-                .map_err(|error| error.to_string())
-        }
+        "linux_realm_exec" => actor.execute_replay_safe(
+            principal,
+            &request.call_id,
+            request.arguments,
+            |actor, args| {
+                actor
+                    .execute(principal, args)
+                    .map_err(|error| error.to_string())
+            },
+        ),
         "linux_realm_status" => {
             let args = serde_json::from_value::<StatusArgs>(request.arguments)
                 .map_err(|error| format!("failed to parse tool arguments: {error}"))?;
@@ -375,6 +438,52 @@ mod tests {
         assert_eq!(bob_first.realm_boot_sequence, 11);
         assert_eq!(bob_first.process_ids, vec![1]);
         assert_eq!(bob_first.next_process_id, Some(2));
+    }
+
+    #[test]
+    fn duplicate_mutating_call_id_replays_without_executing_twice() {
+        let mut actor = RealmActor::default();
+        let arguments = serde_json::json!({
+            "command": "echo",
+            "args": ["exactly once"]
+        });
+        let first = actor
+            .execute_replay_safe("alice", "call-1", arguments.clone(), |actor, args| {
+                actor
+                    .execute_with_boot("alice", args, Box::<TestHost>::default(), || Ok(7))
+                    .and_then(|response| {
+                        serde_json::to_string(&response)
+                            .map_err(|error| SysError::ApiError(error.to_string()))
+                    })
+                    .map_err(|error| error.to_string())
+            })
+            .expect("first request executes");
+        let replay = actor
+            .execute_replay_safe("alice", "call-1", arguments.clone(), |_actor, _args| {
+                panic!("duplicate request must not execute")
+            })
+            .expect("duplicate request replays");
+
+        assert_eq!(replay, first);
+        let snapshot = actor.snapshot("alice");
+        assert_eq!(snapshot.commands_completed, 1);
+        assert_eq!(
+            snapshot
+                .machine
+                .next_process_id
+                .map(|process| process.get()),
+            Some(2)
+        );
+
+        let mismatch = actor
+            .execute_replay_safe(
+                "alice",
+                "call-1",
+                serde_json::json!({"command": "pwd"}),
+                |_actor, _args| panic!("mismatched duplicate must not execute"),
+            )
+            .expect_err("same call id with different arguments fails closed");
+        assert!(mismatch.contains("reused with different arguments"));
     }
 
     #[test]

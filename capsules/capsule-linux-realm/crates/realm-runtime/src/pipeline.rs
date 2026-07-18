@@ -21,6 +21,16 @@ pub struct PipelineReport {
     pub consumer: PipelineProcessReport,
 }
 
+/// One foreground process tree created by guest `spawn-signed` calls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessTreeReport {
+    /// The guest process submitted by the outer Realm request.
+    pub root: PipelineProcessReport,
+    /// Every signed descendant created during that foreground request, ordered
+    /// by its monotonic process identity.
+    pub children: Vec<PipelineProcessReport>,
+}
+
 /// Observable accounting for one long-lived realm machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RealmMachineStatus {
@@ -43,28 +53,45 @@ pub struct RealmMachine {
     runtime: RealmRuntime,
     kernel: Rc<RefCell<RealmKernel>>,
     limits: RealmLimits,
+    generation: u64,
 }
 
 impl Default for RealmMachine {
     fn default() -> Self {
-        Self::new(RealmLimits {
-            max_processes: 64,
-            max_pipes: 64,
-            max_pipe_bytes: MAX_IO_BYTES,
-            max_total_pipe_bytes: MAX_IO_BYTES * 16,
-            max_descriptors_per_process: 64,
-        })
+        Self::with_generation(0)
     }
 }
 
 impl RealmMachine {
+    /// Create a default-quota machine for one explicit actor boot generation.
+    #[must_use]
+    pub fn with_generation(generation: u64) -> Self {
+        Self::new_for_generation(
+            RealmLimits {
+                max_processes: 64,
+                max_pipes: 64,
+                max_pipe_bytes: MAX_IO_BYTES,
+                max_total_pipe_bytes: MAX_IO_BYTES * 16,
+                max_descriptors_per_process: 64,
+            },
+            generation,
+        )
+    }
+
     /// Create a machine with explicit semantic-kernel quotas.
     #[must_use]
     pub fn new(limits: RealmLimits) -> Self {
+        Self::new_for_generation(limits, 0)
+    }
+
+    /// Create a machine with explicit quotas and actor boot generation.
+    #[must_use]
+    pub fn new_for_generation(limits: RealmLimits, generation: u64) -> Self {
         Self {
             runtime: RealmRuntime::default(),
             kernel: Rc::new(RefCell::new(RealmKernel::new(limits))),
             limits,
+            generation,
         }
     }
 
@@ -113,7 +140,14 @@ impl RealmMachine {
             limits,
             report: None,
         };
-        attach_process(&mut slot, process_id, &self.kernel);
+        attach_process(
+            &mut slot,
+            process_id,
+            &self.kernel,
+            self.generation,
+            self.limits.max_descriptors_per_process,
+            None,
+        );
         if let Err(error) = drive_slot(process_id, &mut slot, &self.kernel) {
             abort_processes(&mut self.kernel.borrow_mut(), &[process_id])?;
             return Err(error);
@@ -131,6 +165,122 @@ impl RealmMachine {
             process_id,
             execution,
         })
+    }
+
+    /// Execute one foreground guest that may create a bounded tree of signed
+    /// child modules through the private Realm ABI.
+    ///
+    /// Fuel and output budgets are partitioned before execution across the root
+    /// and the maximum admitted children. Unused child partitions are not
+    /// reclaimed, keeping the aggregate request ceiling independent of guest
+    /// scheduling choices.
+    pub fn execute_process_tree(
+        &mut self,
+        wasm: &[u8],
+        process: ProcessConfig,
+        limits: RunLimits,
+        realm_host: Box<dyn RealmHost>,
+        max_children: usize,
+    ) -> Result<ProcessTreeReport, PipelineError> {
+        self.preflight_process_tree(max_children)?;
+        let partitions = max_children
+            .checked_add(1)
+            .ok_or(KernelError::QuotaExceeded(Quota::Processes))?;
+        let partitions_u64 =
+            u64::try_from(partitions).map_err(|_| KernelError::QuotaExceeded(Quota::Processes))?;
+        let child_limits = RunLimits {
+            fuel: limits.fuel / partitions_u64,
+            memory_bytes: limits.memory_bytes,
+            output_bytes: limits.output_bytes / partitions,
+        };
+        let root_limits = RunLimits {
+            fuel: child_limits
+                .fuel
+                .saturating_add(limits.fuel % partitions_u64),
+            memory_bytes: limits.memory_bytes,
+            output_bytes: child_limits
+                .output_bytes
+                .saturating_add(limits.output_bytes % partitions),
+        };
+
+        let (root_store, root_start) =
+            self.runtime
+                .prepare_process(wasm, process.clone(), root_limits, realm_host, None)?;
+        let root_id = {
+            let mut kernel = self.kernel.borrow_mut();
+            let root = kernel.spawn_root(process_spec(wasm, &process))?;
+            if let Err(error) = kernel.admit(root) {
+                abort_processes(&mut kernel, &[root])?;
+                return Err(error.into());
+            }
+            root
+        };
+        let spawn = Rc::new(RefCell::new(SpawnState {
+            runtime: self.runtime.clone(),
+            child_limits,
+            remaining_children: max_children,
+            prepared: Vec::new(),
+            reaped: Vec::new(),
+        }));
+        let mut root_slot = ProcessSlot {
+            store: root_store,
+            invocation: InvocationState::Start(root_start),
+            limits: root_limits,
+            report: None,
+        };
+        attach_process(
+            &mut root_slot,
+            root_id,
+            &self.kernel,
+            self.generation,
+            self.limits.max_descriptors_per_process,
+            Some(Rc::clone(&spawn)),
+        );
+        let mut slots = BTreeMap::from([(root_id, root_slot)]);
+
+        let drive_result = (|| -> Result<(), PipelineError> {
+            while slots.values().any(|slot| slot.report.is_none()) {
+                complete_preterminated_slots(&mut slots, &self.kernel)?;
+                if slots.values().all(|slot| slot.report.is_some()) {
+                    break;
+                }
+                let process = self
+                    .kernel
+                    .borrow_mut()
+                    .dispatch_next()
+                    .ok_or(PipelineError::Deadlock)?;
+                let slot = slots
+                    .get_mut(&process)
+                    .ok_or(PipelineError::MissingReport(process))?;
+                drive_slot(process, slot, &self.kernel)?;
+                drain_prepared_children(&spawn, &mut slots)?;
+                complete_reaped_slots(&spawn, &mut slots)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = drive_result {
+            let processes = slots.keys().copied().collect::<Vec<_>>();
+            abort_processes(&mut self.kernel.borrow_mut(), &processes)?;
+            return Err(error);
+        }
+
+        let process_ids = slots.keys().copied().collect::<Vec<_>>();
+        reap_completed_roots(&mut self.kernel.borrow_mut(), &process_ids)?;
+        let root = PipelineProcessReport {
+            process_id: root_id,
+            execution: take_report(&mut slots, root_id)?,
+        };
+        let children = process_ids
+            .into_iter()
+            .filter(|process| *process != root_id)
+            .map(|process| {
+                Ok(PipelineProcessReport {
+                    process_id: process,
+                    execution: take_report(&mut slots, process)?,
+                })
+            })
+            .collect::<Result<Vec<_>, PipelineError>>()?;
+        Ok(ProcessTreeReport { root, children })
     }
 
     /// Execute and reap two foreground processes connected by one bounded pipe.
@@ -225,7 +375,14 @@ impl RealmMachine {
             limits: consumer_limits,
             report: None,
         };
-        attach_process(&mut consumer_slot, consumer_id, &self.kernel);
+        attach_process(
+            &mut consumer_slot,
+            consumer_id,
+            &self.kernel,
+            self.generation,
+            self.limits.max_descriptors_per_process,
+            None,
+        );
         slots.insert(consumer_id, consumer_slot);
         let mut producer_slot = ProcessSlot {
             store: producer_store,
@@ -233,7 +390,14 @@ impl RealmMachine {
             limits: producer_limits,
             report: None,
         };
-        attach_process(&mut producer_slot, producer_id, &self.kernel);
+        attach_process(
+            &mut producer_slot,
+            producer_id,
+            &self.kernel,
+            self.generation,
+            self.limits.max_descriptors_per_process,
+            None,
+        );
         slots.insert(producer_id, producer_slot);
 
         let drive_result = (|| -> Result<(), PipelineError> {
@@ -296,6 +460,20 @@ impl RealmMachine {
         }
         if self.limits.max_descriptors_per_process < 2 {
             return Err(KernelError::QuotaExceeded(Quota::Descriptors).into());
+        }
+        Ok(())
+    }
+
+    fn preflight_process_tree(&self, max_children: usize) -> Result<(), PipelineError> {
+        let requested = max_children
+            .checked_add(1)
+            .ok_or(KernelError::QuotaExceeded(Quota::Processes))?;
+        let retained = self.kernel.borrow().process_count();
+        if retained
+            .checked_add(requested)
+            .is_none_or(|count| count > self.limits.max_processes)
+        {
+            return Err(KernelError::QuotaExceeded(Quota::Processes).into());
         }
         Ok(())
     }
@@ -390,22 +568,111 @@ impl RealmRuntime {
     }
 }
 
-fn attach_process(slot: &mut ProcessSlot, process: ProcessId, kernel: &Rc<RefCell<RealmKernel>>) {
+fn attach_process(
+    slot: &mut ProcessSlot,
+    process: ProcessId,
+    kernel: &Rc<RefCell<RealmKernel>>,
+    generation: u64,
+    descriptor_limit: usize,
+    spawn: Option<Rc<RefCell<SpawnState>>>,
+) {
+    slot.store.data_mut().descriptor_limit = descriptor_limit;
     slot.store.data_mut().process = Some(ProcessContext {
         process,
         kernel: Rc::clone(kernel),
+        generation,
+        descriptor_limit,
+        spawn,
     });
 }
 
-fn abort_processes(kernel: &mut RealmKernel, processes: &[ProcessId]) -> Result<(), KernelError> {
-    for process in processes {
-        let Ok(snapshot) = kernel.process(*process) else {
-            continue;
+fn drain_prepared_children(
+    spawn: &Rc<RefCell<SpawnState>>,
+    slots: &mut BTreeMap<ProcessId, ProcessSlot>,
+) -> Result<(), PipelineError> {
+    let prepared = std::mem::take(&mut spawn.borrow_mut().prepared);
+    for child in prepared {
+        let process = child.process;
+        let slot = ProcessSlot {
+            store: child.store,
+            invocation: InvocationState::Start(child.start),
+            limits: child.limits,
+            report: None,
         };
-        if !snapshot.state.is_terminal() {
-            kernel.signal(*process, Signal::Kill)?;
+        if slots.insert(process, slot).is_some() {
+            return Err(PipelineError::Resume(format!(
+                "duplicate prepared process {}",
+                process.get()
+            )));
         }
     }
+    Ok(())
+}
+
+fn complete_reaped_slots(
+    spawn: &Rc<RefCell<SpawnState>>,
+    slots: &mut BTreeMap<ProcessId, ProcessSlot>,
+) -> Result<(), PipelineError> {
+    let reaped = std::mem::take(&mut spawn.borrow_mut().reaped);
+    for (process, termination) in reaped {
+        let slot = slots
+            .get_mut(&process)
+            .ok_or(PipelineError::MissingReport(process))?;
+        if slot.report.is_none() {
+            let outcome = match termination {
+                Termination::Exited(status) => ProcessOutcome::Exited(status),
+                Termination::Signaled(signal) => ProcessOutcome::Signaled(signal),
+            };
+            slot.store.data_mut().pending_io = None;
+            slot.report = Some(execution_report(&slot.store, slot.limits, outcome));
+            slot.invocation = InvocationState::Complete;
+        }
+    }
+    Ok(())
+}
+
+fn complete_preterminated_slots(
+    slots: &mut BTreeMap<ProcessId, ProcessSlot>,
+    kernel: &Rc<RefCell<RealmKernel>>,
+) -> Result<(), PipelineError> {
+    let terminal = {
+        let kernel = kernel.borrow();
+        slots
+            .iter()
+            .filter_map(|(process, slot)| {
+                if slot.report.is_some() {
+                    return None;
+                }
+                match kernel.process(*process).ok()?.state {
+                    ProcessState::Exited(status) => {
+                        Some((*process, ProcessOutcome::Exited(status)))
+                    }
+                    ProcessState::Signaled(signal) => {
+                        Some((*process, ProcessOutcome::Signaled(signal)))
+                    }
+                    ProcessState::Created
+                    | ProcessState::Runnable
+                    | ProcessState::Running
+                    | ProcessState::Waiting(_) => None,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    for (process, outcome) in terminal {
+        let slot = slots
+            .get_mut(&process)
+            .ok_or(PipelineError::MissingReport(process))?;
+        slot.store.data_mut().pending_io = None;
+        slot.report = Some(execution_report(&slot.store, slot.limits, outcome));
+        slot.invocation = InvocationState::Complete;
+    }
+    Ok(())
+}
+
+fn reap_completed_roots(
+    kernel: &mut RealmKernel,
+    processes: &[ProcessId],
+) -> Result<(), KernelError> {
     for process in processes {
         let Ok(snapshot) = kernel.process(*process) else {
             continue;
@@ -417,11 +684,16 @@ fn abort_processes(kernel: &mut RealmKernel, processes: &[ProcessId]) -> Result<
     Ok(())
 }
 
-fn process_spec(wasm: &[u8], process: &ProcessConfig) -> ProcessSpec {
-    ProcessSpec::new(
-        ExecutableId::new(*blake3::hash(wasm).as_bytes()),
-        process.cwd.clone(),
-    )
+fn abort_processes(kernel: &mut RealmKernel, processes: &[ProcessId]) -> Result<(), KernelError> {
+    for process in processes {
+        let Ok(snapshot) = kernel.process(*process) else {
+            continue;
+        };
+        if !snapshot.state.is_terminal() {
+            kernel.signal(*process, Signal::Kill)?;
+        }
+    }
+    reap_completed_roots(kernel, processes)
 }
 
 fn drive_slot(
@@ -491,7 +763,7 @@ fn handle_resumable_call(
             {
                 if slot.store.data().pending_io.is_none() {
                     return Err(PipelineError::Resume(
-                        "suspended process has no pending I/O".to_string(),
+                        "suspended process has no pending host call".to_string(),
                     ));
                 }
                 slot.invocation = InvocationState::Suspended(suspended);
@@ -514,7 +786,7 @@ fn complete_pending_io(
         .data_mut()
         .pending_io
         .take()
-        .ok_or_else(|| PipelineError::Resume("pending I/O disappeared".to_string()))?;
+        .ok_or_else(|| PipelineError::Resume("pending host call disappeared".to_string()))?;
     match pending {
         PendingIo::Read {
             descriptor,
@@ -576,7 +848,56 @@ fn complete_pending_io(
                 }
             }
         }
+        PendingIo::Spawn {
+            child,
+            handle_pointer,
+        } => {
+            let generation = slot
+                .store
+                .data()
+                .process
+                .as_ref()
+                .ok_or_else(|| PipelineError::Resume("spawned process has no context".to_string()))?
+                .generation;
+            let bytes = encode_process_handle(ProcessHandle::new(generation, child));
+            write_store_bytes(slot, handle_pointer, &bytes, "spawn handle")?;
+            Ok(PendingCompletion::Resume(0))
+        }
+        PendingIo::Wait {
+            child,
+            status_pointer,
+        } => match kernel.borrow_mut().wait_child(process, child)? {
+            WaitResult::Reaped(termination) => {
+                if let Some(context) = slot.store.data().process.as_ref() {
+                    record_reaped_child(context, child, termination);
+                }
+                let bytes = encode_termination(termination);
+                write_store_bytes(slot, status_pointer, &bytes, "wait status")?;
+                Ok(PendingCompletion::Resume(0))
+            }
+            WaitResult::Pending => {
+                slot.store.data_mut().pending_io = Some(PendingIo::Wait {
+                    child,
+                    status_pointer,
+                });
+                Ok(PendingCompletion::Reparked)
+            }
+        },
     }
+}
+
+fn write_store_bytes(
+    slot: &mut ProcessSlot,
+    pointer: usize,
+    bytes: &[u8],
+    operation: &str,
+) -> Result<(), PipelineError> {
+    let memory = slot.store.data().memory.ok_or_else(|| {
+        PipelineError::Resume(format!("pending {operation} process has no memory"))
+    })?;
+    memory
+        .write(&mut slot.store, pointer, bytes)
+        .map_err(|error| PipelineError::Resume(error.to_string()))
 }
 
 fn finish_process(
@@ -587,6 +908,7 @@ fn finish_process(
 ) -> Result<(), PipelineError> {
     match &outcome {
         ProcessOutcome::Exited(status) => kernel.borrow_mut().exit(process, *status)?,
+        ProcessOutcome::Signaled(signal) => kernel.borrow_mut().signal(process, *signal)?,
         ProcessOutcome::HostFault(HostFault::BrokenPipe) => {
             kernel.borrow_mut().signal(process, Signal::Pipe)?;
         }
@@ -614,6 +936,308 @@ fn take_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct OpenHost;
+
+    impl RealmHost for OpenHost {
+        fn open(
+            &mut self,
+            _cwd: &str,
+            _path: &str,
+            _mode: OpenMode,
+        ) -> Result<Box<dyn RealmFile>, RealmIoError> {
+            Ok(Box::new(EmptyFile))
+        }
+    }
+
+    struct EmptyFile;
+
+    impl RealmFile for EmptyFile {
+        fn read(&mut self, _max_bytes: usize) -> Result<Vec<u8>, RealmIoError> {
+            Ok(Vec::new())
+        }
+
+        fn write(&mut self, bytes: &[u8]) -> Result<usize, RealmIoError> {
+            Ok(bytes.len())
+        }
+    }
+
+    #[test]
+    fn guest_file_and_pipe_descriptors_share_one_number_space() {
+        let guest = wat::parse_str(
+            r#"(module
+                (import "aos_realm_v0" "open"
+                    (func $open (param i32 i32 i32) (result i32)))
+                (import "aos_realm_v0" "pipe"
+                    (func $pipe (param i32 i32) (result i32)))
+                (import "aos_realm_v0" "close"
+                    (func $close (param i32) (result i32)))
+                (memory (export "memory") 1 1)
+                (data (i32.const 64) "file")
+                (func (export "_start")
+                    (local $file i32)
+                    i32.const 64
+                    i32.const 4
+                    i32.const 1
+                    call $open
+                    local.tee $file
+                    i32.const 3
+                    i32.ne
+                    if unreachable end
+                    i32.const 4
+                    i32.const 0
+                    call $pipe
+                    drop
+                    i32.const 0
+                    i32.load
+                    i32.const 4
+                    i32.ne
+                    if unreachable end
+                    i32.const 4
+                    i32.load
+                    i32.const 5
+                    i32.ne
+                    if unreachable end
+                    local.get $file
+                    call $close
+                    drop
+                    i32.const 0
+                    i32.load
+                    call $close
+                    drop
+                    i32.const 4
+                    i32.load
+                    call $close
+                    drop))"#,
+        )
+        .expect("descriptor guest compiles");
+        let mut machine = RealmMachine::default();
+        let report = machine
+            .execute_process(
+                &guest,
+                ProcessConfig {
+                    argv: vec!["descriptor-space".to_string()],
+                    cwd: "/workspace".to_string(),
+                },
+                RunLimits::default(),
+                Box::<OpenHost>::default(),
+            )
+            .expect("file then pipe completes");
+
+        assert_eq!(report.execution.outcome, ProcessOutcome::Exited(0));
+        assert_eq!(machine.status().process_records, 0);
+        assert_eq!(machine.status().pipe_objects, 0);
+    }
+
+    #[test]
+    fn guest_creates_waits_and_reaps_its_own_signed_pipeline() {
+        let limits = RunLimits::default();
+        let mut machine = RealmMachine::with_generation(9);
+        let report = machine
+            .execute_process_tree(
+                GUEST_PIPELINE_GUEST,
+                ProcessConfig {
+                    argv: vec![
+                        "guest-pipeline".to_string(),
+                        "hello from guest-created children".to_string(),
+                    ],
+                    cwd: "/workspace".to_string(),
+                },
+                limits,
+                Box::<DenyRealmHost>::default(),
+                2,
+            )
+            .expect("guest-created process tree completes");
+
+        assert_eq!(report.root.process_id, ProcessId::new(1));
+        assert_eq!(report.root.execution.outcome, ProcessOutcome::Exited(0));
+        assert!(report.root.execution.suspensions >= 2);
+        assert_eq!(report.children.len(), 2);
+        assert_eq!(report.children[0].process_id, ProcessId::new(2));
+        assert_eq!(report.children[1].process_id, ProcessId::new(3));
+        assert_eq!(
+            report.children[0].execution.stdout,
+            b"hello from guest-created children\n"
+        );
+        assert!(report.children[1].execution.stdout.is_empty());
+        assert!(
+            report
+                .children
+                .iter()
+                .all(|child| child.execution.outcome == ProcessOutcome::Exited(0))
+        );
+        let fuel = report
+            .children
+            .iter()
+            .fold(report.root.execution.fuel_consumed, |total, child| {
+                total.saturating_add(child.execution.fuel_consumed)
+            });
+        assert!(fuel <= limits.fuel);
+        assert_eq!(machine.status().process_records, 0);
+        assert_eq!(machine.status().pipe_objects, 0);
+        assert_eq!(machine.status().reserved_pipe_bytes, 0);
+        assert_eq!(machine.status().next_process_id, Some(ProcessId::new(4)));
+    }
+
+    #[test]
+    fn guest_child_budget_fails_closed_and_cleans_up_the_partial_tree() {
+        let mut machine = RealmMachine::with_generation(4);
+        let report = machine
+            .execute_process_tree(
+                GUEST_PIPELINE_GUEST,
+                ProcessConfig {
+                    argv: vec!["guest-pipeline".to_string(), "bounded".to_string()],
+                    cwd: "/workspace".to_string(),
+                },
+                RunLimits::default(),
+                Box::<DenyRealmHost>::default(),
+                1,
+            )
+            .expect("runtime returns the bounded failure report");
+
+        assert_eq!(
+            report.root.execution.outcome,
+            ProcessOutcome::HostFault(HostFault::InvalidArgument)
+        );
+        assert_eq!(report.children.len(), 1);
+        assert_eq!(
+            report.children[0].execution.outcome,
+            ProcessOutcome::Exited(0)
+        );
+        assert_eq!(machine.status().process_records, 0);
+        assert_eq!(machine.status().pipe_objects, 0);
+    }
+
+    #[test]
+    fn stale_generation_handle_cannot_wait_for_a_child() {
+        let guest = wat::parse_str(
+            r#"(module
+                (import "aos_realm_v0" "spawn-signed"
+                    (func $spawn (param i32 i32 i32 i32 i32 i32) (result i32)))
+                (import "aos_realm_v0" "wait"
+                    (func $wait (param i32 i32) (result i32)))
+                (memory (export "memory") 1 1)
+                (func (export "_start")
+                    i32.const 1
+                    i32.const 0
+                    i32.const 0
+                    i32.const -1
+                    i32.const -1
+                    i32.const 16
+                    call $spawn
+                    drop
+                    i32.const 16
+                    i64.const 10
+                    i64.store
+                    i32.const 16
+                    i32.const 32
+                    call $wait
+                    drop))"#,
+        )
+        .expect("forged-handle guest compiles");
+        let mut machine = RealmMachine::with_generation(9);
+        let report = machine
+            .execute_process_tree(
+                &guest,
+                ProcessConfig {
+                    argv: vec!["forged-wait".to_string()],
+                    cwd: "/workspace".to_string(),
+                },
+                RunLimits::default(),
+                Box::<DenyRealmHost>::default(),
+                1,
+            )
+            .expect("runtime returns the forged-handle fault");
+
+        assert_eq!(
+            report.root.execution.outcome,
+            ProcessOutcome::HostFault(HostFault::InvalidArgument)
+        );
+        assert_eq!(report.children.len(), 1);
+        assert_eq!(machine.status().process_records, 0);
+    }
+
+    #[test]
+    fn guest_can_signal_and_reap_its_own_blocked_child() {
+        let guest = wat::parse_str(
+            r#"(module
+                (import "aos_realm_v0" "pipe"
+                    (func $pipe (param i32 i32) (result i32)))
+                (import "aos_realm_v0" "spawn-signed"
+                    (func $spawn (param i32 i32 i32 i32 i32 i32) (result i32)))
+                (import "aos_realm_v0" "signal"
+                    (func $signal (param i32 i32) (result i32)))
+                (import "aos_realm_v0" "close"
+                    (func $close (param i32) (result i32)))
+                (import "aos_realm_v0" "wait"
+                    (func $wait (param i32 i32) (result i32)))
+                (memory (export "memory") 1 1)
+                (func (export "_start")
+                    i32.const 4
+                    i32.const 0
+                    call $pipe
+                    drop
+                    i32.const 2
+                    i32.const 0
+                    i32.const 0
+                    i32.const 0
+                    i32.load
+                    i32.const 0
+                    i32.const 16
+                    call $spawn
+                    drop
+                    i32.const 16
+                    i32.const 3
+                    call $signal
+                    drop
+                    i32.const 0
+                    i32.load
+                    call $close
+                    drop
+                    i32.const 4
+                    i32.load
+                    call $close
+                    drop
+                    i32.const 16
+                    i32.const 32
+                    call $wait
+                    drop
+                    i32.const 32
+                    i32.load
+                    i32.const 1
+                    i32.ne
+                    if unreachable end
+                    i32.const 36
+                    i32.load
+                    i32.const 3
+                    i32.ne
+                    if unreachable end))"#,
+        )
+        .expect("signal guest compiles");
+        let mut machine = RealmMachine::with_generation(12);
+        let report = machine
+            .execute_process_tree(
+                &guest,
+                ProcessConfig {
+                    argv: vec!["signal-child".to_string()],
+                    cwd: "/workspace".to_string(),
+                },
+                RunLimits::default(),
+                Box::<DenyRealmHost>::default(),
+                1,
+            )
+            .expect("guest signals and waits for child");
+
+        assert_eq!(report.root.execution.outcome, ProcessOutcome::Exited(0));
+        assert_eq!(report.children.len(), 1);
+        assert_eq!(
+            report.children[0].execution.outcome,
+            ProcessOutcome::Signaled(Signal::Kill)
+        );
+        assert_eq!(machine.status().process_records, 0);
+        assert_eq!(machine.status().pipe_objects, 0);
+    }
 
     #[test]
     fn two_isolated_guests_stream_through_a_resumable_bounded_pipe() {

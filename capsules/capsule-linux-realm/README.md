@@ -16,11 +16,13 @@ agent -> realm tool -> nested WASM command -> private realm ABI
 
 ## What works
 
-`linux_realm_exec` currently admits exactly six signed workloads:
+`linux_realm_exec` currently admits exactly seven signed workloads:
 
 - `pwd`
 - `echo`
 - `pipe-echo`, a two-process resumable echo-to-stdin-cat pipeline
+- `guest-pipe-echo`, whose supervisor guest creates that pipe and both children,
+  then waits for and reaps them itself
 - `write-file`
 - `cat`
 - `smoke-write`, the original interpreter smoke test
@@ -101,12 +103,28 @@ to zero while their identifiers are never reused during that capsule boot. A
 principal-scoped boot sequence is advanced with KV compare-and-swap and makes PID
 reuse after restart explicit as `(boot sequence, PID)`.
 
-This model is intentionally not exposed as guest `spawn`, `wait`, or `pipe`
-creation imports yet. `pipe-echo` exercises two isolated, resumable Wasmi
-processes and a four-byte bounded pipe during one foreground request. Process
-handles and background jobs still do not survive calls because every admitted job
-is foreground and reaped; the actor establishes the honest owner in which those
-guest operations can be added next.
+The private ABI now exposes bounded `pipe`, `spawn-signed`, `wait`, and `signal`
+operations. `guest-pipe-echo` is the first workload whose topology is selected by
+guest code: it creates a four-byte pipe, starts signed `stdin-cat` and `echo`
+children with exact descriptor mappings, closes its copies, waits for both, and
+checks their terminal records. Every process has an isolated Wasmi store and
+memory.
+
+This is deliberately narrower than `posix_spawn`. A guest selects an immutable
+executable-catalog entry, one bounded UTF-8 argument, and at most one pipe
+descriptor mapping. It cannot submit module bytes, inherit Astrid authority, or
+start a host process. Process handles encode `(realm boot generation, PID)` and
+`wait`/`signal` reject a stale generation or a process that is not the caller's
+direct child. The foreground command admits at most two descendants; fuel and
+captured-output budgets are partitioned before execution, and all process and pipe
+records are deterministically cleaned before the tool result returns. Background
+jobs still do not survive calls.
+
+The actor also retains a bounded 64-entry replay window for mutating tool call
+IDs. A transport retry with the same principal, call ID, and arguments returns the
+recorded result without running the process tree or filesystem mutation again;
+reusing the ID with different arguments fails closed. This is an in-memory
+per-actor-boot guarantee, not yet a durable exactly-once receipt across crashes.
 
 ## Build and install
 
@@ -122,7 +140,7 @@ cargo clippy -p aos-realm-abi -p aos-realm-core -p aos-realm-runtime \
 cargo check -p aos-linux-realm --target wasm32-unknown-unknown
 astrid capsule build capsules/capsule-linux-realm
 astrid --principal default capsule install \
-  capsules/capsule-linux-realm/dist/aos-linux-realm.capsule
+  dist/aos-linux-realm.capsule
 ```
 
 The installed realm appears as two MCP tools when a current Astrid MCP broker is
@@ -135,6 +153,7 @@ Example tool arguments:
 {"command":"pwd"}
 {"command":"echo","args":["hello", "realm"]}
 {"command":"pipe-echo","args":["hello through two processes"]}
+{"command":"guest-pipe-echo","args":["the guest built this pipeline"]}
 {"command":"write-file","args":["notes.txt","durable\n"],"cwd":"/home/agent"}
 {"command":"cat","args":["notes.txt"],"cwd":"/home/agent"}
 {"command":"write-file","args":["candidate.rs","..."],"cwd":"/workspace"}
@@ -146,17 +165,18 @@ is rejected as an unknown program rather than evaluated by Bash.
 ## Current boundary
 
 The private `aos_realm_v0` ABI supplies bounded argument and CWD reads,
-open/read/write/close, monotonic time, and exit. Paths are normalized within
+open/read/write/close, pipe creation, signed child creation, direct-child wait,
+direct-child signal, monotonic time, and exit. Paths are normalized within
 `/home/agent`, `/workspace`, or `/tmp`; unmounted absolute paths and upward escape
 fail closed. Writes are buffered at the capsule edge and committed only when the
 nested descriptor closes, so a trapped command does not leave a partial guest
 file. Durable-home closes select a content-addressed generation with a KV CAS;
 workspace and temporary files retain their outer mount semantics.
 
-This slice does not provide Bash, guest-created processes or pipes, general Linux
-syscalls, a libc, package management, networking, PTYs, or a compiler. Those
-belong behind the same realm boundary; they must not be simulated by granting a
-host process.
+This slice does not provide arbitrary executable resolution, full `posix_spawn`
+file actions, `execve`, Bash, general Linux syscalls, a libc, package management,
+networking, PTYs, background jobs, or a compiler. Those belong behind the same
+realm boundary; they must not be simulated by granting a host process.
 
 ## Distribution direction
 

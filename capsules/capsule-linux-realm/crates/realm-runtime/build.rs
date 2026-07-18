@@ -11,6 +11,7 @@ fn main() {
         ("write-file", "write_file.wasm"),
         ("cat", "cat.wasm"),
         ("stdin-cat", "stdin_cat.wasm"),
+        ("guest-pipeline", "guest_pipeline.wasm"),
     ] {
         let guest_source = manifest_dir.join(format!("../../guests/{directory}/{directory}.wat"));
         println!("cargo:rerun-if-changed={}", guest_source.display());
