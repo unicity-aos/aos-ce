@@ -9,7 +9,8 @@ mod actor;
 mod host;
 
 use aos_realm_machine::{
-    Machine as Rv64Machine, MachineConfig as Rv64MachineConfig, RV64_SMOKE_PROGRAM, SliceOutcome,
+    Machine as Rv64Machine, MachineConfig as Rv64MachineConfig, RV64_SMOKE_PROGRAM,
+    RV64_SUPERVISOR_PROGRAM, SliceOutcome,
 };
 use aos_realm_runtime::{
     CAT_GUEST, ECHO_GUEST, ExecutionReport, GUEST_PIPELINE_GUEST, HostFault, MINI_SHELL_GUEST,
@@ -43,6 +44,7 @@ pub enum RealmProgram {
     GuestPipeEcho,
     RealmSh,
     Rv64Smoke,
+    Rv64Supervisor,
     WriteFile,
     Cat,
 }
@@ -113,7 +115,7 @@ struct StatusResponse {
     home_files: usize,
     home_manifest: Option<String>,
     mounts: Vec<MountStatus>,
-    commands: [&'static str; 9],
+    commands: [&'static str; 10],
     workspace_commit: &'static str,
     host_process: bool,
     actor_state: &'static str,
@@ -166,7 +168,7 @@ enum SelectedExecution {
     EchoPipeline,
     GuestPipeline,
     MiniShell,
-    Rv64Smoke,
+    Rv64(&'static [u8]),
 }
 
 impl SelectedExecution {
@@ -175,7 +177,7 @@ impl SelectedExecution {
             Self::Single(_) | Self::EchoPipeline | Self::GuestPipeline | Self::MiniShell => {
                 "nested-core-wasm"
             }
-            Self::Rv64Smoke => "aos-rv64-interpreter",
+            Self::Rv64(_) => "aos-rv64-interpreter",
         }
     }
 }
@@ -359,18 +361,20 @@ fn execute_selected(
             process_ids.extend(tree.children.iter().map(|child| child.process_id.get()));
             Ok((combine_process_tree(tree), process_ids))
         }
-        SelectedExecution::Rv64Smoke => execute_rv64_smoke(limits).map(|report| (report, vec![])),
+        SelectedExecution::Rv64(program) => {
+            execute_rv64(program, limits).map(|report| (report, vec![]))
+        }
     }
 }
 
-fn execute_rv64_smoke(limits: RunLimits) -> Result<ExecutionReport, SysError> {
+fn execute_rv64(program: &[u8], limits: RunLimits) -> Result<ExecutionReport, SysError> {
     let mut machine = Rv64Machine::new(Rv64MachineConfig {
         ram_bytes: HARD_MEMORY_BYTES,
         max_console_bytes: limits.output_bytes,
     })
     .map_err(|error| SysError::ApiError(error.to_string()))?;
     machine
-        .load_program(&RV64_SMOKE_PROGRAM)
+        .load_program(program)
         .map_err(|error| SysError::ApiError(error.to_string()))?;
     let report = machine.run_slice(limits.fuel);
     let outcome = match report.outcome {
@@ -385,7 +389,7 @@ fn execute_rv64_smoke(limits: RunLimits) -> Result<ExecutionReport, SysError> {
         outcome,
         stdout: report.console,
         stderr: Vec::new(),
-        fuel_consumed: report.total_instructions_retired,
+        fuel_consumed: report.total_steps_executed,
         memory_limit_bytes: HARD_MEMORY_BYTES,
         suspensions: 0,
     })
@@ -468,11 +472,12 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
             "guest-pipe-echo" => RealmProgram::GuestPipeEcho,
             "realm-sh" => RealmProgram::RealmSh,
             "rv64-smoke" => RealmProgram::Rv64Smoke,
+            "rv64-supervisor" => RealmProgram::Rv64Supervisor,
             "write-file" => RealmProgram::WriteFile,
             "cat" => RealmProgram::Cat,
             _ => {
                 return Err(SysError::ApiError(format!(
-                    "unsupported realm command `{command}`; supported: pwd, echo, pipe-echo, guest-pipe-echo, realm-sh, rv64-smoke, write-file, cat, smoke-write"
+                    "unsupported realm command `{command}`; supported: pwd, echo, pipe-echo, guest-pipe-echo, realm-sh, rv64-smoke, rv64-supervisor, write-file, cat, smoke-write"
                 )));
             }
         }
@@ -527,8 +532,16 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
             require_arity("rv64-smoke", &args.args, 0)?;
             (
                 "rv64-smoke",
-                SelectedExecution::Rv64Smoke,
+                SelectedExecution::Rv64(&RV64_SMOKE_PROGRAM),
                 vec!["rv64-smoke".to_string()],
+            )
+        }
+        RealmProgram::Rv64Supervisor => {
+            require_arity("rv64-supervisor", &args.args, 0)?;
+            (
+                "rv64-supervisor",
+                SelectedExecution::Rv64(&RV64_SUPERVISOR_PROGRAM),
+                vec!["rv64-supervisor".to_string()],
             )
         }
         RealmProgram::WriteFile => {
@@ -614,6 +627,7 @@ fn status_response(
             "guest-pipe-echo",
             "realm-sh",
             "rv64-smoke",
+            "rv64-supervisor",
             "write-file",
             "cat",
             "smoke-write",
@@ -735,6 +749,29 @@ mod tests {
         assert_eq!(response.exit_status, Some(0));
         assert_eq!(response.stdout, "AOS RV64\n");
         assert_eq!(response.fuel_consumed, 23);
+        assert_eq!(response.memory_limit_bytes, HARD_MEMORY_BYTES);
+        assert_eq!(response.processes, 0);
+        assert!(response.process_ids.is_empty());
+    }
+
+    #[test]
+    fn rv64_supervisor_probe_crosses_privilege_and_delegated_trap_path() {
+        let response = run_command(
+            ExecArgs {
+                command: Some("rv64-supervisor".to_string()),
+                ..ExecArgs::default()
+            },
+            "alice".to_string(),
+            Box::<TestHost>::default(),
+        )
+        .expect("RV64 supervisor probe succeeds");
+
+        assert_eq!(response.program, "rv64-supervisor");
+        assert_eq!(response.execution_backend, "aos-rv64-interpreter");
+        assert_eq!(response.outcome, "exited");
+        assert_eq!(response.exit_status, Some(0));
+        assert_eq!(response.stdout, "STR\n");
+        assert_eq!(response.fuel_consumed, 31);
         assert_eq!(response.memory_limit_bytes, HARD_MEMORY_BYTES);
         assert_eq!(response.processes, 0);
         assert!(response.process_ids.is_empty());
