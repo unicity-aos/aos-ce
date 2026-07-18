@@ -41,6 +41,11 @@ const LINUX_INIT_MARKER: &[u8] = b"AOS LINUX /init";
 const LINUX_COOPERATE_TOPIC: &str = "realm.v1.linux.cooperate";
 const AOS_LINUX_IMAGE: &[u8] = include_bytes!("../linux/Image");
 
+/// One principal-owned Realm service.
+///
+/// The SDK singleton lives in the component's Wasmtime Store. Astrid keeps
+/// that Store affined to one verified principal; the inner state repeats the
+/// owner check before every operation.
 #[derive(Default)]
 pub struct LinuxRealm;
 
@@ -149,6 +154,8 @@ struct StatusResponse {
     linux_last_exit_status: Option<i32>,
     linux_guest_accounting_scope: &'static str,
     linux_outer_wasm_metering: &'static str,
+    component_residency: &'static str,
+    component_state_durability: &'static str,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -187,16 +194,6 @@ impl ActorSnapshot {
     fn idle() -> Self {
         Self {
             state: "idle",
-            boot_sequence: 0,
-            commands_completed: 0,
-            machine: RealmMachine::default().status(),
-            linux: LinuxSnapshot::cold(),
-        }
-    }
-
-    fn compatibility() -> Self {
-        Self {
-            state: "compatibility-entrypoint",
             boot_sequence: 0,
             commands_completed: 0,
             machine: RealmMachine::default().status(),
@@ -250,12 +247,6 @@ impl SelectedExecution {
 
 #[capsule]
 impl LinuxRealm {
-    /// Own the principal-isolated Realm machines for this capsule boot.
-    #[astrid::run]
-    fn run(&self) -> Result<(), SysError> {
-        actor::run_actor_loop()
-    }
-
     /// Run one signed command in the caller's principal-scoped AOS Realm.
     ///
     /// `/workspace` maps to the invocation's confined Astrid copy-on-write
@@ -265,24 +256,14 @@ impl LinuxRealm {
     #[astrid::tool("linux_realm_exec", mutable)]
     pub fn exec(&self, args: ExecArgs) -> Result<String, SysError> {
         let principal = caller_principal()?;
-        ensure_layout()?;
-        let cwd = args.cwd.as_deref().unwrap_or(DEFAULT_CWD);
-        validate_cwd(cwd)?;
-        let response = run_command(args, principal, Box::<AstridRealmHost>::default())?;
-        serde_json::to_string(&response).map_err(|error| SysError::ApiError(error.to_string()))
+        actor::execute_resident(&principal, args)
     }
 
     /// Inspect the initialized realm without exposing physical host paths.
     #[astrid::tool("linux_realm_status")]
-    pub fn status(&self, _args: StatusArgs) -> Result<String, SysError> {
+    pub fn status(&self, args: StatusArgs) -> Result<String, SysError> {
         let principal = caller_principal()?;
-        let response = status_response(
-            principal,
-            layout_state()?,
-            home_status()?,
-            ActorSnapshot::compatibility(),
-        );
-        serde_json::to_string(&response).map_err(|error| SysError::ApiError(error.to_string()))
+        actor::status_resident(&principal, args)
     }
 }
 
@@ -293,6 +274,7 @@ fn caller_principal() -> Result<String, SysError> {
         .ok_or_else(|| SysError::ApiError("AOS Realm requires a stamped principal".to_string()))
 }
 
+#[cfg(test)]
 fn run_command(
     args: ExecArgs,
     principal: String,
@@ -810,7 +792,9 @@ fn status_response(
         linux_last_outcome: actor.linux.last_outcome,
         linux_last_exit_status: actor.linux.last_exit_status,
         linux_guest_accounting_scope: "verified-principal+actor-boot",
-        linux_outer_wasm_metering: "run-loop-owner",
+        linux_outer_wasm_metering: "principal-affine-invocation",
+        component_residency: "principal-affine-store",
+        component_state_durability: "evictable-cache+durable-home",
     }
 }
 
@@ -1256,7 +1240,8 @@ mod tests {
         assert!(json.contains("\"linux_state\":\"cold\""));
         assert!(json.contains("\"linux_boot_executions_this_actor_boot\":2"));
         assert!(json.contains("\"linux_guest_steps_this_actor_boot\":25000000"));
-        assert!(json.contains("\"linux_outer_wasm_metering\":\"run-loop-owner\""));
+        assert!(json.contains("\"linux_outer_wasm_metering\":\"principal-affine-invocation\""));
+        assert!(json.contains("\"component_residency\":\"principal-affine-store\""));
         assert!(json.contains("outer-astrid-promotion-required"));
         assert!(!json.contains("/Users/"));
         assert!(!json.contains(".astrid/home"));
@@ -1273,6 +1258,15 @@ mod tests {
 
         assert!(!capabilities.contains_key("host_process"));
         assert!(capabilities.contains_key("kv"));
+
+        assert_eq!(
+            manifest["package"]["astrid-version"].as_str(),
+            Some(">=0.10.2")
+        );
+        assert_eq!(
+            manifest["package"]["metadata"]["astrid-runtime"]["component-residency"].as_str(),
+            Some("principal")
+        );
         assert!(capabilities.contains_key("fs_read"));
         assert!(capabilities.contains_key("fs_write"));
     }

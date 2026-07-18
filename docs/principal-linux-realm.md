@@ -625,11 +625,14 @@ closes. Closing the final reader wakes writers, whose next write returns
 removed and its reserved capacity released only after its last read and write
 endpoint close.
 
-The capsule is a long-lived run-loop actor with one `RealmMachine` and semantic
-kernel per kernel-verified principal. It keeps process identifiers monotonic across
-tool calls within one capsule boot, reaps completed foreground jobs, and exposes
-live process, pipe, reserved-byte, command, and next-PID accounting. Constructing a
-new process table inside each one-shot tool call is no longer the live path.
+The capsule is a principal-affine service. Astrid owns a bounded map of resident
+Wasmtime Stores keyed by verified principal; each Store contains one
+`RealmMachine` and semantic kernel. It keeps process identifiers monotonic across
+tool calls during that Store residency, reaps completed foreground jobs, and
+exposes live process, pipe, reserved-byte, command, and next-PID accounting. The
+capsule repeats the owner binding internally and rejects a principal change even
+if the runtime invariant regresses. Constructing a new process table inside each
+one-shot tool call is no longer the live path.
 
 There are now four executable topology proofs. `pipe-echo` has the outer Realm
 runtime choose and connect two signed processes. `guest-pipe-echo` instead launches
@@ -656,16 +659,19 @@ before the root runs; a third spawn fails closed. Every process has an independe
 memory ceiling, and the combined result reports aggregate fuel, output, memory
 ceilings, suspensions, and all PIDs. Success, invalid generation, child-budget
 exhaustion, signal/reap, partial construction, file/pipe descriptor collision, and
-final zero-resource cleanup are host-tested. Calls remain serialized by one
-capsule run loop; fair cross-principal scheduling is mandatory before background
-jobs are admitted.
+final zero-resource cleanup are host-tested. The runtime serializes calls that
+target one principal Store while allowing different principals' Stores to run
+concurrently. Background jobs still require an explicit job lifecycle rather
+than being smuggled through residency.
 
-Mutating actor requests have a bounded 64-result replay window keyed by verified
-principal and broker call ID. An identical redelivery returns the prior result;
-the same ID with different arguments is rejected. This closes the observed MCP
-reconnect retry within one actor boot without pretending to provide durable
-exactly-once execution across an actor crash. Durable job receipts remain part of
-the future service contract.
+The earlier manual actor could see the broker call ID and held a bounded replay
+window. The SDK's direct tool method currently receives only deserialized tool
+arguments, so that cache is not present in the principal-affine path. This is an
+explicit regression in delivery semantics, not an excuse to claim duplicate
+mutation safety. The correction belongs in SDK/runtime dispatch: expose a
+verified invocation context or implement durable mutation receipts before
+dispatch. Until then, a lost mutating response is indeterminate and a caller must
+inspect durable state before retrying.
 
 Astrid's subscription host returns at most one routed message per envelope and
 installs that message's principal as the invocation context before Realm KV, file,
@@ -673,11 +679,11 @@ and publish calls. The actor additionally requires `verified` attribution rather
 than trusting a principal string in the payload.
 
 Process identity is the tuple `(realm boot sequence, process id)`. The process ID
-returns to 1 after a capsule restart, while a principal-scoped boot sequence is
-advanced atomically with KV compare-and-swap. Read-only status does not allocate a
-machine or advance that sequence. The actor admits at most 32 principal machines
-per capsule boot and currently has no eviction policy; reaching the bound fails
-before initializing durable state for the rejected machine.
+returns to 1 after Store eviction or daemon restart, while a principal-scoped boot
+sequence is advanced atomically with KV compare-and-swap. Read-only status binds
+the Store owner but does not allocate a semantic machine or advance that sequence.
+Aggregate admission and idle LRU eviction are runtime responsibilities; the guest
+does not recreate a hidden multi-principal map.
 
 ### 7.1 Linux residency and principal accounting
 
@@ -693,31 +699,37 @@ harts are CPUs inside that Realm. The principal boundary remains outside the
 machine and every CPU, memory, storage, network, and device charge rolls up to
 that owner.
 
-The current Linux adapter is deliberately cold/on-demand. A request constructs a
+The current Linux adapter is still deliberately cold/on-demand. A request constructs a
 32 MiB single-hart machine, boots Linux, runs the controlled `/init`, powers down,
-returns exact charged guest steps, and drops RAM. The `run()` actor remains alive
-only for message routing, semantic-WASM PID continuity, replay protection, and
-per-principal Linux boot counters. Principal Realm home state is durable but is
+returns exact charged guest steps, and drops RAM. The affined Store remains alive
+for semantic-WASM PID continuity and per-principal Linux boot counters. Principal
+Realm home state is durable but is
 not yet attached to the Linux guest; Linux storage, RAM, kernel state, and
 processes are not persistent. `linux_realm_status` exposes this distinction
-instead of calling the actor itself a persistent Linux VM.
+instead of calling the resident component itself a persistent Linux VM.
 
-This boundary was checked on 2026-07-19 against freshly fetched Astrid Runtime
-0.10.1 upstream `main`, commit
-`4771bab3c33d1bce53186e40d01cf014e2dce666`. The current runtime has two Store
-models:
+The missing runtime primitive was implemented from freshly fetched Astrid Runtime
+0.10.1 upstream `main` commit
+`4771bab3c33d1bce53186e40d01cf014e2dce666`, on branch checkpoint
+`a7c2358e848cdc041c04f7a34c20ae653143597f`. Runtime 0.10.1 itself still has the
+two old Store models below; the experimental branch adds a third:
 
 | Store model | Principal accounting | Residency |
 | --- | --- | --- |
 | Pooled interceptor | Invoking principal receives the fuel charge, CPU-rate admission, memory ceiling, VFS/KV/secrets, and cancellation context | No principal affinity; a later call may lease another clean Store |
 | `run()` singleton | Message principal receives VFS/KV/secrets/profile/cancellation context and stamps follow-up publishes | One persistent Store whose outer CPU and linear memory remain bounded and attributed to its load-time owner |
+| Principal-affine service | Invoking principal receives fuel/rate charging plus exact cross-capsule current resident-memory accounting | One evictable Store permanently bound to that principal; same-principal calls serialize, unrelated principals can run concurrently |
 
-Consequently, placing multiple resident Linux machines in today's shared
-`run()` Store would fail the intended resource-isolation claim. The capsule's
-exact RV64 step totals are useful inner accounting, but cannot substitute for
-kernel-owned Wasmtime fuel and memory enforcement.
+The capsule opts into the third model with fail-closed package metadata and
+requires Astrid `>=0.10.2` so a 0.10.1 runtime cannot silently ignore the
+contract. The implementation rejects `run()`, `host_process`, shared guest
+memory, missing stamped principals, typoed metadata, and uplink-daemon semantics.
+It destroys over-quota Stores when a memory limit is lowered, evicts only idle
+least-recently-used Stores, and releases exact current memory on eviction or
+unload. Residency remains an evictable cache; durable state must cross KV/home
+before a call returns.
 
-The required Astrid primitive is a principal-affine resident service lease:
+The next required primitive is the Linux Realm lifecycle built on that service:
 
 ```text
 key = (capsule digest, component id, verified principal, realm id)
@@ -748,8 +760,9 @@ Its non-negotiable rules are:
 7. Audit identifies the principal, Realm identity, resident generation, hart,
    charged guest steps, charged outer fuel, peak memory, and lifecycle reason.
 
-The implementation order is therefore principal-affine residency, lifecycle
-tools and eviction, then deterministic virtual SMP. Initial SMP can interleave
+Principal-affine residency and idle Store eviction are now implemented. The next
+order is a persistent Linux supervisor and command transport, durable block
+device, explicit lifecycle tools, then deterministic virtual SMP. Initial SMP can interleave
 harts in one host thread with a fixed scheduling quantum. True host-parallel
 harts remain optional because they add races to snapshots, metering, devices,
 and reproducibility without improving cross-principal isolation.
@@ -1045,8 +1058,9 @@ The proof deliberately avoids Bash, Debian, networking, and a large image.
   and exit;
 - Wasmi configured with fuel and memory limits;
 - structured `linux_realm_exec` and read-only `linux_realm_status` tools;
-- one long-lived run-loop actor with a separate Realm machine per verified
-  principal, CAS-allocated boot identity, and bounded aggregate admission;
+- one principal-affine Wasmtime Store and Realm machine per verified principal,
+  with CAS-allocated boot identity, runtime-bounded aggregate admission, and
+  idle LRU eviction;
 - `/home/agent`, `/workspace`, and `/tmp` mount projections;
 - no `host_process` grant.
 
@@ -1092,7 +1106,7 @@ agent invokes linux_realm_exec(write-file, ["notes.txt", "hello"], /home/agent)
 ### Exit condition
 
 An installed Astrid capsule runs signed nested WASM commands through an internal
-Linux-shaped descriptor boundary and a long-lived principal Realm actor, returns
+Linux-shaped descriptor boundary and a principal-affine Realm service, returns
 exact output and accounting, reads and writes principal-scoped storage, survives a
 daemon restart where promised, rejects cross-principal home and process-state
 reads, traps safely, reaps foreground resources, and has no host-process
@@ -1301,9 +1315,9 @@ CE set rather than test-installed companions.
   pipes, atomic descriptor inheritance, and aggregate process/pipe quotas;
 - [x] bind resumable Wasmi process slots to the kernel for a foreground
   two-process stdout-to-stdin pipeline with measured suspension and exact output;
-- [x] add a long-lived principal Realm actor with per-boot PID continuity,
-  restart-disambiguating boot identity, verified-principal isolation, aggregate
-  admission, foreground cleanup, and live accounting;
+- [x] add principal-affine Realm state with per-boot PID continuity,
+  restart-disambiguating boot identity, a redundant verified-owner guard,
+  runtime-bounded admission, foreground cleanup, and live accounting;
 - [x] add the bounded guest `pipe`, signed-child spawn, direct-child wait, and
   direct-child signal substrate with generation-checked handles;
 - [x] add a bounded record spawn with argv, environment, exact absolute catalog
@@ -1341,8 +1355,11 @@ CE set rather than test-installed companions.
   exact serial evidence, and run it through the capsule command adapter;
 - [x] expose the current cold/on-demand Linux lifecycle, request-scoped RAM,
   single-vCPU topology, and per-principal actor-boot guest-step totals;
-- add a principal-affine resident service Store to Astrid before claiming
-  per-principal persistent Linux RAM or process state;
+- [x] add a principal-affine resident service Store to Astrid with permanent
+  owner binding, per-call charging, exact resident-memory accounting, live quota
+  enforcement, cancellation-safe construction, and idle LRU eviction;
+- keep one RV64 machine in the affined Store and add a bounded command transport
+  before claiming per-principal persistent Linux RAM or process state;
 - add explicit Realm `start`, `stop`, and status transitions plus bounded idle
   eviction after that Store is kernel-metered to its verified principal;
 - add deterministic multi-hart scheduling, SBI HSM/IPI support, per-hart CLINT
@@ -1575,23 +1592,25 @@ idle-evicted Realm may cold-start on its next admitted command.
 - [x] run two signed guest modules with isolated memories through the core
   scheduler, a four-byte bounded pipe, resumable read/write host calls, partial
   producer writes, consumer EOF, and exact combined accounting;
-- [x] add a long-lived principal Realm actor with isolated machine state,
-  monotonic per-boot PIDs, CAS-allocated boot sequences, read-only idle status,
-  a 32-principal aggregate bound, and foreground process/pipe cleanup;
+- [x] add principal-affine Realm state with isolated machine state, monotonic
+  per-boot PIDs, CAS-allocated boot sequences, read-only idle status, a redundant
+  owner guard, runtime-bounded residency, and foreground process/pipe cleanup;
 - [x] verify the actor model against Astrid Runtime 0.10.1 and record that recv
   switches principal data context but not the dedicated Store's outer CPU/RAM
   attributee;
 - [x] expose Linux as cold/on-demand with exact principal-local guest-step totals
   rather than imply persistent RAM;
-- [ ] implement the principal-affine resident service lease in Astrid Runtime,
-  then move Linux lifecycle ownership onto it;
+- [x] implement the principal-affine resident service lease in Astrid Runtime;
+- [ ] move Linux lifecycle ownership onto it by retaining one RV64 machine and
+  defining a bounded command/result channel;
 - [ ] add deterministic virtual SMP within one principal-owned Realm after that
   lifecycle and metering boundary is executable;
 - [x] expose bounded pipe creation, signed child creation, direct-child wait, and
   direct-child signal through the private guest ABI without allowing jobs to
   escape foreground actor accounting;
-- [x] make same-boot mutating transport retries idempotent with a bounded
-  principal/call-ID replay window and fail closed on argument mismatch;
+- [ ] restore duplicate-delivery safety at the SDK/runtime direct-tool boundary;
+  the former manual actor replay cache is not reachable from the affined tool
+  method because the call ID is not exposed;
 - [ ] add an outer workspace diff/promote workflow; realm code must not silently
   commit its own COW projection;
 - [ ] put a supported MCP broker/invocation front door in the CE distribution

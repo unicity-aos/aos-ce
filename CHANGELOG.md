@@ -39,15 +39,16 @@
 - A signed `pipe-echo` realm workload that runs two isolated Wasmi process stores
   through the core scheduler and a four-byte stdout-to-stdin pipe, exercising
   partial writes, read/write suspension, wakeup, EOF, and exact output accounting.
-- A long-lived `aos-linux-realm` service actor with one isolated Realm machine per
-  kernel-verified principal, monotonic per-boot process identities, CAS-allocated
-  boot sequences, bounded aggregate principal admission, foreground resource
-  reaping, and live process/pipe accounting through the existing tool protocol.
+- A principal-affine `aos-linux-realm` service with one resident Wasmtime Store
+  and semantic Realm machine per kernel-verified principal, monotonic per-boot
+  process identities, CAS-allocated boot sequences, an inner owner guard,
+  foreground resource reaping, and live process/pipe accounting through direct
+  metered tool entry points.
 - A private Realm `pipe`/`spawn-signed`/`wait`/`signal` ABI and signed
   `guest-pipe-echo` workload, with generation-checked process handles, bounded
   descendant admission, pre-partitioned request budgets, unified file/pipe
   descriptor allocation, deterministic foreground-tree cleanup, and bounded
-  call-ID replay protection against duplicate mutating transport delivery.
+  bounded execution and deterministic resource cleanup.
 - A versioned record-oriented signed-spawn ABI with bounded argv and environment
   vectors, build-manifest-generated immutable-catalog resolution, multiple exact
   descriptor mappings, atomic parent-endpoint close actions, kernel-owned file

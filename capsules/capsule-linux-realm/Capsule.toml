@@ -6,7 +6,10 @@ authors = [
     "Joshua J. Bouw <dev@joshuajbouw.com>",
     "Unicity Labs <info@unicity-labs.com>",
 ]
-astrid-version = ">=0.10.1"
+astrid-version = ">=0.10.2"
+
+[package.metadata.astrid-runtime]
+component-residency = "principal"
 
 [[component]]
 id = "linux-realm"
