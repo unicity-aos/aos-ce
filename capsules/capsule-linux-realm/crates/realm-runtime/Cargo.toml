@@ -14,6 +14,8 @@ build = "build.rs"
 
 [dependencies]
 aos-realm-abi = { workspace = true }
+aos-realm-core = { workspace = true }
+blake3 = { workspace = true }
 wasmi = { workspace = true }
 
 [build-dependencies]

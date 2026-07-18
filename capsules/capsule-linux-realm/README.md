@@ -16,10 +16,11 @@ agent -> realm tool -> nested WASM command -> private realm ABI
 
 ## What works
 
-`linux_realm_exec` currently admits exactly five nested programs:
+`linux_realm_exec` currently admits exactly six signed workloads:
 
 - `pwd`
 - `echo`
+- `pipe-echo`, a two-process resumable echo-to-stdin-cat pipeline
 - `write-file`
 - `cat`
 - `smoke-write`, the original interpreter smoke test
@@ -79,14 +80,32 @@ directory metadata, permissions, links, garbage collection, named checkpoints, o
 a guest `fsync`/flush call. `linux_realm_status` exposes the format, selected
 generation, file count, and manifest digest without exposing a physical path.
 
+## Process-kernel model
+
+`crates/realm-core` is now the host-testable semantic kernel for the next runtime
+increment. It provides monotonic typed process and pipe identifiers, explicit
+created/runnable/running/waiting/zombie transitions, direct-child wait and reap,
+typed signal termination, a single-running-process FIFO reference scheduler,
+atomic pipe-descriptor inheritance, bounded partial pipe I/O, backpressure, EOF,
+broken-pipe behavior, and aggregate quotas.
+
+This model is intentionally not exposed as guest `spawn`, `wait`, or `pipe`
+creation imports yet. `pipe-echo` does exercise two isolated, resumable Wasmi
+processes and a four-byte bounded pipe during one foreground tool invocation. A
+long-lived realm actor is still required before process handles or background jobs
+can survive across calls; recreating that state per call would make persistent PID
+and wait semantics false.
+
 ## Build and install
 
 From the `aos-ce` repository:
 
 ```sh
-cargo test -p aos-realm-abi -p aos-realm-runtime -p aos-realm-vfs -p aos-linux-realm \
+cargo test -p aos-realm-abi -p aos-realm-core -p aos-realm-runtime \
+  -p aos-realm-vfs -p aos-linux-realm \
   --target "$(rustc -vV | sed -n 's/^host: //p')"
-cargo clippy -p aos-realm-abi -p aos-realm-runtime -p aos-realm-vfs -p aos-linux-realm \
+cargo clippy -p aos-realm-abi -p aos-realm-core -p aos-realm-runtime \
+  -p aos-realm-vfs -p aos-linux-realm \
   --target "$(rustc -vV | sed -n 's/^host: //p')" -- -D warnings
 cargo check -p aos-linux-realm --target wasm32-unknown-unknown
 astrid capsule build capsules/capsule-linux-realm
@@ -103,6 +122,7 @@ Example tool arguments:
 ```json
 {"command":"pwd"}
 {"command":"echo","args":["hello", "realm"]}
+{"command":"pipe-echo","args":["hello through two processes"]}
 {"command":"write-file","args":["notes.txt","durable\n"],"cwd":"/home/agent"}
 {"command":"cat","args":["notes.txt"],"cwd":"/home/agent"}
 {"command":"write-file","args":["candidate.rs","..."],"cwd":"/workspace"}
@@ -121,9 +141,10 @@ nested descriptor closes, so a trapped command does not leave a partial guest
 file. Durable-home closes select a content-addressed generation with a KV CAS;
 workspace and temporary files retain their outer mount semantics.
 
-This slice does not provide Bash, pipes, child processes, Linux syscalls, a libc,
-package management, networking, PTYs, or a compiler. Those belong behind the same
-realm boundary; they must not be simulated by granting a host process.
+This slice does not provide Bash, guest-created processes or pipes, general Linux
+syscalls, a libc, package management, networking, PTYs, or a compiler. Those
+belong behind the same realm boundary; they must not be simulated by granting a
+host process.
 
 ## Distribution direction
 
