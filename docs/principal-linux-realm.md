@@ -1,6 +1,6 @@
 # AOS Principal Linux Realm Capsule
 
-Status: active implementation programme; bounded RV64 privileged boot spine live
+Status: active implementation programme; bounded RV64IMA/Sv39 machine core live
 
 Last reviewed: 2026-07-18
 
@@ -135,10 +135,22 @@ misaligned superpages; enforces U/S, R/W/X, SUM, and MXR; translates MPRV data
 accesses; and updates A/D bits in admitted RAM. `sfence.vma` is privilege checked
 and retires as a no-op because the interpreter has no software TLB.
 
-This is not Linux yet. Interrupt state still reads zero, and the machine does not
-yet implement the M/A instruction extensions, counters, compressed instructions,
-a deterministic timer, PLIC, an SBI/boot handoff, a generated device tree, or
-virtio block. Those are measurable boot prerequisites, not implied scaffolding.
+The fourth slice supplies the single-hart execution and time substrate. `misa`
+reports RV64IMA plus S/U; all base M multiply/divide operations and W forms, LR/SC,
+and the W/D AMO set execute with architectural edge behavior. Reservations are
+physical, cleared by overlapping stores and traps, and never weaken the outer
+single-threaded machine boundary. Architectural cycle/time/instret counters are
+separate from unforgeable Realm fuel accounting, and `mcounteren`/`scounteren`
+gate lower-privilege reads.
+
+The deterministic CLINT exposes `msip`, `mtimecmp`, and `mtime`. Guest time advances
+once per charged machine step rather than from ambient host wall time. M/S
+interrupt CSRs, delegation, global enables, direct/vectored entry, and bounded
+`wfi` are live; machine and supervisor timer-interrupt paths have executable tests.
+
+This is not Linux yet. The machine does not yet provide SBI firmware, a generated
+device tree, Linux image placement, a PLIC, compressed instructions, or virtio
+block. Those are measurable boot prerequisites, not implied scaffolding.
 
 ### 2.5 Privileged-machine component sketch and invariant ledger
 
@@ -148,12 +160,12 @@ subsystem names:
 ```text
 Realm adapter (program admission, outer fuel/output ceilings)
   -> Machine::run_slice (bounded scheduling and accounting)
-     -> instruction decode/commit (RV64I + Zicsr + xRET + sfence.vma)
+     -> instruction decode/commit (RV64IMA + Zicsr + xRET + sfence.vma + wfi)
         -> Cpu (integer registers, PC, current privilege)
         -> CsrFile (typed implemented CSR set and WARL masks)
         -> exception entry (delegation and xstatus stack update)
         -> Sv39 walk and permission check (virtual to admitted physical address)
-        -> Devices (admitted RAM, UART, test finisher)
+        -> Devices (admitted RAM, deterministic CLINT, UART, test finisher)
 ```
 
 Exception entry is a private machine operation rather than a pluggable object:
@@ -179,11 +191,15 @@ an implicit RISC-V device.
 | Synchronous faults | Faulting instructions do not partially commit; cause/EPC/tval enter the selected architectural vector | illegal CSR, breakpoint, bad jump, misaligned store, and delegated page-fault regressions |
 | Sv39 | Walks are bounded to three levels; canonicality, leaf/superpage form, U/S and R/W/X permissions, SUM/MXR, MPRV, and A/D updates are exact | 4 KiB R/W/X, execute-only, 2 MiB superpage, non-canonical, and privilege-matrix regressions |
 | Translation fence | `sfence.vma` is illegal in U and retires in S/M; no cached translation survives because this implementation has no TLB | S retirement and U illegal-instruction regression |
+| RV64M | Signed/unsigned high products, divide-by-zero, signed overflow, remainder, and W sign extension follow the ISA | decode-driven operation matrix for all M funct3 values and W forms |
+| RV64A | LR/SC uses a physical single-hart reservation; overlapping writes and traps invalidate it; W/D AMOs return the old value exactly | successful and failed LR/SC plus AMOSWAP/AMOADD regressions |
+| Counters | Architectural counters are deterministic and guest-writable machine counters cannot rewrite outer Realm accounting | cycle/time/instret reads and M/S/U counter-enable matrix |
+| Interrupts | Pending/enable/delegation/global-enable selection precedes fetch; entry preserves the interrupted PC and vectors only interrupts | CLINT M-timer vectored entry and delegated S-timer/WFI regressions |
 
 The table is also the review boundary: a checkmark for privileged mode does not
-mean Linux compatibility. The next increment must add the M/A instruction
-extensions, architectural counters, and deterministic interrupt delivery before a
-kernel image is admitted.
+mean Linux compatibility. The next increment must define the firmware boundary,
+SBI calls, Linux image placement, and generated device tree before a kernel image
+is admitted.
 
 ## 3. The system seen from each side
 
@@ -1202,8 +1218,10 @@ CE set rather than test-installed companions.
   accounting, and an installable Supervisor transition probe;
 - [x] complete architectural delivery for instruction, load, and store faults,
   then implement Sv39 translation and `sfence.vma` against adversarial page tables;
-- add deterministic CLINT and PLIC models, boot ROM/SBI handoff, and a generated,
-  versioned device tree;
+- [x] add RV64M, RV64A, architectural counters, deterministic CLINT time, interrupt
+  CSR/delegation/global-enable behavior, vectored entry, and bounded `wfi`;
+- add the boot ROM/SBI handoff and a generated, versioned device tree;
+- add a PLIC when an admitted interrupting device requires it;
 - boot signed Linux longterm 6.18.39 with a Buildroot 2026.05.1 initramfs to an
   AOS-controlled `/init`, and retain an exact serial trace as an executable test;
 - add virtio-block behind an immutable base plus principal-private COW block
@@ -1466,10 +1484,10 @@ The first implementation must resolve these with executable evidence:
 - [ ] defer public WIT, Debian naming, arbitrary package claims, and native-kernel
     coupling until evidence requires them.
 
-The next Linux-bearing executable artifact is the Linux-required execution and
-interrupt surface: RV64IMA integer/atomic operations, architectural counters,
-deterministic timer interrupts, boot handoff, and a generated device tree. It is
-followed by pinned Linux 6.18.39 plus Buildroot 2026.05.1 serial boot to `/init`.
+The next Linux-bearing executable artifact is the firmware contract: exact Linux
+image/initramfs placement, generated FDT bytes, S-mode register state, and bounded
+SBI base/time/debug-console/reset handling. It is followed by pinned Linux 6.18.39
+plus Buildroot 2026.05.1 serial boot to `/init`.
 Every artifact must run in bounded slices and
 fail with an exact architectural trap before virtio block, persistence,
 networking, or a shell are added. The parallel process track still needs
