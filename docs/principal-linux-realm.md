@@ -146,9 +146,10 @@ now precise rather than POSIX-shaped by assertion:
 |---|---|---|
 | `arg-count()`, `arg-len/read(index, ...)` | Read a bounded argv vector without a C layout dependency | At most 64 entries and 32 KiB combined UTF-8; no NUL |
 | `env-count()`, `env-len/read(index, ...)` | Read canonical, unique `KEY=VALUE` entries | At most 64 entries and 32 KiB combined UTF-8; identifier-shaped keys only |
+| `open(path, mode)`, `read/write(fd, ...)`, `close(fd)` | Use one kernel-allocated descriptor table for host-backed files and realm pipes | File descriptions remain process-store-local and cannot yet participate in child descriptor actions |
 | `pipe(capacity, ends_ptr)` | Create one quota-charged bounded pipe and write exact read/write descriptors | No flags or socket pairs |
 | `spawn-signed(program, arg, source_fd, target_fd, handle_ptr)` | Compatibility scalar form for the first guest-created pipeline | One argument and at most one mapping; new code uses the record form |
-| `spawn-signed-record(record_ptr, 44)` | Resolve one absolute immutable-catalog path; copy bounded argv/environment vectors; apply up to 16 exact descriptor actions; return a generation-checked handle | No module bytes, host PATH lookup, implicit inheritance, arbitrary files, or `fork` |
+| `spawn-signed-record(record_ptr, 44)` | Resolve one absolute build-generated immutable-catalog path; copy bounded argv/environment vectors; apply up to 16 exact descriptor actions; return a generation-checked handle | No module bytes, host PATH lookup, implicit inheritance, file actions, or `fork` |
 | `wait(handle, status_ptr)` | Park until one direct child terminates, reap it, and write an explicit exited/signalled record | No `waitpid(-1)`, groups, or nonblocking mode |
 | `signal(handle, signal)` | Terminate one direct child with a typed Realm signal | No host signal and no cross-job PID targeting |
 
@@ -175,6 +176,7 @@ The admission cases are intentionally closed rather than inferred:
 | Empty argv, too many entries/actions, aggregate byte overflow, invalid UTF-8/NUL | Reject before PID allocation |
 | Malformed or duplicate environment key | Reject before PID allocation; no last-value-wins ambiguity |
 | Missing action source, duplicate child target, duplicate parent close, negative descriptor | Reject the entire action table; retain the parent's table |
+| Action selects a host-backed file descriptor | Reject before PID allocation; shared offset and last-close semantics are not guessed |
 | Catalog module fails validation or store admission | Reject before PID allocation |
 | Child quota exhausted | Reject while preserving every live endpoint and existing process |
 | Spawn succeeds but the foreground tree later faults, traps, exhausts fuel, or is cancelled | Terminate descendants, close all endpoints, retain exact accounting, and reap the tree before returning |
@@ -186,11 +188,18 @@ fuel/output, and final cleanup paths. Core tests separately check that invalid
 inherit/close transactions leave the PID sequence, parent descriptor table, pipe
 counts, and endpoint reference counts unchanged.
 
+The immutable executable table is generated from the validated
+`guests/catalog.tsv` build manifest. Absolute paths, guest source directories,
+output names, and Rust byte symbols must be unique and syntactically bounded;
+invalid metadata fails the capsule build rather than changing runtime lookup.
+
 Process handles are explicit little-endian records containing the actor boot
 generation and the monotonic Realm PID. Both fields are checked before `wait` or
 `signal`; a bare PID is never sufficient across actor restart. File and pipe
-descriptors share one allocation space even though the current implementation is
-still migrating file objects into the semantic kernel.
+descriptors now share one kernel-owned allocation space. The runtime maps the
+kernel's typed `FileDescriptionId` to the actual Astrid-backed file object; that
+object is still process-store-local, so sharing it across child stores remains a
+separate, explicit design step.
 
 The outer boundary remains the audited Astrid Component Model surface. For example:
 
@@ -445,6 +454,14 @@ output, and error. Spawn validates the complete mapping before allocating a PID
 or incrementing an endpoint reference, so an invalid mapping cannot create a
 partial child.
 
+Files and pipes use the same first-free descriptor allocator in `realm-core`.
+Opening a file installs `File(FileDescriptionId)` in the running process table;
+the Wasmi store retains only the backing `RealmFile`. Read, write, and close first
+resolve the kernel resource kind, so the outer backend cannot independently pick
+or collide descriptor numbers. File inheritance and atomic child-close actions
+are rejected before PID allocation until a realm-wide open-file-description table
+defines shared offsets, reference counts, and final-close commit behavior.
+
 Each pipe has an immutable positive capacity and contributes that capacity to an
 aggregate realm quota. Writes may be partial up to available capacity. A full pipe
 returns `WouldBlock`; a read frees capacity and wakes parked writers. An empty pipe
@@ -460,7 +477,7 @@ tool calls within one capsule boot, reaps completed foreground jobs, and exposes
 live process, pipe, reserved-byte, command, and next-PID accounting. Constructing a
 new process table inside each one-shot tool call is no longer the live path.
 
-There are now three executable topology proofs. `pipe-echo` has the outer Realm
+There are now four executable topology proofs. `pipe-echo` has the outer Realm
 runtime choose and connect two signed processes. `guest-pipe-echo` instead launches
 one signed supervisor guest; that guest calls `pipe`, starts the consumer and
 producer through `spawn-signed`, closes its pipe copies, blocks in `wait`, checks
@@ -471,11 +488,13 @@ accounting record and is waitable by its parent.
 
 `realm-sh` is the record-ABI proof. The outer capsule passes separate structured
 tokens; the nested shell, not the host, recognizes `echo TEXT`, `env KEY=VALUE`,
-or `echo TEXT | cat`. It maps those names to `/bin/echo`, `/usr/bin/env`, and
+`echo TEXT | cat`, or `echo TEXT > PATH`. It maps those names to `/bin/echo`, `/usr/bin/env`, and
 `/bin/cat`, encodes argv/environment/action tables in its own memory, spawns the
 signed processes, atomically transfers the required pipe endpoints, and waits for
-the foreground job. A single text argument such as `"echo x | cat"` is not
-retokenized. The catalog has three exact paths and performs no host PATH search.
+the foreground job. Redirection opens the file in the shell process and pumps a
+signed echo child's bounded pipe into it; it does not pretend file descriptors are
+shareable yet. A single text argument such as `"echo x | cat"` is not retokenized.
+The generated catalog has three exact paths and performs no host PATH search.
 
 The caller's fuel and captured-output budgets are partitioned before execution
 across the root and its maximum two descendants. The process quota is reserved
@@ -942,6 +961,28 @@ compatibility.
   stdout `ASTRID_REALM=final\n`, and advanced next PID to 6. Final status reported
   two completed commands and zero retained process records, pipe objects, or
   reserved pipe bytes;
+- the final generated-catalog/redirection artifact is 415,603 bytes with outer
+  SHA-256
+  `3947b2890a992c7b0e0051f68b295df8ca0bc469b7e528f841cbac9e3f1482d4`
+  and installed component hash
+  `91709be6ae12947788ca021af42a32e05479c36e7598aebff42ad36a69b42dab`.
+  An isolated Astrid 0.10.1 daemon exposed the capsule through the real MCP
+  2025-06-18 front door to a least-privilege `realm-redir` principal. Guest
+  `realm-sh echo ... > final-component.txt` ran as PIDs 1 and 2 under boot
+  sequence 3, consumed 5,577 fuel with one suspension and a 128 KiB aggregate
+  memory ceiling, and returned empty stdout. A separate `cat` at PID 3 returned
+  exact stdout `final component redirection\n`; status reported durable home
+  generation 2, two files, two completed commands, next PID 4, and zero retained
+  process records, pipe objects, or reserved pipe bytes. The same installed
+  component had first selected generation 1 for `live-redirection.txt`; after a
+  full daemon restart, `cat` returned exact stdout `live Astrid redirection\n`
+  under boot sequence 2/PID 1 while the home stayed at generation 1 with manifest
+  `bcbb9e4366ebe6f870457e9e033fdd5d5644a08c3e0e8447a9370af501764796`;
+  final status again reported zero live resources. Host tests separately pump a
+  message larger than pipe capacity and then read it from a distinct process.
+  Kernel tests prove file descriptor 3 followed by pipe endpoints 4 and 5,
+  failure-atomic rejection of file child actions, and descriptor-quota rejection
+  before any outer filesystem open;
 - the initial live run discovered two integration constraints rather than hiding
   them: Astrid's component FileHandle methods are not implemented, so the adapter
   uses bounded whole-file I/O and commits on descriptor close; `/tmp` must be
@@ -997,8 +1038,12 @@ companions.
   direct-child signal substrate with generation-checked handles;
 - [x] add a bounded record spawn with argv, environment, exact absolute catalog
   paths, multiple pipe mappings, and atomic parent close actions;
-- [ ] translate that record into libc-grade sequential `posix_spawn` file actions
-  after files move into the kernel descriptor table, then add `execve` without
+- [x] move file descriptor allocation into the semantic kernel and reject file
+  child actions until open-file-description sharing is defined;
+- [x] generate the immutable signed executable catalog from validated image
+  metadata and add guest-owned, file-backed `echo TEXT > PATH` redirection;
+- [ ] add a realm-wide open-file-description table, then translate the record into
+  libc-grade sequential `posix_spawn` file actions and add `execve` without
   host process authority;
 - [ ] add PTYs, sessions, process groups, and job-control signals;
 - [x] run multiple guest modules with isolated memories;
@@ -1067,7 +1112,8 @@ The design must be tested against at least these scenarios:
 | Guest exceeds its admitted descendant count | Spawn fails closed; the partial foreground tree is cancelled and reaped |
 | Guest supplies a malformed record, vector, environment, or catalog path | Reject before child PID allocation and preserve the parent's descriptors |
 | Record maps one pipe endpoint and closes the parent copy | Child retains the endpoint; EOF/broken-pipe accounting observes no leaked parent reference |
-| Guest opens a file before creating a pipe | Pipe descriptors skip the file descriptor and remain in one process-local number space |
+| Guest opens a file before creating a pipe | The kernel allocates file descriptor 3 and pipe descriptors 4/5 from one process-local table |
+| Spawn action selects a file before shared open-file descriptions exist | Reject before PID allocation and retain the file and parent descriptor table |
 | Guest signals a blocked direct child | Child becomes waitable, abandoned continuation is not resumed, and all resources are released |
 | MCP reconnect redelivers one mutating call ID | Actor returns the cached result without repeating the process tree or mutation |
 | Call ID is reused with different arguments | Request fails closed rather than replaying or executing |
@@ -1239,6 +1285,10 @@ The first implementation must resolve these with executable evidence:
   than an older installed companion;
 - [x] generalize the signed executable catalog and spawn record, then add a small
   shell over the now-live guest-created process/pipe/wait/signal substrate;
+- [x] generate that catalog from one validated manifest, move file descriptor
+  identity/allocation into `realm-core`, reject undefined file child actions
+  atomically, and add guest-owned `echo TEXT > PATH` redirection with exact
+  persisted-byte and cleanup tests;
 - [ ] define the attenuating capsule-to-realm job contract and migrate Forge as the
   first non-interactive consumer after artifact verification exists;
 - [ ] replace `aos-shell` in the default distro only after interactive and
@@ -1250,10 +1300,10 @@ The first implementation must resolve these with executable evidence:
 - [ ] defer public WIT, Debian naming, arbitrary package claims, and native-kernel
     coupling until evidence requires them.
 
-The next executable artifact should generate the signed catalog from image
-metadata, add guest-visible executable lookup without delegating to a host PATH,
-and extend the shell with file-backed redirection and explicit foreground job
-records. Descriptor-file migration must happen before redirection so pipe and file
-actions share one kernel-owned table. The storage track adds named
+The next executable artifact should add guest-visible executable lookup without
+delegating to a host PATH, define the realm-wide open-file-description table, and
+translate ordered spawn actions without weakening close/commit semantics. It
+should also expose explicit foreground job records rather than only the completed
+tree report. The storage track adds named
 checkpoint/diff/reset and outer workspace promotion. Bash and a compiler remain
 acceptance workloads, not claims made by this seed.

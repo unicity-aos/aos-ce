@@ -49,9 +49,10 @@
   descriptor allocation, deterministic foreground-tree cleanup, and bounded
   call-ID replay protection against duplicate mutating transport delivery.
 - A versioned record-oriented signed-spawn ABI with bounded argv and environment
-  vectors, absolute immutable-catalog resolution, multiple exact descriptor
-  mappings, atomic parent-endpoint close actions, and the guest-side `realm-sh`
-  workload for direct `echo`, environment, and `echo | cat` foreground jobs.
+  vectors, build-manifest-generated immutable-catalog resolution, multiple exact
+  descriptor mappings, atomic parent-endpoint close actions, kernel-owned file
+  and pipe descriptor allocation, and the guest-side `realm-sh` workload for
+  direct `echo`, environment, `echo | cat`, and file-backed `echo > PATH` jobs.
 - Homebrew formula updates initiated by the tap's authenticated stable-release
   poll, eliminating the cross-repository dispatch credential.
 - Strict, signed stable/dev/nightly channel and immutable release metadata

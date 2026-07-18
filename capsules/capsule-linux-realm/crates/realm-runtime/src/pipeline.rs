@@ -63,6 +63,13 @@ impl Default for RealmMachine {
 }
 
 impl RealmMachine {
+    pub(super) fn with_runtime(runtime: RealmRuntime) -> Self {
+        Self {
+            runtime,
+            ..Self::default()
+        }
+    }
+
     /// Create a default-quota machine for one explicit actor boot generation.
     #[must_use]
     pub fn with_generation(generation: u64) -> Self {
@@ -963,6 +970,100 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct CountingHost {
+        opens: Rc<RefCell<usize>>,
+    }
+
+    impl RealmHost for CountingHost {
+        fn open(
+            &mut self,
+            _cwd: &str,
+            _path: &str,
+            _mode: OpenMode,
+        ) -> Result<Box<dyn RealmFile>, RealmIoError> {
+            *self.opens.borrow_mut() += 1;
+            Ok(Box::new(EmptyFile))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingHost {
+        files: Rc<RefCell<BTreeMap<String, Vec<u8>>>>,
+    }
+
+    impl RecordingHost {
+        fn contents(&self, path: &str) -> Option<Vec<u8>> {
+            self.files.borrow().get(path).cloned()
+        }
+    }
+
+    impl RealmHost for RecordingHost {
+        fn open(
+            &mut self,
+            cwd: &str,
+            path: &str,
+            mode: OpenMode,
+        ) -> Result<Box<dyn RealmFile>, RealmIoError> {
+            let path = if path.starts_with('/') {
+                path.to_string()
+            } else {
+                format!("{}/{path}", cwd.trim_end_matches('/'))
+            };
+            if mode == OpenMode::Read && !self.files.borrow().contains_key(&path) {
+                return Err(RealmIoError::NotFound);
+            }
+            if mode == OpenMode::WriteTruncate {
+                self.files.borrow_mut().insert(path.clone(), Vec::new());
+            }
+            Ok(Box::new(RecordingFile {
+                files: Rc::clone(&self.files),
+                path,
+                offset: 0,
+                mode,
+            }))
+        }
+    }
+
+    struct RecordingFile {
+        files: Rc<RefCell<BTreeMap<String, Vec<u8>>>>,
+        path: String,
+        offset: usize,
+        mode: OpenMode,
+    }
+
+    impl RealmFile for RecordingFile {
+        fn read(&mut self, max_bytes: usize) -> Result<Vec<u8>, RealmIoError> {
+            if self.mode != OpenMode::Read {
+                return Err(RealmIoError::Denied);
+            }
+            let files = self.files.borrow();
+            let bytes = files.get(&self.path).ok_or(RealmIoError::NotFound)?;
+            let end = self.offset.saturating_add(max_bytes).min(bytes.len());
+            let result = bytes[self.offset..end].to_vec();
+            self.offset = end;
+            Ok(result)
+        }
+
+        fn write(&mut self, bytes: &[u8]) -> Result<usize, RealmIoError> {
+            if self.mode != OpenMode::WriteTruncate {
+                return Err(RealmIoError::Denied);
+            }
+            let mut files = self.files.borrow_mut();
+            let file = files.get_mut(&self.path).ok_or(RealmIoError::NotFound)?;
+            let end = self
+                .offset
+                .checked_add(bytes.len())
+                .ok_or(RealmIoError::TooLarge)?;
+            if end > file.len() {
+                file.resize(end, 0);
+            }
+            file[self.offset..end].copy_from_slice(bytes);
+            self.offset = end;
+            Ok(bytes.len())
+        }
+    }
+
     fn assert_spawn_record_rejected_without_child(wat_source: &str, fault: HostFault) {
         let guest = wat::parse_str(wat_source).expect("spawn-record test guest compiles");
         let mut machine = RealmMachine::with_generation(21);
@@ -1060,6 +1161,38 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_quota_is_checked_before_the_outer_filesystem_is_opened() {
+        let host = CountingHost::default();
+        let mut machine = RealmMachine::new(RealmLimits {
+            max_descriptors_per_process: 0,
+            ..RealmLimits::default()
+        });
+        let report = machine
+            .execute_process(
+                WRITE_FILE_GUEST,
+                ProcessConfig {
+                    argv: vec![
+                        "write-file".to_string(),
+                        "side-effect.txt".to_string(),
+                        "must not be written".to_string(),
+                    ],
+                    environment: Vec::new(),
+                    cwd: "/workspace".to_string(),
+                },
+                RunLimits::default(),
+                Box::new(host.clone()),
+            )
+            .expect("quota failure is a bounded process outcome");
+
+        assert_eq!(
+            report.execution.outcome,
+            ProcessOutcome::HostFault(HostFault::InvalidArgument)
+        );
+        assert_eq!(*host.opens.borrow(), 0);
+        assert_eq!(machine.status().process_records, 0);
+    }
+
+    #[test]
     fn guest_creates_waits_and_reaps_its_own_signed_pipeline() {
         let limits = RunLimits::default();
         let mut machine = RealmMachine::with_generation(9);
@@ -1153,6 +1286,72 @@ mod tests {
         assert_eq!(machine.status().process_records, 0);
         assert_eq!(machine.status().pipe_objects, 0);
         assert_eq!(machine.status().reserved_pipe_bytes, 0);
+        assert_eq!(machine.status().next_process_id, Some(ProcessId::new(4)));
+    }
+
+    #[test]
+    fn mini_shell_redirects_a_backpressured_child_into_the_realm_filesystem() {
+        let host = RecordingHost::default();
+        let message = "realm-redirection-".repeat(700);
+        let expected = format!("{message}\n").into_bytes();
+        let mut machine = RealmMachine::with_generation(11);
+        let report = machine
+            .execute_process_tree(
+                MINI_SHELL_GUEST,
+                ProcessConfig {
+                    argv: vec![
+                        "realm-sh".to_string(),
+                        "echo".to_string(),
+                        message,
+                        ">".to_string(),
+                        "/workspace/redirected.txt".to_string(),
+                    ],
+                    environment: Vec::new(),
+                    cwd: "/workspace".to_string(),
+                },
+                RunLimits {
+                    fuel: 1_000_000,
+                    ..RunLimits::default()
+                },
+                Box::new(host.clone()),
+                1,
+            )
+            .expect("mini shell redirection completes");
+
+        assert_eq!(report.root.execution.outcome, ProcessOutcome::Exited(0));
+        assert!(report.root.execution.stdout.is_empty());
+        assert_eq!(report.children.len(), 1);
+        assert_eq!(
+            report.children[0].execution.outcome,
+            ProcessOutcome::Exited(0)
+        );
+        assert!(report.children[0].execution.stdout.is_empty());
+        assert_eq!(
+            host.contents("/workspace/redirected.txt"),
+            Some(expected.clone())
+        );
+        assert_eq!(machine.status().process_records, 0);
+        assert_eq!(machine.status().pipe_objects, 0);
+        assert_eq!(machine.status().reserved_pipe_bytes, 0);
+
+        let cat = machine
+            .execute_process(
+                CAT_GUEST,
+                ProcessConfig {
+                    argv: vec!["cat".to_string(), "redirected.txt".to_string()],
+                    environment: Vec::new(),
+                    cwd: "/workspace".to_string(),
+                },
+                RunLimits {
+                    fuel: 1_000_000,
+                    output_bytes: expected.len(),
+                    ..RunLimits::default()
+                },
+                Box::new(host),
+            )
+            .expect("cat reads redirected bytes");
+        assert_eq!(cat.execution.outcome, ProcessOutcome::Exited(0));
+        assert_eq!(cat.execution.stdout, expected);
         assert_eq!(machine.status().next_process_id, Some(ProcessId::new(4)));
     }
 

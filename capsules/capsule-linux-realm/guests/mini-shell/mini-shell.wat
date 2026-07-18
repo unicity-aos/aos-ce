@@ -3,6 +3,13 @@
   (import "aos_realm_v0" "arg-len" (func $arg-len (param i32) (result i32)))
   (import "aos_realm_v0" "arg-read"
     (func $arg-read (param i32 i32 i32) (result i32)))
+  (import "aos_realm_v0" "open"
+    (func $open (param i32 i32 i32) (result i32)))
+  (import "aos_realm_v0" "read"
+    (func $read (param i32 i32 i32) (result i32)))
+  (import "aos_realm_v0" "write"
+    (func $write (param i32 i32 i32) (result i32)))
+  (import "aos_realm_v0" "close" (func $close (param i32) (result i32)))
   (import "aos_realm_v0" "pipe" (func $pipe (param i32 i32) (result i32)))
   (import "aos_realm_v0" "spawn-signed-record"
     (func $spawn (param i32 i32) (result i32)))
@@ -10,13 +17,15 @@
   (import "aos_realm_v0" "exit" (func $exit (param i32)))
 
   (memory (export "memory") 1 1)
-  (data (i32.const 4096) "echo")
-  (data (i32.const 4100) "cat")
-  (data (i32.const 4103) "env")
-  (data (i32.const 4106) "|")
-  (data (i32.const 4107) "/bin/echo")
-  (data (i32.const 4116) "/bin/cat")
-  (data (i32.const 4124) "/usr/bin/env")
+  ;; Static strings remain below the 32 KiB argument buffer at 4096.
+  (data (i32.const 1536) "echo")
+  (data (i32.const 1540) "cat")
+  (data (i32.const 1543) "env")
+  (data (i32.const 1546) "|")
+  (data (i32.const 1547) ">")
+  (data (i32.const 1548) "/bin/echo")
+  (data (i32.const 1557) "/bin/cat")
+  (data (i32.const 1565) "/usr/bin/env")
 
   ;; Compare one structured process argument with a literal already in memory.
   (func $arg-is
@@ -130,11 +139,11 @@
 
   (func $spawn-echo (param $message-length i32) (param $handle i32)
     ;; argv = ["echo", message]
-    i32.const 256 i32.const 4096 i32.store
+    i32.const 256 i32.const 1536 i32.store
     i32.const 260 i32.const 4 i32.store
-    i32.const 264 i32.const 2048 i32.store
+    i32.const 264 i32.const 4096 i32.store
     i32.const 268 local.get $message-length i32.store
-    i32.const 4107 i32.const 9
+    i32.const 1548 i32.const 9
     i32.const 256 i32.const 2
     i32.const 0 i32.const 0
     i32.const 0 i32.const 0
@@ -151,11 +160,11 @@
 
   (func $direct-env (param $entry-length i32)
     ;; argv = ["env"], environment = [argv[2]]
-    i32.const 256 i32.const 4103 i32.store
+    i32.const 256 i32.const 1543 i32.store
     i32.const 260 i32.const 3 i32.store
-    i32.const 320 i32.const 2048 i32.store
+    i32.const 320 i32.const 4096 i32.store
     i32.const 324 local.get $entry-length i32.store
-    i32.const 4124 i32.const 12
+    i32.const 1565 i32.const 12
     i32.const 256 i32.const 1
     i32.const 320 i32.const 1
     i32.const 0 i32.const 0
@@ -165,6 +174,91 @@
     drop
     i32.const 80 i32.const 112 i32.const 71 call $wait-ok)
 
+  (func $write-all (param $fd i32) (param $pointer i32) (param $length i32)
+    (local $offset i32)
+    (local $written i32)
+    (block $done
+      (loop $next
+        local.get $offset
+        local.get $length
+        i32.ge_u
+        br_if $done
+        local.get $fd
+        local.get $pointer
+        local.get $offset
+        i32.add
+        local.get $length
+        local.get $offset
+        i32.sub
+        call $write
+        local.tee $written
+        i32.const 0
+        i32.le_s
+        if
+          i32.const 74
+          call $exit
+        end
+        local.get $offset
+        local.get $written
+        i32.add
+        local.set $offset
+        br $next)))
+
+  ;; `echo TEXT > PATH`: the shell owns the destination. Only the pipe writer
+  ;; is inherited; the shell pumps bytes into its host-backed file descriptor.
+  (func $redirect (param $message-length i32) (param $path-length i32)
+    (local $file-fd i32)
+    (local $read-fd i32)
+    (local $write-fd i32)
+    (local $count i32)
+
+    i32.const 36864
+    local.get $path-length
+    i32.const 1
+    call $open
+    local.set $file-fd
+    i32.const 4096 i32.const 64 call $pipe drop
+    i32.const 64 i32.load local.set $read-fd
+    i32.const 68 i32.load local.set $write-fd
+
+    ;; Producer: /bin/echo, dup(write, stdout), close-parent(write).
+    i32.const 256 i32.const 1536 i32.store
+    i32.const 260 i32.const 4 i32.store
+    i32.const 264 i32.const 4096 i32.store
+    i32.const 268 local.get $message-length i32.store
+    i32.const 352 i32.const 1 i32.store
+    i32.const 356 local.get $write-fd i32.store
+    i32.const 360 i32.const 1 i32.store
+    i32.const 364 i32.const 2 i32.store
+    i32.const 368 local.get $write-fd i32.store
+    i32.const 372 i32.const -1 i32.store
+    i32.const 1548 i32.const 9
+    i32.const 256 i32.const 2
+    i32.const 0 i32.const 0
+    i32.const 352 i32.const 2
+    i32.const 80
+    call $record
+    i32.const 0 i32.const 44 call $spawn drop
+
+    (block $eof
+      (loop $pump
+        local.get $read-fd
+        i32.const 45056
+        i32.const 4096
+        call $read
+        local.tee $count
+        i32.eqz
+        br_if $eof
+        local.get $file-fd
+        i32.const 45056
+        local.get $count
+        call $write-all
+        br $pump))
+
+    local.get $read-fd call $close drop
+    local.get $file-fd call $close drop
+    i32.const 80 i32.const 112 i32.const 75 call $wait-ok)
+
   (func $pipeline (param $message-length i32)
     (local $read-fd i32)
     (local $write-fd i32)
@@ -173,7 +267,7 @@
     i32.const 68 i32.load local.set $write-fd
 
     ;; Consumer: /bin/cat, dup(read, stdin), close-parent(read).
-    i32.const 256 i32.const 4100 i32.store
+    i32.const 256 i32.const 1540 i32.store
     i32.const 260 i32.const 3 i32.store
     i32.const 352 i32.const 1 i32.store
     i32.const 356 local.get $read-fd i32.store
@@ -181,7 +275,7 @@
     i32.const 364 i32.const 2 i32.store
     i32.const 368 local.get $read-fd i32.store
     i32.const 372 i32.const -1 i32.store
-    i32.const 4116 i32.const 8
+    i32.const 1557 i32.const 8
     i32.const 256 i32.const 1
     i32.const 0 i32.const 0
     i32.const 352 i32.const 2
@@ -190,9 +284,9 @@
     i32.const 0 i32.const 44 call $spawn drop
 
     ;; Producer: /bin/echo, dup(write, stdout), close-parent(write).
-    i32.const 256 i32.const 4096 i32.store
+    i32.const 256 i32.const 1536 i32.store
     i32.const 260 i32.const 4 i32.store
-    i32.const 264 i32.const 2048 i32.store
+    i32.const 264 i32.const 4096 i32.store
     i32.const 268 local.get $message-length i32.store
     i32.const 352 i32.const 1 i32.store
     i32.const 356 local.get $write-fd i32.store
@@ -200,7 +294,7 @@
     i32.const 364 i32.const 2 i32.store
     i32.const 368 local.get $write-fd i32.store
     i32.const 372 i32.const -1 i32.store
-    i32.const 4107 i32.const 9
+    i32.const 1548 i32.const 9
     i32.const 256 i32.const 2
     i32.const 0 i32.const 0
     i32.const 352 i32.const 2
@@ -213,20 +307,21 @@
 
   (func (export "_start")
     (local $length i32)
+    (local $path-length i32)
     call $arg-count
     i32.const 3
     i32.eq
     if
-      i32.const 1 i32.const 4096 i32.const 4 call $arg-is
+      i32.const 1 i32.const 1536 i32.const 4 call $arg-is
       if
-        i32.const 2 i32.const 2048 i32.const 32768 call $copy-arg
+        i32.const 2 i32.const 4096 i32.const 32768 call $copy-arg
         local.set $length
         local.get $length call $direct-echo
         i32.const 0 call $exit
       end
-      i32.const 1 i32.const 4103 i32.const 3 call $arg-is
+      i32.const 1 i32.const 1543 i32.const 3 call $arg-is
       if
-        i32.const 2 i32.const 2048 i32.const 32768 call $copy-arg
+        i32.const 2 i32.const 4096 i32.const 32768 call $copy-arg
         local.set $length
         local.get $length call $direct-env
         i32.const 0 call $exit
@@ -237,13 +332,26 @@
     i32.const 5
     i32.eq
     if
-      i32.const 1 i32.const 4096 i32.const 4 call $arg-is
-      i32.const 3 i32.const 4106 i32.const 1 call $arg-is
-      i32.and
-      i32.const 4 i32.const 4100 i32.const 3 call $arg-is
+      i32.const 1 i32.const 1536 i32.const 4 call $arg-is
+      i32.const 3 i32.const 1547 i32.const 1 call $arg-is
       i32.and
       if
-        i32.const 2 i32.const 2048 i32.const 32768 call $copy-arg
+        i32.const 2 i32.const 4096 i32.const 32768 call $copy-arg
+        local.set $length
+        i32.const 4 i32.const 36864 i32.const 4096 call $copy-arg
+        local.set $path-length
+        local.get $length
+        local.get $path-length
+        call $redirect
+        i32.const 0 call $exit
+      end
+      i32.const 1 i32.const 1536 i32.const 4 call $arg-is
+      i32.const 3 i32.const 1546 i32.const 1 call $arg-is
+      i32.and
+      i32.const 4 i32.const 1540 i32.const 3 call $arg-is
+      i32.and
+      if
+        i32.const 2 i32.const 4096 i32.const 32768 call $copy-arg
         local.set $length
         local.get $length call $pipeline
         i32.const 0 call $exit

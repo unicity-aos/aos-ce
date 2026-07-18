@@ -51,7 +51,7 @@ pub struct ExecArgs {
     /// Exact command name. This is never evaluated by a host shell.
     pub command: Option<String>,
     /// Structured command arguments. The outer adapter never tokenizes strings;
-    /// `realm-sh` alone recognizes its separate `|` token.
+    /// `realm-sh` alone recognizes separate `|` and `>` operator tokens.
     #[serde(default)]
     pub args: Vec<String>,
     /// Guest-visible CWD beneath `/workspace`, `/home/agent`, or `/tmp`.
