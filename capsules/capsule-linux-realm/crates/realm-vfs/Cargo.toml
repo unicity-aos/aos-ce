@@ -1,5 +1,5 @@
 [package]
-name = "aos-linux-realm"
+name = "aos-realm-vfs"
 version = "0.1.0"
 edition = "2024"
 authors = [
@@ -8,18 +8,10 @@ authors = [
 ]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/unicity-aos/aos-ce"
-description = "Principal-owned Linux-compatible workbench capsule for Unicity AOS"
+description = "Versioned content-addressed filesystem metadata for AOS Realm"
 publish = false
 
-[lib]
-crate-type = ["cdylib", "lib"]
-
 [dependencies]
-aos-realm-runtime = { workspace = true }
-aos-realm-vfs = { workspace = true }
-astrid-sdk = { workspace = true }
+blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-toml = { workspace = true }

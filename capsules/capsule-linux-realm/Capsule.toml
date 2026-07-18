@@ -16,6 +16,7 @@ type = "executable"
 # The realm sees only the invocation CWD, its private subtree of the caller's
 # principal home, and its principal-scoped tmp subtree. It has no host_process.
 [capabilities]
+kv = []
 fs_read = ["cwd://", "home://.local/share/aos-realm/", "home://.local/tmp/aos-realm/"]
 fs_write = ["cwd://", "home://.local/share/aos-realm/", "home://.local/tmp/aos-realm/"]
 

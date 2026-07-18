@@ -205,8 +205,10 @@ cannot silently reach unrelated Astrid state.
 
 The executable seed uses the same shape with a deliberately narrower guarantee:
 
-- `/home/agent` is a direct principal-scoped durable subtree and has been verified
-  across daemon restart;
+- `/home/agent` is a principal-scoped versioned filesystem: KV atomically selects
+  one immutable content-addressed manifest, while file and manifest blobs live in
+  the principal's private realm file store. It has been verified across daemon
+  restart;
 - `/workspace` is the invocation's Astrid `cwd://` copy-on-write view. Its writes
   remain staged until the outer Astrid workflow promotes them, and an unpromoted
   view is discarded on daemon restart;
@@ -232,16 +234,63 @@ base image digest
 The host should hold encryption keys and derive or unwrap them only for the bound
 principal and realm. Guest root never receives an Astrid storage key.
 
-### 6.1 Base and overlay
+### 6.1 Selected seed representation
+
+The seed deliberately uses both Astrid storage mechanisms, each for the property
+it is good at:
+
+```text
+KV realm/default/fs/head
+  = { format, generation, manifest_digest }
+
+file store .../store/blobs/<blake3>
+  = immutable file content or immutable JSON manifest
+```
+
+KV is not the file store. It contains only the exact raw head bytes required for
+an atomic compare-and-swap. The principal file store is not the transaction log.
+It contains immutable, read-after-write-verified blobs identified by BLAKE3. Both
+outer stores are already scoped by the kernel-stamped principal and capsule.
+
+One create-or-truncate commit is:
+
+1. normalize and bound the realm-relative path and bytes;
+2. materialize and verify the immutable file blob;
+3. load the currently selected head and manifest;
+4. build, materialize, and verify a new manifest containing the replacement and
+   the prior manifest digest as its parent;
+5. compare-and-swap the exact old head bytes to the new head;
+6. if another writer won, reload its generation, merge, and retry up to eight
+   attempts.
+
+A crash before step 5 may leave an orphan content or manifest blob, but it cannot
+make a partial generation visible. A crash after step 5 leaves a complete selected
+generation. Missing, tampered, malformed, or newer selected metadata fails closed.
+Garbage collection can later remove objects unreachable from retained heads and
+named checkpoints.
+
+Format-0 direct-home files are lazily imported on first read. The direct path is
+then maintained as a best-effort compatibility projection, never as the selected
+truth. This preserves the currently deployed seed without requiring a stop-the-
+world migration.
+
+The present semantic boundary is intentionally narrow: regular-file read and
+create/truncate, 64 KiB per file, a 1 MiB manifest, no delete or rename, no
+directory metadata, no links, no guest flush instruction, no named checkpoint,
+and no garbage collection. These omissions are reported as remaining work rather
+than implied POSIX behavior.
+
+### 6.2 Base and overlay
 
 - The base image is immutable, signed, content-addressed, and globally cacheable.
 - The overlay contains only blocks or files changed by the principal.
 - The durable home can be a separate volume so it can migrate between base images.
 - `/tmp`, pipes, process tables, and transient logs do not enter durable storage.
-- `fsync`, rename, truncate, flush ordering, and crash recovery require explicit
-  tests; persistence is not established by writing bytes into an in-memory map.
+- Guest `fsync`, atomic rename, directory ordering, and full-overlay crash recovery
+  require explicit tests. The seed currently proves only bounded file replacement
+  and atomic selected-home generations over real Astrid storage.
 
-### 6.2 Persistence levels
+### 6.3 Persistence levels
 
 The first guarantee is durable filesystem state across realm restart. It does not
 include a live RAM or process checkpoint.
@@ -609,7 +658,7 @@ agent invokes linux_realm_exec(write-file, ["notes.txt", "hello"], /home/agent)
   -> interpreter validates and instantiates guest module
   -> guest opens and writes a realm-local descriptor
   -> realm resolves the normalized path through the admitted mount
-  -> close commits the buffered file through Astrid's principal VFS
+  -> close materializes immutable blobs and CAS-selects a new home generation
   -> guest exits with status 0
   -> capsule returns bounded stdout/stderr/status/accounting
 ```
@@ -629,6 +678,9 @@ agent invokes linux_realm_exec(write-file, ["notes.txt", "hello"], /home/agent)
 - path traversal and unmounted absolute paths;
 - shell syntax presented as a command name;
 - typed Astrid host errors mapped to stable realm I/O faults;
+- selected metadata missing, malformed, from a newer format, or content-tampered;
+- an interrupted commit leaving unselected blobs;
+- concurrent head loss, bounded retry, and persistent contention;
 - concurrent invocation state leakage.
 
 ### Exit condition
@@ -645,16 +697,17 @@ compatibility.
 
 - the seed is based on `unicity-aos/aos-ce` main commit
   `dfa1d71c2737a016d8d4dd169d0755ff624f6b50`;
-- twenty-five focused host tests pass, including nested argument/CWD delivery,
+- thirty-five focused host tests pass, including nested argument/CWD delivery,
   file round trips across process instances, path confinement, stable host-error
-  mapping, the actual manifest authority test, fuel exhaustion, and memory/output
-  admission;
+  mapping, the actual manifest authority test, fuel exhaustion, memory/output
+  admission, selected-generation restart reconstruction, competing-writer merge,
+  orphan invisibility, and corruption failure;
 - the complete non-WASI capsule workspace checks under
   `wasm32-unknown-unknown`;
 - the current stable Wasmi 1.1.0 runs with default `std` and WAT parsing disabled,
   BTree-backed collections, extra runtime checks, fuel, and store limits;
-- `astrid-build` 0.10.1 produced a 332 KiB final test artifact with SHA-256
-  `90650dd67170be68b5a4d329b970a1f6a71781b14603f250dbe8508e7f0f24ee`;
+- `astrid-build` 0.10.1 produced a 348 KiB final test artifact with SHA-256
+  `fe8704940d1eae060d67857046ecc9449419c8b19aa77457c653b47de7fe7832`;
   Astrid 0.10.1 loads it as a shared component with `host_process=false`;
 - the two outer archive digests differed because `astrid-build` copied the
   rebuilt component's modification time into its tar header. Reproducible outer
@@ -671,6 +724,11 @@ compatibility.
   identity and an `io-not-found` fault for the default principal's durable
   `persist.txt`; it wrote and read `alice-only.txt`, while the default principal
   received `io-not-found` for that same name;
+- the upgraded live realm reported `migration-required` before first mutation;
+  reading each principal's format-0 file lazily selected an independent
+  generation-1 manifest, the default principal's next write selected generation 2
+  with two files, and both exact heads and contents survived a full daemon
+  stop/start;
 - the initial live run discovered two integration constraints rather than hiding
   them: Astrid's component FileHandle methods are not implemented, so the adapter
   uses bounded whole-file I/O and commits on descriptor close; `/tmp` must be
@@ -870,8 +928,8 @@ The first implementation must resolve these with executable evidence:
 2. Should the internal guest ABI use named functions, a syscall dispatcher, WASI
    compatibility, or generated shims?
 3. Which shell can prove process semantics before Bash?
-4. Which filesystem representation gives correct crash behavior over current
-   Astrid storage interfaces?
+4. Which retention and garbage-collection policy should preserve named
+   checkpoints over the now-selected KV-head/content-addressed-blob filesystem?
 5. Is direct principal VFS projection safe enough, or should the first realm use a
    single private block volume?
 6. How are guest continuations represented for `fork`, signals, and blocking calls?
@@ -906,8 +964,11 @@ The first implementation must resolve these with executable evidence:
   second principal's read of those bytes;
 - [x] invoke the packaged capsule through a live Astrid 0.10.1 daemon and MCP
   front door, including ingress consent and grant-on-use;
-- [ ] add crash-consistent realm generations, explicit flush semantics, and
-  named checkpoints; current close-time whole-file durability is not that claim;
+- [x] add crash-consistent principal-home generations with an atomic KV head,
+  immutable content-addressed manifests and files, bounded concurrent-writer
+  retry, corruption checks, and lazy migration from the format-0 direct home;
+- [ ] add explicit guest flush semantics, retained named checkpoints, diff/reset,
+  and unreachable-blob garbage collection;
 - [ ] add an outer workspace diff/promote workflow; realm code must not silently
   commit its own COW projection;
 - [ ] put a supported MCP broker/invocation front door in the CE distribution
@@ -927,6 +988,6 @@ The first implementation must resolve these with executable evidence:
     coupling until evidence requires them.
 
 The next code artifact is the first multi-process substrate—process identifiers,
-spawn/wait, bounded pipes, and a tiny shell—while the storage track adds explicit
-generations and promotion. Bash and a compiler remain acceptance workloads, not
-names attached to the current five-command seed.
+spawn/wait, bounded pipes, and a tiny shell—while the storage track adds named
+checkpoint/diff/reset and outer workspace promotion. Bash and a compiler remain
+acceptance workloads, not names attached to the current five-command seed.

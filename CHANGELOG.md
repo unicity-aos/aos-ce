@@ -28,6 +28,10 @@
 - The installable `aos-linux-realm` seed: principal-owned durable home storage,
   an Astrid copy-on-write workspace projection, and bounded nested-WASM `pwd`,
   `echo`, `write-file`, and `cat` commands with no host-process authority.
+- Crash-consistent `aos-linux-realm` home generations: a principal-scoped atomic
+  KV head selects immutable BLAKE3-addressed file and manifest blobs, with
+  concurrent-writer retry, corruption checks, daemon-restart recovery, and lazy
+  migration from the original direct-home format.
 - Homebrew formula updates initiated by the tap's authenticated stable-release
   poll, eliminating the cross-repository dispatch credential.
 - Strict, signed stable/dev/nightly channel and immutable release metadata

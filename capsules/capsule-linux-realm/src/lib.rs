@@ -11,10 +11,12 @@ use aos_realm_runtime::{
     CAT_GUEST, ECHO_GUEST, HostFault, PWD_GUEST, ProcessConfig, ProcessOutcome, RealmHost,
     RealmIoError, RealmRuntime, RunLimits, SMOKE_WRITE_GUEST, WRITE_FILE_GUEST,
 };
+use aos_realm_vfs::FsStatus;
 use astrid_sdk::prelude::*;
 use astrid_sdk::schemars;
 use host::{
-    AstridRealmHost, DEFAULT_CWD, REALM_NAME, ensure_layout, layout_initialized, validate_cwd,
+    AstridRealmHost, DEFAULT_CWD, REALM_NAME, ensure_layout, home_status, layout_state,
+    validate_cwd,
 };
 use serde::{Deserialize, Serialize};
 
@@ -88,6 +90,11 @@ struct StatusResponse {
     state: &'static str,
     default_cwd: &'static str,
     home: &'static str,
+    home_storage: &'static str,
+    home_format: u32,
+    home_generation: u64,
+    home_files: usize,
+    home_manifest: Option<String>,
     mounts: Vec<MountStatus>,
     commands: [&'static str; 5],
     workspace_commit: &'static str,
@@ -123,7 +130,7 @@ impl LinuxRealm {
     #[astrid::tool("linux_realm_status")]
     pub fn status(&self, _args: StatusArgs) -> Result<String, SysError> {
         let principal = caller_principal()?;
-        let response = status_response(principal, layout_initialized()?);
+        let response = status_response(principal, layout_state()?, home_status()?);
         serde_json::to_string(&response).map_err(|error| SysError::ApiError(error.to_string()))
     }
 }
@@ -250,17 +257,24 @@ fn require_arity(command: &str, args: &[String], expected: usize) -> Result<(), 
     }
 }
 
-fn status_response(principal: String, initialized: bool) -> StatusResponse {
+fn status_response(
+    principal: String,
+    state: &'static str,
+    home_status: FsStatus,
+) -> StatusResponse {
     StatusResponse {
         realm: REALM_NAME,
         owner_principal: principal,
-        state: if initialized {
-            "ready"
-        } else {
-            "uninitialized"
-        },
+        state,
         default_cwd: DEFAULT_CWD,
         home: "/home/agent",
+        home_storage: "kv-cas-head+content-addressed-file-blobs",
+        home_format: home_status.format,
+        home_generation: home_status.generation,
+        home_files: home_status.files,
+        home_manifest: home_status
+            .manifest
+            .map(|digest| digest.as_str().to_string()),
         mounts: vec![
             MountStatus {
                 guest_path: "/home/agent",
@@ -400,11 +414,22 @@ mod tests {
 
     #[test]
     fn status_exposes_guest_mounts_without_physical_paths() {
-        let json = serde_json::to_string(&status_response("alice".to_string(), true))
-            .expect("status serializes");
+        let json = serde_json::to_string(&status_response(
+            "alice".to_string(),
+            "ready",
+            FsStatus {
+                format: aos_realm_vfs::FORMAT_VERSION,
+                generation: 7,
+                files: 3,
+                manifest: None,
+            },
+        ))
+        .expect("status serializes");
 
         assert!(json.contains("/workspace"));
         assert!(json.contains("/home/agent"));
+        assert!(json.contains("kv-cas-head+content-addressed-file-blobs"));
+        assert!(json.contains("\"home_generation\":7"));
         assert!(json.contains("outer-astrid-promotion-required"));
         assert!(!json.contains("/Users/"));
         assert!(!json.contains(".astrid/home"));
@@ -420,6 +445,7 @@ mod tests {
             .expect("capabilities is a table");
 
         assert!(!capabilities.contains_key("host_process"));
+        assert!(capabilities.contains_key("kv"));
         assert!(capabilities.contains_key("fs_read"));
         assert!(capabilities.contains_key("fs_write"));
     }

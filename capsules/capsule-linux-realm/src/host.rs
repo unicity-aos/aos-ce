@@ -1,7 +1,10 @@
 //! Astrid-backed mounts for the private AOS Realm guest filesystem.
 
 use aos_realm_runtime::{OpenMode, RealmFile, RealmHost, RealmIoError};
-use astrid_sdk::{SysError, fs};
+use aos_realm_vfs::{
+    BlobDigest, FsError, FsStatus, MAX_MANIFEST_BYTES, RealmFs, RealmStore, StoreError,
+};
+use astrid_sdk::{SysError, fs, kv};
 
 pub(crate) const REALM_NAME: &str = "default";
 pub(crate) const DEFAULT_CWD: &str = "/workspace";
@@ -12,6 +15,10 @@ pub(crate) const REALM_STATE: &str = "home://.local/share/aos-realm/default/stat
 // principal before checking the path. The guest still sees only `/tmp`.
 pub(crate) const REALM_TMP: &str = "home://.local/tmp/aos-realm/default";
 const FORMAT_MARKER: &str = "home://.local/share/aos-realm/default/state/format";
+const BLOB_ROOT: &str = "home://.local/share/aos-realm/default/store/blobs";
+const HEAD_KEY: &str = "realm/default/fs/head";
+const LEGACY_FORMAT_MARKER: &[u8] = b"aos-realm-format=0\n";
+const CURRENT_FORMAT_MARKER: &[u8] = b"aos-realm-format=1\n";
 const MAX_SEED_FILE_BYTES: usize = 64 * 1024;
 
 /// Create the durable and ephemeral mount roots required by the seed realm.
@@ -19,15 +26,42 @@ pub(crate) fn ensure_layout() -> Result<(), SysError> {
     fs::create_dir_all(REALM_HOME)?;
     fs::create_dir_all(REALM_STATE)?;
     fs::create_dir_all(REALM_TMP)?;
-    if !fs::exists(FORMAT_MARKER)? {
-        fs::write(FORMAT_MARKER, b"aos-realm-format=0\n")?;
+    fs::create_dir_all(BLOB_ROOT)?;
+    if fs::exists(FORMAT_MARKER)? {
+        match fs::read(FORMAT_MARKER)?.as_slice() {
+            CURRENT_FORMAT_MARKER => {}
+            LEGACY_FORMAT_MARKER => fs::write(FORMAT_MARKER, CURRENT_FORMAT_MARKER)?,
+            _ => {
+                return Err(SysError::ApiError(
+                    "unsupported AOS Realm storage format marker".to_string(),
+                ));
+            }
+        }
+    } else {
+        fs::write(FORMAT_MARKER, CURRENT_FORMAT_MARKER)?;
     }
     Ok(())
 }
 
-/// Inspect whether the realm layout exists without creating it.
-pub(crate) fn layout_initialized() -> Result<bool, SysError> {
-    fs::exists(FORMAT_MARKER)
+/// Inspect the realm layout state without creating or migrating it.
+pub(crate) fn layout_state() -> Result<&'static str, SysError> {
+    if !fs::exists(FORMAT_MARKER)? {
+        return Ok("uninitialized");
+    }
+    match fs::read(FORMAT_MARKER)?.as_slice() {
+        CURRENT_FORMAT_MARKER => Ok("ready"),
+        LEGACY_FORMAT_MARKER => Ok("migration-required"),
+        _ => Err(SysError::ApiError(
+            "unsupported AOS Realm storage format marker".to_string(),
+        )),
+    }
+}
+
+/// Read the selected home generation without mutating it.
+pub(crate) fn home_status() -> Result<FsStatus, SysError> {
+    RealmFs::new(AstridRealmStore)
+        .status()
+        .map_err(fs_to_sys_error)
 }
 
 /// Confirm that a guest CWD names an existing directory in one admitted mount.
@@ -120,12 +154,20 @@ impl RealmHost for AstridRealmHost {
         mode: OpenMode,
     ) -> Result<Box<dyn RealmFile>, RealmIoError> {
         let resolved = resolve_guest_path(cwd, path)?;
+        let home_relative = resolved
+            .strip_prefix(REALM_HOME)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+            .map(str::to_string);
         let backing = match mode {
             // Astrid's current component host exposes reliable whole-file I/O;
             // its positional FileHandle port is not live yet. Buffering here
             // keeps that host limitation out of the private nested-WASM ABI.
             OpenMode::Read => {
-                let bytes = fs::read(&resolved).map_err(map_sdk_error)?;
+                let bytes = if let Some(relative) = home_relative.as_deref() {
+                    read_versioned_home_file(relative, &resolved)?
+                } else {
+                    fs::read(&resolved).map_err(map_sdk_error)?
+                };
                 if bytes.len() > MAX_SEED_FILE_BYTES {
                     return Err(RealmIoError::TooLarge);
                 }
@@ -133,10 +175,20 @@ impl RealmHost for AstridRealmHost {
             }
             // Defer replacement until `close`, so a trapped guest cannot leave
             // a partially written file behind.
-            OpenMode::WriteTruncate => AstridFileBacking::Write {
-                path: resolved,
-                bytes: Vec::new(),
-            },
+            OpenMode::WriteTruncate => {
+                if let Some(relative) = home_relative.as_deref() {
+                    AstridFileBacking::VersionedWrite {
+                        relative: relative.to_string(),
+                        projection_path: resolved,
+                        bytes: Vec::new(),
+                    }
+                } else {
+                    AstridFileBacking::DirectWrite {
+                        path: resolved,
+                        bytes: Vec::new(),
+                    }
+                }
+            }
         };
         Ok(Box::new(AstridRealmFile { backing, offset: 0 }))
     }
@@ -148,8 +200,18 @@ struct AstridRealmFile {
 }
 
 enum AstridFileBacking {
-    Read { bytes: Vec<u8> },
-    Write { path: String, bytes: Vec<u8> },
+    Read {
+        bytes: Vec<u8>,
+    },
+    DirectWrite {
+        path: String,
+        bytes: Vec<u8>,
+    },
+    VersionedWrite {
+        relative: String,
+        projection_path: String,
+        bytes: Vec<u8>,
+    },
 }
 
 impl RealmFile for AstridRealmFile {
@@ -171,11 +233,10 @@ impl RealmFile for AstridRealmFile {
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<usize, RealmIoError> {
-        let AstridFileBacking::Write {
-            bytes: buffered, ..
-        } = &mut self.backing
-        else {
-            return Err(RealmIoError::Unsupported);
+        let buffered = match &mut self.backing {
+            AstridFileBacking::DirectWrite { bytes, .. }
+            | AstridFileBacking::VersionedWrite { bytes, .. } => bytes,
+            AstridFileBacking::Read { .. } => return Err(RealmIoError::Unsupported),
         };
         let end = self
             .offset
@@ -195,10 +256,125 @@ impl RealmFile for AstridRealmFile {
     fn close(&mut self) -> Result<(), RealmIoError> {
         match &self.backing {
             AstridFileBacking::Read { .. } => Ok(()),
-            AstridFileBacking::Write { path, bytes } => {
+            AstridFileBacking::DirectWrite { path, bytes } => {
                 fs::write(path, bytes).map_err(map_sdk_error)
             }
+            AstridFileBacking::VersionedWrite {
+                relative,
+                projection_path,
+                bytes,
+            } => {
+                let mut filesystem = RealmFs::new(AstridRealmStore);
+                filesystem
+                    .write_file(relative, bytes)
+                    .map_err(map_vfs_error)?;
+                // This plain-file projection is a rebuildable compatibility
+                // view. The CAS-selected content-addressed generation above is
+                // authoritative if projection refresh fails or is interrupted.
+                if let Err(error) = fs::write(projection_path, bytes) {
+                    astrid_sdk::log::warn(format!(
+                        "AOS Realm committed {relative} but could not refresh its legacy projection: {error}"
+                    ));
+                }
+                Ok(())
+            }
         }
+    }
+}
+
+#[derive(Default)]
+struct AstridRealmStore;
+
+impl RealmStore for AstridRealmStore {
+    fn read_head(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        kv::get_bytes_opt(HEAD_KEY).map_err(map_sdk_store_error)
+    }
+
+    fn compare_and_swap_head(
+        &mut self,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<bool, StoreError> {
+        kv::cas(HEAD_KEY, expected, new).map_err(map_sdk_store_error)
+    }
+
+    fn get_blob(&self, digest: &BlobDigest) -> Result<Option<Vec<u8>>, StoreError> {
+        let path = blob_path(digest);
+        if !fs::exists(&path).map_err(map_sdk_store_error)? {
+            return Ok(None);
+        }
+        fs::read(&path).map(Some).map_err(map_sdk_store_error)
+    }
+
+    fn put_blob(&mut self, digest: &BlobDigest, bytes: &[u8]) -> Result<(), StoreError> {
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(StoreError::TooLarge);
+        }
+        let path = blob_path(digest);
+        if fs::exists(&path).map_err(map_sdk_store_error)?
+            && fs::read(&path).map_err(map_sdk_store_error)? == bytes
+        {
+            return Ok(());
+        }
+        // A prior interrupted first materialization may have left a corrupt
+        // unreachable object at this digest path. Rewriting the expected bytes
+        // repairs it before any head can select it.
+        fs::write(&path, bytes).map_err(map_sdk_store_error)?;
+        let stored = fs::read(&path).map_err(map_sdk_store_error)?;
+        if stored == bytes {
+            Ok(())
+        } else {
+            Err(StoreError::Corrupt(format!(
+                "blob {} failed read-after-write verification",
+                digest.as_str()
+            )))
+        }
+    }
+}
+
+fn blob_path(digest: &BlobDigest) -> String {
+    format!("{BLOB_ROOT}/{}", digest.as_str())
+}
+
+fn read_versioned_home_file(relative: &str, legacy_path: &str) -> Result<Vec<u8>, RealmIoError> {
+    let mut filesystem = RealmFs::new(AstridRealmStore);
+    match filesystem.read_file(relative) {
+        Ok(bytes) => Ok(bytes),
+        Err(FsError::NotFound) => {
+            // Format-0 stored files directly beneath REALM_HOME. Import each
+            // one lazily into the immutable store when it is first observed.
+            let bytes = fs::read(legacy_path).map_err(map_sdk_error)?;
+            filesystem
+                .write_file(relative, &bytes)
+                .map_err(map_vfs_error)?;
+            Ok(bytes)
+        }
+        Err(error) => Err(map_vfs_error(error)),
+    }
+}
+
+fn map_vfs_error(error: FsError) -> RealmIoError {
+    match error {
+        FsError::NotFound => RealmIoError::NotFound,
+        FsError::InvalidPath => RealmIoError::InvalidPath,
+        FsError::TooLarge | FsError::Store(StoreError::TooLarge) => RealmIoError::TooLarge,
+        FsError::Store(StoreError::Denied) => RealmIoError::Denied,
+        FsError::Contended
+        | FsError::Corrupt(_)
+        | FsError::Serialization(_)
+        | FsError::Store(StoreError::Corrupt(_) | StoreError::Io(_)) => RealmIoError::Io,
+    }
+}
+
+fn fs_to_sys_error(error: FsError) -> SysError {
+    SysError::ApiError(error.to_string())
+}
+
+fn map_sdk_store_error(error: SysError) -> StoreError {
+    match map_sdk_error(error) {
+        RealmIoError::Denied => StoreError::Denied,
+        RealmIoError::TooLarge => StoreError::TooLarge,
+        other => StoreError::Io(other.to_string()),
     }
 }
 
@@ -313,7 +489,7 @@ mod tests {
     #[test]
     fn buffered_seed_files_are_bounded() {
         let mut file = AstridRealmFile {
-            backing: AstridFileBacking::Write {
+            backing: AstridFileBacking::DirectWrite {
                 path: "unused".to_string(),
                 bytes: Vec::new(),
             },
