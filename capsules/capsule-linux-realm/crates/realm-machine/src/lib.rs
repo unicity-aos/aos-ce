@@ -22,8 +22,15 @@ pub const UART_BASE: u64 = 0x1000_0000;
 /// Guest physical base of the SiFive/QEMU-compatible test finisher.
 pub const TEST_FINISHER_BASE: u64 = 0x0010_0000;
 
+/// Guest physical base of the deterministic single-hart CLINT profile.
+pub const CLINT_BASE: u64 = 0x0200_0000;
+
 const UART_SIZE: u64 = 0x100;
 const TEST_FINISHER_SIZE: u64 = 0x1000;
+const CLINT_SIZE: u64 = 0x1_0000;
+const CLINT_MSIP: u64 = 0;
+const CLINT_MTIMECMP: u64 = 0x4000;
+const CLINT_MTIME: u64 = 0xbff8;
 const UART_RECEIVE: u64 = 0;
 const UART_TRANSMIT: u64 = 0;
 const UART_INTERRUPT_IDENTIFICATION: u64 = 2;
@@ -58,7 +65,7 @@ const MSTATUS_WRITABLE: u64 = MSTATUS_SIE
 const SSTATUS_VISIBLE: u64 =
     MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR | MSTATUS_UXL_RV64;
 const SSTATUS_WRITABLE: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR;
-const MISA_RV64_ISU: u64 = (0b10 << 62) | (1 << 8) | (1 << 18) | (1 << 20);
+const MISA_RV64_IMASU: u64 = (0b10 << 62) | (1 << 0) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20);
 const MEDELEG_SUPPORTED: u64 = (1 << 0)
     | (1 << 1)
     | (1 << 2)
@@ -95,6 +102,22 @@ const CAUSE_ECALL_FROM_MACHINE: u64 = 11;
 const CAUSE_INSTRUCTION_PAGE_FAULT: u64 = 12;
 const CAUSE_LOAD_PAGE_FAULT: u64 = 13;
 const CAUSE_STORE_PAGE_FAULT: u64 = 15;
+
+const INTERRUPT_SUPERVISOR_SOFTWARE: u64 = 1;
+const INTERRUPT_MACHINE_SOFTWARE: u64 = 3;
+const INTERRUPT_SUPERVISOR_TIMER: u64 = 5;
+const INTERRUPT_MACHINE_TIMER: u64 = 7;
+const INTERRUPT_SUPERVISOR_EXTERNAL: u64 = 9;
+const INTERRUPT_MACHINE_EXTERNAL: u64 = 11;
+const INTERRUPT_CAUSE_BIT: u64 = 1 << 63;
+const MIP_SSIP: u64 = 1 << INTERRUPT_SUPERVISOR_SOFTWARE;
+const MIP_MSIP: u64 = 1 << INTERRUPT_MACHINE_SOFTWARE;
+const MIP_STIP: u64 = 1 << INTERRUPT_SUPERVISOR_TIMER;
+const MIP_MTIP: u64 = 1 << INTERRUPT_MACHINE_TIMER;
+const MIP_SEIP: u64 = 1 << INTERRUPT_SUPERVISOR_EXTERNAL;
+const MIP_MEIP: u64 = 1 << INTERRUPT_MACHINE_EXTERNAL;
+const INTERRUPT_SUPPORTED: u64 = MIP_SSIP | MIP_MSIP | MIP_STIP | MIP_MTIP | MIP_SEIP | MIP_MEIP;
+const MIDELEG_SUPPORTED: u64 = MIP_SSIP | MIP_STIP | MIP_SEIP;
 
 /// Explicit resource admission for one virtual machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +206,8 @@ pub enum Csr {
     Sie = 0x104,
     /// Supervisor trap vector.
     Stvec = 0x105,
+    /// Supervisor permission for user counter reads.
+    Scounteren = 0x106,
     /// Supervisor scratch register.
     Sscratch = 0x140,
     /// Supervisor exception program counter.
@@ -208,6 +233,8 @@ pub enum Csr {
     Mie = 0x304,
     /// Machine trap vector.
     Mtvec = 0x305,
+    /// Machine permission for lower-privilege counter reads.
+    Mcounteren = 0x306,
     /// Machine scratch register.
     Mscratch = 0x340,
     /// Machine exception program counter.
@@ -220,6 +247,16 @@ pub enum Csr {
     Mip = 0x344,
     /// Hardware-thread identifier. The first machine profile has one hart.
     Mhartid = 0xf14,
+    /// Read-only cycle counter view.
+    Cycle = 0xc00,
+    /// Read-only deterministic time counter view.
+    Time = 0xc01,
+    /// Read-only retired-instruction counter view.
+    Instret = 0xc02,
+    /// Machine cycle counter.
+    Mcycle = 0xb00,
+    /// Machine retired-instruction counter.
+    Minstret = 0xb02,
 }
 
 impl Csr {
@@ -228,6 +265,7 @@ impl Csr {
             0x100 => Self::Sstatus,
             0x104 => Self::Sie,
             0x105 => Self::Stvec,
+            0x106 => Self::Scounteren,
             0x140 => Self::Sscratch,
             0x141 => Self::Sepc,
             0x142 => Self::Scause,
@@ -240,11 +278,17 @@ impl Csr {
             0x303 => Self::Mideleg,
             0x304 => Self::Mie,
             0x305 => Self::Mtvec,
+            0x306 => Self::Mcounteren,
             0x340 => Self::Mscratch,
             0x341 => Self::Mepc,
             0x342 => Self::Mcause,
             0x343 => Self::Mtval,
             0x344 => Self::Mip,
+            0xb00 => Self::Mcycle,
+            0xb02 => Self::Minstret,
+            0xc00 => Self::Cycle,
+            0xc01 => Self::Time,
+            0xc02 => Self::Instret,
             0xf14 => Self::Mhartid,
             _ => return None,
         })
@@ -400,6 +444,11 @@ impl Cpu {
 struct CsrFile {
     mstatus: u64,
     medeleg: u64,
+    mideleg: u64,
+    mie: u64,
+    mip: u64,
+    mcounteren: u64,
+    scounteren: u64,
     satp: u64,
     mtvec: u64,
     mscratch: u64,
@@ -429,28 +478,43 @@ impl CsrFile {
         if privilege < required || write && ((address >> 10) & 0b11) == 0b11 {
             return None;
         }
+        if matches!(csr, Csr::Cycle | Csr::Time | Csr::Instret) {
+            let bit = 1 << (address - Csr::Cycle.address());
+            if privilege < Privilege::Machine && self.mcounteren & bit == 0
+                || privilege == Privilege::User && self.scounteren & bit == 0
+            {
+                return None;
+            }
+        }
         Some(csr)
     }
 
     const fn read(&self, csr: Csr) -> u64 {
         match csr {
             Csr::Sstatus => self.mstatus & SSTATUS_VISIBLE,
-            Csr::Sie | Csr::Sip | Csr::Mideleg | Csr::Mie | Csr::Mip => 0,
+            Csr::Sie => self.mie & self.mideleg,
+            Csr::Sip => self.mip & self.mideleg,
+            Csr::Mideleg => self.mideleg,
+            Csr::Mie => self.mie,
+            Csr::Mip => self.mip,
             Csr::Stvec => self.stvec,
+            Csr::Scounteren => self.scounteren,
             Csr::Sscratch => self.sscratch,
             Csr::Sepc => self.sepc & !0b11,
             Csr::Scause => self.scause,
             Csr::Stval => self.stval,
             Csr::Satp => self.satp,
             Csr::Mstatus => self.mstatus | MSTATUS_UXL_RV64 | MSTATUS_SXL_RV64,
-            Csr::Misa => MISA_RV64_ISU,
+            Csr::Misa => MISA_RV64_IMASU,
             Csr::Medeleg => self.medeleg,
             Csr::Mtvec => self.mtvec,
+            Csr::Mcounteren => self.mcounteren,
             Csr::Mscratch => self.mscratch,
             Csr::Mepc => self.mepc & !0b11,
             Csr::Mcause => self.mcause,
             Csr::Mtval => self.mtval,
             Csr::Mhartid => 0,
+            Csr::Cycle | Csr::Time | Csr::Instret | Csr::Mcycle | Csr::Minstret => 0,
         }
     }
 
@@ -459,8 +523,19 @@ impl CsrFile {
             Csr::Sstatus => {
                 self.mstatus = (self.mstatus & !SSTATUS_WRITABLE) | (value & SSTATUS_WRITABLE);
             }
-            Csr::Sie | Csr::Sip | Csr::Mideleg | Csr::Mie | Csr::Mip => {}
+            Csr::Sie => self.mie = (self.mie & !self.mideleg) | (value & self.mideleg),
+            Csr::Sip => {
+                let writable = MIP_SSIP & self.mideleg;
+                self.mip = (self.mip & !writable) | (value & writable);
+            }
+            Csr::Mideleg => self.mideleg = value & MIDELEG_SUPPORTED,
+            Csr::Mie => self.mie = value & INTERRUPT_SUPPORTED,
+            Csr::Mip => {
+                let writable = MIP_SSIP | MIP_STIP;
+                self.mip = (self.mip & !writable) | (value & writable);
+            }
             Csr::Stvec => self.stvec = legal_trap_vector(value),
+            Csr::Scounteren => self.scounteren = value & 0b111,
             Csr::Sscratch => self.sscratch = value,
             Csr::Sepc => self.sepc = value & !0b11,
             Csr::Scause => self.scause = value,
@@ -483,11 +558,14 @@ impl CsrFile {
             Csr::Misa => {}
             Csr::Medeleg => self.medeleg = value & MEDELEG_SUPPORTED,
             Csr::Mtvec => self.mtvec = legal_trap_vector(value),
+            Csr::Mcounteren => self.mcounteren = value & 0b111,
             Csr::Mscratch => self.mscratch = value,
             Csr::Mepc => self.mepc = value & !0b11,
             Csr::Mcause => self.mcause = value,
             Csr::Mtval => self.mtval = value,
             Csr::Mhartid => {}
+            Csr::Cycle | Csr::Time | Csr::Instret => {}
+            Csr::Mcycle | Csr::Minstret => {}
         }
     }
 }
@@ -509,6 +587,9 @@ enum RunState {
 #[derive(Debug)]
 struct Devices {
     ram: Vec<u8>,
+    mtime: u64,
+    mtimecmp: u64,
+    msip: bool,
     console_input: VecDeque<u8>,
     console_output: Vec<u8>,
     console_reported: usize,
@@ -566,6 +647,9 @@ impl Devices {
     fn new(config: MachineConfig) -> Self {
         Self {
             ram: vec![0; config.ram_bytes],
+            mtime: 0,
+            mtimecmp: u64::MAX,
+            msip: false,
             console_input: VecDeque::new(),
             console_output: Vec::new(),
             console_reported: 0,
@@ -575,6 +659,9 @@ impl Devices {
 
     fn reset(&mut self) {
         self.ram.fill(0);
+        self.mtime = 0;
+        self.mtimecmp = u64::MAX;
+        self.msip = false;
         self.console_input.clear();
         self.console_output.clear();
         self.console_reported = 0;
@@ -591,6 +678,17 @@ impl Devices {
     }
 
     fn read(&mut self, address: u64, bytes: u8) -> Result<u64, MachineTrap> {
+        if let Some(offset) = address
+            .checked_sub(CLINT_BASE)
+            .filter(|offset| *offset < CLINT_SIZE)
+        {
+            return match (offset, bytes) {
+                (CLINT_MSIP, 4) => Ok(u64::from(self.msip)),
+                (CLINT_MTIMECMP, 8) => Ok(self.mtimecmp),
+                (CLINT_MTIME, 8) => Ok(self.mtime),
+                _ => Err(MachineTrap::LoadAccessFault { address, bytes }),
+            };
+        }
         if let Some(offset) = address
             .checked_sub(UART_BASE)
             .filter(|offset| *offset < UART_SIZE)
@@ -629,6 +727,26 @@ impl Devices {
         value: u64,
         bytes: u8,
     ) -> Result<Option<HaltStatus>, MachineTrap> {
+        if let Some(offset) = address
+            .checked_sub(CLINT_BASE)
+            .filter(|offset| *offset < CLINT_SIZE)
+        {
+            return match (offset, bytes) {
+                (CLINT_MSIP, 4) => {
+                    self.msip = value & 1 != 0;
+                    Ok(None)
+                }
+                (CLINT_MTIMECMP, 8) => {
+                    self.mtimecmp = value;
+                    Ok(None)
+                }
+                (CLINT_MTIME, 8) => {
+                    self.mtime = value;
+                    Ok(None)
+                }
+                _ => Err(MachineTrap::StoreAccessFault { address, bytes }),
+            };
+        }
         if let Some(offset) = address
             .checked_sub(UART_BASE)
             .filter(|offset| *offset < UART_SIZE)
@@ -698,6 +816,21 @@ impl Devices {
         }
         true
     }
+
+    fn tick(&mut self) {
+        self.mtime = self.mtime.wrapping_add(1);
+    }
+
+    fn hardware_interrupts(&self) -> u64 {
+        let mut pending = 0;
+        if self.msip {
+            pending |= MIP_MSIP;
+        }
+        if self.mtime >= self.mtimecmp {
+            pending |= MIP_MTIP;
+        }
+        pending
+    }
 }
 
 /// An admitted RV64 machine whose execution can only advance in explicit slices.
@@ -710,6 +843,9 @@ pub struct Machine {
     state: RunState,
     steps_executed: u64,
     instructions_retired: u64,
+    cycle: u64,
+    instret: u64,
+    reservation: Option<(u64, u8)>,
 }
 
 impl Machine {
@@ -731,6 +867,9 @@ impl Machine {
             state: RunState::Runnable,
             steps_executed: 0,
             instructions_retired: 0,
+            cycle: 0,
+            instret: 0,
+            reservation: None,
         })
     }
 
@@ -749,6 +888,9 @@ impl Machine {
         self.state = RunState::Runnable;
         self.steps_executed = 0;
         self.instructions_retired = 0;
+        self.cycle = 0;
+        self.instret = 0;
+        self.reservation = None;
         Ok(())
     }
 
@@ -777,8 +919,8 @@ impl Machine {
 
     /// Read an implemented architectural CSR without bypassing the typed set.
     #[must_use]
-    pub const fn csr(&self, csr: Csr) -> u64 {
-        self.csrs.read(csr)
+    pub fn csr(&self, csr: Csr) -> u64 {
+        self.read_csr(csr)
     }
 
     /// Run at most `instruction_budget` instructions and return control to the Realm.
@@ -790,9 +932,12 @@ impl Machine {
                 Ok(effect) => {
                     steps = steps.saturating_add(1);
                     self.steps_executed = self.steps_executed.saturating_add(1);
+                    self.cycle = self.cycle.wrapping_add(1);
+                    self.devices.tick();
                     if effect.retired {
                         retired = retired.saturating_add(1);
                         self.instructions_retired = self.instructions_retired.saturating_add(1);
+                        self.instret = self.instret.wrapping_add(1);
                     }
                     if let Some(status) = effect.halt {
                         self.state = RunState::Halted(status);
@@ -802,6 +947,8 @@ impl Machine {
                     if let Some((cause, value)) = architectural_exception(&trap) {
                         steps = steps.saturating_add(1);
                         self.steps_executed = self.steps_executed.saturating_add(1);
+                        self.cycle = self.cycle.wrapping_add(1);
+                        self.devices.tick();
                         self.take_exception(cause, value, self.cpu.pc);
                         self.cpu.registers[0] = 0;
                     } else {
@@ -827,6 +974,10 @@ impl Machine {
     }
 
     fn step(&mut self) -> Result<StepEffect, MachineTrap> {
+        self.refresh_hardware_interrupts();
+        if self.take_pending_interrupt() {
+            return Ok(StepEffect::trapped_architecturally());
+        }
         let pc = self.cpu.pc;
         if pc & 3 != 0 {
             return Err(MachineTrap::InstructionAddressMisaligned { address: pc });
@@ -893,6 +1044,7 @@ impl Machine {
                 let address = self.cpu.read(rs1).wrapping_add(immediate_s(instruction));
                 ensure_aligned(address, bytes, true)?;
                 let physical = self.translate(address, AccessType::Store)?;
+                self.invalidate_reservation(physical, bytes);
                 halt = self
                     .devices
                     .write(physical, self.cpu.read(rs2), bytes)
@@ -901,6 +1053,7 @@ impl Machine {
                         _ => MachineTrap::StoreAccessFault { address, bytes },
                     })?;
             }
+            0x2f => halt = self.execute_atomic(instruction, rd, rs1, rs2, funct3, pc)?,
             0x33 => self.execute_op(instruction, rd, rs1, rs2, funct3, funct7, pc)?,
             0x37 => self.cpu.write(rd, immediate_u(instruction)),
             0x3b => self.execute_op_32(instruction, rd, rs1, rs2, funct3, funct7, pc)?,
@@ -949,6 +1102,11 @@ impl Machine {
                         }
                         0x0010_0073 => return Err(MachineTrap::Breakpoint { pc }),
                         value if value & 0xfe00_7fff == 0x1200_0073 => {
+                            if self.cpu.privilege < Privilege::Supervisor {
+                                return Err(illegal(pc, instruction));
+                            }
+                        }
+                        0x1050_0073 => {
                             if self.cpu.privilege < Privilege::Supervisor {
                                 return Err(illegal(pc, instruction));
                             }
@@ -1068,6 +1226,100 @@ impl Machine {
         }
     }
 
+    fn execute_atomic(
+        &mut self,
+        instruction: u32,
+        rd: usize,
+        rs1: usize,
+        rs2: usize,
+        funct3: u32,
+        pc: u64,
+    ) -> Result<Option<HaltStatus>, MachineTrap> {
+        let bytes = match funct3 {
+            2 => 4,
+            3 => 8,
+            _ => return Err(illegal(pc, instruction)),
+        };
+        let operation = instruction >> 27;
+        let virtual_address = self.cpu.read(rs1);
+        if operation == 0x02 {
+            if rs2 != 0 {
+                return Err(illegal(pc, instruction));
+            }
+            ensure_aligned(virtual_address, bytes, false)?;
+            let physical = self.translate(virtual_address, AccessType::Load)?;
+            let value =
+                self.devices
+                    .read(physical, bytes)
+                    .map_err(|_| MachineTrap::LoadAccessFault {
+                        address: virtual_address,
+                        bytes,
+                    })?;
+            self.reservation = Some((physical, bytes));
+            self.cpu.write(
+                rd,
+                if bytes == 4 {
+                    sign_extend(value, 32)
+                } else {
+                    value
+                },
+            );
+            return Ok(None);
+        }
+
+        ensure_aligned(virtual_address, bytes, true)?;
+        let physical = self.translate(virtual_address, AccessType::Store)?;
+        if operation == 0x03 {
+            let succeeds = self.reservation == Some((physical, bytes));
+            self.reservation = None;
+            if !succeeds {
+                self.cpu.write(rd, 1);
+                return Ok(None);
+            }
+            let halt = self
+                .devices
+                .write(physical, self.cpu.read(rs2), bytes)
+                .map_err(|trap| map_store_fault(trap, virtual_address, bytes))?;
+            self.cpu.write(rd, 0);
+            return Ok(halt);
+        }
+
+        let old =
+            self.devices
+                .read(physical, bytes)
+                .map_err(|_| MachineTrap::StoreAccessFault {
+                    address: virtual_address,
+                    bytes,
+                })?;
+        let rhs = self.cpu.read(rs2);
+        let value =
+            atomic_result(operation, old, rhs, bytes).ok_or_else(|| illegal(pc, instruction))?;
+        self.invalidate_reservation(physical, bytes);
+        let halt = self
+            .devices
+            .write(physical, value, bytes)
+            .map_err(|trap| map_store_fault(trap, virtual_address, bytes))?;
+        self.cpu.write(
+            rd,
+            if bytes == 4 {
+                sign_extend(old, 32)
+            } else {
+                old
+            },
+        );
+        Ok(halt)
+    }
+
+    fn invalidate_reservation(&mut self, address: u64, bytes: u8) {
+        if let Some((reserved, reserved_bytes)) = self.reservation {
+            let end = address.saturating_add(u64::from(bytes));
+            let reserved_end = reserved.saturating_add(u64::from(reserved_bytes));
+            if address < reserved_end && reserved < end {
+                self.reservation = None;
+            }
+        }
+    }
+
     fn execute_csr(
         &mut self,
         instruction: u32,
@@ -1094,7 +1346,7 @@ impl Machine {
             .validate_access(address, self.cpu.privilege, writes)
             .ok_or_else(|| illegal(pc, instruction))?;
         let old = if reads || operation != 1 {
-            self.csrs.read(csr)
+            self.read_csr(csr)
         } else {
             0
         };
@@ -1105,7 +1357,7 @@ impl Machine {
                 3 => old & !source,
                 _ => unreachable!("validated CSR operation"),
             };
-            self.csrs.write(csr, value);
+            self.write_csr(csr, value);
         }
         if reads {
             self.cpu.write(rd, old);
@@ -1113,8 +1365,102 @@ impl Machine {
         Ok(())
     }
 
+    fn read_csr(&self, csr: Csr) -> u64 {
+        match csr {
+            Csr::Cycle | Csr::Mcycle => self.cycle,
+            Csr::Time => self.devices.mtime,
+            Csr::Instret | Csr::Minstret => self.instret,
+            _ => self.csrs.read(csr),
+        }
+    }
+
+    fn write_csr(&mut self, csr: Csr, value: u64) {
+        match csr {
+            Csr::Mcycle => self.cycle = value,
+            Csr::Minstret => self.instret = value,
+            _ => self.csrs.write(csr, value),
+        }
+    }
+
+    fn refresh_hardware_interrupts(&mut self) {
+        self.csrs.mip =
+            (self.csrs.mip & !(MIP_MSIP | MIP_MTIP)) | self.devices.hardware_interrupts();
+    }
+
+    fn take_pending_interrupt(&mut self) -> bool {
+        let pending = self.csrs.mie & self.csrs.mip;
+        for cause in [
+            INTERRUPT_MACHINE_EXTERNAL,
+            INTERRUPT_MACHINE_SOFTWARE,
+            INTERRUPT_MACHINE_TIMER,
+            INTERRUPT_SUPERVISOR_EXTERNAL,
+            INTERRUPT_SUPERVISOR_SOFTWARE,
+            INTERRUPT_SUPERVISOR_TIMER,
+        ] {
+            let mask = 1 << cause;
+            if pending & mask == 0 {
+                continue;
+            }
+            let delegated =
+                self.cpu.privilege != Privilege::Machine && self.csrs.mideleg & mask != 0;
+            let enabled = if delegated {
+                self.cpu.privilege < Privilege::Supervisor
+                    || self.cpu.privilege == Privilege::Supervisor
+                        && self.csrs.mstatus & MSTATUS_SIE != 0
+            } else {
+                self.cpu.privilege < Privilege::Machine
+                    || self.cpu.privilege == Privilege::Machine
+                        && self.csrs.mstatus & MSTATUS_MIE != 0
+            };
+            if enabled {
+                self.take_interrupt(cause, delegated);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn take_interrupt(&mut self, cause: u64, delegated: bool) {
+        let origin = self.cpu.privilege;
+        let pc = self.cpu.pc;
+        self.reservation = None;
+        if delegated {
+            self.csrs.sepc = pc & !0b11;
+            self.csrs.scause = INTERRUPT_CAUSE_BIT | cause;
+            self.csrs.stval = 0;
+            self.csrs.mstatus = if origin == Privilege::User {
+                self.csrs.mstatus & !MSTATUS_SPP
+            } else {
+                self.csrs.mstatus | MSTATUS_SPP
+            };
+            self.csrs.mstatus = if self.csrs.mstatus & MSTATUS_SIE == 0 {
+                self.csrs.mstatus & !MSTATUS_SPIE
+            } else {
+                self.csrs.mstatus | MSTATUS_SPIE
+            };
+            self.csrs.mstatus &= !MSTATUS_SIE;
+            self.cpu.privilege = Privilege::Supervisor;
+            self.cpu.pc = interrupt_vector(self.csrs.stvec, cause);
+        } else {
+            self.csrs.mepc = pc & !0b11;
+            self.csrs.mcause = INTERRUPT_CAUSE_BIT | cause;
+            self.csrs.mtval = 0;
+            self.csrs.mstatus =
+                (self.csrs.mstatus & !MSTATUS_MPP) | ((origin as u64) << MSTATUS_MPP_SHIFT);
+            self.csrs.mstatus = if self.csrs.mstatus & MSTATUS_MIE == 0 {
+                self.csrs.mstatus & !MSTATUS_MPIE
+            } else {
+                self.csrs.mstatus | MSTATUS_MPIE
+            };
+            self.csrs.mstatus &= !MSTATUS_MIE;
+            self.cpu.privilege = Privilege::Machine;
+            self.cpu.pc = interrupt_vector(self.csrs.mtvec, cause);
+        }
+    }
+
     fn take_exception(&mut self, cause: u64, value: u64, pc: u64) {
         let origin = self.cpu.privilege;
+        self.reservation = None;
         if origin != Privilege::Machine && self.csrs.medeleg & (1 << cause) != 0 {
             self.csrs.sepc = pc & !0b11;
             self.csrs.scause = cause;
@@ -1266,6 +1612,20 @@ impl Machine {
             (0x20, 5) => ((lhs as i64) >> (rhs & 0x3f)) as u64,
             (0x00, 6) => lhs | rhs,
             (0x00, 7) => lhs & rhs,
+            (0x01, 0) => lhs.wrapping_mul(rhs),
+            (0x01, 1) => (((lhs as i64 as i128) * (rhs as i64 as i128)) >> 64) as u64,
+            (0x01, 2) => (((lhs as i64 as i128) * (rhs as i128)) >> 64) as u64,
+            (0x01, 3) => ((u128::from(lhs) * u128::from(rhs)) >> 64) as u64,
+            (0x01, 4) => signed_divide(lhs, rhs),
+            (0x01, 5) => lhs.checked_div(rhs).unwrap_or(u64::MAX),
+            (0x01, 6) => signed_remainder(lhs, rhs),
+            (0x01, 7) => {
+                if rhs == 0 {
+                    lhs
+                } else {
+                    lhs % rhs
+                }
+            }
             _ => return Err(illegal(pc, instruction)),
         };
         self.cpu.write(rd, value);
@@ -1291,6 +1651,17 @@ impl Machine {
             (0x00, 1) => lhs.wrapping_shl(rhs & 0x1f),
             (0x00, 5) => lhs.wrapping_shr(rhs & 0x1f),
             (0x20, 5) => ((lhs as i32) >> (rhs & 0x1f)) as u32,
+            (0x01, 0) => lhs.wrapping_mul(rhs),
+            (0x01, 4) => signed_divide_32(lhs, rhs),
+            (0x01, 5) => lhs.checked_div(rhs).unwrap_or(u32::MAX),
+            (0x01, 6) => signed_remainder_32(lhs, rhs),
+            (0x01, 7) => {
+                if rhs == 0 {
+                    lhs
+                } else {
+                    lhs % rhs
+                }
+            }
             _ => return Err(illegal(pc, instruction)),
         };
         self.cpu.write(rd, sign_extend(u64::from(value), 32));
@@ -1336,6 +1707,102 @@ fn architectural_exception(trap: &MachineTrap) -> Option<(u64, u64)> {
         MachineTrap::StorePageFault { address } => (CAUSE_STORE_PAGE_FAULT, address),
         MachineTrap::ConsoleLimit { .. } => return None,
     })
+}
+
+const fn interrupt_vector(vector: u64, cause: u64) -> u64 {
+    let base = vector & !0b11;
+    if vector & 0b11 == 1 {
+        base.wrapping_add(cause * 4)
+    } else {
+        base
+    }
+}
+
+fn map_store_fault(trap: MachineTrap, address: u64, bytes: u8) -> MachineTrap {
+    match trap {
+        MachineTrap::ConsoleLimit { .. } => trap,
+        _ => MachineTrap::StoreAccessFault { address, bytes },
+    }
+}
+
+fn atomic_result(operation: u32, old: u64, rhs: u64, bytes: u8) -> Option<u64> {
+    if bytes == 4 {
+        let old = old as u32;
+        let rhs = rhs as u32;
+        Some(u64::from(match operation {
+            0x00 => old.wrapping_add(rhs),
+            0x01 => rhs,
+            0x04 => old ^ rhs,
+            0x08 => old | rhs,
+            0x0c => old & rhs,
+            0x10 => u32::from_ne_bytes((old as i32).min(rhs as i32).to_ne_bytes()),
+            0x14 => u32::from_ne_bytes((old as i32).max(rhs as i32).to_ne_bytes()),
+            0x18 => old.min(rhs),
+            0x1c => old.max(rhs),
+            _ => return None,
+        }))
+    } else {
+        Some(match operation {
+            0x00 => old.wrapping_add(rhs),
+            0x01 => rhs,
+            0x04 => old ^ rhs,
+            0x08 => old | rhs,
+            0x0c => old & rhs,
+            0x10 => (old as i64).min(rhs as i64) as u64,
+            0x14 => (old as i64).max(rhs as i64) as u64,
+            0x18 => old.min(rhs),
+            0x1c => old.max(rhs),
+            _ => return None,
+        })
+    }
+}
+
+fn signed_divide(lhs: u64, rhs: u64) -> u64 {
+    let lhs = lhs as i64;
+    let rhs = rhs as i64;
+    if rhs == 0 {
+        u64::MAX
+    } else if lhs == i64::MIN && rhs == -1 {
+        lhs as u64
+    } else {
+        (lhs / rhs) as u64
+    }
+}
+
+fn signed_remainder(lhs: u64, rhs: u64) -> u64 {
+    let lhs = lhs as i64;
+    let rhs = rhs as i64;
+    if rhs == 0 {
+        lhs as u64
+    } else if lhs == i64::MIN && rhs == -1 {
+        0
+    } else {
+        (lhs % rhs) as u64
+    }
+}
+
+fn signed_divide_32(lhs: u32, rhs: u32) -> u32 {
+    let lhs = lhs as i32;
+    let rhs = rhs as i32;
+    if rhs == 0 {
+        u32::MAX
+    } else if lhs == i32::MIN && rhs == -1 {
+        lhs as u32
+    } else {
+        (lhs / rhs) as u32
+    }
+}
+
+fn signed_remainder_32(lhs: u32, rhs: u32) -> u32 {
+    let lhs = lhs as i32;
+    let rhs = rhs as i32;
+    if rhs == 0 {
+        lhs as u32
+    } else if lhs == i32::MIN && rhs == -1 {
+        0
+    } else {
+        (lhs % rhs) as u32
+    }
 }
 
 const fn is_sv39_canonical(address: u64) -> bool {
@@ -1612,6 +2079,18 @@ mod tests {
 
     const fn encode_load(rd: u32, rs1: u32, immediate: u32, funct3: u32) -> u32 {
         ((immediate & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x03
+    }
+
+    const fn encode_op(rd: u32, rs1: u32, rs2: u32, funct3: u32, funct7: u32) -> u32 {
+        (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x33
+    }
+
+    const fn encode_op_32(rd: u32, rs1: u32, rs2: u32, funct3: u32, funct7: u32) -> u32 {
+        (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x3b
+    }
+
+    const fn encode_atomic(rd: u32, rs1: u32, rs2: u32, funct3: u32, operation: u32) -> u32 {
+        (operation << 27) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x2f
     }
 
     #[test]
@@ -2155,5 +2634,256 @@ mod tests {
             AccessType::Load,
             Privilege::Supervisor,
         ));
+    }
+
+    #[test]
+    fn rv64m_operations_cover_high_halves_and_division_edges() {
+        let cases = [
+            (0, 7, 9, 63),
+            (1, u64::MAX - 1, 3, u64::MAX),
+            (2, u64::MAX - 1, 3, u64::MAX),
+            (3, u64::MAX, u64::MAX, u64::MAX - 1),
+            (4, (-20_i64) as u64, 3, (-6_i64) as u64),
+            (5, 20, 3, 6),
+            (6, (-20_i64) as u64, 3, (-2_i64) as u64),
+            (7, 20, 3, 2),
+            (4, i64::MIN as u64, (-1_i64) as u64, i64::MIN as u64),
+            (4, 7, 0, u64::MAX),
+            (6, 7, 0, 7),
+        ];
+        for (funct3, lhs, rhs, expected) in cases {
+            let mut machine = machine(8);
+            machine
+                .load_program(&encode_op(7, 5, 6, funct3, 1).to_le_bytes())
+                .expect("load M operation");
+            machine.cpu.registers[5] = lhs;
+            machine.cpu.registers[6] = rhs;
+            assert_eq!(machine.run_slice(1).instructions_retired, 1);
+            assert_eq!(machine.register(7), Some(expected), "funct3={funct3}");
+        }
+
+        let word_cases = [
+            (0, 0xffff_ffff, 2, u64::MAX - 1),
+            (4, i32::MIN as u32, u32::MAX, 0xffff_ffff_8000_0000),
+            (5, 12, 5, 2),
+            (6, (-12_i32) as u32, 5, (-2_i64) as u64),
+            (7, 12, 5, 2),
+        ];
+        for (funct3, lhs, rhs, expected) in word_cases {
+            let mut machine = machine(8);
+            machine
+                .load_program(&encode_op_32(7, 5, 6, funct3, 1).to_le_bytes())
+                .expect("load M word operation");
+            machine.cpu.registers[5] = u64::from(lhs);
+            machine.cpu.registers[6] = u64::from(rhs);
+            assert_eq!(machine.run_slice(1).instructions_retired, 1);
+            assert_eq!(machine.register(7), Some(expected), "funct3={funct3}");
+        }
+    }
+
+    #[test]
+    fn rv64a_lr_sc_and_amo_are_single_hart_atomic_and_sign_extend_words() {
+        let mut rv = machine(8);
+        let address = DRAM_BASE + 0x100;
+        let program = words(&[
+            encode_atomic(5, 6, 0, 3, 0x02),
+            encode_addi(7, 0, 1),
+            encode_atomic(8, 6, 7, 3, 0x03),
+            encode_atomic(9, 6, 7, 3, 0x00),
+        ]);
+        rv.load_program(&program).expect("load atomic program");
+        rv.cpu.registers[6] = address;
+        assert!(rv.devices.write_ram(address, 41, 8));
+
+        let report = rv.run_slice(4);
+        assert_eq!(report.instructions_retired, 4);
+        assert_eq!(rv.register(5), Some(41));
+        assert_eq!(rv.register(8), Some(0));
+        assert_eq!(rv.register(9), Some(1));
+        assert_eq!(rv.devices.read_ram(address, 8), Some(2));
+
+        let mut invalidated = machine(8);
+        let program = words(&[
+            encode_atomic(5, 6, 0, 3, 0x02),
+            encode_store(6, 7, 0, 3),
+            encode_atomic(8, 6, 9, 3, 0x03),
+        ]);
+        invalidated
+            .load_program(&program)
+            .expect("load invalidation program");
+        invalidated.cpu.registers[6] = address;
+        invalidated.cpu.registers[7] = 7;
+        invalidated.cpu.registers[9] = 9;
+        assert!(invalidated.devices.write_ram(address, 41, 8));
+        assert_eq!(invalidated.run_slice(3).instructions_retired, 3);
+        assert_eq!(invalidated.register(8), Some(1));
+        assert_eq!(invalidated.devices.read_ram(address, 8), Some(7));
+
+        let mut word = machine(8);
+        word.load_program(&encode_atomic(5, 6, 7, 2, 0x01).to_le_bytes())
+            .expect("load amoswap.w");
+        word.cpu.registers[6] = address;
+        word.cpu.registers[7] = 1;
+        assert!(word.devices.write_ram(address, 0x8000_0000, 4));
+        assert_eq!(word.run_slice(1).instructions_retired, 1);
+        assert_eq!(word.register(5), Some(0xffff_ffff_8000_0000));
+        assert_eq!(word.devices.read_ram(address, 4), Some(1));
+
+        let amo_cases = [
+            (0x00, 5, 3, 8),
+            (0x01, 5, 3, 3),
+            (0x04, 5, 3, 6),
+            (0x08, 5, 3, 7),
+            (0x0c, 5, 3, 1),
+            (0x10, (-5_i64) as u64, 3, (-5_i64) as u64),
+            (0x14, (-5_i64) as u64, 3, 3),
+            (0x18, 5, 3, 3),
+            (0x1c, 5, 3, 5),
+        ];
+        for (operation, old, rhs, expected) in amo_cases {
+            assert_eq!(atomic_result(operation, old, rhs, 8), Some(expected));
+        }
+    }
+
+    #[test]
+    fn counters_are_deterministic_and_counteren_gates_lower_privilege() {
+        let mut rv = machine(8);
+        let program = words(&[
+            encode_csrr(5, Csr::Cycle),
+            encode_csrr(6, Csr::Time),
+            encode_csrr(7, Csr::Instret),
+        ]);
+        rv.load_program(&program).expect("load counter reads");
+        let report = rv.run_slice(3);
+        assert_eq!(report.instructions_retired, 3);
+        assert_eq!(rv.register(5), Some(0));
+        assert_eq!(rv.register(6), Some(1));
+        assert_eq!(rv.register(7), Some(2));
+        assert_eq!(rv.csr(Csr::Mcycle), 3);
+        assert_eq!(rv.csr(Csr::Time), 3);
+        assert_eq!(rv.csr(Csr::Minstret), 3);
+
+        assert_eq!(
+            rv.csrs
+                .validate_access(Csr::Time.address(), Privilege::Supervisor, false),
+            None
+        );
+        rv.csrs.write(Csr::Mcounteren, 0b111);
+        assert_eq!(
+            rv.csrs
+                .validate_access(Csr::Time.address(), Privilege::Supervisor, false),
+            Some(Csr::Time)
+        );
+        assert_eq!(
+            rv.csrs
+                .validate_access(Csr::Time.address(), Privilege::User, false),
+            None
+        );
+        rv.csrs.write(Csr::Scounteren, 0b010);
+        assert_eq!(
+            rv.csrs
+                .validate_access(Csr::Time.address(), Privilege::User, false),
+            Some(Csr::Time)
+        );
+
+        let mut writable = machine(8);
+        writable
+            .load_program(&words(&[
+                encode_addi(5, 0, 100),
+                encode_csrw(Csr::Mcycle, 5),
+                encode_csrr(6, Csr::Mcycle),
+            ]))
+            .expect("load writable counter program");
+        let report = writable.run_slice(3);
+        assert_eq!(report.total_steps_executed, 3);
+        assert_eq!(report.total_instructions_retired, 3);
+        assert_eq!(writable.register(6), Some(101));
+        assert_eq!(writable.csr(Csr::Mcycle), 102);
+    }
+
+    #[test]
+    fn deterministic_clint_timer_enters_vectored_machine_interrupt() {
+        let mut machine = machine(8);
+        machine
+            .load_program(&words(&[
+                encode_addi(5, 5, 1),
+                encode_addi(5, 5, 1),
+                encode_addi(5, 5, 1),
+            ]))
+            .expect("load timer program");
+        machine.devices.mtimecmp = 2;
+        machine.csrs.mie = MIP_MTIP;
+        machine.csrs.mstatus = MSTATUS_MIE;
+        machine.csrs.mtvec = (DRAM_BASE + 0x100) | 1;
+
+        let report = machine.run_slice(3);
+        assert_eq!(report.outcome, SliceOutcome::Yielded);
+        assert_eq!(report.instructions_retired, 2);
+        assert_eq!(machine.register(5), Some(2));
+        assert_eq!(
+            machine.csr(Csr::Mcause),
+            INTERRUPT_CAUSE_BIT | INTERRUPT_MACHINE_TIMER
+        );
+        assert_eq!(machine.csr(Csr::Mepc), DRAM_BASE + 8);
+        assert_eq!(
+            machine.pc(),
+            DRAM_BASE + 0x100 + INTERRUPT_MACHINE_TIMER * 4
+        );
+        assert_eq!(machine.csr(Csr::Mtval), 0);
+    }
+
+    #[test]
+    fn delegated_supervisor_interrupt_obeys_global_enable_and_wfi_is_bounded() {
+        let mut machine = machine(8);
+        machine
+            .load_program(&0x1050_0073_u32.to_le_bytes())
+            .expect("load WFI");
+        machine.cpu.privilege = Privilege::Supervisor;
+        machine.csrs.mideleg = MIP_STIP;
+        machine.csrs.mie = MIP_STIP;
+        machine.csrs.mip = MIP_STIP;
+        machine.csrs.stvec = DRAM_BASE + 0x100;
+
+        let waiting = machine.run_slice(1);
+        assert_eq!(waiting.instructions_retired, 1);
+        assert_eq!(machine.pc(), DRAM_BASE + 4);
+
+        machine.cpu.pc = DRAM_BASE;
+        machine.csrs.mstatus |= MSTATUS_SIE;
+        let interrupted = machine.run_slice(1);
+        assert_eq!(interrupted.instructions_retired, 0);
+        assert_eq!(
+            machine.csr(Csr::Scause),
+            INTERRUPT_CAUSE_BIT | INTERRUPT_SUPERVISOR_TIMER
+        );
+        assert_eq!(machine.csr(Csr::Sepc), DRAM_BASE);
+        assert_eq!(machine.pc(), DRAM_BASE + 0x100);
+        assert_eq!(machine.privilege(), Privilege::Supervisor);
+    }
+
+    #[test]
+    fn clint_mmio_is_width_checked_and_drives_hardware_pending_bits() {
+        let mut machine = machine(8);
+        assert_eq!(machine.devices.read(CLINT_BASE + CLINT_MTIME, 8), Ok(0));
+        assert_eq!(
+            machine.devices.write(CLINT_BASE + CLINT_MTIMECMP, 3, 8),
+            Ok(None)
+        );
+        assert_eq!(
+            machine.devices.write(CLINT_BASE + CLINT_MSIP, 1, 4),
+            Ok(None)
+        );
+        assert_eq!(machine.devices.hardware_interrupts(), MIP_MSIP);
+        machine.devices.tick();
+        machine.devices.tick();
+        machine.devices.tick();
+        assert_eq!(machine.devices.hardware_interrupts(), MIP_MSIP | MIP_MTIP);
+        assert_eq!(
+            machine.devices.read(CLINT_BASE + CLINT_MTIME, 4),
+            Err(MachineTrap::LoadAccessFault {
+                address: CLINT_BASE + CLINT_MTIME,
+                bytes: 4,
+            })
+        );
     }
 }

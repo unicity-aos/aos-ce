@@ -119,20 +119,22 @@ reuse after restart explicit as `(boot sequence, PID)`.
 
 `crates/realm-machine` is the host-testable full-system backend seed. It owns only
 admitted guest CPU/CSR state, contiguous RAM, bounded serial input/output, the
-standard test finisher, and slice execution. Its current surface is the RV64I
-integer subset used by the probes plus Zicsr, typed M/S CSRs, general synchronous
+standard test finisher, and slice execution. Its current surface is RV64IMA plus
+Zicsr, typed M/S CSRs, general synchronous
 exception delivery/delegation, `mret`/`sret`, Sv39 translation, and `sfence.vma`
 under the ratified RISC-V Machine and Supervisor ISA 1.13. The page walker is
 bounded and checks canonicality, PTE/superpage form, U/S and R/W/X permissions,
-SUM/MXR, MPRV, and A/D updates against admitted RAM. It has
+SUM/MXR, MPRV, and A/D updates against admitted RAM. It also owns independent
+architectural counters, the deterministic single-hart CLINT, interrupt selection
+and vector entry, and bounded `wfi`. It has
 no browser, JavaScript, JIT, host process, host filesystem, or network dependency
 and compiles for the capsule's `wasm32-unknown-unknown` target.
 
-Those probes are architectural boundary tests, not Linux claims. The M/A
-extensions, counters, compressed instructions, timer/interrupt delivery, PLIC,
-SBI/boot handoff, a device tree, and virtio block still have to land before a Linux
-kernel can boot. Interrupt CSRs remain hardwired to zero until their corresponding
-machine components exist.
+Those probes are architectural boundary tests, not Linux claims. SBI/boot handoff,
+a generated device tree, Linux image placement, and an admitted initramfs still
+have to land before a Linux kernel can boot. Compressed instructions, PLIC, and
+virtio block are deliberately deferred until the selected kernel/device profile
+requires them.
 
 The private ABI exposes bounded `pipe`, compatibility `spawn-signed`, record-based
 `spawn-signed-record`, `wait`, and `signal` operations. The record form selects an
