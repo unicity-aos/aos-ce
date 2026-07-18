@@ -1,6 +1,6 @@
 # AOS Principal Linux Realm Capsule
 
-Status: active implementation programme; guest-created signed process trees live
+Status: active implementation programme; bounded RV64 machine probe live
 
 Last reviewed: 2026-07-18
 
@@ -20,8 +20,9 @@ by an ordinary Astrid component boundary:
 ```text
 agent principal
   -> Linux realm tool/service interface
-  -> Linux-compatible syscall kernel inside the capsule
-  -> sandboxed WASM processes
+  -> realm process and resource kernel inside the capsule
+  -> signed core-WASM processes, or an admitted RV64 virtual machine
+  -> eventually Linux plus AOS Realm userland on the RV64 machine
   -> Astrid host imports for explicitly granted effects
   -> principal-scoped storage, network, clocks, entropy, and audit
 ```
@@ -85,6 +86,37 @@ that their browser packages can be placed unchanged inside an Astrid
 `wasm32-unknown-unknown` component. Browser APIs, JavaScript workers, dynamic module
 instantiation, filesystem backends, JIT treatment, and licensing must all be
 replaced or explicitly integrated.
+
+### 2.4 Embedded backend decision, 2026-07-18
+
+The embedded backend is an AOS-owned, interpreter-first RV64 virtual machine. AOS
+owns the machine model, resource limits, scheduling slices, console, interrupt and
+clock behavior, block-overlay semantics, device tree, snapshots, and capability
+portals. It may adapt narrowly scoped permissive implementation techniques, but no
+third-party browser runtime defines the Realm boundary.
+
+The decision was made against current upstream state rather than project names:
+
+| Candidate pinned during evaluation | Useful property | Why it is not the embedded backend |
+|---|---|---|
+| CheerpX 1.2.8 and WebVM commit [`007fedb`](https://github.com/leaningtech/webvm/tree/007fedb26946a8c31563dab2fed9d85bcd1f8963) | Strong x86 Linux userland, persistent overlay, excellent product proof | Requires a browser JavaScript environment, `SharedArrayBuffer`, workers, IndexedDB/WebSockets and CheerpX licensing; not a core-WASM library that can be linked into this capsule |
+| v86 tag `latest`, commit [`2f1346b`](https://github.com/copy/v86/tree/2f1346b0e7d88d4cbbbcc05fe15b4e369c3de23f) | BSD-licensed full x86 PC with Linux and virtio devices | Browser/JavaScript orchestration and runtime generation of new WebAssembly modules are fundamental to its fast path; Astrid's nested interpreter does not provide that host |
+| `rvemu` 0.0.11, current commit [`f55eb5b`](https://github.com/d0iasm/rvemu/tree/f55eb5b376f22a73c0cf2630848c03f8d5c93922) | MIT Rust RV64GC, Sv39, PLIC/CLINT/virtio, and a `wasm32-unknown-unknown` build | The Wasm UART calls the browser DOM, construction runs host `dtc`, RAM eagerly allocates 1 GiB, execution is unbounded, and its Linux recipe remains on 4.19; it is a reference donor, not a dependency |
+| `semu` commit [`fd08129`](https://github.com/sysprog21/semu/tree/fd0812970c3c934b46e4897284894e9705355b50) with rolling `prebuilt` tag [`c722c11`](https://github.com/sysprog21/semu/tree/c722c1140770a67e638fd8154446825563ebd738) | Active MIT full-system Linux proof with virtio block, filesystem, network, input, sound, and 2D GPU | It is an RV32IMA C host program with native host integrations, not an embeddable RV64 core-WASM component; its device behavior remains valuable comparison evidence |
+
+The first `aos-rv64-virt-v0` slice is intentionally smaller than all four. It has
+explicitly admitted contiguous RAM, a slice-driven interpreter for the initial
+RV64I integer surface, a bounded 16550 UART subset, and the standard test finisher.
+`linux_realm_exec({"command":"rv64-smoke"})` executes 23 real RISC-V
+instructions, returns `AOS RV64\n` from virtual UART, and halts with the standard
+pass value. The result names `aos-rv64-interpreter` as its backend. Fuel exhaustion,
+illegal instructions, misalignment, RAM bounds, and serial-output exhaustion all
+return control to the outer Realm rather than escaping into host behavior.
+
+This is not Linux yet. The machine does not yet implement privileged CSRs, trap
+delegation, atomics, compressed instructions, Sv39 translation, CLINT, PLIC, an
+SBI/boot handoff, a generated device tree, or virtio block. Those are measurable
+boot prerequisites, not implied scaffolding.
 
 ## 3. The system seen from each side
 
@@ -689,7 +721,8 @@ The capsule uses existing tool-bus conventions without creating a public WIT
 package. The live seed exports:
 
 - `linux_realm_exec`: run one exact signed program with structured arguments, CWD,
-  and caller-reducible fuel/output limits;
+  and caller-reducible fuel/output limits; the temporary `rv64-smoke` diagnostic
+  selects the bounded RV64 backend explicitly rather than a signed core-WASM guest;
 - `linux_realm_status`: report the guest-visible mounts, supported programs, owner
   principal, and workspace commit policy without physical host paths.
 
@@ -772,6 +805,7 @@ capsules/capsule-linux-realm/
   crates/
     realm-abi/          guest syscall numbers, records, errno, executable metadata
     realm-core/         process, descriptor, scheduler, signal, namespace model
+    realm-machine/      bounded RV64 CPU, RAM, console, finisher, scheduling slices
     realm-vfs/          mounts, paths, overlay, persistence, crash semantics
     realm-runtime/      nested WASM interpreter and process instances
   guests/
@@ -983,6 +1017,24 @@ compatibility.
   Kernel tests prove file descriptor 3 followed by pipe endpoints 4 and 5,
   failure-atomic rejection of file child actions, and descriptor-quota rejection
   before any outer filesystem open;
+- the reviewed RV64-machine artifact is 419,387 bytes with outer SHA-256
+  `5194f486ece4e8e13280656058ac1a8b114fad5f4ff6e8a8a277754905496e64`,
+  raw built-Wasm SHA-256
+  `af6eae6e503250baec97f4918c3066d5ead70b1dce52c93385ad6b48028e8f4c`,
+  and installed component hash
+  `e210d0200b7f6a4e75cae47910b536f72b089bd92e2eacdc4ff76b020a4ca662`.
+  Ninety-five focused host tests pass, deny-warnings clippy is clean, and the
+  linked capsule checks under `wasm32-unknown-unknown`. The live Astrid 0.10.1
+  MCP 2025-11-25 front door ran `rv64-smoke`; the installed component reported
+  backend `aos-rv64-interpreter`, retired exactly 23 instructions in 64 KiB of
+  admitted RAM, returned exact virtual-UART stdout `AOS RV64\n`, and halted with
+  exit status 0. Final status reported boot sequence 4, one completed command,
+  `host_process=false`, next PID 1, and zero retained process, pipe, or
+  reserved-byte resources. An immediately preceding packaged run deliberately
+  encountered the MCP publish path's broken-pipe retry and still reported one
+  completed command, proving replay rather than double execution. The probe does
+  not allocate a semantic Realm PID yet; replacing that diagnostic adapter with
+  a normal job record is an explicit pre-workbench task;
 - the initial live run discovered two integration constraints rather than hiding
   them: Astrid's component FileHandle methods are not implemented, so the adapter
   uses bounded whole-file I/O and commits on descriptor close; `/tmp` must be
@@ -1053,6 +1105,21 @@ companions.
 
 ### Milestone D: useful agent workbench
 
+- [x] establish the AOS-owned `aos-rv64-virt-v0` machine boundary with explicit
+  RAM/output admission and bounded execution slices;
+- [x] execute a real RV64I probe through the installable capsule command path and
+  report exact backend, instruction, memory, output, and halt accounting;
+- implement the privileged ISA/CSR and trap-delegation subset exercised by a
+  current Linux boot, then Sv39 virtual memory;
+- add deterministic CLINT and PLIC models, boot ROM/SBI handoff, and a generated,
+  versioned device tree;
+- boot signed Linux longterm 6.18.39 with a Buildroot 2026.05.1 initramfs to an
+  AOS-controlled `/init`, and retain an exact serial trace as an executable test;
+- add virtio-block behind an immutable base plus principal-private COW block
+  overlay before making the root filesystem writable;
+- replace the probe-only execution adapter with a Realm process/job record whose
+  lifecycle, cancellation, and accounting use the same semantic kernel as other
+  foreground work;
 - produce a signed minimal image with shell, Git, and Python;
 - add workspace projection and artifact export;
 - add a mediated dependency fetch path;
@@ -1289,6 +1356,10 @@ The first implementation must resolve these with executable evidence:
   identity/allocation into `realm-core`, reject undefined file child actions
   atomically, and add guest-owned `echo TEXT > PATH` redirection with exact
   persisted-byte and cleanup tests;
+- [x] add the host-testable `aos-realm-machine` crate and route `rv64-smoke`
+  through the real capsule adapter: 23 RV64 instructions, bounded virtual UART,
+  standard finisher, explicit backend identity, fuel/output traps, no browser or
+  host-process dependency, and a successful `wasm32-unknown-unknown` build;
 - [ ] define the attenuating capsule-to-realm job contract and migrate Forge as the
   first non-interactive consumer after artifact verification exists;
 - [ ] replace `aos-shell` in the default distro only after interactive and
@@ -1300,10 +1371,13 @@ The first implementation must resolve these with executable evidence:
 - [ ] defer public WIT, Debian naming, arbitrary package claims, and native-kernel
     coupling until evidence requires them.
 
-The next executable artifact should add guest-visible executable lookup without
-delegating to a host PATH, define the realm-wide open-file-description table, and
-translate ordered spawn actions without weakening close/commit semantics. It
-should also expose explicit foreground job records rather than only the completed
-tree report. The storage track adds named
-checkpoint/diff/reset and outer workspace promotion. Bash and a compiler remain
-acceptance workloads, not claims made by this seed.
+The next Linux-bearing executable artifact is the privileged-machine boot spine:
+CSR/trap delegation, Sv39, deterministic timer/interrupt devices, boot handoff,
+and a generated device tree, followed by a pinned Linux 6.18.39 plus Buildroot
+2026.05.1 serial boot to `/init`. It must run in bounded slices and fail with an
+exact architectural trap before virtio block, persistence, networking, or a shell
+are added. The parallel process track still needs guest-visible executable lookup,
+the realm-wide open-file-description table, sequential spawn actions, and explicit
+foreground job records. The storage track adds named checkpoint/diff/reset and
+outer workspace promotion. Bash and a compiler remain acceptance workloads, not
+claims made by this seed.

@@ -8,6 +8,9 @@
 mod actor;
 mod host;
 
+use aos_realm_machine::{
+    Machine as Rv64Machine, MachineConfig as Rv64MachineConfig, RV64_SMOKE_PROGRAM, SliceOutcome,
+};
 use aos_realm_runtime::{
     CAT_GUEST, ECHO_GUEST, ExecutionReport, GUEST_PIPELINE_GUEST, HostFault, MINI_SHELL_GUEST,
     PWD_GUEST, ProcessConfig, ProcessOutcome, ProcessTreeReport, RealmHost, RealmIoError,
@@ -39,6 +42,7 @@ pub enum RealmProgram {
     PipeEcho,
     GuestPipeEcho,
     RealmSh,
+    Rv64Smoke,
     WriteFile,
     Cat,
 }
@@ -67,6 +71,7 @@ struct ExecResponse {
     realm: &'static str,
     owner_principal: String,
     program: String,
+    execution_backend: &'static str,
     argv: Vec<String>,
     cwd: String,
     outcome: &'static str,
@@ -108,7 +113,7 @@ struct StatusResponse {
     home_files: usize,
     home_manifest: Option<String>,
     mounts: Vec<MountStatus>,
-    commands: [&'static str; 8],
+    commands: [&'static str; 9],
     workspace_commit: &'static str,
     host_process: bool,
     actor_state: &'static str,
@@ -161,6 +166,18 @@ enum SelectedExecution {
     EchoPipeline,
     GuestPipeline,
     MiniShell,
+    Rv64Smoke,
+}
+
+impl SelectedExecution {
+    const fn backend(self) -> &'static str {
+        match self {
+            Self::Single(_) | Self::EchoPipeline | Self::GuestPipeline | Self::MiniShell => {
+                "nested-core-wasm"
+            }
+            Self::Rv64Smoke => "aos-rv64-interpreter",
+        }
+    }
 }
 
 #[capsule]
@@ -242,6 +259,7 @@ fn run_command_in_machine(
         realm: REALM_NAME,
         owner_principal: principal,
         program: selected.name.to_string(),
+        execution_backend: selected.execution.backend(),
         argv: selected.argv,
         cwd,
         outcome,
@@ -341,7 +359,36 @@ fn execute_selected(
             process_ids.extend(tree.children.iter().map(|child| child.process_id.get()));
             Ok((combine_process_tree(tree), process_ids))
         }
+        SelectedExecution::Rv64Smoke => execute_rv64_smoke(limits).map(|report| (report, vec![])),
     }
+}
+
+fn execute_rv64_smoke(limits: RunLimits) -> Result<ExecutionReport, SysError> {
+    let mut machine = Rv64Machine::new(Rv64MachineConfig {
+        ram_bytes: HARD_MEMORY_BYTES,
+        max_console_bytes: limits.output_bytes,
+    })
+    .map_err(|error| SysError::ApiError(error.to_string()))?;
+    machine
+        .load_program(&RV64_SMOKE_PROGRAM)
+        .map_err(|error| SysError::ApiError(error.to_string()))?;
+    let report = machine.run_slice(limits.fuel);
+    let outcome = match report.outcome {
+        SliceOutcome::Yielded => ProcessOutcome::FuelExhausted,
+        SliceOutcome::Halted(status) if status.passed => ProcessOutcome::Exited(0),
+        SliceOutcome::Halted(status) => {
+            ProcessOutcome::Exited(i32::try_from(status.code).unwrap_or(i32::MAX))
+        }
+        SliceOutcome::Trapped(trap) => ProcessOutcome::Trapped(trap.to_string()),
+    };
+    Ok(ExecutionReport {
+        outcome,
+        stdout: report.console,
+        stderr: Vec::new(),
+        fuel_consumed: report.total_instructions_retired,
+        memory_limit_bytes: HARD_MEMORY_BYTES,
+        suspensions: 0,
+    })
 }
 
 fn combine_process_tree(tree: ProcessTreeReport) -> ExecutionReport {
@@ -420,11 +467,12 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
             "pipe-echo" => RealmProgram::PipeEcho,
             "guest-pipe-echo" => RealmProgram::GuestPipeEcho,
             "realm-sh" => RealmProgram::RealmSh,
+            "rv64-smoke" => RealmProgram::Rv64Smoke,
             "write-file" => RealmProgram::WriteFile,
             "cat" => RealmProgram::Cat,
             _ => {
                 return Err(SysError::ApiError(format!(
-                    "unsupported realm command `{command}`; supported: pwd, echo, pipe-echo, guest-pipe-echo, realm-sh, write-file, cat, smoke-write"
+                    "unsupported realm command `{command}`; supported: pwd, echo, pipe-echo, guest-pipe-echo, realm-sh, rv64-smoke, write-file, cat, smoke-write"
                 )));
             }
         }
@@ -474,6 +522,14 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
             let mut argv = vec!["realm-sh".to_string()];
             argv.extend(args.args.iter().cloned());
             ("realm-sh", SelectedExecution::MiniShell, argv)
+        }
+        RealmProgram::Rv64Smoke => {
+            require_arity("rv64-smoke", &args.args, 0)?;
+            (
+                "rv64-smoke",
+                SelectedExecution::Rv64Smoke,
+                vec!["rv64-smoke".to_string()],
+            )
         }
         RealmProgram::WriteFile => {
             require_arity("write-file", &args.args, 2)?;
@@ -557,6 +613,7 @@ fn status_response(
             "pipe-echo",
             "guest-pipe-echo",
             "realm-sh",
+            "rv64-smoke",
             "write-file",
             "cat",
             "smoke-write",
@@ -655,9 +712,69 @@ mod tests {
         .expect("realm command succeeds");
 
         assert_eq!(response.owner_principal, "alice");
+        assert_eq!(response.execution_backend, "nested-core-wasm");
         assert_eq!(response.outcome, "exited");
         assert_eq!(response.exit_status, Some(0));
         assert_eq!(response.stdout, "/workspace/project\n");
+    }
+
+    #[test]
+    fn rv64_probe_runs_real_guest_instructions_through_virtual_uart() {
+        let response = run_command(
+            ExecArgs {
+                command: Some("rv64-smoke".to_string()),
+                ..ExecArgs::default()
+            },
+            "alice".to_string(),
+            Box::<TestHost>::default(),
+        )
+        .expect("RV64 probe succeeds");
+
+        assert_eq!(response.execution_backend, "aos-rv64-interpreter");
+        assert_eq!(response.outcome, "exited");
+        assert_eq!(response.exit_status, Some(0));
+        assert_eq!(response.stdout, "AOS RV64\n");
+        assert_eq!(response.fuel_consumed, 23);
+        assert_eq!(response.memory_limit_bytes, HARD_MEMORY_BYTES);
+        assert_eq!(response.processes, 0);
+        assert!(response.process_ids.is_empty());
+    }
+
+    #[test]
+    fn rv64_probe_obeys_outer_fuel_and_output_limits() {
+        let fuel = run_command(
+            ExecArgs {
+                command: Some("rv64-smoke".to_string()),
+                fuel: Some(2),
+                ..ExecArgs::default()
+            },
+            "alice".to_string(),
+            Box::<TestHost>::default(),
+        )
+        .expect("bounded RV64 probe returns accounting");
+        assert_eq!(fuel.outcome, "fuel-exhausted");
+        assert_eq!(fuel.fuel_consumed, 2);
+        assert!(fuel.stdout.is_empty());
+
+        let output = run_command(
+            ExecArgs {
+                command: Some("rv64-smoke".to_string()),
+                max_output_bytes: Some(0),
+                ..ExecArgs::default()
+            },
+            "alice".to_string(),
+            Box::<TestHost>::default(),
+        )
+        .expect("output-limited RV64 probe returns a trap");
+        assert_eq!(output.outcome, "trapped");
+        assert_eq!(output.fuel_consumed, 2);
+        assert!(output.stdout.is_empty());
+        assert!(
+            output
+                .fault
+                .as_deref()
+                .is_some_and(|fault| fault.contains("console output"))
+        );
     }
 
     #[test]

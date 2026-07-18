@@ -177,6 +177,7 @@ dependencies = [
 name = "aos-linux-realm"
 version = "0.1.0"
 dependencies = [
+ "aos-realm-machine",
  "aos-realm-runtime",
  "aos-realm-vfs",
  "astrid-sdk",
@@ -274,6 +275,10 @@ version = "0.1.0"
 dependencies = [
  "aos-realm-abi",
 ]
+
+[[package]]
+name = "aos-realm-machine"
+version = "0.1.0"
 
 [[package]]
 name = "aos-realm-runtime"
