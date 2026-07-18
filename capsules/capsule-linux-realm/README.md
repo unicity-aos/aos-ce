@@ -38,25 +38,55 @@ status reports `uninitialized` before that point without mutating storage:
 /tmp          principal-private temporary subtree
 ```
 
-`/home/agent` is stored beneath the caller's principal home and survives daemon
-restart. `/workspace` is deliberately transactional: writes enter Astrid's
-copy-on-write view and do not change the source workspace until the outer Astrid
-workflow promotes them. An unpromoted workspace overlay is discarded on daemon
-restart. `/tmp` is not durable state.
+`/home/agent` is a versioned filesystem. One principal-scoped KV value atomically
+selects its current generation; immutable manifests and file contents are stored
+as BLAKE3-addressed blobs beneath the caller's private realm store. It survives
+daemon restart. `/workspace` is deliberately transactional: writes enter
+Astrid's copy-on-write view and do not change the source workspace until the
+outer Astrid workflow promotes them. An unpromoted workspace overlay is
+discarded on daemon restart. `/tmp` is not durable state.
 
 The default realm name is `default`, giving one durable home per principal. The
 principal is never accepted from tool input. It comes from the kernel-stamped
 invocation, so two principals using the same capsule bytes receive different
-homes.
+KV heads and different blob namespaces.
+
+## Durable home format
+
+The selected metadata is deliberately small:
+
+```text
+principal KV: realm/default/fs/head
+  -> { format, generation, manifest_digest }
+
+principal file store: .../store/blobs/<blake3>
+  -> immutable file bytes or immutable manifest bytes
+```
+
+A create-or-truncate close writes and verifies the file blob, writes and verifies
+a new manifest whose parent is the prior selected manifest, then swaps the head
+with KV compare-and-swap. A crash before the swap can leave unreachable blobs but
+cannot select a partial generation. A losing concurrent writer reloads the winner,
+merges its own replacement, and retries up to a fixed bound.
+
+Existing format-0 homes are not discarded. Their direct files are imported into
+the versioned store lazily on first read. The old direct path remains a rebuildable
+compatibility projection; reads prefer the selected versioned generation.
+
+The current seed supports regular-file create/truncate and read, with a 64 KiB
+per-file limit and 1 MiB manifest limit. It does not yet implement delete, rename,
+directory metadata, permissions, links, garbage collection, named checkpoints, or
+a guest `fsync`/flush call. `linux_realm_status` exposes the format, selected
+generation, file count, and manifest digest without exposing a physical path.
 
 ## Build and install
 
 From the `aos-ce` repository:
 
 ```sh
-cargo test -p aos-realm-abi -p aos-realm-runtime -p aos-linux-realm \
+cargo test -p aos-realm-abi -p aos-realm-runtime -p aos-realm-vfs -p aos-linux-realm \
   --target "$(rustc -vV | sed -n 's/^host: //p')"
-cargo clippy -p aos-realm-abi -p aos-realm-runtime -p aos-linux-realm \
+cargo clippy -p aos-realm-abi -p aos-realm-runtime -p aos-realm-vfs -p aos-linux-realm \
   --target "$(rustc -vV | sed -n 's/^host: //p')" -- -D warnings
 cargo check -p aos-linux-realm --target wasm32-unknown-unknown
 astrid capsule build capsules/capsule-linux-realm
@@ -86,9 +116,10 @@ is rejected as an unknown program rather than evaluated by Bash.
 The private `aos_realm_v0` ABI supplies bounded argument and CWD reads,
 open/read/write/close, monotonic time, and exit. Paths are normalized within
 `/home/agent`, `/workspace`, or `/tmp`; unmounted absolute paths and upward escape
-fail closed. Writes are buffered at the capsule edge and committed through
-Astrid's whole-file VFS operation only when the nested descriptor closes, so a
-trapped command does not leave a partial guest file.
+fail closed. Writes are buffered at the capsule edge and committed only when the
+nested descriptor closes, so a trapped command does not leave a partial guest
+file. Durable-home closes select a content-addressed generation with a KV CAS;
+workspace and temporary files retain their outer mount semantics.
 
 This slice does not provide Bash, pipes, child processes, Linux syscalls, a libc,
 package management, networking, PTYs, or a compiler. Those belong behind the same

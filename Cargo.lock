@@ -178,6 +178,7 @@ name = "aos-linux-realm"
 version = "0.1.0"
 dependencies = [
  "aos-realm-runtime",
+ "aos-realm-vfs",
  "astrid-sdk",
  "serde",
  "serde_json",
@@ -274,6 +275,15 @@ dependencies = [
  "aos-realm-abi",
  "wasmi",
  "wat",
+]
+
+[[package]]
+name = "aos-realm-vfs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

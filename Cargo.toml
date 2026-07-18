@@ -6,6 +6,7 @@ members = [
     "capsules/capsule-linux-realm",
     "capsules/capsule-linux-realm/crates/realm-abi",
     "capsules/capsule-linux-realm/crates/realm-runtime",
+    "capsules/capsule-linux-realm/crates/realm-vfs",
     "capsules/capsule-agents",
     "capsules/capsule-cli",
     "capsules/capsule-context-engine",
@@ -46,6 +47,7 @@ astrid-types = { version = "=0.10.4", features = ["clock"] }
 astrid-uplink = "=0.10.4"
 aos-realm-abi = { path = "capsules/capsule-linux-realm/crates/realm-abi" }
 aos-realm-runtime = { path = "capsules/capsule-linux-realm/crates/realm-runtime" }
+aos-realm-vfs = { path = "capsules/capsule-linux-realm/crates/realm-vfs" }
 axum = "0.8"
 blake3 = "1.8.5"
 clap = { version = "4.6", features = ["derive"] }
