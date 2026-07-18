@@ -1,24 +1,33 @@
-//! Long-lived Astrid run-loop that owns one isolated Realm machine per principal.
+//! In-Store state for one principal-affine AOS Realm component instance.
 
 use super::*;
-use std::collections::{BTreeMap, VecDeque};
-
-const EXEC_TOPIC: &str = "tool.v1.execute.linux_realm_exec";
-const STATUS_TOPIC: &str = "tool.v1.execute.linux_realm_status";
-const DESCRIBE_TOPIC: &str = "tool.v1.request.describe";
+use std::cell::RefCell;
 const BOOT_SEQUENCE_KEY: &str = "realm/default/actor/boot-sequence";
 const BOOT_SEQUENCE_CAS_ATTEMPTS: usize = 8;
-const MAX_PRINCIPAL_REALMS: usize = 32;
-const ACTOR_POLL_MS: u64 = 250;
-const MAX_REPLAY_RESULTS: usize = 64;
-const MAX_CALL_ID_BYTES: usize = 256;
-const MAX_REPLAY_ARGUMENT_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Deserialize)]
-struct ToolRequest {
-    call_id: String,
-    tool_name: String,
-    arguments: serde_json::Value,
+thread_local! {
+    /// A WebAssembly component instance is guest-single-threaded. Keeping the
+    /// singleton in guest TLS avoids imposing host `Send`/`Sync` semantics on
+    /// the semantic kernel's intentionally local `Rc<RefCell<_>>` graph.
+    static RESIDENT_REALM: RefCell<ResidentRealm> = RefCell::new(ResidentRealm::default());
+}
+
+pub(crate) fn execute_resident(principal: &str, args: ExecArgs) -> Result<String, SysError> {
+    RESIDENT_REALM.with(|state| {
+        state
+            .try_borrow_mut()
+            .map_err(|_| SysError::ApiError("principal-affine Realm was re-entered".to_string()))?
+            .execute(principal, args)
+    })
+}
+
+pub(crate) fn status_resident(principal: &str, args: StatusArgs) -> Result<String, SysError> {
+    RESIDENT_REALM.with(|state| {
+        state
+            .try_borrow_mut()
+            .map_err(|_| SysError::ApiError("principal-affine Realm was re-entered".to_string()))?
+            .status(principal, args)
+    })
 }
 
 struct PrincipalRealm {
@@ -87,36 +96,29 @@ impl LinuxActivity {
     }
 }
 
-struct RealmActor {
-    principals: BTreeMap<String, PrincipalRealm>,
-    replay: VecDeque<ReplayEntry>,
+/// Stateful singleton held inside one principal-affine Wasmtime Store.
+///
+/// Astrid permanently binds that Store to a kernel-verified principal. The
+/// owner check here independently fails closed if a runtime regression ever
+/// attempts to retarget the component instance.
+#[derive(Default)]
+pub(crate) struct ResidentRealm {
+    owner_principal: Option<String>,
+    realm: Option<PrincipalRealm>,
 }
 
-impl Default for RealmActor {
-    fn default() -> Self {
-        Self {
-            principals: BTreeMap::new(),
-            replay: VecDeque::with_capacity(MAX_REPLAY_RESULTS),
+impl ResidentRealm {
+    fn bind_owner(&mut self, principal: &str) -> Result<(), SysError> {
+        match self.owner_principal.as_deref() {
+            Some(owner) if owner != principal => Err(SysError::ApiError(format!(
+                "principal-affine Realm Store belongs to `{owner}`, not `{principal}`"
+            ))),
+            Some(_) => Ok(()),
+            None => {
+                self.owner_principal = Some(principal.to_string());
+                Ok(())
+            }
         }
-    }
-}
-
-struct ReplayEntry {
-    principal: String,
-    call_id: String,
-    arguments: String,
-    result: Result<String, String>,
-}
-
-impl RealmActor {
-    fn ensure_capacity(&self, principal: &str) -> Result<(), SysError> {
-        if !self.principals.contains_key(principal) && self.principals.len() >= MAX_PRINCIPAL_REALMS
-        {
-            return Err(SysError::ApiError(format!(
-                "Realm actor principal quota exceeded ({MAX_PRINCIPAL_REALMS})"
-            )));
-        }
-        Ok(())
     }
 
     fn realm_with_boot(
@@ -124,15 +126,14 @@ impl RealmActor {
         principal: &str,
         load_boot: impl FnOnce() -> Result<u64, SysError>,
     ) -> Result<&mut PrincipalRealm, SysError> {
-        self.ensure_capacity(principal)?;
-        if !self.principals.contains_key(principal) {
+        self.bind_owner(principal)?;
+        if self.realm.is_none() {
             let boot_sequence = load_boot()?;
-            self.principals
-                .insert(principal.to_string(), PrincipalRealm::new(boot_sequence));
+            self.realm = Some(PrincipalRealm::new(boot_sequence));
         }
-        self.principals
-            .get_mut(principal)
-            .ok_or_else(|| SysError::ApiError("Realm actor state disappeared".to_string()))
+        self.realm
+            .as_mut()
+            .ok_or_else(|| SysError::ApiError("resident Realm state disappeared".to_string()))
     }
 
     fn execute_with_boot(
@@ -166,16 +167,18 @@ impl RealmActor {
     }
 
     fn snapshot(&self, principal: &str) -> ActorSnapshot {
-        self.principals
-            .get(principal)
-            .map(PrincipalRealm::snapshot)
-            .unwrap_or_else(ActorSnapshot::idle)
+        if self.owner_principal.as_deref() == Some(principal) {
+            self.realm
+                .as_ref()
+                .map(PrincipalRealm::snapshot)
+                .unwrap_or_else(ActorSnapshot::idle)
+        } else {
+            ActorSnapshot::idle()
+        }
     }
 
-    fn execute(&mut self, principal: &str, args: ExecArgs) -> Result<String, SysError> {
-        // Reject aggregate admission before creating durable state for a realm
-        // this actor cannot retain.
-        self.ensure_capacity(principal)?;
+    pub(crate) fn execute(&mut self, principal: &str, args: ExecArgs) -> Result<String, SysError> {
+        self.bind_owner(principal)?;
         ensure_layout()?;
         validate_cwd(args.cwd.as_deref().unwrap_or(DEFAULT_CWD))?;
         let response = self.execute_with_boot(
@@ -187,48 +190,12 @@ impl RealmActor {
         serde_json::to_string(&response).map_err(|error| SysError::ApiError(error.to_string()))
     }
 
-    fn execute_replay_safe(
+    pub(crate) fn status(
         &mut self,
         principal: &str,
-        call_id: &str,
-        arguments: serde_json::Value,
-        execute: impl FnOnce(&mut Self, ExecArgs) -> Result<String, String>,
-    ) -> Result<String, String> {
-        if call_id.is_empty() || call_id.len() > MAX_CALL_ID_BYTES {
-            return Err("Realm tool call_id is empty or too large".to_string());
-        }
-        let arguments = serde_json::to_string(&arguments)
-            .map_err(|error| format!("failed to encode tool arguments: {error}"))?;
-        if arguments.len() > MAX_REPLAY_ARGUMENT_BYTES {
-            return Err("Realm tool arguments exceed the replay-safe bound".to_string());
-        }
-        if let Some(entry) = self
-            .replay
-            .iter()
-            .find(|entry| entry.principal == principal && entry.call_id == call_id)
-        {
-            if entry.arguments != arguments {
-                return Err("Realm tool call_id was reused with different arguments".to_string());
-            }
-            return entry.result.clone();
-        }
-
-        let result = serde_json::from_str::<ExecArgs>(&arguments)
-            .map_err(|error| format!("failed to parse tool arguments: {error}"))
-            .and_then(|args| execute(self, args));
-        if self.replay.len() == MAX_REPLAY_RESULTS {
-            self.replay.pop_front();
-        }
-        self.replay.push_back(ReplayEntry {
-            principal: principal.to_string(),
-            call_id: call_id.to_string(),
-            arguments,
-            result: result.clone(),
-        });
-        result
-    }
-
-    fn status(&mut self, principal: &str, _args: StatusArgs) -> Result<String, SysError> {
+        _args: StatusArgs,
+    ) -> Result<String, SysError> {
+        self.bind_owner(principal)?;
         let layout = layout_state()?;
         let filesystem = home_status()?;
         // Status is declared read-only. In particular, observing a principal
@@ -237,161 +204,6 @@ impl RealmActor {
         let actor = self.snapshot(principal);
         let response = status_response(principal.to_string(), layout, filesystem, actor);
         serde_json::to_string(&response).map_err(|error| SysError::ApiError(error.to_string()))
-    }
-}
-
-pub(crate) fn run_actor_loop() -> Result<(), SysError> {
-    let exec = ipc::subscribe(EXEC_TOPIC)?;
-    let status = ipc::subscribe(STATUS_TOPIC)?;
-    let describe = ipc::subscribe(DESCRIBE_TOPIC)?;
-    let _ = runtime::signal_ready();
-    log::info("AOS Realm actor ready");
-
-    let mut actor = RealmActor::default();
-    loop {
-        let result = exec.recv(ACTOR_POLL_MS)?;
-        dispatch_tool_messages(&mut actor, &result, "linux_realm_exec")?;
-        dispatch_tool_messages(&mut actor, &status.poll()?, "linux_realm_status")?;
-        dispatch_describe_messages(&describe.poll()?)?;
-    }
-}
-
-fn dispatch_tool_messages(
-    actor: &mut RealmActor,
-    result: &ipc::PollResult,
-    expected_tool: &str,
-) -> Result<(), SysError> {
-    log_lag(result, expected_tool);
-    for message in &result.messages {
-        let request: ToolRequest = match serde_json::from_str(&message.payload) {
-            Ok(request) => request,
-            Err(error) => {
-                log::warn(format!(
-                    "AOS Realm rejected malformed {expected_tool} request: {error}"
-                ));
-                continue;
-            }
-        };
-        let call_id = request.call_id.clone();
-        let execution = handle_tool_message(actor, message, expected_tool, request);
-        publish_tool_result(expected_tool, &call_id, execution)?;
-    }
-    Ok(())
-}
-
-fn handle_tool_message(
-    actor: &mut RealmActor,
-    message: &ipc::Message,
-    expected_tool: &str,
-    request: ToolRequest,
-) -> Result<String, String> {
-    if request.tool_name != expected_tool {
-        return Err(format!(
-            "tool payload named `{}` arrived on `{expected_tool}`",
-            request.tool_name
-        ));
-    }
-    let principal = message
-        .principal
-        .verified()
-        .ok_or_else(|| "AOS Realm requires a kernel-verified principal".to_string())?;
-    match expected_tool {
-        "linux_realm_exec" => actor.execute_replay_safe(
-            principal,
-            &request.call_id,
-            request.arguments,
-            |actor, args| {
-                actor
-                    .execute(principal, args)
-                    .map_err(|error| error.to_string())
-            },
-        ),
-        "linux_realm_status" => {
-            let args = serde_json::from_value::<StatusArgs>(request.arguments)
-                .map_err(|error| format!("failed to parse tool arguments: {error}"))?;
-            actor
-                .status(principal, args)
-                .map_err(|error| error.to_string())
-        }
-        _ => Err(format!("unsupported Realm actor tool `{expected_tool}`")),
-    }
-}
-
-fn publish_tool_result(
-    tool_name: &str,
-    call_id: &str,
-    result: Result<String, String>,
-) -> Result<(), SysError> {
-    let (content, is_error) = match result {
-        // Preserve the SDK macro's existing tool contract: a Rust String result
-        // is JSON-serialized before it is placed in ToolCallResult.content.
-        Ok(value) => (
-            serde_json::to_string(&value).map_err(|error| SysError::ApiError(error.to_string()))?,
-            false,
-        ),
-        Err(error) => (error, true),
-    };
-    ipc::publish_json(
-        &format!("tool.v1.execute.{tool_name}.result"),
-        &serde_json::json!({
-            "type": "tool_execute_result",
-            "call_id": call_id,
-            "result": {
-                "call_id": call_id,
-                "content": content,
-                "is_error": is_error,
-            }
-        }),
-    )
-}
-
-fn dispatch_describe_messages(result: &ipc::PollResult) -> Result<(), SysError> {
-    log_lag(result, "tool_describe");
-    for _message in &result.messages {
-        ipc::publish_json("tool.v1.response.describe.self", &tool_description())?;
-    }
-    Ok(())
-}
-
-fn tool_description() -> serde_json::Value {
-    let mut exec_schema = schemars::schema_for!(ExecArgs);
-    exec_schema
-        .schema
-        .extensions
-        .insert("mutable".to_string(), serde_json::Value::Bool(true));
-    let mut status_schema = schemars::schema_for!(StatusArgs);
-    status_schema
-        .schema
-        .extensions
-        .insert("mutable".to_string(), serde_json::Value::Bool(false));
-    let mut exec_schema = serde_json::to_value(exec_schema)
-        .unwrap_or_else(|_| serde_json::json!({"type": "object", "properties": {}}));
-    let mut status_schema = serde_json::to_value(status_schema)
-        .unwrap_or_else(|_| serde_json::json!({"type": "object", "properties": {}}));
-    ensure_properties(&mut exec_schema);
-    ensure_properties(&mut status_schema);
-    serde_json::json!({
-        "tools": [
-            {
-                "name": "linux_realm_exec",
-                "description": "Run one signed command in the caller's principal-scoped AOS Realm.",
-                "input_schema": exec_schema,
-            },
-            {
-                "name": "linux_realm_status",
-                "description": "Inspect the initialized Realm and its live actor accounting.",
-                "input_schema": status_schema,
-            }
-        ],
-        "description": "Principal-scoped AOS Realm workbench",
-    })
-}
-
-fn ensure_properties(schema: &mut serde_json::Value) {
-    if let Some(object) = schema.as_object_mut() {
-        object
-            .entry("properties")
-            .or_insert_with(|| serde_json::json!({}));
     }
 }
 
@@ -423,15 +235,6 @@ fn increment_boot_sequence(current: Option<&[u8]>) -> Result<(u64, Vec<u8>), Sys
     Ok((next, encoded))
 }
 
-fn log_lag(result: &ipc::PollResult, operation: &str) {
-    if result.dropped > 0 || result.lagged > 0 {
-        log::warn(format!(
-            "AOS Realm actor {operation} lagged: dropped={}, lagged={}",
-            result.dropped, result.lagged
-        ));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,78 +262,47 @@ mod tests {
     }
 
     #[test]
-    fn one_actor_keeps_monotonic_pids_but_isolates_principal_machines() {
-        let mut actor = RealmActor::default();
-        let alice_first = actor
+    fn one_resident_store_keeps_monotonic_pids_and_rejects_retargeting() {
+        let mut alice = ResidentRealm::default();
+        let alice_first = alice
             .execute_with_boot("alice", echo("one"), Box::<TestHost>::default(), || Ok(7))
             .expect("alice first command");
-        let alice_second = actor
+        let alice_second = alice
             .execute_with_boot("alice", echo("two"), Box::<TestHost>::default(), || {
                 panic!("existing principal must not allocate another boot")
             })
             .expect("alice second command");
-        let bob_first = actor
+        let error = alice
             .execute_with_boot("bob", echo("other"), Box::<TestHost>::default(), || Ok(11))
-            .expect("bob first command");
+            .expect_err("a resident Store cannot cross principals");
 
         assert_eq!(alice_first.realm_boot_sequence, 7);
         assert_eq!(alice_first.process_ids, vec![1]);
         assert_eq!(alice_second.process_ids, vec![2]);
         assert_eq!(alice_second.next_process_id, Some(3));
-        assert_eq!(bob_first.realm_boot_sequence, 11);
-        assert_eq!(bob_first.process_ids, vec![1]);
-        assert_eq!(bob_first.next_process_id, Some(2));
+        assert!(error.to_string().contains("belongs to `alice`, not `bob`"));
     }
 
     #[test]
-    fn duplicate_mutating_call_id_replays_without_executing_twice() {
-        let mut actor = RealmActor::default();
-        let arguments = serde_json::json!({
-            "command": "echo",
-            "args": ["exactly once"]
-        });
-        let first = actor
-            .execute_replay_safe("alice", "call-1", arguments.clone(), |actor, args| {
-                actor
-                    .execute_with_boot("alice", args, Box::<TestHost>::default(), || Ok(7))
-                    .and_then(|response| {
-                        serde_json::to_string(&response)
-                            .map_err(|error| SysError::ApiError(error.to_string()))
-                    })
-                    .map_err(|error| error.to_string())
-            })
-            .expect("first request executes");
-        let replay = actor
-            .execute_replay_safe("alice", "call-1", arguments.clone(), |_actor, _args| {
-                panic!("duplicate request must not execute")
-            })
-            .expect("duplicate request replays");
+    fn separate_resident_stores_isolate_principal_machines() {
+        let mut alice = ResidentRealm::default();
+        let mut bob = ResidentRealm::default();
+        let alice_first = alice
+            .execute_with_boot("alice", echo("one"), Box::<TestHost>::default(), || Ok(7))
+            .expect("alice command");
+        let bob_first = bob
+            .execute_with_boot("bob", echo("other"), Box::<TestHost>::default(), || Ok(11))
+            .expect("bob command");
 
-        assert_eq!(replay, first);
-        let snapshot = actor.snapshot("alice");
-        assert_eq!(snapshot.commands_completed, 1);
-        assert_eq!(
-            snapshot
-                .machine
-                .next_process_id
-                .map(|process| process.get()),
-            Some(2)
-        );
-
-        let mismatch = actor
-            .execute_replay_safe(
-                "alice",
-                "call-1",
-                serde_json::json!({"command": "pwd"}),
-                |_actor, _args| panic!("mismatched duplicate must not execute"),
-            )
-            .expect_err("same call id with different arguments fails closed");
-        assert!(mismatch.contains("reused with different arguments"));
+        assert_eq!(alice_first.realm_boot_sequence, 7);
+        assert_eq!(bob_first.realm_boot_sequence, 11);
+        assert_eq!(alice_first.process_ids, vec![1]);
+        assert_eq!(bob_first.process_ids, vec![1]);
     }
 
     #[test]
     fn pipeline_ids_share_the_principals_monotonic_boot_namespace() {
-        let mut actor = RealmActor::default();
+        let mut actor = ResidentRealm::default();
         let first = actor
             .execute_with_boot("alice", echo("seed"), Box::<TestHost>::default(), || Ok(3))
             .expect("first command");
@@ -561,14 +333,14 @@ mod tests {
 
     #[test]
     fn read_only_snapshot_does_not_allocate_a_machine_or_boot_identity() {
-        let actor = RealmActor::default();
+        let actor = ResidentRealm::default();
         let snapshot = actor.snapshot("unseen");
 
         assert_eq!(snapshot.state, "idle");
         assert_eq!(snapshot.boot_sequence, 0);
         assert_eq!(snapshot.commands_completed, 0);
         assert_eq!(snapshot.machine.next_process_id.map(|id| id.get()), Some(1));
-        assert!(actor.principals.is_empty());
+        assert!(actor.realm.is_none());
     }
 
     #[test]
@@ -626,32 +398,5 @@ mod tests {
         assert_eq!(snapshot.last_exit_status, Some(0));
         assert_eq!(bob.linux.snapshot().boot_executions, 0);
         assert_eq!(bob.linux.snapshot().guest_steps, 0);
-    }
-
-    #[test]
-    fn manual_describe_contract_matches_the_run_loop_tools() {
-        let description = tool_description();
-        let tools = description["tools"].as_array().expect("tools array");
-
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0]["name"], "linux_realm_exec");
-        assert_eq!(tools[0]["input_schema"]["mutable"], true);
-        assert_eq!(tools[1]["name"], "linux_realm_status");
-        assert_eq!(tools[1]["input_schema"]["mutable"], false);
-    }
-
-    #[test]
-    fn actor_has_an_explicit_aggregate_principal_quota() {
-        let mut actor = RealmActor::default();
-        for index in 0..MAX_PRINCIPAL_REALMS {
-            actor
-                .snapshot_with_boot(&format!("principal-{index}"), || Ok(1))
-                .expect("principal admitted within quota");
-        }
-
-        let error = actor
-            .snapshot_with_boot("one-too-many", || Ok(1))
-            .expect_err("aggregate principal quota is enforced");
-        assert!(error.to_string().contains("principal quota exceeded"));
     }
 }

@@ -51,8 +51,8 @@ exposing physical host paths. It also reports the caller's actor boot sequence,
 completed-command count, next process identifier, and live process/pipe resource
 accounting. Linux-specific fields state that the current adapter is an on-demand
 cold boot with one vCPU, request-scoped RAM, no Linux-attached persistent storage,
-exact per-principal guest-step totals for the current actor boot, and outer Wasm
-metering still attached to the run-loop owner. The separate Realm home is durable
+exact per-principal guest-step totals for the current resident Store, and outer
+Wasm metering charged to the verified invoking principal. The separate Realm home is durable
 but does not become a Linux mount until the virtio-block/COW path exists. Every execution result identifies
 the kernel-stamped owner principal and exact execution backend, and includes the
 outcome, exit status, stdout, stderr, fuel or instruction accounting, memory
@@ -121,13 +121,16 @@ typed signal termination, a single-running-process FIFO reference scheduler,
 atomic pipe-descriptor inheritance, bounded partial pipe I/O, backpressure, EOF,
 broken-pipe behavior, and aggregate quotas.
 
-The capsule now runs as a long-lived service actor. It admits at most 32 active
-principal machines, derives identity only from each kernel-verified message, and
-keeps a separate semantic kernel and monotonic PID namespace for each principal.
+The capsule now opts into Astrid's principal-affine service mode. The runtime
+lazily creates one Wasmtime Store per active principal, bounds the resident set,
+and evicts only idle Stores by least-recent use. Inside each Store the capsule
+keeps exactly one semantic kernel and monotonic PID namespace. It repeats the
+runtime's owner check and fails closed if that component instance ever sees a
+different principal.
 Completed foreground jobs are reaped, so their process and pipe resources return
-to zero while their identifiers are never reused during that capsule boot. A
+to zero while their identifiers are never reused during that Store residency. A
 principal-scoped boot sequence is advanced with KV compare-and-swap and makes PID
-reuse after restart explicit as `(boot sequence, PID)`.
+reuse after eviction or restart explicit as `(boot sequence, PID)`.
 
 `crates/realm-machine` is the host-testable full-system backend seed. It owns only
 admitted guest CPU/CSR state, contiguous RAM, bounded serial input/output, the
@@ -177,16 +180,18 @@ most two descendants, budgets are partitioned before execution, and all process
 and pipe records are cleaned before the tool result returns. Background jobs still
 do not survive calls.
 
-The actor also retains a bounded 64-entry replay window for mutating tool call
-IDs. A transport retry with the same principal, call ID, and arguments returns the
-recorded result without running the process tree or filesystem mutation again;
-reusing the ID with different arguments fails closed. This is an in-memory
-per-actor-boot guarantee, not yet a durable exactly-once receipt across crashes.
+The direct SDK tool entry point does not expose the transport call ID to capsule
+code. The earlier manual run-loop replay cache therefore cannot be retained in
+this execution mode without pretending that duplicate delivery is safe. Durable
+exactly-once mutation receipts belong in the SDK/runtime tool-dispatch boundary;
+until that lands, callers must treat a lost mutating response as indeterminate
+and inspect state before retrying.
 
 ## Linux lifecycle and metering
 
-The `run()` actor remains resident for the capsule boot, but the Linux machine
-does not. Each `linux-boot` request allocates admitted RV64 RAM, boots the pinned
+The principal-affine component Store and semantic Realm machine remain resident
+while idle, but the Linux machine does not. Each `linux-boot` request allocates
+admitted RV64 RAM, boots the pinned
 kernel, runs `/init`, powers down, and destroys the machine. The durable guarantee
 will be the principal filesystem, not RAM or process state. The existing durable
 Realm home is not yet attached to the Linux guest. Status therefore returns
@@ -194,26 +199,20 @@ Realm home is not yet attached to the Linux guest. Status therefore returns
 `linux_ram_persistent=false` plus `linux_storage_persistent=false` even after a
 successful boot.
 
-This is intentional until Astrid has a principal-affine resident service Store.
-The boundary was reverified against Astrid Runtime 0.10.1 upstream `main` at
-`4771bab3c33d1bce53186e40d01cf014e2dce666` on 2026-07-19:
+Astrid Runtime now has the experimental primitive required to make this boundary
+honest: an opt-in Store permanently keyed by `(capsule, component, verified
+principal)`, with per-call fuel charging, exact aggregate resident-memory
+accounting, live quota enforcement, bounded LRU residency, and idle-only
+eviction. `Capsule.toml` requests it through fail-closed package metadata and
+requires Astrid `>=0.10.2`; 0.10.1 must not silently run this capsule with its old
+free-pool or shared-run-loop semantics.
 
-- pooled interceptor calls are re-seeded, measured, rate-gated, and memory-capped
-  for their invoking principal, but do not retain instance affinity;
-- a `run()` capsule retains one dedicated Store, but its Wasmtime fuel and linear
-  memory remain bounded and attributed to the capsule owner;
-- receiving a message correctly switches principal KV, home, temporary storage,
-  secrets, profile, cancellation, and publish provenance, but does not retarget
-  the Store memory meter or charge the message's Wasmtime fuel to its publisher.
-
-Keeping several principals' resident Linux machines inside that shared Store
-would therefore provide misleading isolation: storage would be principal-scoped,
-while CPU and RAM enforcement would not be. The required runtime primitive is a
-Store keyed by `(capsule, component, verified principal, realm)` with permanent
-principal ownership, per-command fuel admission and charging, a principal memory
-ceiling, bounded global residency, and explicit idle eviction. Until that exists,
-Linux remains cold/on-demand and its exact RV64 step count is retained as a
-separate principal-local inner accounting record for the current actor boot.
+This closes outer component affinity, not the inner Linux lifecycle. Linux
+remains cold/on-demand and its exact RV64 step count is retained as a separate
+principal-local record for the current Store residency. The next proof is to keep
+one `Rv64Machine` in that Store, leave `/init` alive, and route bounded commands
+through a virtual console or mailbox. Durable disk remains an independent
+virtio-block/COW device problem rather than a promise made by resident RAM.
 
 ## Build and install
 
