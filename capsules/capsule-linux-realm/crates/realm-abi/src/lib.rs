@@ -18,7 +18,7 @@ pub const STDOUT_FD: i32 = 1;
 /// Guest file descriptor for standard error.
 pub const STDERR_FD: i32 = 2;
 
-/// First descriptor available to guest-opened files.
+/// First descriptor available to guest-created files, pipes, and later resources.
 pub const FIRST_FILE_FD: i32 = 3;
 
 /// Guest `open` mode for an existing read-only file.
@@ -238,6 +238,27 @@ impl PipeId {
     }
 }
 
+/// Host-backed open-file description identity within one process store.
+///
+/// Descriptor numbers are process-local and owned by the semantic kernel. This
+/// identity selects the backing file object without making that host object
+/// part of the kernel model. It is intentionally not inheritable until Realm
+/// owns a shared open-file-description table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileDescriptionId(u64);
+
+impl FileDescriptionId {
+    /// Creates an identifier from its process-store-local representation.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the process-store-local representation.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Descriptor number in a single process descriptor table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Descriptor(i32);
@@ -272,9 +293,11 @@ mod tests {
         let realm = RealmId::new(7);
         let process = ProcessId::new(7);
         let pipe = PipeId::new(7);
+        let file = FileDescriptionId::new(7);
 
         assert_eq!(realm.get(), process.get());
         assert_eq!(process.get(), pipe.get());
+        assert_eq!(pipe.get(), file.get());
         assert_eq!(Descriptor::STDIN.get(), STDIN_FD);
         assert_eq!(Descriptor::STDOUT.get(), STDOUT_FD);
         assert_eq!(Descriptor::STDERR.get(), STDERR_FD);

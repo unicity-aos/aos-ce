@@ -7,7 +7,9 @@
 //! This crate owns no Wasmi instances and performs no Astrid host calls. It is a
 //! host-testable semantic oracle for the realm actor and execution backends.
 
-use aos_realm_abi::{Descriptor, FIRST_FILE_FD, MAX_PATH_BYTES, PipeId, ProcessId};
+use aos_realm_abi::{
+    Descriptor, FIRST_FILE_FD, FileDescriptionId, MAX_PATH_BYTES, PipeId, ProcessId,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
@@ -149,6 +151,8 @@ pub struct PipeEnds {
 /// Process-local resource selected by a descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorResource {
+    /// Host-backed file description owned by this process store.
+    File(FileDescriptionId),
     /// Read endpoint of a realm pipe.
     PipeRead(PipeId),
     /// Write endpoint of a realm pipe.
@@ -168,7 +172,7 @@ pub struct ProcessSnapshot {
     pub cwd: String,
     /// Current lifecycle state.
     pub state: ProcessState,
-    /// Number of installed pipe descriptors.
+    /// Number of installed descriptors.
     pub descriptors: usize,
 }
 
@@ -196,7 +200,7 @@ pub struct RealmLimits {
     pub max_pipe_bytes: usize,
     /// Sum of capacities reserved by all live pipes.
     pub max_total_pipe_bytes: usize,
-    /// Pipe descriptors installed in one process.
+    /// Resource descriptors installed in one process.
     pub max_descriptors_per_process: usize,
 }
 
@@ -297,6 +301,13 @@ pub enum KernelError {
     DuplicateDescriptorTarget(Descriptor),
     /// One parent descriptor was selected for close more than once.
     DuplicateDescriptorClose(Descriptor),
+    /// A descriptor names a resource whose child-action semantics are not defined.
+    DescriptorNotTransferable {
+        /// Process containing the descriptor table.
+        process: ProcessId,
+        /// Source descriptor selected for inheritance.
+        descriptor: Descriptor,
+    },
     /// A configured realm quota was exceeded.
     QuotaExceeded(Quota),
     /// A monotonic identifier reached the end of its representation.
@@ -360,6 +371,15 @@ impl fmt::Display for KernelError {
             Self::DuplicateDescriptorClose(descriptor) => write!(
                 formatter,
                 "parent descriptor {} is closed more than once",
+                descriptor.get()
+            ),
+            Self::DescriptorNotTransferable {
+                process,
+                descriptor,
+            } => write!(
+                formatter,
+                "process {} descriptor {} cannot participate in child descriptor actions",
+                process.get(),
                 descriptor.get()
             ),
             Self::QuotaExceeded(quota) => write!(formatter, "realm {quota:?} quota exceeded"),
@@ -586,6 +606,12 @@ impl RealmKernel {
                     process: parent,
                     descriptor: binding.source,
                 })?;
+            if matches!(resource, DescriptorResource::File(_)) {
+                return Err(KernelError::DescriptorNotTransferable {
+                    process: parent,
+                    descriptor: binding.source,
+                });
+            }
             descriptors.insert(binding.target, resource);
         }
         let mut closes = BTreeSet::new();
@@ -595,6 +621,15 @@ impl RealmKernel {
             }
             if !parent_record.descriptors.contains_key(descriptor) {
                 return Err(KernelError::DescriptorNotFound {
+                    process: parent,
+                    descriptor: *descriptor,
+                });
+            }
+            if matches!(
+                parent_record.descriptors.get(descriptor),
+                Some(DescriptorResource::File(_))
+            ) {
+                return Err(KernelError::DescriptorNotTransferable {
                     process: parent,
                     descriptor: *descriptor,
                 });
@@ -743,17 +778,6 @@ impl RealmKernel {
         owner: ProcessId,
         capacity: usize,
     ) -> Result<PipeEnds, KernelError> {
-        self.create_pipe_avoiding(owner, capacity, &[])
-    }
-
-    /// Create a pipe while excluding descriptor numbers owned by an outer
-    /// backend table during the descriptor-model migration.
-    pub fn create_pipe_avoiding(
-        &mut self,
-        owner: ProcessId,
-        capacity: usize,
-        reserved_descriptors: &[Descriptor],
-    ) -> Result<PipeEnds, KernelError> {
         self.require_state(owner, ProcessState::Running, ProcessOperation::Descriptor)?;
         if capacity == 0 {
             return Err(KernelError::InvalidPipeCapacity);
@@ -775,25 +799,12 @@ impl RealmKernel {
             .processes
             .get(&owner)
             .ok_or(KernelError::ProcessNotFound(owner))?;
-        let reserved_count = reserved_descriptors
-            .iter()
-            .copied()
-            .filter(|descriptor| {
-                descriptor.get() >= FIRST_FILE_FD
-                    && !owner_record.descriptors.contains_key(descriptor)
-            })
-            .collect::<BTreeSet<_>>()
-            .len();
-        if owner_record
-            .descriptors
-            .len()
-            .saturating_add(reserved_count)
-            .saturating_add(2)
+        if owner_record.descriptors.len().saturating_add(2)
             > self.limits.max_descriptors_per_process
         {
             return Err(KernelError::QuotaExceeded(Quota::Descriptors));
         }
-        let descriptors = available_descriptors(owner_record, reserved_descriptors, 2)?;
+        let descriptors = available_descriptors(owner_record, 2)?;
         let pipe_id = self.take_pipe_id()?;
         let ends = PipeEnds {
             read: descriptors[0],
@@ -818,6 +829,33 @@ impl RealmKernel {
             .descriptors
             .insert(ends.write, DescriptorResource::PipeWrite(pipe_id));
         Ok(ends)
+    }
+
+    /// Install a host-backed open-file description at the first free process
+    /// descriptor number.
+    ///
+    /// The kernel owns descriptor allocation and lifecycle state, while the
+    /// runtime owns the actual file object selected by `file`.
+    pub fn install_file_description(
+        &mut self,
+        owner: ProcessId,
+        file: FileDescriptionId,
+    ) -> Result<Descriptor, KernelError> {
+        self.require_state(owner, ProcessState::Running, ProcessOperation::Descriptor)?;
+        let owner_record = self
+            .processes
+            .get(&owner)
+            .ok_or(KernelError::ProcessNotFound(owner))?;
+        if owner_record.descriptors.len() >= self.limits.max_descriptors_per_process {
+            return Err(KernelError::QuotaExceeded(Quota::Descriptors));
+        }
+        let descriptor = available_descriptors(owner_record, 1)?[0];
+        self.processes
+            .get_mut(&owner)
+            .expect("owner checked")
+            .descriptors
+            .insert(descriptor, DescriptorResource::File(file));
+        Ok(descriptor)
     }
 
     /// Close one process descriptor and update pipe endpoint references.
@@ -1060,10 +1098,14 @@ impl RealmKernel {
         let mut increments = BTreeMap::<PipeId, (usize, usize)>::new();
         for resource in resources {
             let entry = match resource {
+                DescriptorResource::File(_) => {
+                    unreachable!("file child actions are rejected before reference validation")
+                }
                 DescriptorResource::PipeRead(pipe) => increments.entry(pipe).or_default(),
                 DescriptorResource::PipeWrite(pipe) => increments.entry(pipe).or_default(),
             };
             match resource {
+                DescriptorResource::File(_) => unreachable!("file inheritance is rejected"),
                 DescriptorResource::PipeRead(_) => {
                     entry.0 = entry
                         .0
@@ -1095,6 +1137,7 @@ impl RealmKernel {
 
     fn retain_resource(&mut self, resource: DescriptorResource) {
         match resource {
+            DescriptorResource::File(_) => unreachable!("file inheritance is rejected"),
             DescriptorResource::PipeRead(pipe_id) => {
                 let pipe = self
                     .pipes
@@ -1120,6 +1163,7 @@ impl RealmKernel {
 
     fn release_resource(&mut self, resource: DescriptorResource) {
         let (pipe_id, wake_reason, remove, capacity) = match resource {
+            DescriptorResource::File(_) => return,
             DescriptorResource::PipeRead(pipe_id) => {
                 let pipe = self
                     .pipes
@@ -1172,10 +1216,12 @@ impl RealmKernel {
     ) -> Result<PipeId, KernelError> {
         match self.descriptor(process, descriptor)? {
             DescriptorResource::PipeRead(pipe) => Ok(pipe),
-            DescriptorResource::PipeWrite(_) => Err(KernelError::WrongDescriptorKind {
-                process,
-                descriptor,
-            }),
+            DescriptorResource::File(_) | DescriptorResource::PipeWrite(_) => {
+                Err(KernelError::WrongDescriptorKind {
+                    process,
+                    descriptor,
+                })
+            }
         }
     }
 
@@ -1186,10 +1232,12 @@ impl RealmKernel {
     ) -> Result<PipeId, KernelError> {
         match self.descriptor(process, descriptor)? {
             DescriptorResource::PipeWrite(pipe) => Ok(pipe),
-            DescriptorResource::PipeRead(_) => Err(KernelError::WrongDescriptorKind {
-                process,
-                descriptor,
-            }),
+            DescriptorResource::File(_) | DescriptorResource::PipeRead(_) => {
+                Err(KernelError::WrongDescriptorKind {
+                    process,
+                    descriptor,
+                })
+            }
         }
     }
 
@@ -1227,14 +1275,13 @@ fn validate_cwd(cwd: &str) -> Result<(), KernelError> {
 
 fn available_descriptors(
     record: &ProcessRecord,
-    reserved: &[Descriptor],
     count: usize,
 ) -> Result<Vec<Descriptor>, KernelError> {
     let mut result = Vec::with_capacity(count);
     let mut raw = FIRST_FILE_FD;
     while result.len() < count {
         let descriptor = Descriptor::new(raw);
-        if !record.descriptors.contains_key(&descriptor) && !reserved.contains(&descriptor) {
+        if !record.descriptors.contains_key(&descriptor) {
             result.push(descriptor);
         }
         raw = raw.checked_add(1).ok_or(KernelError::IdentifierExhausted)?;
@@ -1264,6 +1311,7 @@ mod tests {
     fn pipe_id(kernel: &RealmKernel, process: ProcessId, descriptor: Descriptor) -> PipeId {
         match kernel.descriptor(process, descriptor).expect("descriptor") {
             DescriptorResource::PipeRead(pipe) | DescriptorResource::PipeWrite(pipe) => pipe,
+            DescriptorResource::File(_) => panic!("expected pipe descriptor"),
         }
     }
 
@@ -1620,6 +1668,64 @@ mod tests {
     }
 
     #[test]
+    fn kernel_allocates_one_descriptor_number_space_for_files_and_pipes() {
+        let mut kernel = RealmKernel::new(RealmLimits::default());
+        let process = running_root(&mut kernel, 1);
+
+        let file = kernel
+            .install_file_description(process, FileDescriptionId::new(41))
+            .expect("file descriptor installs");
+        let pipe = kernel.create_pipe(process, 8).expect("pipe creates");
+
+        assert_eq!(file, Descriptor::new(3));
+        assert_eq!(pipe.read, Descriptor::new(4));
+        assert_eq!(pipe.write, Descriptor::new(5));
+        assert_eq!(
+            kernel.descriptor(process, file),
+            Ok(DescriptorResource::File(FileDescriptionId::new(41)))
+        );
+        assert_eq!(kernel.process(process).expect("process").descriptors, 3);
+    }
+
+    #[test]
+    fn file_child_actions_fail_before_pid_or_descriptor_mutation() {
+        let mut kernel = RealmKernel::new(RealmLimits::default());
+        let parent = running_root(&mut kernel, 1);
+        let file = kernel
+            .install_file_description(parent, FileDescriptionId::new(7))
+            .expect("file descriptor installs");
+        let next_process = kernel.next_process_id();
+
+        assert_eq!(
+            kernel.spawn_child(
+                parent,
+                spec(2),
+                &[DescriptorBinding {
+                    source: file,
+                    target: Descriptor::STDOUT,
+                }],
+            ),
+            Err(KernelError::DescriptorNotTransferable {
+                process: parent,
+                descriptor: file,
+            })
+        );
+        assert_eq!(kernel.next_process_id(), next_process);
+        assert_eq!(
+            kernel.spawn_child_and_close(parent, spec(2), &[], &[file]),
+            Err(KernelError::DescriptorNotTransferable {
+                process: parent,
+                descriptor: file,
+            })
+        );
+        assert_eq!(kernel.next_process_id(), next_process);
+        assert_eq!(
+            kernel.descriptor(parent, file),
+            Ok(DescriptorResource::File(FileDescriptionId::new(7)))
+        );
+    }
+
+    #[test]
     fn child_inheritance_and_parent_close_are_one_atomic_transition() {
         let mut kernel = RealmKernel::new(RealmLimits::default());
         let parent = running_root(&mut kernel, 1);
@@ -1731,29 +1837,6 @@ mod tests {
         );
         assert_eq!(kernel.pipe_count(), 0);
         assert_eq!(kernel.reserved_pipe_bytes(), 0);
-    }
-
-    #[test]
-    fn pipe_allocation_avoids_outer_backend_descriptor_numbers() {
-        let mut kernel = RealmKernel::new(RealmLimits::default());
-        let process = running_root(&mut kernel, 1);
-        let ends = kernel
-            .create_pipe_avoiding(process, 4, &[Descriptor::new(3), Descriptor::new(5)])
-            .expect("pipe avoids reserved descriptors");
-
-        assert_eq!(ends.read, Descriptor::new(4));
-        assert_eq!(ends.write, Descriptor::new(6));
-
-        let mut bounded = RealmKernel::new(RealmLimits {
-            max_descriptors_per_process: 2,
-            ..RealmLimits::default()
-        });
-        let bounded_process = running_root(&mut bounded, 2);
-        assert_eq!(
-            bounded.create_pipe_avoiding(bounded_process, 4, &[Descriptor::new(3)]),
-            Err(KernelError::QuotaExceeded(Quota::Descriptors))
-        );
-        assert_eq!(bounded.pipe_count(), 0);
     }
 
     #[test]

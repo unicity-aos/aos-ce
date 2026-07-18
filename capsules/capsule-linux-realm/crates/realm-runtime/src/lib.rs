@@ -3,7 +3,7 @@
 //! Bounded execution of nested core WebAssembly processes.
 
 use aos_realm_abi::{
-    Descriptor, FIRST_FILE_FD, IMPORT_MODULE_V0, MAX_ARGUMENT_BYTES, MAX_ARGUMENT_COUNT,
+    Descriptor, FileDescriptionId, IMPORT_MODULE_V0, MAX_ARGUMENT_BYTES, MAX_ARGUMENT_COUNT,
     MAX_ENVIRONMENT_BYTES, MAX_ENVIRONMENT_COUNT, MAX_EXECUTABLE_PATH_BYTES, MAX_PATH_BYTES,
     MAX_SPAWN_ACTIONS, NO_DESCRIPTOR, OPEN_READ, OPEN_WRITE_TRUNCATE, PIPE_ENDS_BYTES,
     PROCESS_HANDLE_BYTES, PROCESS_HANDLE_GENERATION_OFFSET, PROCESS_HANDLE_ID_OFFSET,
@@ -69,6 +69,13 @@ pub const GUEST_PIPELINE_GUEST: &[u8] =
 
 /// Guest-side shell for a small signed foreground-job grammar.
 pub const MINI_SHELL_GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mini_shell.wasm"));
+
+struct SignedCatalogEntry {
+    executable: &'static str,
+    wasm: &'static [u8],
+}
+
+include!(concat!(env!("OUT_DIR"), "/signed_catalog.rs"));
 
 /// Hard limits for one nested process invocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -314,8 +321,8 @@ struct HostState {
     environment: Vec<String>,
     cwd: String,
     realm_host: Box<dyn RealmHost>,
-    files: BTreeMap<i32, Box<dyn RealmFile>>,
-    next_fd: i32,
+    files: BTreeMap<FileDescriptionId, Box<dyn RealmFile>>,
+    next_file_description: u64,
     descriptor_limit: usize,
     process: Option<ProcessContext>,
     memory: Option<Memory>,
@@ -420,12 +427,13 @@ impl RealmRuntime {
         limits: RunLimits,
         realm_host: Box<dyn RealmHost>,
     ) -> Result<ExecutionReport, LaunchError> {
-        let (mut store, start) = self.prepare_process(wasm, process, limits, realm_host, None)?;
-        let outcome = match start.call(&mut store, ()) {
-            Ok(()) => ProcessOutcome::Exited(0),
-            Err(error) => classify_process_error(&error),
-        };
-        Ok(execution_report(&store, limits, outcome))
+        RealmMachine::with_runtime(self.clone())
+            .execute_process(wasm, process, limits, realm_host)
+            .map(|report| report.execution)
+            .map_err(|error| match error {
+                PipelineError::Launch(error) => error,
+                error => LaunchError::RuntimeConfiguration(error.to_string()),
+            })
     }
 
     fn prepare_process(
@@ -457,7 +465,7 @@ impl RealmRuntime {
             cwd: process.cwd,
             realm_host,
             files: BTreeMap::new(),
-            next_fd: FIRST_FILE_FD,
+            next_file_description: 1,
             descriptor_limit: 64,
             process: process_context,
             memory: None,
@@ -861,46 +869,38 @@ fn realm_open(
         OPEN_WRITE_TRUNCATE => OpenMode::WriteTruncate,
         _ => return Err(WasmiError::host(HostFault::InvalidArgument)),
     };
-    if descriptor_count(caller.data()) >= caller.data().descriptor_limit {
-        return Err(WasmiError::host(HostFault::InvalidArgument));
-    }
-    let cwd = caller.data().cwd.clone();
-    let file = caller
-        .data_mut()
-        .realm_host
-        .open(&cwd, &path, mode)
-        .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
-    let mut fd = caller.data().next_fd;
-    while caller.data().files.contains_key(&fd) || core_descriptor_exists(caller.data(), fd) {
-        fd = fd
-            .checked_add(1)
-            .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
-    }
-    let next_fd = fd
+    let context = caller
+        .data()
+        .process
+        .clone()
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
+    let file_id = FileDescriptionId::new(caller.data().next_file_description);
+    let next_file_description = caller
+        .data()
+        .next_file_description
         .checked_add(1)
         .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
-    caller.data_mut().next_fd = next_fd;
-    caller.data_mut().files.insert(fd, file);
-    Ok(fd)
-}
-
-fn core_descriptor_exists(state: &HostState, fd: i32) -> bool {
-    state.process.as_ref().is_some_and(|context| {
-        context
-            .kernel
-            .borrow()
-            .descriptor(context.process, Descriptor::new(fd))
-            .is_ok()
-    })
-}
-
-fn descriptor_count(state: &HostState) -> usize {
-    let core = state
-        .process
-        .as_ref()
-        .and_then(|context| context.kernel.borrow().process(context.process).ok())
-        .map_or(0, |process| process.descriptors);
-    state.files.len().saturating_add(core)
+    let descriptor = context
+        .kernel
+        .borrow_mut()
+        .install_file_description(context.process, file_id)
+        .map_err(kernel_host_error)?;
+    let cwd = caller.data().cwd.clone();
+    let file = match caller.data_mut().realm_host.open(&cwd, &path, mode) {
+        Ok(file) => file,
+        Err(error) => {
+            context
+                .kernel
+                .borrow_mut()
+                .close_descriptor(context.process, descriptor)
+                .map_err(kernel_host_error)?;
+            return Err(WasmiError::host(HostFault::Io(error)));
+        }
+    };
+    caller.data_mut().next_file_description = next_file_description;
+    let previous = caller.data_mut().files.insert(file_id, file);
+    debug_assert!(previous.is_none(), "file description ids are monotonic");
+    Ok(descriptor.get())
 }
 
 fn realm_read(
@@ -915,75 +915,87 @@ fn realm_read(
         return Err(WasmiError::host(HostFault::InvalidArgument));
     }
     let (_, pointer) = validate_guest_range(caller, ptr, capacity)?;
-    if let Some(context) = caller.data().process.clone()
-        && let Some(resource) = process_descriptor(&context, fd)?
-    {
-        let DescriptorResource::PipeRead(_) = resource else {
-            return Err(WasmiError::host(HostFault::InvalidArgument));
-        };
-        let descriptor = Descriptor::new(fd);
-        let result = context
-            .kernel
-            .borrow_mut()
-            .read_pipe(context.process, descriptor, capacity)
-            .map_err(kernel_host_error)?;
-        return match result {
-            PipeReadResult::Data(bytes) => {
-                write_guest_bytes(caller, ptr, capacity, &bytes)?;
-                i32::try_from(bytes.len()).map_err(|_| WasmiError::host(HostFault::InvalidArgument))
-            }
-            PipeReadResult::Eof => Ok(0),
-            PipeReadResult::WouldBlock => {
-                let parked = context
-                    .kernel
-                    .borrow_mut()
-                    .park_pipe_read(context.process, descriptor)
-                    .map_err(kernel_host_error)?;
-                if parked != ParkResult::Parked {
-                    return Err(WasmiError::host(HostFault::InvalidArgument));
+    let context = caller
+        .data()
+        .process
+        .clone()
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
+    match process_descriptor(&context, fd)? {
+        Some(DescriptorResource::PipeRead(_)) => {
+            let descriptor = Descriptor::new(fd);
+            let result = context
+                .kernel
+                .borrow_mut()
+                .read_pipe(context.process, descriptor, capacity)
+                .map_err(kernel_host_error)?;
+            match result {
+                PipeReadResult::Data(bytes) => {
+                    write_guest_bytes(caller, ptr, capacity, &bytes)?;
+                    i32::try_from(bytes.len())
+                        .map_err(|_| WasmiError::host(HostFault::InvalidArgument))
                 }
-                caller.data_mut().pending_io = Some(PendingIo::Read {
-                    descriptor,
-                    pointer,
-                    capacity,
-                });
-                caller.data_mut().suspensions = caller.data().suspensions.saturating_add(1);
-                Err(WasmiError::host(ProcessSuspended))
+                PipeReadResult::Eof => Ok(0),
+                PipeReadResult::WouldBlock => {
+                    let parked = context
+                        .kernel
+                        .borrow_mut()
+                        .park_pipe_read(context.process, descriptor)
+                        .map_err(kernel_host_error)?;
+                    if parked != ParkResult::Parked {
+                        return Err(WasmiError::host(HostFault::InvalidArgument));
+                    }
+                    caller.data_mut().pending_io = Some(PendingIo::Read {
+                        descriptor,
+                        pointer,
+                        capacity,
+                    });
+                    caller.data_mut().suspensions = caller.data().suspensions.saturating_add(1);
+                    Err(WasmiError::host(ProcessSuspended))
+                }
             }
-        };
+        }
+        Some(DescriptorResource::File(file_id)) => {
+            let bytes = caller
+                .data_mut()
+                .files
+                .get_mut(&file_id)
+                .ok_or_else(|| WasmiError::host(HostFault::UnknownDescriptor(fd)))?
+                .read(capacity)
+                .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
+            if bytes.len() > capacity {
+                return Err(WasmiError::host(HostFault::Io(RealmIoError::TooLarge)));
+            }
+            write_guest_bytes(caller, ptr, capacity, &bytes)?;
+            i32::try_from(bytes.len()).map_err(|_| WasmiError::host(HostFault::InvalidArgument))
+        }
+        Some(DescriptorResource::PipeWrite(_)) => Err(WasmiError::host(HostFault::InvalidArgument)),
+        None => Err(WasmiError::host(HostFault::UnknownDescriptor(fd))),
     }
-    let bytes = caller
-        .data_mut()
-        .files
-        .get_mut(&fd)
-        .ok_or_else(|| WasmiError::host(HostFault::UnknownDescriptor(fd)))?
-        .read(capacity)
-        .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
-    if bytes.len() > capacity {
-        return Err(WasmiError::host(HostFault::Io(RealmIoError::TooLarge)));
-    }
-    write_guest_bytes(caller, ptr, capacity, &bytes)?;
-    i32::try_from(bytes.len()).map_err(|_| WasmiError::host(HostFault::InvalidArgument))
 }
 
 fn realm_close(caller: &mut Caller<'_, HostState>, fd: i32) -> Result<i32, WasmiError> {
-    if let Some(context) = caller.data().process.clone()
-        && process_descriptor(&context, fd)?.is_some()
-    {
-        context
-            .kernel
-            .borrow_mut()
-            .close_descriptor(context.process, Descriptor::new(fd))
-            .map_err(kernel_host_error)?;
-        return Ok(0);
-    }
-    let mut file = caller
-        .data_mut()
-        .files
-        .remove(&fd)
+    let context = caller
+        .data()
+        .process
+        .clone()
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
+    let resource = process_descriptor(&context, fd)?
         .ok_or_else(|| WasmiError::host(HostFault::UnknownDescriptor(fd)))?;
-    file.close()
-        .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
+    if let DescriptorResource::File(file_id) = resource {
+        caller
+            .data_mut()
+            .files
+            .get_mut(&file_id)
+            .ok_or_else(|| WasmiError::host(HostFault::UnknownDescriptor(fd)))?
+            .close()
+            .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
+        caller.data_mut().files.remove(&file_id);
+    }
+    context
+        .kernel
+        .borrow_mut()
+        .close_descriptor(context.process, Descriptor::new(fd))
+        .map_err(kernel_host_error)?;
     Ok(0)
 }
 
@@ -1000,20 +1012,10 @@ fn realm_pipe(
         .process
         .clone()
         .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
-    if descriptor_count(caller.data()).saturating_add(2) > context.descriptor_limit {
-        return Err(WasmiError::host(HostFault::InvalidArgument));
-    }
-    let reserved = caller
-        .data()
-        .files
-        .keys()
-        .copied()
-        .map(Descriptor::new)
-        .collect::<Vec<_>>();
     let ends = context
         .kernel
         .borrow_mut()
-        .create_pipe_avoiding(context.process, capacity, &reserved)
+        .create_pipe(context.process, capacity)
         .map_err(kernel_host_error)?;
     let mut encoded = [0_u8; PIPE_ENDS_BYTES];
     encoded[..4].copy_from_slice(&ends.read.get().to_le_bytes());
@@ -1386,12 +1388,11 @@ fn signed_catalog_process(
     environment: Vec<String>,
     cwd: &str,
 ) -> Result<(&'static [u8], ProcessConfig), WasmiError> {
-    let wasm = match executable {
-        "/bin/echo" => ECHO_GUEST,
-        "/bin/cat" => STDIN_CAT_GUEST,
-        "/usr/bin/env" => ENV_GUEST,
-        _ => return Err(WasmiError::host(HostFault::InvalidArgument)),
-    };
+    let wasm = SIGNED_CATALOG
+        .iter()
+        .find(|entry| entry.executable == executable)
+        .map(|entry| entry.wasm)
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
     let process = ProcessConfig {
         argv,
         environment,
@@ -1551,9 +1552,24 @@ fn realm_write(
     len: i32,
 ) -> Result<i32, WasmiError> {
     let length = usize::try_from(len).map_err(|_| WasmiError::host(HostFault::InvalidPointer))?;
-    if let Some(context) = caller.data().process.clone()
-        && let Some(resource) = process_descriptor(&context, fd)?
-    {
+    let context = caller
+        .data()
+        .process
+        .clone()
+        .ok_or_else(|| WasmiError::host(HostFault::InvalidArgument))?;
+    if let Some(resource) = process_descriptor(&context, fd)? {
+        if let DescriptorResource::File(file_id) = resource {
+            let bytes = read_guest_bytes(caller, ptr, length)?;
+            let written = caller
+                .data_mut()
+                .files
+                .get_mut(&file_id)
+                .ok_or_else(|| WasmiError::host(HostFault::UnknownDescriptor(fd)))?
+                .write(&bytes)
+                .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
+            return i32::try_from(written)
+                .map_err(|_| WasmiError::host(HostFault::InvalidArgument));
+        }
         let DescriptorResource::PipeWrite(_) = resource else {
             return Err(WasmiError::host(HostFault::InvalidArgument));
         };
@@ -1602,20 +1618,7 @@ fn realm_write(
             }
             Ok(len)
         }
-        file_fd => {
-            if !caller.data().files.contains_key(&file_fd) {
-                return Err(WasmiError::host(HostFault::UnknownDescriptor(file_fd)));
-            }
-            let bytes = read_guest_bytes(caller, ptr, length)?;
-            let written = caller
-                .data_mut()
-                .files
-                .get_mut(&file_fd)
-                .expect("descriptor existence checked")
-                .write(&bytes)
-                .map_err(|error| WasmiError::host(HostFault::Io(error)))?;
-            i32::try_from(written).map_err(|_| WasmiError::host(HostFault::InvalidArgument))
-        }
+        file_fd => Err(WasmiError::host(HostFault::UnknownDescriptor(file_fd))),
     }
 }
 
@@ -1736,6 +1739,21 @@ mod tests {
 
     fn compile(wat_source: &str) -> Vec<u8> {
         wat::parse_str(wat_source).expect("valid test WAT")
+    }
+
+    #[test]
+    fn generated_signed_catalog_is_unique_and_resolves_expected_images() {
+        let paths = SIGNED_CATALOG
+            .iter()
+            .map(|entry| entry.executable)
+            .collect::<Vec<_>>();
+        let unique = paths.iter().copied().collect::<BTreeSet<_>>();
+
+        assert_eq!(paths, ["/bin/echo", "/bin/cat", "/usr/bin/env"]);
+        assert_eq!(unique.len(), paths.len());
+        assert!(SIGNED_CATALOG.iter().all(|entry| {
+            entry.executable.starts_with('/') && entry.wasm.starts_with(b"\0asm")
+        }));
     }
 
     #[test]

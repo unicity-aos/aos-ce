@@ -24,7 +24,7 @@ agent -> realm tool -> nested WASM command -> private realm ABI
 - `guest-pipe-echo`, whose supervisor guest creates that pipe and both children,
   then waits for and reaps them itself
 - `realm-sh`, a guest-side shell over structured tokens. Its current grammar is
-  `echo TEXT`, `env KEY=VALUE`, or `echo TEXT | cat`
+  `echo TEXT`, `env KEY=VALUE`, `echo TEXT | cat`, or `echo TEXT > PATH`
 - `write-file`
 - `cat`
 - `smoke-write`, the original interpreter smoke test
@@ -91,7 +91,8 @@ generation, file count, and manifest digest without exposing a physical path.
 ## Process-kernel model
 
 `crates/realm-core` is now the host-testable semantic kernel for the next runtime
-increment. It provides monotonic typed process and pipe identifiers, explicit
+increment. It provides monotonic typed process, pipe, and backing-file-description
+identifiers, one kernel-allocated descriptor-number space, explicit
 created/runnable/running/waiting/zombie transitions, direct-child wait and reap,
 typed signal termination, a single-running-process FIFO reference scheduler,
 atomic pipe-descriptor inheritance, bounded partial pipe I/O, backpressure, EOF,
@@ -109,12 +110,16 @@ The private ABI exposes bounded `pipe`, compatibility `spawn-signed`, record-bas
 `spawn-signed-record`, `wait`, and `signal` operations. The record form selects an
 absolute path from an immutable catalog, carries up to 64 argv entries and 64
 validated `KEY=VALUE` environment entries, and applies at most 16 explicit
-descriptor actions. A `dup` action grants one named pipe endpoint at one child
+descriptor actions. The catalog is generated from validated `guests/catalog.tsv`
+metadata at build time. A `dup` action grants one named pipe endpoint at one child
 descriptor. A `close-parent` action atomically releases the parent's copy only
 after child creation succeeds; rejected records leave its table unchanged.
+File descriptor numbers are also kernel-owned, but file child actions fail closed
+until a realm-wide open-file-description table can preserve shared offsets and
+last-close behavior.
 
 `realm-sh` is ordinary nested guest code, not host parsing. It reads the structured
-tokens passed in `argv`, resolves the three currently admitted catalog paths
+tokens passed in `argv`, resolves the three generated catalog paths
 (`/bin/echo`, `/bin/cat`, and `/usr/bin/env`), writes spawn records into its own
 linear memory, starts the children, and waits for exact terminal records. Every
 process has an isolated Wasmi store and memory. A guest cannot submit module bytes,
@@ -160,6 +165,7 @@ Example tool arguments:
 {"command":"guest-pipe-echo","args":["the guest built this pipeline"]}
 {"command":"realm-sh","args":["echo","the shell built this job"]}
 {"command":"realm-sh","args":["echo","the shell built this pipe","|","cat"]}
+{"command":"realm-sh","args":["echo","persisted by the guest shell",">","/home/agent/note.txt"]}
 {"command":"realm-sh","args":["env","ASTRID_REALM=ready"]}
 {"command":"write-file","args":["notes.txt","durable\n"],"cwd":"/home/agent"}
 {"command":"cat","args":["notes.txt"],"cwd":"/home/agent"}
@@ -183,8 +189,8 @@ nested descriptor closes, so a trapped command does not leave a partial guest
 file. Durable-home closes select a content-addressed generation with a KV CAS;
 workspace and temporary files retain their outer mount semantics.
 
-This slice does not provide arbitrary executable resolution, inherited file
-descriptors, sequential POSIX file actions, `execve`, Bash, general Linux syscalls,
+This slice does not provide arbitrary executable resolution, shared or inherited
+open-file descriptions, sequential POSIX file actions, `execve`, Bash, general Linux syscalls,
 a libc, package management, networking, PTYs, background jobs, or a compiler.
 Those belong behind the same realm boundary; they must not be simulated by
 granting a host process.
