@@ -136,6 +136,19 @@ struct StatusResponse {
     pipe_objects: usize,
     reserved_pipe_bytes: usize,
     next_process_id: Option<u64>,
+    linux_lifecycle: &'static str,
+    linux_state: &'static str,
+    linux_residency: &'static str,
+    linux_vcpus: u32,
+    linux_ram_persistent: bool,
+    linux_storage_persistent: bool,
+    linux_boot_executions_this_actor_boot: u64,
+    linux_clean_shutdowns: u64,
+    linux_guest_steps_this_actor_boot: u64,
+    linux_last_outcome: Option<&'static str>,
+    linux_last_exit_status: Option<i32>,
+    linux_guest_accounting_scope: &'static str,
+    linux_outer_wasm_metering: &'static str,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -144,6 +157,30 @@ struct ActorSnapshot {
     boot_sequence: u64,
     commands_completed: u64,
     machine: RealmMachineStatus,
+    linux: LinuxSnapshot,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LinuxSnapshot {
+    state: &'static str,
+    boot_executions: u64,
+    clean_shutdowns: u64,
+    guest_steps: u64,
+    last_outcome: Option<&'static str>,
+    last_exit_status: Option<i32>,
+}
+
+impl LinuxSnapshot {
+    const fn cold() -> Self {
+        Self {
+            state: "cold",
+            boot_executions: 0,
+            clean_shutdowns: 0,
+            guest_steps: 0,
+            last_outcome: None,
+            last_exit_status: None,
+        }
+    }
 }
 
 impl ActorSnapshot {
@@ -153,6 +190,7 @@ impl ActorSnapshot {
             boot_sequence: 0,
             commands_completed: 0,
             machine: RealmMachine::default().status(),
+            linux: LinuxSnapshot::cold(),
         }
     }
 
@@ -162,6 +200,7 @@ impl ActorSnapshot {
             boot_sequence: 0,
             commands_completed: 0,
             machine: RealmMachine::default().status(),
+            linux: LinuxSnapshot::cold(),
         }
     }
 }
@@ -759,6 +798,19 @@ fn status_response(
         pipe_objects: actor.machine.pipe_objects,
         reserved_pipe_bytes: actor.machine.reserved_pipe_bytes,
         next_process_id: actor.machine.next_process_id.map(|process| process.get()),
+        linux_lifecycle: "on-demand-cold-boot",
+        linux_state: actor.linux.state,
+        linux_residency: "request-scoped",
+        linux_vcpus: 1,
+        linux_ram_persistent: false,
+        linux_storage_persistent: false,
+        linux_boot_executions_this_actor_boot: actor.linux.boot_executions,
+        linux_clean_shutdowns: actor.linux.clean_shutdowns,
+        linux_guest_steps_this_actor_boot: actor.linux.guest_steps,
+        linux_last_outcome: actor.linux.last_outcome,
+        linux_last_exit_status: actor.linux.last_exit_status,
+        linux_guest_accounting_scope: "verified-principal+actor-boot",
+        linux_outer_wasm_metering: "run-loop-owner",
     }
 }
 
@@ -1182,6 +1234,14 @@ mod tests {
                 boot_sequence: 9,
                 commands_completed: 4,
                 machine: RealmMachine::default().status(),
+                linux: LinuxSnapshot {
+                    state: "cold",
+                    boot_executions: 2,
+                    clean_shutdowns: 1,
+                    guest_steps: 25_000_000,
+                    last_outcome: Some("exited"),
+                    last_exit_status: Some(0),
+                },
             },
         ))
         .expect("status serializes");
@@ -1192,6 +1252,11 @@ mod tests {
         assert!(json.contains("\"home_generation\":7"));
         assert!(json.contains("\"realm_boot_sequence\":9"));
         assert!(json.contains("\"commands_completed\":4"));
+        assert!(json.contains("\"linux_lifecycle\":\"on-demand-cold-boot\""));
+        assert!(json.contains("\"linux_state\":\"cold\""));
+        assert!(json.contains("\"linux_boot_executions_this_actor_boot\":2"));
+        assert!(json.contains("\"linux_guest_steps_this_actor_boot\":25000000"));
+        assert!(json.contains("\"linux_outer_wasm_metering\":\"run-loop-owner\""));
         assert!(json.contains("outer-astrid-promotion-required"));
         assert!(!json.contains("/Users/"));
         assert!(!json.contains(".astrid/home"));

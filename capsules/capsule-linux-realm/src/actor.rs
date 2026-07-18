@@ -25,6 +25,7 @@ struct PrincipalRealm {
     boot_sequence: u64,
     commands_completed: u64,
     machine: RealmMachine,
+    linux: LinuxActivity,
 }
 
 impl PrincipalRealm {
@@ -33,6 +34,7 @@ impl PrincipalRealm {
             boot_sequence,
             commands_completed: 0,
             machine: RealmMachine::with_generation(boot_sequence),
+            linux: LinuxActivity::default(),
         }
     }
 
@@ -42,6 +44,45 @@ impl PrincipalRealm {
             boot_sequence: self.boot_sequence,
             commands_completed: self.commands_completed,
             machine: self.machine.status(),
+            linux: self.linux.snapshot(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct LinuxActivity {
+    boot_executions: u64,
+    clean_shutdowns: u64,
+    guest_steps: u64,
+    last_outcome: Option<&'static str>,
+    last_exit_status: Option<i32>,
+}
+
+impl LinuxActivity {
+    fn record(&mut self, response: &ExecResponse) {
+        if response.execution_backend != "aos-rv64-linux" {
+            return;
+        }
+        self.boot_executions = self.boot_executions.saturating_add(1);
+        self.guest_steps = self.guest_steps.saturating_add(response.fuel_consumed);
+        self.last_outcome = Some(response.outcome);
+        self.last_exit_status = response.exit_status;
+        if response.outcome == "exited" && response.exit_status == Some(0) {
+            self.clean_shutdowns = self.clean_shutdowns.saturating_add(1);
+        }
+    }
+
+    const fn snapshot(&self) -> LinuxSnapshot {
+        LinuxSnapshot {
+            // The current adapter destroys RV64 RAM after every request. A
+            // completed, failed, or exhausted boot therefore always returns
+            // to cold; durable storage is a separate principal-owned concern.
+            state: "cold",
+            boot_executions: self.boot_executions,
+            clean_shutdowns: self.clean_shutdowns,
+            guest_steps: self.guest_steps,
+            last_outcome: self.last_outcome,
+            last_exit_status: self.last_exit_status,
         }
     }
 }
@@ -109,6 +150,7 @@ impl RealmActor {
             &mut realm.machine,
             realm.boot_sequence,
         )?;
+        realm.linux.record(&response);
         realm.commands_completed = realm.commands_completed.saturating_add(1);
         Ok(response)
     }
@@ -543,6 +585,47 @@ mod tests {
         );
         assert!(increment_boot_sequence(Some(b"not-json")).is_err());
         assert!(increment_boot_sequence(Some(b"18446744073709551615")).is_err());
+    }
+
+    #[test]
+    fn linux_activity_is_principal_local_and_counts_only_completed_linux_execution() {
+        let mut alice = PrincipalRealm::new(7);
+        let bob = PrincipalRealm::new(11);
+        let mut response = ExecResponse {
+            realm: REALM_NAME,
+            owner_principal: "alice".to_string(),
+            program: "linux-boot".to_string(),
+            execution_backend: "aos-rv64-linux",
+            argv: vec!["linux-boot".to_string()],
+            cwd: DEFAULT_CWD.to_string(),
+            outcome: "exited",
+            exit_status: Some(0),
+            fault: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            fuel_consumed: 14_823_384,
+            memory_limit_bytes: HARD_LINUX_MEMORY_BYTES,
+            suspensions: 148,
+            processes: 0,
+            realm_boot_sequence: 7,
+            process_ids: Vec::new(),
+            next_process_id: Some(1),
+        };
+
+        alice.linux.record(&response);
+        response.execution_backend = "nested-core-wasm";
+        response.fuel_consumed = 9;
+        alice.linux.record(&response);
+
+        let snapshot = alice.linux.snapshot();
+        assert_eq!(snapshot.state, "cold");
+        assert_eq!(snapshot.boot_executions, 1);
+        assert_eq!(snapshot.clean_shutdowns, 1);
+        assert_eq!(snapshot.guest_steps, 14_823_384);
+        assert_eq!(snapshot.last_outcome, Some("exited"));
+        assert_eq!(snapshot.last_exit_status, Some(0));
+        assert_eq!(bob.linux.snapshot().boot_executions, 0);
+        assert_eq!(bob.linux.snapshot().guest_steps, 0);
     }
 
     #[test]
