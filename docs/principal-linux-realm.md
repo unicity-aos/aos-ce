@@ -679,6 +679,81 @@ machine or advance that sequence. The actor admits at most 32 principal machines
 per capsule boot and currently has no eviction policy; reaching the bound fails
 before initializing durable state for the rejected machine.
 
+### 7.1 Linux residency and principal accounting
+
+There are two different concurrency axes and they must not be collapsed:
+
+```text
+across principals:  Astrid admits, isolates, meters, schedules, and evicts realms
+inside one realm:   the RV64 machine deterministically schedules one or more harts
+```
+
+Virtual SMP does not make a shared machine multi-tenant. A principal owns a Realm;
+harts are CPUs inside that Realm. The principal boundary remains outside the
+machine and every CPU, memory, storage, network, and device charge rolls up to
+that owner.
+
+The current Linux adapter is deliberately cold/on-demand. A request constructs a
+32 MiB single-hart machine, boots Linux, runs the controlled `/init`, powers down,
+returns exact charged guest steps, and drops RAM. The `run()` actor remains alive
+only for message routing, semantic-WASM PID continuity, replay protection, and
+per-principal Linux boot counters. Principal Realm home state is durable but is
+not yet attached to the Linux guest; Linux storage, RAM, kernel state, and
+processes are not persistent. `linux_realm_status` exposes this distinction
+instead of calling the actor itself a persistent Linux VM.
+
+This boundary was checked on 2026-07-19 against freshly fetched Astrid Runtime
+0.10.1 upstream `main`, commit
+`4771bab3c33d1bce53186e40d01cf014e2dce666`. The current runtime has two Store
+models:
+
+| Store model | Principal accounting | Residency |
+| --- | --- | --- |
+| Pooled interceptor | Invoking principal receives the fuel charge, CPU-rate admission, memory ceiling, VFS/KV/secrets, and cancellation context | No principal affinity; a later call may lease another clean Store |
+| `run()` singleton | Message principal receives VFS/KV/secrets/profile/cancellation context and stamps follow-up publishes | One persistent Store whose outer CPU and linear memory remain bounded and attributed to its load-time owner |
+
+Consequently, placing multiple resident Linux machines in today's shared
+`run()` Store would fail the intended resource-isolation claim. The capsule's
+exact RV64 step totals are useful inner accounting, but cannot substitute for
+kernel-owned Wasmtime fuel and memory enforcement.
+
+The required Astrid primitive is a principal-affine resident service lease:
+
+```text
+key = (capsule digest, component id, verified principal, realm id)
+
+cold --start/admit--> booting --boot complete--> running --idle--> warm
+  ^                         |                       |          |
+  |                         +--failure------------+          |
+  +--destroy after flush------- suspending <---stop/evict----+
+
+stopped --explicit start--> booting
+```
+
+Its non-negotiable rules are:
+
+1. The kernel derives the principal from verified invocation provenance; no
+   capsule payload may select the lease owner.
+2. One Store never changes principal. Its linear-memory limiter is permanently
+   bound to that principal and Realm.
+3. Every admitted command or machine slice is fuel-seeded, charged, and fed into
+   the same per-principal rate limiter used by ordinary capsule invocations.
+4. Residency is bounded both per principal and globally. Admission fails or
+   explicitly evicts an idle lease; it never grows an unbounded map in one Store.
+5. Eviction stops admission, cancels or drains bounded work, flushes the durable
+   filesystem generation, destroys RAM, and returns the Realm to `cold`. The
+   first guarantee is filesystem persistence, not a memory checkpoint.
+6. `stop` is observable and disables implicit auto-start until an explicit
+   `start`; idle eviction remains transparently restartable.
+7. Audit identifies the principal, Realm identity, resident generation, hart,
+   charged guest steps, charged outer fuel, peak memory, and lifecycle reason.
+
+The implementation order is therefore principal-affine residency, lifecycle
+tools and eviction, then deterministic virtual SMP. Initial SMP can interleave
+harts in one host thread with a fixed scheduling quantum. True host-parallel
+harts remain optional because they add races to snapshots, metering, devices,
+and reproducibility without improving cross-principal isolation.
+
 ## 8. Executable compatibility lanes
 
 There are two compatible long-term execution lanes behind the same realm API.
@@ -1264,6 +1339,14 @@ CE set rather than test-installed companions.
 - add a PLIC when an admitted interrupting device requires it;
 - [x] boot pinned Linux longterm 6.18.39 to an AOS-controlled `/init`, retain its
   exact serial evidence, and run it through the capsule command adapter;
+- [x] expose the current cold/on-demand Linux lifecycle, request-scoped RAM,
+  single-vCPU topology, and per-principal actor-boot guest-step totals;
+- add a principal-affine resident service Store to Astrid before claiming
+  per-principal persistent Linux RAM or process state;
+- add explicit Realm `start`, `stop`, and status transitions plus bounded idle
+  eviction after that Store is kernel-metered to its verified principal;
+- add deterministic multi-hart scheduling, SBI HSM/IPI support, per-hart CLINT
+  state, and an SMP-enabled kernel only after the principal residency boundary;
 - replace the proof initramfs with a pinned Buildroot 2026.05.1 AOS userland;
 - add virtio-block behind an immutable base plus principal-private COW block
   overlay before making the root filesystem writable;
@@ -1450,6 +1533,12 @@ The first implementation must resolve these with executable evidence:
 13. Should idle principal machines be evicted, and if so which process, descriptor,
     and boot-generation conditions make eviction observable and safe?
 
+Decision 13 for the first resident implementation: evict only an idle Realm with
+no foreground job, refuse implicit eviction of background work, flush its selected
+filesystem generation, destroy RAM, preserve its boot-generation history, and
+report the eviction reason. A stopped Realm requires explicit restart; an
+idle-evicted Realm may cold-start on its next admitted command.
+
 ## 22. Implementation ledger and immediate task list
 
 - [x] place `capsule-linux-realm` in the authoritative `unicity-aos/aos-ce`
@@ -1489,6 +1578,15 @@ The first implementation must resolve these with executable evidence:
 - [x] add a long-lived principal Realm actor with isolated machine state,
   monotonic per-boot PIDs, CAS-allocated boot sequences, read-only idle status,
   a 32-principal aggregate bound, and foreground process/pipe cleanup;
+- [x] verify the actor model against Astrid Runtime 0.10.1 and record that recv
+  switches principal data context but not the dedicated Store's outer CPU/RAM
+  attributee;
+- [x] expose Linux as cold/on-demand with exact principal-local guest-step totals
+  rather than imply persistent RAM;
+- [ ] implement the principal-affine resident service lease in Astrid Runtime,
+  then move Linux lifecycle ownership onto it;
+- [ ] add deterministic virtual SMP within one principal-owned Realm after that
+  lifecycle and metering boundary is executable;
 - [x] expose bounded pipe creation, signed child creation, direct-child wait, and
   direct-child signal through the private guest ABI without allowing jobs to
   escape foreground actor accounting;

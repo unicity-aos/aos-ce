@@ -49,10 +49,15 @@ diagnostic RV64 instruction images, and the first full Linux boot image:
 `linux_realm_status` reports the guest-visible mount and command surface without
 exposing physical host paths. It also reports the caller's actor boot sequence,
 completed-command count, next process identifier, and live process/pipe resource
-accounting. Every execution result identifies the kernel-stamped owner principal
-and exact execution backend, and includes the outcome, exit status, stdout,
-stderr, fuel or instruction accounting, memory ceiling, and process identifiers
-where the semantic process kernel allocated them.
+accounting. Linux-specific fields state that the current adapter is an on-demand
+cold boot with one vCPU, request-scoped RAM, no Linux-attached persistent storage,
+exact per-principal guest-step totals for the current actor boot, and outer Wasm
+metering still attached to the run-loop owner. The separate Realm home is durable
+but does not become a Linux mount until the virtio-block/COW path exists. Every execution result identifies
+the kernel-stamped owner principal and exact execution backend, and includes the
+outcome, exit status, stdout, stderr, fuel or instruction accounting, memory
+ceiling, and process identifiers where the semantic process kernel allocated
+them.
 
 The first execution call lazily creates this layout and its in-memory Realm
 machine for the invoking principal. Status reports `uninitialized` and an idle
@@ -177,6 +182,38 @@ IDs. A transport retry with the same principal, call ID, and arguments returns t
 recorded result without running the process tree or filesystem mutation again;
 reusing the ID with different arguments fails closed. This is an in-memory
 per-actor-boot guarantee, not yet a durable exactly-once receipt across crashes.
+
+## Linux lifecycle and metering
+
+The `run()` actor remains resident for the capsule boot, but the Linux machine
+does not. Each `linux-boot` request allocates admitted RV64 RAM, boots the pinned
+kernel, runs `/init`, powers down, and destroys the machine. The durable guarantee
+will be the principal filesystem, not RAM or process state. The existing durable
+Realm home is not yet attached to the Linux guest. Status therefore returns
+`linux_state=cold`, `linux_residency=request-scoped`, and
+`linux_ram_persistent=false` plus `linux_storage_persistent=false` even after a
+successful boot.
+
+This is intentional until Astrid has a principal-affine resident service Store.
+The boundary was reverified against Astrid Runtime 0.10.1 upstream `main` at
+`4771bab3c33d1bce53186e40d01cf014e2dce666` on 2026-07-19:
+
+- pooled interceptor calls are re-seeded, measured, rate-gated, and memory-capped
+  for their invoking principal, but do not retain instance affinity;
+- a `run()` capsule retains one dedicated Store, but its Wasmtime fuel and linear
+  memory remain bounded and attributed to the capsule owner;
+- receiving a message correctly switches principal KV, home, temporary storage,
+  secrets, profile, cancellation, and publish provenance, but does not retarget
+  the Store memory meter or charge the message's Wasmtime fuel to its publisher.
+
+Keeping several principals' resident Linux machines inside that shared Store
+would therefore provide misleading isolation: storage would be principal-scoped,
+while CPU and RAM enforcement would not be. The required runtime primitive is a
+Store keyed by `(capsule, component, verified principal, realm)` with permanent
+principal ownership, per-command fuel admission and charging, a principal memory
+ceiling, bounded global residency, and explicit idle eviction. Until that exists,
+Linux remains cold/on-demand and its exact RV64 step count is retained as a
+separate principal-local inner accounting record for the current actor boot.
 
 ## Build and install
 
