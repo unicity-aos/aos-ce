@@ -10,7 +10,7 @@ import tarfile
 import tomllib
 
 
-def _safe_relative_asset(value: str) -> bool:
+def safe_relative_asset(value: str) -> bool:
     if not value or value.startswith("/") or "\\" in value or "://" in value:
         return False
     parts = value.split("/")
@@ -31,7 +31,7 @@ def validate_capsule(path: pathlib.Path) -> None:
         for skill in manifest.get("skill", []):
             name = skill.get("name", "<unnamed>")
             asset = skill.get("file")
-            if not isinstance(asset, str) or not _safe_relative_asset(asset):
+            if not isinstance(asset, str) or not safe_relative_asset(asset):
                 raise ValueError(
                     f"{path.name}: skill {name!r} has unsafe file path {asset!r}"
                 )
