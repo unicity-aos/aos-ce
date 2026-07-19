@@ -7,10 +7,11 @@ is an ordinary Astrid capsule.
 It now keeps Linux resident for each active principal, but it is not yet the
 useful AOS Realm distribution. The capsule runs signed, embedded core WebAssembly
 command modules under Wasmi and a pinned Linux 6.18.39 image inside the bounded
-`aos-rv64-virt-v0` machine. The first Linux image reaches an AOS-controlled
-`/init`, accepts a bounded serial command protocol, and remains alive until an
-explicit shutdown or runtime eviction. It does not yet contain a shell or general
-userland.
+`aos-rv64-virt-v0` machine. Linux now reaches an AOS-controlled PID 1 and a
+static Buildroot 2026.05.1/musl/BusyBox userland, accepts token-bound bounded
+command frames, and remains alive until an explicit shutdown or runtime eviction.
+Its `ash` shell is useful today, although it is not yet Bash or a development
+distribution.
 Commands receive structured `argv` and an explicit current directory; there is
 no host shell command line and the manifest requests no `host_process`
 capability.
@@ -46,6 +47,9 @@ RV64 instruction images, and the first resident Linux boot image:
 - `linux-console`, which lazily boots if needed, sends one validated line to the
   resident `/init`, and returns one framed result while preserving Linux RAM;
   the proof commands are `ping`, `counter`, and `echo ...`
+- `linux-sh`, which executes one bounded script with BusyBox `ash` as UID/GID
+  1000 in `/home/agent`, propagates its exact exit status, kills/reaps background
+  descendants, and preserves the in-RAM home across warm calls
 - `linux-shutdown`, which cleanly powers a warm guest down through SBI and
   releases its RAM; stopping an already-cold realm is an idempotent zero-step
   operation
@@ -159,11 +163,12 @@ it is not presented as an assigned RISC-V SBI implementation ID. The machine has
 no browser, JavaScript, JIT, host process, host filesystem, or network dependency
 and compiles for the capsule's `wasm32-unknown-unknown` target.
 
-The pinned kernel and AOS-controlled `/init` now provide a framed serial command
-channel inside this machine. That is a resident-Linux claim, not yet a
-Linux-workbench claim: the initramfs has only `/init` and `/dev/console`.
-Compressed instructions, PLIC, and virtio block are deliberately deferred until
-the selected kernel/device profile requires them.
+The pinned kernel, Buildroot rootfs, and AOS-controlled `/init` provide a
+token-bound serial command channel inside this machine. The static BusyBox shell
+is a useful Linux-workbench seed, not a claim of Debian compatibility: Bash,
+Python, an in-guest compiler, networking, durable block storage, and PTYs remain
+absent. Compressed instructions, PLIC, and virtio block are deliberately deferred
+until the selected kernel/device profile requires them.
 
 The private ABI exposes bounded `pipe`, compatibility `spawn-signed`, record-based
 `spawn-signed-record`, `wait`, and `signal` operations. The record form selects an
@@ -198,11 +203,11 @@ and inspect state before retrying.
 ## Linux lifecycle and metering
 
 The principal-affine component Store owns one optional `Rv64Machine`. The first
-`linux-boot` or `linux-console` allocates admitted RAM and advances the guest in
-bounded 100,000-step slices until `/init` is ready. Later calls resume the same
-kernel and userspace memory, so the `counter` proof advances across separate tool
-invocations. There is no background CPU: Linux advances only inside an admitted,
-metered invocation. A clean `linux-shutdown`, execution failure, output-limit
+`linux-boot`, `linux-console`, or `linux-sh` allocates admitted RAM and advances
+the guest in bounded 100,000-step slices until `/init` is ready. Later calls
+resume the same kernel and userspace memory, so the `counter` proof advances
+across separate tool invocations. There is no background CPU: Linux advances
+only inside an admitted, metered invocation. A clean `linux-shutdown`, execution failure, output-limit
 failure, runtime eviction, daemon restart, or capsule unload destroys RAM.
 
 RAM residency is therefore an evictable cache, not durable process state. The
@@ -222,8 +227,9 @@ This closes both outer component affinity and the first inner Linux lifecycle:
 lazy boot, ready, bounded command, clean stop, and restart are executable. Exact
 RV64 step counts remain separate principal-local records for the current Store
 residency. Durable disk remains an independent virtio-block/COW device problem
-rather than a promise made by resident RAM. The next distribution increment is a
-pinned Buildroot 2026.05.1 userland behind this same lifecycle.
+rather than a promise made by resident RAM. The pinned Buildroot 2026.05.1
+userland is now behind this lifecycle; attaching principal storage and workspace
+projections is the next distribution increment.
 
 ## Build and install
 
@@ -264,6 +270,8 @@ Example tool arguments:
 {"command":"linux-console","args":["ping"]}
 {"command":"linux-console","args":["counter"]}
 {"command":"linux-console","args":["echo","hello from Linux"]}
+{"command":"linux-sh","args":["id -u; uname -m; pwd"]}
+{"command":"linux-sh","args":["printf persisted > proof && cat proof"]}
 {"command":"linux-shutdown"}
 {"command":"write-file","args":["notes.txt","durable\n"],"cwd":"/home/agent"}
 {"command":"cat","args":["notes.txt"],"cwd":"/home/agent"}
@@ -287,13 +295,14 @@ nested descriptor closes, so a trapped command does not leave a partial guest
 file. Durable-home closes select a content-addressed generation with a KV CAS;
 workspace and temporary files retain their outer mount semantics.
 
-The embedded kernel does execute general RV64 Linux syscalls, including the
-minimal init's console `read`/`write` loop and `reboot`; the earlier nested
-core-WASM process lane still uses the private Realm ABI. This slice does not yet provide arbitrary
-executable resolution, shared or inherited open-file descriptions, sequential
-POSIX file actions, `execve`, Bash, a libc, package management, networking, PTYs,
-background jobs, or a compiler. Those belong behind the same realm boundary;
-they must not be simulated by granting a host process.
+The embedded kernel executes general RV64 Linux syscalls, including PID 1's
+console, mount, credential, process, and reboot paths; the earlier nested
+core-WASM process lane still uses the private Realm ABI. Static musl, BusyBox
+`execve`, and `ash` are live. This slice does not yet provide shared or inherited
+open-file descriptions, sequential POSIX file actions, Bash, package management,
+networking, PTYs, surviving background jobs, or an in-guest compiler. Those
+belong behind the same realm boundary; they must not be simulated by granting a
+host process.
 
 ## Distribution direction
 

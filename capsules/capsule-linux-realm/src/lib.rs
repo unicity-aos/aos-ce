@@ -28,7 +28,7 @@ use host::{
 use serde::{Deserialize, Serialize};
 
 const HARD_MAX_FUEL: u64 = 100_000;
-const HARD_MAX_LINUX_STEPS: u64 = 20_000_000;
+const HARD_MAX_LINUX_STEPS: u64 = 50_000_000;
 const HARD_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const HARD_MEMORY_BYTES: usize = 64 * 1024;
 // The enclosing Astrid component has a 64 MiB linear-memory ceiling. Keep the
@@ -41,9 +41,10 @@ const LINUX_INIT_MARKER: &[u8] = b"AOS LINUX /init";
 // `/dev/console` has the normal TTY output transformation enabled, so the
 // init protocol's line feeds emerge as CRLF on the SBI debug console.
 const LINUX_READY_MARKER: &[u8] = b"AOS READY\r\n";
-const LINUX_RESULT_OK_MARKER: &[u8] = b"AOS END 0\r\n";
-const LINUX_RESULT_USAGE_MARKER: &[u8] = b"AOS END 64\r\n";
-const MAX_LINUX_COMMAND_BYTES: usize = 255;
+const LINUX_PROTOCOL_PREFIX: &str = "AOS/1 ";
+const LINUX_FRAME_TOKEN_BYTES: usize = 16;
+const LINUX_FRAME_TOKEN_HEX_BYTES: usize = LINUX_FRAME_TOKEN_BYTES * 2;
+const MAX_LINUX_COMMAND_BYTES: usize = 1024;
 #[cfg(target_arch = "wasm32")]
 const LINUX_COOPERATE_TOPIC: &str = "realm.v1.linux.cooperate";
 const AOS_LINUX_IMAGE: &[u8] = include_bytes!("../linux/Image");
@@ -69,6 +70,7 @@ pub enum RealmProgram {
     Rv64Supervisor,
     LinuxBoot,
     LinuxConsole,
+    LinuxSh,
     LinuxShutdown,
     WriteFile,
     Cat,
@@ -140,7 +142,7 @@ struct StatusResponse {
     home_files: usize,
     home_manifest: Option<String>,
     mounts: Vec<MountStatus>,
-    commands: [&'static str; 13],
+    commands: [&'static str; 14],
     workspace_commit: &'static str,
     host_process: bool,
     actor_state: &'static str,
@@ -236,6 +238,7 @@ enum SelectedExecution {
 enum LinuxAction {
     Boot,
     Console,
+    Shell,
     Shutdown,
 }
 
@@ -504,32 +507,53 @@ fn execute_linux_resident(
     command: Option<&str>,
     limits: RunLimits,
 ) -> Result<LinuxInvocationReport, SysError> {
+    let frame_token =
+        if action == LinuxAction::Boot || (action == LinuxAction::Shutdown && machine.is_none()) {
+            None
+        } else {
+            Some(linux_frame_token()?)
+        };
     #[cfg(target_arch = "wasm32")]
     {
         let cooperate = ipc::subscribe(LINUX_COOPERATE_TOPIC)?;
-        return execute_linux_resident_cooperatively(machine, action, command, limits, || {
-            // recv(0) is the kernel-recognized run-loop yield primitive. A
-            // private never-published topic makes this a scheduling boundary
-            // without admitting input or consuming another service queue.
-            let _ = cooperate.recv(0)?;
-            Ok(())
-        });
+        return execute_linux_resident_cooperatively(
+            machine,
+            action,
+            command,
+            frame_token.as_deref(),
+            limits,
+            || {
+                // recv(0) is the kernel-recognized run-loop yield primitive. A
+                // private never-published topic makes this a scheduling boundary
+                // without admitting input or consuming another service queue.
+                let _ = cooperate.recv(0)?;
+                Ok(())
+            },
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    execute_linux_resident_cooperatively(machine, action, command, limits, || Ok(()))
+    execute_linux_resident_cooperatively(
+        machine,
+        action,
+        command,
+        frame_token.as_deref(),
+        limits,
+        || Ok(()),
+    )
 }
 
 fn execute_linux_resident_cooperatively(
     machine: &mut Option<Rv64Machine>,
     action: LinuxAction,
     command: Option<&str>,
+    frame_token: Option<&str>,
     limits: RunLimits,
     mut cooperate: impl FnMut() -> Result<(), SysError>,
 ) -> Result<LinuxInvocationReport, SysError> {
-    if action == LinuxAction::Console && command.is_none() {
+    if matches!(action, LinuxAction::Console | LinuxAction::Shell) && command.is_none() {
         return Err(SysError::ApiError(
-            "linux-console requires a validated command".to_string(),
+            "Linux execution requires a validated command".to_string(),
         ));
     }
     if action == LinuxAction::Shutdown && machine.is_none() {
@@ -573,6 +597,7 @@ fn execute_linux_resident_cooperatively(
             limits.fuel,
             limits.output_bytes,
             LinuxAction::Boot,
+            None,
             &mut cooperate,
         ) {
             Ok(report) => report,
@@ -612,15 +637,24 @@ fn execute_linux_resident_cooperatively(
 
     let command = match action {
         LinuxAction::Console => command.expect("validated before boot"),
+        LinuxAction::Shell => command.expect("validated before boot"),
         LinuxAction::Shutdown => "shutdown",
         LinuxAction::Boot => unreachable!("handled above"),
     };
-    let mut input = command.as_bytes().to_vec();
-    input.push(b'\n');
+    let frame_token = frame_token.ok_or_else(|| {
+        SysError::ApiError("Linux command frame is missing its correlation token".to_string())
+    })?;
+    validate_linux_frame_token(frame_token)?;
+    let framed_command = if action == LinuxAction::Shell {
+        format!("sh {command}")
+    } else {
+        command.to_string()
+    };
+    let input = format!("{LINUX_PROTOCOL_PREFIX}{frame_token} {framed_command}\n");
     machine
         .as_mut()
         .expect("booted or pre-existing machine")
-        .push_console_input(&input);
+        .push_console_input(input.as_bytes());
 
     let remaining_fuel = limits.fuel.saturating_sub(fuel_consumed);
     let remaining_output = limits.output_bytes.saturating_sub(stdout.len());
@@ -629,6 +663,7 @@ fn execute_linux_resident_cooperatively(
         remaining_fuel,
         remaining_output,
         action,
+        Some(frame_token),
         &mut cooperate,
     ) {
         Ok(report) => report,
@@ -685,6 +720,7 @@ fn drive_linux_until(
     fuel: u64,
     output_bytes: usize,
     target: LinuxAction,
+    frame_token: Option<&str>,
     cooperate: &mut impl FnMut() -> Result<(), SysError>,
 ) -> Result<LinuxDriveReport, SysError> {
     let mut stdout = Vec::new();
@@ -721,7 +757,9 @@ fn drive_linux_until(
             LinuxAction::Boot if contains_bytes(&stdout, LINUX_READY_MARKER) => {
                 Some(LinuxDriveOutcome::Ready)
             }
-            LinuxAction::Console => linux_command_status(&stdout).map(LinuxDriveOutcome::Command),
+            LinuxAction::Console | LinuxAction::Shell => frame_token
+                .and_then(|token| linux_command_status(&stdout, token))
+                .map(LinuxDriveOutcome::Command),
             _ => None,
         };
         if let Some(outcome) = marker_outcome {
@@ -797,13 +835,63 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|candidate| candidate == needle)
 }
 
-fn linux_command_status(stdout: &[u8]) -> Option<i32> {
+fn linux_frame_token() -> Result<String, SysError> {
+    let bytes = astrid_sdk::runtime::random_bytes(LINUX_FRAME_TOKEN_BYTES)?;
+    if bytes.len() != LINUX_FRAME_TOKEN_BYTES {
+        return Err(SysError::ApiError(format!(
+            "runtime returned {} bytes for a {LINUX_FRAME_TOKEN_BYTES}-byte Linux frame token",
+            bytes.len()
+        )));
+    }
+    let mut token = String::with_capacity(LINUX_FRAME_TOKEN_HEX_BYTES);
+    for byte in bytes {
+        token.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        token.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+    }
+    Ok(token)
+}
+
+fn validate_linux_frame_token(token: &str) -> Result<(), SysError> {
+    if token.len() == LINUX_FRAME_TOKEN_HEX_BYTES
+        && token
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        Ok(())
+    } else {
+        Err(SysError::ApiError(
+            "Linux frame token must be 32 lowercase hexadecimal characters".to_string(),
+        ))
+    }
+}
+
+fn linux_command_status(stdout: &[u8], frame_token: &str) -> Option<i32> {
+    validate_linux_frame_token(frame_token).ok()?;
     let ready_at = find_last_bytes(stdout, LINUX_READY_MARKER)?;
-    [(0, LINUX_RESULT_OK_MARKER), (64, LINUX_RESULT_USAGE_MARKER)]
-        .into_iter()
-        .filter_map(|(status, marker)| {
-            let marker_at = find_last_bytes(stdout, marker)?;
-            (marker_at + marker.len() <= ready_at).then_some((marker_at, status))
+    let result_prefix = format!("AOS END {frame_token} ");
+    stdout[..ready_at]
+        .windows(result_prefix.len())
+        .enumerate()
+        .filter_map(|(marker_at, candidate)| {
+            if candidate != result_prefix.as_bytes() {
+                return None;
+            }
+            let status_start = marker_at + result_prefix.len();
+            let suffix = &stdout[status_start..ready_at];
+            let status_end = suffix.windows(2).position(|bytes| bytes == b"\r\n")?;
+            let status_bytes = &suffix[..status_end];
+            if status_bytes.is_empty()
+                || status_bytes.len() > 3
+                || !status_bytes.iter().all(u8::is_ascii_digit)
+            {
+                return None;
+            }
+            let status = std::str::from_utf8(status_bytes)
+                .ok()?
+                .parse::<i32>()
+                .ok()?;
+            (status <= 255).then_some((marker_at, status))
         })
         .max_by_key(|(marker_at, _)| *marker_at)
         .map(|(_, status)| status)
@@ -895,12 +983,13 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
             "rv64-supervisor" => RealmProgram::Rv64Supervisor,
             "linux-boot" => RealmProgram::LinuxBoot,
             "linux-console" => RealmProgram::LinuxConsole,
+            "linux-sh" => RealmProgram::LinuxSh,
             "linux-shutdown" => RealmProgram::LinuxShutdown,
             "write-file" => RealmProgram::WriteFile,
             "cat" => RealmProgram::Cat,
             _ => {
                 return Err(SysError::ApiError(format!(
-                    "unsupported realm command `{command}`; supported: pwd, echo, pipe-echo, guest-pipe-echo, realm-sh, rv64-smoke, rv64-supervisor, linux-boot, linux-console, linux-shutdown, write-file, cat, smoke-write"
+                    "unsupported realm command `{command}`; supported: pwd, echo, pipe-echo, guest-pipe-echo, realm-sh, rv64-smoke, rv64-supervisor, linux-boot, linux-console, linux-sh, linux-shutdown, write-file, cat, smoke-write"
                 )));
             }
         }
@@ -988,16 +1077,36 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
                     .as_bytes()
                     .iter()
                     .any(|byte| *byte == 0 || *byte == b'\n' || *byte == b'\r')
+                || !(command == "ping" || command == "counter" || command.starts_with("echo "))
             {
                 return Err(SysError::ApiError(
-                    "linux-console command is empty, too large, or contains a line break"
-                        .to_string(),
+                    "linux-console accepts one bounded ping, counter, or echo command".to_string(),
                 ));
             }
             (
                 "linux-console",
                 SelectedExecution::Linux(LinuxAction::Console),
                 vec!["linux-console".to_string(), command],
+            )
+        }
+        RealmProgram::LinuxSh => {
+            require_arity("linux-sh", &args.args, 1)?;
+            let script = args.args[0].clone();
+            if script.is_empty()
+                || script.len() > MAX_LINUX_COMMAND_BYTES.saturating_sub(3)
+                || script
+                    .as_bytes()
+                    .iter()
+                    .any(|byte| *byte == 0 || *byte == b'\n' || *byte == b'\r')
+            {
+                return Err(SysError::ApiError(
+                    "linux-sh script is empty, too large, or contains a line break".to_string(),
+                ));
+            }
+            (
+                "linux-sh",
+                SelectedExecution::Linux(LinuxAction::Shell),
+                vec!["linux-sh".to_string(), script],
             )
         }
         RealmProgram::LinuxShutdown => {
@@ -1094,6 +1203,7 @@ fn status_response(
             "rv64-supervisor",
             "linux-boot",
             "linux-console",
+            "linux-sh",
             "linux-shutdown",
             "write-file",
             "cat",
@@ -1273,6 +1383,7 @@ mod tests {
             &mut machine,
             LinuxAction::Boot,
             None,
+            None,
             limits,
             || Ok(()),
         )
@@ -1298,6 +1409,7 @@ mod tests {
             &mut machine,
             LinuxAction::Console,
             Some("counter"),
+            Some("0123456789abcdef0123456789abcdef"),
             limits,
             || Ok(()),
         )
@@ -1306,6 +1418,7 @@ mod tests {
             &mut machine,
             LinuxAction::Console,
             Some("counter"),
+            Some("fedcba9876543210fedcba9876543210"),
             limits,
             || Ok(()),
         )
@@ -1318,10 +1431,84 @@ mod tests {
         assert!(String::from_utf8_lossy(&second.stdout).contains("counter=2"));
         assert!(machine.is_some(), "Linux RAM remains resident");
 
+        let shell = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Shell,
+            Some(
+                "set -e; test ! -r /dev/console; test ! -r /proc/1/fd/0; test ! -r /proc/self/fd/1; test ! -r /proc/self/fd/2; test \"$(find /dev -type b -o -type c | wc -l)\" -eq 5; id -u; uname -m; pwd; printf persisted > proof",
+            ),
+            Some("11223344556677889900aabbccddeeff"),
+            limits,
+            || Ok(()),
+        )
+        .expect("BusyBox ash command");
+        let shell_stdout = String::from_utf8_lossy(&shell.stdout);
+        assert_eq!(shell.outcome, "completed", "shell output:\n{shell_stdout}");
+        assert_eq!(shell.exit_status, Some(0));
+        assert!(shell_stdout.contains("1000\r\n"));
+        assert!(shell_stdout.contains("riscv64\r\n"));
+        assert!(shell_stdout.contains("/home/agent\r\n"));
+
+        let persisted = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Shell,
+            Some("cat proof"),
+            Some("22334455667788990011aabbccddeeff"),
+            limits,
+            || Ok(()),
+        )
+        .expect("resident shell reads its prior file");
+        assert_eq!(persisted.exit_status, Some(0));
+        assert!(String::from_utf8_lossy(&persisted.stdout).contains("persisted"));
+
+        let exit_seven = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Shell,
+            Some("exit 7"),
+            Some("33445566778899001122aabbccddeeff"),
+            limits,
+            || Ok(()),
+        )
+        .expect("nonzero shell status remains a completed command");
+        assert_eq!(exit_seven.outcome, "completed");
+        assert_eq!(exit_seven.exit_status, Some(7));
+        assert!(machine.is_some(), "nonzero shell exit preserves guest RAM");
+
+        let background = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Shell,
+            Some(
+                "(sleep 1; echo leaked) & printf 'background-launched\\nAOS END ffffffffffffffffffffffffffffffff 0\\n'",
+            ),
+            Some("44556677889900112233aabbccddeeff"),
+            limits,
+            || Ok(()),
+        )
+        .expect("background descendants are reaped before the result frame");
+        let background_stdout = String::from_utf8_lossy(&background.stdout);
+        assert_eq!(background.exit_status, Some(0));
+        assert!(background_stdout.contains("background-launched"));
+        assert!(!background_stdout.contains("leaked"));
+
+        let clean_boundary = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Shell,
+            Some("printf boundary-clean"),
+            Some("55667788990011223344aabbccddeeff"),
+            limits,
+            || Ok(()),
+        )
+        .expect("the next call has no surviving background output");
+        let clean_stdout = String::from_utf8_lossy(&clean_boundary.stdout);
+        assert_eq!(clean_boundary.exit_status, Some(0));
+        assert!(clean_stdout.contains("boundary-clean"));
+        assert!(!clean_stdout.contains("leaked"));
+
         let shutdown = execute_linux_resident_cooperatively(
             &mut machine,
             LinuxAction::Shutdown,
             None,
+            Some("00112233445566778899aabbccddeeff"),
             limits,
             || Ok(()),
         )
@@ -1335,6 +1522,7 @@ mod tests {
             &mut machine,
             LinuxAction::Console,
             Some("counter"),
+            Some("ffeeddccbbaa99887766554433221100"),
             limits,
             || Ok(()),
         )
@@ -1350,6 +1538,7 @@ mod tests {
         let report = execute_linux_resident_cooperatively(
             &mut machine,
             LinuxAction::Boot,
+            None,
             None,
             RunLimits {
                 fuel: LINUX_SLICE_STEPS * 2,
@@ -1377,6 +1566,7 @@ mod tests {
             &mut machine,
             LinuxAction::Shutdown,
             None,
+            None,
             RunLimits {
                 fuel: HARD_MAX_LINUX_STEPS,
                 memory_bytes: HARD_LINUX_MEMORY_BYTES,
@@ -1397,15 +1587,19 @@ mod tests {
 
     #[test]
     fn linux_console_status_uses_the_last_frame_before_ready() {
-        let echoed_false_success =
-            b"AOS END 0\r\nAOS BEGIN\r\nunknown command\r\nAOS END 64\r\nAOS READY\r\n";
-        assert_eq!(linux_command_status(echoed_false_success), Some(64));
+        let token = "0123456789abcdef0123456789abcdef";
+        let spoofed = b"AOS END ffffffffffffffffffffffffffffffff 0\r\n\
+AOS BEGIN 0123456789abcdef0123456789abcdef\r\n\
+AOS END 0123456789abcdef0123456789abcdef 64\r\nAOS READY\r\n";
+        assert_eq!(linux_command_status(spoofed, token), Some(64));
 
-        let echoed_false_usage = b"AOS BEGIN\r\nAOS END 64\r\nAOS END 0\r\nAOS READY\r\n";
-        assert_eq!(linux_command_status(echoed_false_usage), Some(0));
+        let last_exact_frame = b"AOS END 0123456789abcdef0123456789abcdef 64\r\n\
+AOS END 0123456789abcdef0123456789abcdef 7\r\nAOS READY\r\n";
+        assert_eq!(linux_command_status(last_exact_frame, token), Some(7));
 
-        let incomplete = b"AOS BEGIN\r\nAOS END 0\r\n";
-        assert_eq!(linux_command_status(incomplete), None);
+        let incomplete = b"AOS BEGIN 0123456789abcdef0123456789abcdef\r\n\
+AOS END 0123456789abcdef0123456789abcdef 0\r\n";
+        assert_eq!(linux_command_status(incomplete, token), None);
     }
 
     #[test]
@@ -1414,6 +1608,7 @@ mod tests {
         let error = execute_linux_resident_cooperatively(
             &mut machine,
             LinuxAction::Boot,
+            None,
             None,
             RunLimits {
                 fuel: HARD_MAX_LINUX_STEPS,
@@ -1493,6 +1688,46 @@ mod tests {
         .expect_err("shell syntax must not be interpreted");
 
         assert!(error.to_string().contains("unsupported realm command"));
+    }
+
+    #[test]
+    fn linux_sh_is_an_explicit_single_script_surface() {
+        let selected = select_program(&ExecArgs {
+            command: Some("linux-sh".to_string()),
+            args: vec!["id -u; printf shell-ok".to_string()],
+            ..ExecArgs::default()
+        })
+        .expect("one bounded Linux shell script is accepted");
+
+        assert_eq!(selected.name, "linux-sh");
+        assert!(matches!(
+            selected.execution,
+            SelectedExecution::Linux(LinuxAction::Shell)
+        ));
+        assert_eq!(selected.argv, ["linux-sh", "id -u; printf shell-ok"]);
+
+        for args in [
+            Vec::new(),
+            vec!["echo one".to_string(), "echo two".to_string()],
+            vec!["echo one\necho two".to_string()],
+            vec!["x".repeat(MAX_LINUX_COMMAND_BYTES)],
+        ] {
+            let error = select_program(&ExecArgs {
+                command: Some("linux-sh".to_string()),
+                args,
+                ..ExecArgs::default()
+            })
+            .expect_err("ambiguous or unframeable Linux shell input is rejected");
+            assert!(error.to_string().contains("linux-sh"));
+        }
+
+        let bypass = select_program(&ExecArgs {
+            command: Some("linux-console".to_string()),
+            args: vec!["sh".to_string(), "id -u".to_string()],
+            ..ExecArgs::default()
+        })
+        .expect_err("the diagnostic console cannot bypass the linux-sh surface");
+        assert!(bypass.to_string().contains("ping, counter, or echo"));
     }
 
     #[test]
@@ -1685,6 +1920,7 @@ mod tests {
         assert!(json.contains("\"realm_boot_sequence\":9"));
         assert!(json.contains("\"commands_completed\":4"));
         assert!(json.contains("\"linux_lifecycle\":\"lazy-principal-resident\""));
+        assert!(json.contains("\"linux-sh\""));
         assert!(json.contains("\"linux_state\":\"cold\""));
         assert!(json.contains("\"linux_boot_executions_this_actor_boot\":2"));
         assert!(json.contains("\"linux_commands_completed_this_actor_boot\":3"));

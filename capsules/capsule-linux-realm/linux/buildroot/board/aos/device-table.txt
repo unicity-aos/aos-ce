@@ -1,0 +1,7 @@
+# name         type mode uid gid major minor start inc count
+/dev           d    755  0   0   -     -     -     -   -
+/dev/console   c    600  0   0   5     1     -     -   -
+/dev/null      c    666  0   0   1     3     -     -   -
+/dev/zero      c    666  0   0   1     5     -     -   -
+/dev/random    c    666  0   0   1     8     -     -   -
+/dev/urandom   c    666  0   0   1     9     -     -   -
