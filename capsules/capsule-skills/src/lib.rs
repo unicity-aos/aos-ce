@@ -163,13 +163,10 @@ impl SkillsLoader {
                     "Failed to scan installed capsule skills: {error:?}"
                 ))
             })?;
-            if let Some(skill) = declared.iter().find(|skill| skill.id == args.skill_id) {
-                return read_file_string(&skill.path).map_err(|error| {
-                    SysError::ApiError(format!(
-                        "Failed to read declared skill '{}' from '{}': {error:?}",
-                        args.skill_id, skill.path
-                    ))
-                });
+            for skill in declared.iter().filter(|skill| skill.id == args.skill_id) {
+                if let Some((content, _)) = read_valid_declared_skill(skill) {
+                    return Ok(content);
+                }
             }
         }
 
@@ -290,8 +287,9 @@ fn collect_skills_from(
 ///
 /// Capsule manifests are untrusted input even after installation. Capsule
 /// names, global skill IDs, and asset paths are validated before constructing
-/// a VFS path. Capsule order is sorted and the first declaration owns a
-/// duplicate ID, making list/read resolution deterministic.
+/// a VFS path. Capsule order is sorted; duplicate declarations are retained so
+/// list/read resolution can select the first declaration whose asset is
+/// readable and has valid frontmatter.
 fn collect_declared_capsule_skills() -> Result<Vec<DeclaredCapsuleSkill>, wit_fs::ErrorCode> {
     let mut capsule_names = match wit_fs::fs_readdir(CAPSULES_DIR) {
         Ok(names) => names,
@@ -301,7 +299,6 @@ fn collect_declared_capsule_skills() -> Result<Vec<DeclaredCapsuleSkill>, wit_fs
     capsule_names.sort();
 
     let mut declared = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
     for capsule_name in capsule_names {
         if !is_safe_name(&capsule_name) {
             log::warn(format!(
@@ -324,16 +321,7 @@ fn collect_declared_capsule_skills() -> Result<Vec<DeclaredCapsuleSkill>, wit_fs
             ));
             continue;
         };
-        for skill in skills {
-            if seen_ids.insert(skill.id.clone()) {
-                declared.push(skill);
-            } else {
-                log::warn(format!(
-                    "ignoring duplicate capsule-declared skill ID {:?}",
-                    skill.id
-                ));
-            }
-        }
+        declared.extend(skills);
     }
     Ok(declared)
 }
@@ -378,26 +366,50 @@ fn collect_declared_skill_info(
     skills: &mut Vec<SkillInfo>,
     seen_ids: &mut std::collections::HashSet<String>,
 ) {
+    collect_declared_skill_info_with(declared, skills, seen_ids, read_valid_declared_skill);
+}
+
+fn collect_declared_skill_info_with<F>(
+    declared: Vec<DeclaredCapsuleSkill>,
+    skills: &mut Vec<SkillInfo>,
+    seen_ids: &mut std::collections::HashSet<String>,
+    mut load: F,
+) where
+    F: FnMut(&DeclaredCapsuleSkill) -> Option<(String, SkillFrontmatter)>,
+{
     for skill in declared {
-        if !seen_ids.insert(skill.id.clone()) {
+        if seen_ids.contains(&skill.id) {
             continue;
         }
-        match read_file_string(&skill.path) {
-            Ok(content) => {
-                if let Some(frontmatter) = parse_frontmatter(&content) {
-                    skills.push(SkillInfo {
-                        id: skill.id,
-                        name: frontmatter.name,
-                        description: frontmatter.description,
-                    });
-                } else {
-                    log::warn(format!(
-                        "skipping {}: invalid skill frontmatter",
-                        skill.path
-                    ));
-                }
+        if let Some((_, frontmatter)) = load(&skill) {
+            seen_ids.insert(skill.id.clone());
+            skills.push(SkillInfo {
+                id: skill.id,
+                name: frontmatter.name,
+                description: frontmatter.description,
+            });
+        }
+    }
+}
+
+/// Load a declared skill asset and require valid frontmatter before it can
+/// claim its global ID. A broken declaration therefore cannot shadow a later
+/// valid declaration from another installed capsule.
+fn read_valid_declared_skill(skill: &DeclaredCapsuleSkill) -> Option<(String, SkillFrontmatter)> {
+    match read_file_string(&skill.path) {
+        Ok(content) => match parse_frontmatter(&content) {
+            Some(frontmatter) => Some((content, frontmatter)),
+            None => {
+                log::warn(format!(
+                    "skipping {}: invalid skill frontmatter",
+                    skill.path
+                ));
+                None
             }
-            Err(error) => log::warn(format!("failed to read {}: {error:?}", skill.path)),
+        },
+        Err(error) => {
+            log::warn(format!("failed to read {}: {error:?}", skill.path));
+            None
         }
     }
 }
@@ -635,5 +647,38 @@ mod tests {
             assert!(declared_skills_from_manifest("capsule", manifest).is_none());
         }
         assert!(declared_skills_from_manifest("../capsule", "").is_none());
+    }
+
+    #[test]
+    fn broken_declaration_does_not_claim_duplicate_skill_id() {
+        let declared = vec![
+            DeclaredCapsuleSkill {
+                id: "shared-skill".into(),
+                path: "first/SKILL.md".into(),
+            },
+            DeclaredCapsuleSkill {
+                id: "shared-skill".into(),
+                path: "second/SKILL.md".into(),
+            },
+        ];
+        let mut skills = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+
+        collect_declared_skill_info_with(declared, &mut skills, &mut seen_ids, |skill| {
+            (skill.path == "second/SKILL.md").then(|| {
+                (
+                    "valid content".into(),
+                    SkillFrontmatter {
+                        name: "Shared Skill".into(),
+                        description: "Loaded from the later valid declaration".into(),
+                    },
+                )
+            })
+        });
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].id, "shared-skill");
+        assert_eq!(skills[0].name, "Shared Skill");
+        assert!(seen_ids.contains("shared-skill"));
     }
 }
