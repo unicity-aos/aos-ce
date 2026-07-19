@@ -165,27 +165,30 @@ Supervisor timer line; a successful reset halts the bounded machine. The
 claim to an assigned RISC-V SBI implementation ID.
 
 The pinned Linux longterm 6.18.39 image now reaches the AOS-controlled `/init`
-inside a 32 MiB machine and powers down through SRST after 14,823,384 bounded
-steps. Its source archive matches kernel.org SHA-256
+inside a 32 MiB machine and remains alive in a framed console command loop. Its
+source archive matches kernel.org SHA-256
 `a7a7e3d2ae9d95e74197223a8d4eb5f6be7aac21b6e6de27e9685d001c1f8cb0`;
 the deterministic raw `Image` is
-`0dd20934e7c1b54484803a9a474a35e931f26dd881b280178d3e4fe937595852`.
-An identical rebuild produces the same digest. The checked-in capsule regression
-retains and asserts the exact kernel version, AOS machine model, `/init` launch,
-marker, and powerdown trace.
+`fd81101a96b7bccfdaa1a0f451cf828df3126f337e0dfbd13db37495cf206982`.
+An independent clean rebuild in the recorded OCI builder produces the same
+digest. The checked-in capsule regression asserts the exact kernel version, AOS
+machine model, `/init` launch and ready markers, userspace state continuity over
+separate calls, clean SBI shutdown, RAM release, and fresh restart.
 
-The live packaged proof runs through AOS Runtime 0.10.1 as an installed
-`wasm32-unknown-unknown` component. The Realm performs a kernel-recognized
-cooperative IPC yield between each 100,000-step RV64 slice, and the successful
-MCP result reports 148 suspensions before `/init` powers down. The 32 MiB guest
-limit is deliberately below Astrid's independently enforced 64 MiB component
-linear-memory ceiling, leaving room for the embedded image, interpreter, stack,
-and capsule state.
+The earlier cold-boot artifact ran through AOS Runtime 0.10.1 as an installed
+`wasm32-unknown-unknown` component and established the live tool path. The
+resident artifact now requires the principal-affine Store contract in Astrid
+`>=0.10.2`; it must not be represented as compatible with an unmodified 0.10.1
+runtime. The Realm performs a kernel-recognized cooperative IPC yield between
+each 100,000-step RV64 slice. The 32 MiB guest limit is deliberately below
+Astrid's independently enforced 64 MiB component linear-memory ceiling, leaving
+room for the embedded image, interpreter, stack, and capsule state.
 
-This is Linux, but it is not yet the agent workbench. The initramfs has only the
-static AOS `/init` and `/dev/console`; it has no shell, libc, packages, writable
-root, or workspace mount. A PLIC, compressed instructions, and virtio block also
-remain absent and will be added only when an admitted device requires them.
+This is resident Linux, but it is not yet the agent workbench. The initramfs has
+only the static AOS `/init` and `/dev/console`; its commands are protocol probes,
+not shell built-ins. It has no shell, libc, packages, writable root, or workspace
+mount. A PLIC, compressed instructions, and virtio block also remain absent and
+will be added only when an admitted device requires them.
 
 ### 2.5 Privileged-machine component sketch and invariant ledger
 
@@ -235,10 +238,10 @@ an implicit RISC-V device.
 | Linux placement | Kernel, initramfs, and FDT ranges are checked before mutation; Linux receives the standard RV64 register handoff in S-mode | exact RAM-byte, FDT-header, layout, register, CSR, and privilege assertions |
 | SBI boundary | Firmware sees only admitted RAM, deterministic time, and bounded console/reset devices; unsupported extensions fail closed | Base 3.0 probe, DBCN write, TIME interrupt, SRST halt, and invalid-address regressions |
 
-The table is also the review boundary: a Linux boot checkmark does not mean a
-useful Linux environment. The next increment replaces the proof initramfs with a
-pinned Buildroot AOS userland and connects its process lifetime and durable state
-to the principal Realm actor.
+The table is also the review boundary: resident Linux does not mean a useful
+Linux environment. The next increment replaces the proof initramfs with a pinned
+Buildroot AOS userland, then connects a durable block overlay to the principal
+Realm filesystem contract.
 
 ## 3. The system seen from each side
 
@@ -699,14 +702,22 @@ harts are CPUs inside that Realm. The principal boundary remains outside the
 machine and every CPU, memory, storage, network, and device charge rolls up to
 that owner.
 
-The current Linux adapter is still deliberately cold/on-demand. A request constructs a
-32 MiB single-hart machine, boots Linux, runs the controlled `/init`, powers down,
-returns exact charged guest steps, and drops RAM. The affined Store remains alive
-for semantic-WASM PID continuity and per-principal Linux boot counters. Principal
-Realm home state is durable but is
-not yet attached to the Linux guest; Linux storage, RAM, kernel state, and
-processes are not persistent. `linux_realm_status` exposes this distinction
-instead of calling the resident component itself a persistent Linux VM.
+The current Linux adapter is lazy and principal-resident. The affined Store owns
+one optional 32 MiB single-hart machine. `linux-boot` or `linux-console` creates
+it when cold, advances Linux in bounded slices until the controlled `/init`
+reports ready, and retains its CPU and RAM for later invocations. A `counter`
+probe reaches 1 and then 2 across separate calls. No CPU runs while the Store is
+idle: every guest step occurs inside an admitted outer tool invocation and is
+charged to the verified principal.
+
+`linux-shutdown` asks PID 1 to power down through SRST and releases the machine;
+stopping an already-cold Realm is idempotent. A guest trap, fuel exhaustion,
+output-limit failure, or cooperative-host failure also discards uncertain RAM.
+Runtime idle eviction, unload, and daemon restart destroy the Store and therefore
+the VM. Principal Realm home state is durable but is not yet attached to the
+Linux guest. `linux_realm_status` exposes this distinction as resident but
+evictable RAM and non-persistent Linux storage rather than calling it a durable
+VM.
 
 The missing runtime primitive was implemented from freshly fetched Astrid Runtime
 0.10.1 upstream `main` commit
@@ -729,17 +740,16 @@ least-recently-used Stores, and releases exact current memory on eviction or
 unload. Residency remains an evictable cache; durable state must cross KV/home
 before a call returns.
 
-The next required primitive is the Linux Realm lifecycle built on that service:
+The first Linux Realm lifecycle now runs on that service:
 
 ```text
 key = (capsule digest, component id, verified principal, realm id)
 
-cold --start/admit--> booting --boot complete--> running --idle--> warm
-  ^                         |                       |          |
-  |                         +--failure------------+          |
-  +--destroy after flush------- suspending <---stop/evict----+
+cold --boot/command--> booting --ready--> running --idle--> warm
+  ^                         |                  |          |
+  |                         +--failure---------+          |
+  +--destroy RAM <----- shutdown/failure/evict/unload-----+
 
-stopped --explicit start--> booting
 ```
 
 Its non-negotiable rules are:
@@ -752,20 +762,22 @@ Its non-negotiable rules are:
    the same per-principal rate limiter used by ordinary capsule invocations.
 4. Residency is bounded both per principal and globally. Admission fails or
    explicitly evicts an idle lease; it never grows an unbounded map in one Store.
-5. Eviction stops admission, cancels or drains bounded work, flushes the durable
-   filesystem generation, destroys RAM, and returns the Realm to `cold`. The
-   first guarantee is filesystem persistence, not a memory checkpoint.
-6. `stop` is observable and disables implicit auto-start until an explicit
-   `start`; idle eviction remains transparently restartable.
+5. Idle eviction destroys RAM and returns the Realm to `cold`. The first
+   guarantee is filesystem persistence, not a memory checkpoint; Linux does not
+   yet have a block device to flush.
+6. The current `linux-shutdown` returns to restartable `cold`. A distinct
+   operator-disabled `stopped` state that prevents implicit auto-start remains an
+   explicit lifecycle-policy increment rather than an invented guarantee.
 7. Audit identifies the principal, Realm identity, resident generation, hart,
    charged guest steps, charged outer fuel, peak memory, and lifecycle reason.
 
-Principal-affine residency and idle Store eviction are now implemented. The next
-order is a persistent Linux supervisor and command transport, durable block
-device, explicit lifecycle tools, then deterministic virtual SMP. Initial SMP can interleave
-harts in one host thread with a fixed scheduling quantum. True host-parallel
-harts remain optional because they add races to snapshots, metering, devices,
-and reproducibility without improving cross-principal isolation.
+Principal-affine residency, idle Store eviction, the persistent Linux supervisor,
+bounded console transport, and clean shutdown are now implemented. The next order
+is the Buildroot AOS userland, durable block device, explicit disabled-vs-evicted
+lifecycle policy, then deterministic virtual SMP. Initial SMP can interleave
+harts in one host thread with a fixed scheduling quantum. True host-parallel harts
+remain optional because they add races to snapshots, metering, devices, and
+reproducibility without improving cross-principal isolation.
 
 ## 8. Executable compatibility lanes
 
@@ -1353,13 +1365,14 @@ CE set rather than test-installed companions.
 - add a PLIC when an admitted interrupting device requires it;
 - [x] boot pinned Linux longterm 6.18.39 to an AOS-controlled `/init`, retain its
   exact serial evidence, and run it through the capsule command adapter;
-- [x] expose the current cold/on-demand Linux lifecycle, request-scoped RAM,
-  single-vCPU topology, and per-principal actor-boot guest-step totals;
+- [x] expose the current lazy Linux lifecycle, single-vCPU topology, evictable
+  resident RAM, and per-principal Store-residency guest-step totals;
 - [x] add a principal-affine resident service Store to Astrid with permanent
   owner binding, per-call charging, exact resident-memory accounting, live quota
   enforcement, cancellation-safe construction, and idle LRU eviction;
-- keep one RV64 machine in the affined Store and add a bounded command transport
-  before claiming per-principal persistent Linux RAM or process state;
+- [x] keep one RV64 machine in the affined Store, leave PID 1 alive, and add a
+  bounded framed console command transport with cross-invocation userspace-state
+  proof, clean shutdown, restart, and fail-closed RAM destruction;
 - add explicit Realm `start`, `stop`, and status transitions plus bounded idle
   eviction after that Store is kernel-metered to its verified principal;
 - add deterministic multi-hart scheduling, SBI HSM/IPI support, per-hart CLINT
@@ -1550,11 +1563,13 @@ The first implementation must resolve these with executable evidence:
 13. Should idle principal machines be evicted, and if so which process, descriptor,
     and boot-generation conditions make eviction observable and safe?
 
-Decision 13 for the first resident implementation: evict only an idle Realm with
+Decision 13 for the eventual explicit lifecycle: evict only an idle Realm with
 no foreground job, refuse implicit eviction of background work, flush its selected
 filesystem generation, destroy RAM, preserve its boot-generation history, and
-report the eviction reason. A stopped Realm requires explicit restart; an
-idle-evicted Realm may cold-start on its next admitted command.
+report the eviction reason. The current proof has no background jobs or
+Linux-attached filesystem to flush. It maps clean shutdown and eviction to
+restartable `cold`; a future operator-disabled `stopped` state will require
+explicit restart.
 
 ## 22. Implementation ledger and immediate task list
 
@@ -1598,11 +1613,11 @@ idle-evicted Realm may cold-start on its next admitted command.
 - [x] verify the actor model against Astrid Runtime 0.10.1 and record that recv
   switches principal data context but not the dedicated Store's outer CPU/RAM
   attributee;
-- [x] expose Linux as cold/on-demand with exact principal-local guest-step totals
-  rather than imply persistent RAM;
+- [x] expose Linux first as cold/on-demand with exact principal-local guest-step
+  totals rather than imply persistent RAM;
 - [x] implement the principal-affine resident service lease in Astrid Runtime;
-- [ ] move Linux lifecycle ownership onto it by retaining one RV64 machine and
-  defining a bounded command/result channel;
+- [x] move Linux lifecycle ownership onto it by retaining one RV64 machine and
+  defining a bounded command/result channel, clean shutdown, and lazy restart;
 - [ ] add deterministic virtual SMP within one principal-owned Realm after that
   lifecycle and metering boundary is executable;
 - [x] expose bounded pipe creation, signed child creation, direct-child wait, and
@@ -1642,12 +1657,14 @@ idle-evicted Realm may cold-start on its next admitted command.
 - [ ] defer public WIT, Debian naming, arbitrary package claims, and native-kernel
     coupling until evidence requires them.
 
-The first Linux-bearing executable artifact is now live: pinned Linux 6.18.39
-serial-boots to an AOS-controlled `/init` through the installable capsule adapter.
+The Linux-bearing executable artifact is now resident: pinned Linux 6.18.39
+serial-boots to an AOS-controlled `/init`, serves bounded commands across
+separate invocations, preserves userspace RAM, powers down cleanly, and restarts.
 The next artifact is the Buildroot 2026.05.1 AOS userland, followed by a durable
-principal home and workspace projection. The firmware contract beneath it is
-executable: exact image/initramfs placement, generated FDT bytes, S-mode register
-state, and bounded SBI 3.0 Base/TIME/DBCN/SRST handling.
+virtio-block projection of the principal home and workspace. The firmware
+contract beneath it is executable: exact image/initramfs placement, generated
+FDT bytes, S-mode register state, and bounded SBI 3.0 Base/TIME/DBCN/SRST
+handling.
 Every artifact must run in bounded slices and
 fail with an exact architectural trap before virtio block, persistence,
 networking, or a shell are added. The parallel process track still needs

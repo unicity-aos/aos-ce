@@ -36,7 +36,14 @@ const HARD_MEMORY_BYTES: usize = 64 * 1024;
 // stack all fit inside that independently enforced outer limit.
 const HARD_LINUX_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 const LINUX_SLICE_STEPS: u64 = 100_000;
+#[cfg(test)]
 const LINUX_INIT_MARKER: &[u8] = b"AOS LINUX /init";
+// `/dev/console` has the normal TTY output transformation enabled, so the
+// init protocol's line feeds emerge as CRLF on the SBI debug console.
+const LINUX_READY_MARKER: &[u8] = b"AOS READY\r\n";
+const LINUX_RESULT_OK_MARKER: &[u8] = b"AOS END 0\r\n";
+const LINUX_RESULT_USAGE_MARKER: &[u8] = b"AOS END 64\r\n";
+const MAX_LINUX_COMMAND_BYTES: usize = 255;
 #[cfg(target_arch = "wasm32")]
 const LINUX_COOPERATE_TOPIC: &str = "realm.v1.linux.cooperate";
 const AOS_LINUX_IMAGE: &[u8] = include_bytes!("../linux/Image");
@@ -61,6 +68,8 @@ pub enum RealmProgram {
     Rv64Smoke,
     Rv64Supervisor,
     LinuxBoot,
+    LinuxConsole,
+    LinuxShutdown,
     WriteFile,
     Cat,
 }
@@ -131,7 +140,7 @@ struct StatusResponse {
     home_files: usize,
     home_manifest: Option<String>,
     mounts: Vec<MountStatus>,
-    commands: [&'static str; 11],
+    commands: [&'static str; 13],
     workspace_commit: &'static str,
     host_process: bool,
     actor_state: &'static str,
@@ -146,8 +155,10 @@ struct StatusResponse {
     linux_residency: &'static str,
     linux_vcpus: u32,
     linux_ram_persistent: bool,
+    linux_ram_durability: &'static str,
     linux_storage_persistent: bool,
     linux_boot_executions_this_actor_boot: u64,
+    linux_commands_completed_this_actor_boot: u64,
     linux_clean_shutdowns: u64,
     linux_guest_steps_this_actor_boot: u64,
     linux_last_outcome: Option<&'static str>,
@@ -175,6 +186,7 @@ struct LinuxSnapshot {
     guest_steps: u64,
     last_outcome: Option<&'static str>,
     last_exit_status: Option<i32>,
+    commands_completed: u64,
 }
 
 impl LinuxSnapshot {
@@ -186,6 +198,7 @@ impl LinuxSnapshot {
             guest_steps: 0,
             last_outcome: None,
             last_exit_status: None,
+            commands_completed: 0,
         }
     }
 }
@@ -216,7 +229,14 @@ enum SelectedExecution {
     GuestPipeline,
     MiniShell,
     Rv64(&'static [u8]),
-    Linux,
+    Linux(LinuxAction),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxAction {
+    Boot,
+    Console,
+    Shutdown,
 }
 
 impl SelectedExecution {
@@ -226,20 +246,20 @@ impl SelectedExecution {
                 "nested-core-wasm"
             }
             Self::Rv64(_) => "aos-rv64-interpreter",
-            Self::Linux => "aos-rv64-linux",
+            Self::Linux(_) => "aos-rv64-linux",
         }
     }
 
     const fn hard_fuel(self) -> u64 {
         match self {
-            Self::Linux => HARD_MAX_LINUX_STEPS,
+            Self::Linux(_) => HARD_MAX_LINUX_STEPS,
             _ => HARD_MAX_FUEL,
         }
     }
 
     const fn memory_bytes(self) -> usize {
         match self {
-            Self::Linux => HARD_LINUX_MEMORY_BYTES,
+            Self::Linux(_) => HARD_LINUX_MEMORY_BYTES,
             _ => HARD_MEMORY_BYTES,
         }
     }
@@ -413,7 +433,9 @@ fn execute_selected(
         SelectedExecution::Rv64(program) => {
             execute_rv64(program, limits).map(|report| (report, vec![]))
         }
-        SelectedExecution::Linux => execute_linux(limits).map(|report| (report, vec![])),
+        SelectedExecution::Linux(_) => Err(SysError::ApiError(
+            "Linux commands require a principal-affine resident Realm".to_string(),
+        )),
     }
 }
 
@@ -445,83 +467,352 @@ fn execute_rv64(program: &[u8], limits: RunLimits) -> Result<ExecutionReport, Sy
     })
 }
 
-fn execute_linux(limits: RunLimits) -> Result<ExecutionReport, SysError> {
+#[derive(Debug)]
+struct LinuxInvocationReport {
+    outcome: &'static str,
+    exit_status: Option<i32>,
+    fault: Option<String>,
+    stdout: Vec<u8>,
+    fuel_consumed: u64,
+    suspensions: u64,
+    booted: bool,
+    command_completed: bool,
+    clean_shutdown: bool,
+}
+
+#[derive(Debug)]
+enum LinuxDriveOutcome {
+    Ready,
+    Command(i32),
+    Halted(i32),
+    FuelExhausted,
+    OutputLimit,
+    Trapped(String),
+}
+
+#[derive(Debug)]
+struct LinuxDriveReport {
+    outcome: LinuxDriveOutcome,
+    stdout: Vec<u8>,
+    fuel_consumed: u64,
+    suspensions: u64,
+}
+
+fn execute_linux_resident(
+    machine: &mut Option<Rv64Machine>,
+    action: LinuxAction,
+    command: Option<&str>,
+    limits: RunLimits,
+) -> Result<LinuxInvocationReport, SysError> {
     #[cfg(target_arch = "wasm32")]
     {
         let cooperate = ipc::subscribe(LINUX_COOPERATE_TOPIC)?;
-        return execute_linux_cooperatively(limits, || {
+        return execute_linux_resident_cooperatively(machine, action, command, limits, || {
             // recv(0) is the kernel-recognized run-loop yield primitive. A
             // private never-published topic makes this a scheduling boundary
-            // without admitting input or consuming another actor queue.
+            // without admitting input or consuming another service queue.
             let _ = cooperate.recv(0)?;
             Ok(())
         });
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    execute_linux_cooperatively(limits, || Ok(()))
+    execute_linux_resident_cooperatively(machine, action, command, limits, || Ok(()))
 }
 
-fn execute_linux_cooperatively(
+fn execute_linux_resident_cooperatively(
+    machine: &mut Option<Rv64Machine>,
+    action: LinuxAction,
+    command: Option<&str>,
     limits: RunLimits,
     mut cooperate: impl FnMut() -> Result<(), SysError>,
-) -> Result<ExecutionReport, SysError> {
-    let mut machine = Rv64Machine::new(Rv64MachineConfig {
-        ram_bytes: limits.memory_bytes,
-        max_console_bytes: limits.output_bytes,
-    })
-    .map_err(|error| SysError::ApiError(error.to_string()))?;
-    machine
-        .boot_linux(
-            AOS_LINUX_IMAGE,
-            &[],
-            "earlycon=sbi console=hvc0 init=/init panic=-1",
-        )
-        .map_err(|error| SysError::ApiError(error.to_string()))?;
+) -> Result<LinuxInvocationReport, SysError> {
+    if action == LinuxAction::Console && command.is_none() {
+        return Err(SysError::ApiError(
+            "linux-console requires a validated command".to_string(),
+        ));
+    }
+    if action == LinuxAction::Shutdown && machine.is_none() {
+        return Ok(LinuxInvocationReport {
+            outcome: "stopped",
+            exit_status: Some(0),
+            fault: None,
+            stdout: Vec::new(),
+            fuel_consumed: 0,
+            suspensions: 0,
+            booted: false,
+            command_completed: false,
+            clean_shutdown: false,
+        });
+    }
 
     let mut stdout = Vec::new();
-    let mut fuel_consumed = 0;
-    let mut suspensions = 0;
-    let outcome = loop {
-        let remaining = limits.fuel.saturating_sub(fuel_consumed);
-        if remaining == 0 {
-            break ProcessOutcome::FuelExhausted;
+    let mut fuel_consumed = 0_u64;
+    let mut suspensions = 0_u64;
+    let booted = machine.is_none();
+
+    if booted {
+        let mut resident = Rv64Machine::new(Rv64MachineConfig {
+            ram_bytes: limits.memory_bytes,
+            // Console chunks are drained after every scheduling slice. The
+            // invocation-wide output ceiling is enforced below.
+            max_console_bytes: HARD_MAX_OUTPUT_BYTES,
+        })
+        .map_err(|error| SysError::ApiError(error.to_string()))?;
+        resident
+            .boot_linux(
+                AOS_LINUX_IMAGE,
+                &[],
+                "earlycon=sbi console=hvc0 init=/init panic=-1",
+            )
+            .map_err(|error| SysError::ApiError(error.to_string()))?;
+        *machine = Some(resident);
+
+        let report = match drive_linux_until(
+            machine.as_mut().expect("machine inserted"),
+            limits.fuel,
+            limits.output_bytes,
+            LinuxAction::Boot,
+            &mut cooperate,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                *machine = None;
+                return Err(error);
+            }
+        };
+        fuel_consumed = fuel_consumed.saturating_add(report.fuel_consumed);
+        suspensions = suspensions.saturating_add(report.suspensions);
+        stdout.extend_from_slice(&report.stdout);
+        if !matches!(report.outcome, LinuxDriveOutcome::Ready) {
+            *machine = None;
+            return Ok(linux_failure_report(
+                report.outcome,
+                stdout,
+                fuel_consumed,
+                suspensions,
+                true,
+            ));
         }
-        let report = machine.run_slice(remaining.min(LINUX_SLICE_STEPS));
-        fuel_consumed = report.total_steps_executed;
-        let instructions_retired = report.total_instructions_retired;
-        stdout.extend_from_slice(&report.console);
-        match report.outcome {
-            SliceOutcome::Yielded => {
-                suspensions += 1;
-                cooperate()?;
-            }
-            SliceOutcome::Halted(status) if !status.passed => {
-                break ProcessOutcome::Exited(i32::try_from(status.code).unwrap_or(i32::MAX));
-            }
-            SliceOutcome::Halted(_) => {
-                if stdout
-                    .windows(LINUX_INIT_MARKER.len())
-                    .any(|bytes| bytes == LINUX_INIT_MARKER)
-                {
-                    break ProcessOutcome::Exited(0);
-                }
-                break ProcessOutcome::Trapped(format!(
-                    "Linux halted before the AOS /init marker after {instructions_retired} retired instructions"
-                ));
-            }
-            SliceOutcome::Trapped(trap) => break ProcessOutcome::Trapped(trap.to_string()),
+    }
+
+    if action == LinuxAction::Boot {
+        return Ok(LinuxInvocationReport {
+            outcome: "ready",
+            exit_status: None,
+            fault: None,
+            stdout,
+            fuel_consumed,
+            suspensions,
+            booted,
+            command_completed: false,
+            clean_shutdown: false,
+        });
+    }
+
+    let command = match action {
+        LinuxAction::Console => command.expect("validated before boot"),
+        LinuxAction::Shutdown => "shutdown",
+        LinuxAction::Boot => unreachable!("handled above"),
+    };
+    let mut input = command.as_bytes().to_vec();
+    input.push(b'\n');
+    machine
+        .as_mut()
+        .expect("booted or pre-existing machine")
+        .push_console_input(&input);
+
+    let remaining_fuel = limits.fuel.saturating_sub(fuel_consumed);
+    let remaining_output = limits.output_bytes.saturating_sub(stdout.len());
+    let report = match drive_linux_until(
+        machine.as_mut().expect("machine remains resident"),
+        remaining_fuel,
+        remaining_output,
+        action,
+        &mut cooperate,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            *machine = None;
+            return Err(error);
         }
     };
+    fuel_consumed = fuel_consumed.saturating_add(report.fuel_consumed);
+    suspensions = suspensions.saturating_add(report.suspensions);
+    stdout.extend_from_slice(&report.stdout);
 
-    Ok(ExecutionReport {
+    match report.outcome {
+        LinuxDriveOutcome::Command(status) => Ok(LinuxInvocationReport {
+            outcome: "completed",
+            exit_status: Some(status),
+            fault: None,
+            stdout,
+            fuel_consumed,
+            suspensions,
+            booted,
+            command_completed: true,
+            clean_shutdown: false,
+        }),
+        LinuxDriveOutcome::Halted(status) if action == LinuxAction::Shutdown && status == 0 => {
+            *machine = None;
+            Ok(LinuxInvocationReport {
+                outcome: "stopped",
+                exit_status: Some(0),
+                fault: None,
+                stdout,
+                fuel_consumed,
+                suspensions,
+                booted,
+                command_completed: true,
+                clean_shutdown: true,
+            })
+        }
+        outcome => {
+            *machine = None;
+            Ok(linux_failure_report(
+                outcome,
+                stdout,
+                fuel_consumed,
+                suspensions,
+                booted,
+            ))
+        }
+    }
+}
+
+fn drive_linux_until(
+    machine: &mut Rv64Machine,
+    fuel: u64,
+    output_bytes: usize,
+    target: LinuxAction,
+    cooperate: &mut impl FnMut() -> Result<(), SysError>,
+) -> Result<LinuxDriveReport, SysError> {
+    let mut stdout = Vec::new();
+    let mut fuel_consumed = 0_u64;
+    let mut suspensions = 0_u64;
+    loop {
+        let remaining = fuel.saturating_sub(fuel_consumed);
+        if remaining == 0 {
+            return Ok(LinuxDriveReport {
+                outcome: LinuxDriveOutcome::FuelExhausted,
+                stdout,
+                fuel_consumed,
+                suspensions,
+            });
+        }
+        let report = machine.run_slice(remaining.min(LINUX_SLICE_STEPS));
+        fuel_consumed = fuel_consumed.saturating_add(report.steps_executed);
+        if stdout.len().saturating_add(report.console.len()) > output_bytes {
+            return Ok(LinuxDriveReport {
+                outcome: LinuxDriveOutcome::OutputLimit,
+                stdout,
+                fuel_consumed,
+                suspensions,
+            });
+        }
+        stdout.extend_from_slice(&report.console);
+
+        if matches!(report.outcome, SliceOutcome::Yielded) {
+            suspensions = suspensions.saturating_add(1);
+            cooperate()?;
+        }
+
+        let marker_outcome = match target {
+            LinuxAction::Boot if contains_bytes(&stdout, LINUX_READY_MARKER) => {
+                Some(LinuxDriveOutcome::Ready)
+            }
+            LinuxAction::Console => linux_command_status(&stdout).map(LinuxDriveOutcome::Command),
+            _ => None,
+        };
+        if let Some(outcome) = marker_outcome {
+            return Ok(LinuxDriveReport {
+                outcome,
+                stdout,
+                fuel_consumed,
+                suspensions,
+            });
+        }
+
+        match report.outcome {
+            SliceOutcome::Yielded => {}
+            SliceOutcome::Halted(status) => {
+                let status = if status.passed {
+                    0
+                } else {
+                    i32::try_from(status.code).unwrap_or(i32::MAX)
+                };
+                return Ok(LinuxDriveReport {
+                    outcome: LinuxDriveOutcome::Halted(status),
+                    stdout,
+                    fuel_consumed,
+                    suspensions,
+                });
+            }
+            SliceOutcome::Trapped(trap) => {
+                return Ok(LinuxDriveReport {
+                    outcome: LinuxDriveOutcome::Trapped(trap.to_string()),
+                    stdout,
+                    fuel_consumed,
+                    suspensions,
+                });
+            }
+        }
+    }
+}
+
+fn linux_failure_report(
+    outcome: LinuxDriveOutcome,
+    stdout: Vec<u8>,
+    fuel_consumed: u64,
+    suspensions: u64,
+    booted: bool,
+) -> LinuxInvocationReport {
+    let (outcome, exit_status, fault) = match outcome {
+        LinuxDriveOutcome::FuelExhausted => ("fuel-exhausted", None, None),
+        LinuxDriveOutcome::OutputLimit => ("host-fault", None, Some("output-limit".to_string())),
+        LinuxDriveOutcome::Trapped(message) => ("trapped", None, Some(message)),
+        LinuxDriveOutcome::Halted(status) => ("exited", Some(status), None),
+        LinuxDriveOutcome::Ready | LinuxDriveOutcome::Command(_) => (
+            "trapped",
+            None,
+            Some("invalid Linux supervisor transition".to_string()),
+        ),
+    };
+    LinuxInvocationReport {
         outcome,
+        exit_status,
+        fault,
         stdout,
-        stderr: Vec::new(),
         fuel_consumed,
-        memory_limit_bytes: limits.memory_bytes,
         suspensions,
-    })
+        booted,
+        command_completed: false,
+        clean_shutdown: false,
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|candidate| candidate == needle)
+}
+
+fn linux_command_status(stdout: &[u8]) -> Option<i32> {
+    let ready_at = find_last_bytes(stdout, LINUX_READY_MARKER)?;
+    [(0, LINUX_RESULT_OK_MARKER), (64, LINUX_RESULT_USAGE_MARKER)]
+        .into_iter()
+        .filter_map(|(status, marker)| {
+            let marker_at = find_last_bytes(stdout, marker)?;
+            (marker_at + marker.len() <= ready_at).then_some((marker_at, status))
+        })
+        .max_by_key(|(marker_at, _)| *marker_at)
+        .map(|(_, status)| status)
+}
+
+fn find_last_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|candidate| candidate == needle)
 }
 
 fn combine_process_tree(tree: ProcessTreeReport) -> ExecutionReport {
@@ -603,11 +894,13 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
             "rv64-smoke" => RealmProgram::Rv64Smoke,
             "rv64-supervisor" => RealmProgram::Rv64Supervisor,
             "linux-boot" => RealmProgram::LinuxBoot,
+            "linux-console" => RealmProgram::LinuxConsole,
+            "linux-shutdown" => RealmProgram::LinuxShutdown,
             "write-file" => RealmProgram::WriteFile,
             "cat" => RealmProgram::Cat,
             _ => {
                 return Err(SysError::ApiError(format!(
-                    "unsupported realm command `{command}`; supported: pwd, echo, pipe-echo, guest-pipe-echo, realm-sh, rv64-smoke, rv64-supervisor, linux-boot, write-file, cat, smoke-write"
+                    "unsupported realm command `{command}`; supported: pwd, echo, pipe-echo, guest-pipe-echo, realm-sh, rv64-smoke, rv64-supervisor, linux-boot, linux-console, linux-shutdown, write-file, cat, smoke-write"
                 )));
             }
         }
@@ -678,8 +971,41 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
             require_arity("linux-boot", &args.args, 0)?;
             (
                 "linux-boot",
-                SelectedExecution::Linux,
+                SelectedExecution::Linux(LinuxAction::Boot),
                 vec!["linux-boot".to_string()],
+            )
+        }
+        RealmProgram::LinuxConsole => {
+            if args.args.is_empty() {
+                return Err(SysError::ApiError(
+                    "linux-console expects a command token".to_string(),
+                ));
+            }
+            let command = args.args.join(" ");
+            if command.is_empty()
+                || command.len() > MAX_LINUX_COMMAND_BYTES
+                || command
+                    .as_bytes()
+                    .iter()
+                    .any(|byte| *byte == 0 || *byte == b'\n' || *byte == b'\r')
+            {
+                return Err(SysError::ApiError(
+                    "linux-console command is empty, too large, or contains a line break"
+                        .to_string(),
+                ));
+            }
+            (
+                "linux-console",
+                SelectedExecution::Linux(LinuxAction::Console),
+                vec!["linux-console".to_string(), command],
+            )
+        }
+        RealmProgram::LinuxShutdown => {
+            require_arity("linux-shutdown", &args.args, 0)?;
+            (
+                "linux-shutdown",
+                SelectedExecution::Linux(LinuxAction::Shutdown),
+                vec!["linux-shutdown".to_string()],
             )
         }
         RealmProgram::WriteFile => {
@@ -767,6 +1093,8 @@ fn status_response(
             "rv64-smoke",
             "rv64-supervisor",
             "linux-boot",
+            "linux-console",
+            "linux-shutdown",
             "write-file",
             "cat",
             "smoke-write",
@@ -780,13 +1108,15 @@ fn status_response(
         pipe_objects: actor.machine.pipe_objects,
         reserved_pipe_bytes: actor.machine.reserved_pipe_bytes,
         next_process_id: actor.machine.next_process_id.map(|process| process.get()),
-        linux_lifecycle: "on-demand-cold-boot",
+        linux_lifecycle: "lazy-principal-resident",
         linux_state: actor.linux.state,
-        linux_residency: "request-scoped",
+        linux_residency: "principal-affine-store",
         linux_vcpus: 1,
-        linux_ram_persistent: false,
+        linux_ram_persistent: actor.linux.state == "running",
+        linux_ram_durability: "evictable-cache",
         linux_storage_persistent: false,
         linux_boot_executions_this_actor_boot: actor.linux.boot_executions,
+        linux_commands_completed_this_actor_boot: actor.linux.commands_completed,
         linux_clean_shutdowns: actor.linux.clean_shutdowns,
         linux_guest_steps_this_actor_boot: actor.linux.guest_steps,
         linux_last_outcome: actor.linux.last_outcome,
@@ -932,40 +1262,95 @@ mod tests {
     }
 
     #[test]
-    fn linux_boot_reaches_aos_init_and_powers_down_inside_the_rv64_machine() {
-        let response = run_command(
-            ExecArgs {
-                command: Some("linux-boot".to_string()),
-                ..ExecArgs::default()
-            },
-            "alice".to_string(),
-            Box::<TestHost>::default(),
+    fn linux_boot_and_console_preserve_userspace_across_invocations() {
+        let limits = RunLimits {
+            fuel: HARD_MAX_LINUX_STEPS,
+            memory_bytes: HARD_LINUX_MEMORY_BYTES,
+            output_bytes: HARD_MAX_OUTPUT_BYTES,
+        };
+        let mut machine = None;
+        let boot = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Boot,
+            None,
+            limits,
+            || Ok(()),
         )
         .expect("embedded Linux boot succeeds");
 
-        assert_eq!(response.program, "linux-boot");
-        assert_eq!(response.execution_backend, "aos-rv64-linux");
-        assert_eq!(response.outcome, "exited");
-        assert_eq!(response.exit_status, Some(0));
-        assert!(response.stdout.contains("Linux version 6.18.39"));
-        assert!(
-            response
-                .stdout
-                .contains("Machine model: AOS RV64 virtual machine v0")
+        assert_eq!(
+            boot.outcome,
+            "ready",
+            "Linux boot output:\n{}",
+            String::from_utf8_lossy(&boot.stdout)
         );
-        assert!(response.stdout.contains("Run /init as init process"));
-        assert!(response.stdout.contains("AOS LINUX /init"));
-        assert!(response.stdout.contains("reboot: Power down"));
-        assert_eq!(response.memory_limit_bytes, HARD_LINUX_MEMORY_BYTES);
-        assert!(response.fuel_consumed < HARD_MAX_LINUX_STEPS);
-        assert!(response.suspensions > 100);
-        assert_eq!(response.processes, 0);
+        assert!(machine.is_some());
+        let stdout = String::from_utf8_lossy(&boot.stdout);
+        assert!(stdout.contains("Linux version 6.18.39"));
+        assert!(stdout.contains("Machine model: AOS RV64 virtual machine v0"));
+        assert!(stdout.contains("Run /init as init process"));
+        assert!(contains_bytes(&boot.stdout, LINUX_INIT_MARKER));
+        assert!(contains_bytes(&boot.stdout, LINUX_READY_MARKER));
+        assert!(boot.fuel_consumed < HARD_MAX_LINUX_STEPS);
+        assert!(boot.suspensions > 100);
+
+        let first = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Console,
+            Some("counter"),
+            limits,
+            || Ok(()),
+        )
+        .expect("first resident command");
+        let second = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Console,
+            Some("counter"),
+            limits,
+            || Ok(()),
+        )
+        .expect("second resident command");
+
+        assert_eq!(first.outcome, "completed");
+        assert_eq!(first.exit_status, Some(0));
+        assert!(String::from_utf8_lossy(&first.stdout).contains("counter=1"));
+        assert_eq!(second.outcome, "completed");
+        assert!(String::from_utf8_lossy(&second.stdout).contains("counter=2"));
+        assert!(machine.is_some(), "Linux RAM remains resident");
+
+        let shutdown = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Shutdown,
+            None,
+            limits,
+            || Ok(()),
+        )
+        .expect("clean resident shutdown");
+        assert_eq!(shutdown.outcome, "stopped");
+        assert_eq!(shutdown.exit_status, Some(0));
+        assert!(String::from_utf8_lossy(&shutdown.stdout).contains("shutting down"));
+        assert!(machine.is_none(), "clean shutdown releases guest RAM");
+
+        let restarted = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Console,
+            Some("counter"),
+            limits,
+            || Ok(()),
+        )
+        .expect("console lazily restarts Linux");
+        assert!(restarted.booted);
+        assert!(String::from_utf8_lossy(&restarted.stdout).contains("counter=1"));
     }
 
     #[test]
     fn linux_runner_cooperates_after_every_yielded_slice() {
         let mut cooperative_yields = 0_u64;
-        let report = execute_linux_cooperatively(
+        let mut machine = None;
+        let report = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Boot,
+            None,
             RunLimits {
                 fuel: LINUX_SLICE_STEPS * 2,
                 memory_bytes: HARD_LINUX_MEMORY_BYTES,
@@ -978,10 +1363,72 @@ mod tests {
         )
         .expect("bounded Linux execution yields cooperatively");
 
-        assert_eq!(report.outcome, ProcessOutcome::FuelExhausted);
+        assert_eq!(report.outcome, "fuel-exhausted");
         assert_eq!(report.fuel_consumed, LINUX_SLICE_STEPS * 2);
         assert_eq!(report.suspensions, 2);
         assert_eq!(cooperative_yields, report.suspensions);
+        assert!(machine.is_none(), "partial boot RAM is discarded");
+    }
+
+    #[test]
+    fn linux_shutdown_is_idempotent_while_cold() {
+        let mut machine = None;
+        let report = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Shutdown,
+            None,
+            RunLimits {
+                fuel: HARD_MAX_LINUX_STEPS,
+                memory_bytes: HARD_LINUX_MEMORY_BYTES,
+                output_bytes: HARD_MAX_OUTPUT_BYTES,
+            },
+            || Ok(()),
+        )
+        .expect("stopping a cold Linux realm succeeds");
+
+        assert_eq!(report.outcome, "stopped");
+        assert_eq!(report.exit_status, Some(0));
+        assert_eq!(report.fuel_consumed, 0);
+        assert!(!report.booted);
+        assert!(!report.command_completed);
+        assert!(!report.clean_shutdown);
+        assert!(machine.is_none());
+    }
+
+    #[test]
+    fn linux_console_status_uses_the_last_frame_before_ready() {
+        let echoed_false_success =
+            b"AOS END 0\r\nAOS BEGIN\r\nunknown command\r\nAOS END 64\r\nAOS READY\r\n";
+        assert_eq!(linux_command_status(echoed_false_success), Some(64));
+
+        let echoed_false_usage = b"AOS BEGIN\r\nAOS END 64\r\nAOS END 0\r\nAOS READY\r\n";
+        assert_eq!(linux_command_status(echoed_false_usage), Some(0));
+
+        let incomplete = b"AOS BEGIN\r\nAOS END 0\r\n";
+        assert_eq!(linux_command_status(incomplete), None);
+    }
+
+    #[test]
+    fn linux_cooperation_failure_discards_partial_ram() {
+        let mut machine = None;
+        let error = execute_linux_resident_cooperatively(
+            &mut machine,
+            LinuxAction::Boot,
+            None,
+            RunLimits {
+                fuel: HARD_MAX_LINUX_STEPS,
+                memory_bytes: HARD_LINUX_MEMORY_BYTES,
+                output_bytes: HARD_MAX_OUTPUT_BYTES,
+            },
+            || Err(SysError::ApiError("cooperation failed".to_string())),
+        )
+        .expect_err("cooperation failure must escape the Linux supervisor");
+
+        assert!(error.to_string().contains("cooperation failed"));
+        assert!(
+            machine.is_none(),
+            "uncertain guest RAM must not remain cached"
+        );
     }
 
     #[test]
@@ -1225,6 +1672,7 @@ mod tests {
                     guest_steps: 25_000_000,
                     last_outcome: Some("exited"),
                     last_exit_status: Some(0),
+                    commands_completed: 3,
                 },
             },
         ))
@@ -1236,9 +1684,10 @@ mod tests {
         assert!(json.contains("\"home_generation\":7"));
         assert!(json.contains("\"realm_boot_sequence\":9"));
         assert!(json.contains("\"commands_completed\":4"));
-        assert!(json.contains("\"linux_lifecycle\":\"on-demand-cold-boot\""));
+        assert!(json.contains("\"linux_lifecycle\":\"lazy-principal-resident\""));
         assert!(json.contains("\"linux_state\":\"cold\""));
         assert!(json.contains("\"linux_boot_executions_this_actor_boot\":2"));
+        assert!(json.contains("\"linux_commands_completed_this_actor_boot\":3"));
         assert!(json.contains("\"linux_guest_steps_this_actor_boot\":25000000"));
         assert!(json.contains("\"linux_outer_wasm_metering\":\"principal-affine-invocation\""));
         assert!(json.contains("\"component_residency\":\"principal-affine-store\""));
