@@ -51,6 +51,10 @@
   hook bus, collect private same-turn prompt context, and route it back only to
   the exact originating session. Adaptive, propose, automatic, and off modes
   preserve the agent's judgment while respecting its existing authority.
+- A versioned Linux Realm path-identity contract separating semantic mount IDs,
+  guest paths, Astrid resource URIs, and human display paths. Execution and
+  status responses now distinguish mounted nested-WASM projections from the
+  Linux guest's current RAM-only home and unmounted workspace.
 - Crash-consistent `aos-linux-realm` home generations: a principal-scoped atomic
   KV head selects immutable BLAKE3-addressed file and manifest blobs, with
   concurrent-writer retry, corruption checks, daemon-restart recovery, and lazy
