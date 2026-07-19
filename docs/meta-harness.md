@@ -112,6 +112,14 @@ future reasoning needs them. Turn a repeated workflow or domain-specific method
 into a skill so it becomes available when relevant rather than occupying every
 prompt.
 
+Capsules contribute durable skills by writing valid
+`home://skills/<id>/SKILL.md` files for the principal. The `aos-skills` service
+indexes that directory generically: `list_skills` returns metadata and
+`read_skill` loads the selected workflow. This works for user-authored capsules
+as well as the Community Edition fleet. Host plugins can vendor important
+first-party skills for native startup discovery and offline operation, while
+the AOS index carries skills installed after the plugin was published.
+
 ### Harness code
 
 Improve context construction, retrieval, prompt assembly, planning, tool

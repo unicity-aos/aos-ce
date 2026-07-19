@@ -21,6 +21,8 @@ meta-harness.
 1. Keep the user's current objective and instructions as the anchor.
 2. Inspect the relevant skills, memory, capsules, interfaces, tools, and prior
    traces instead of assuming what your world contains.
+   When `list_skills` is present, inspect `dir_path: "skills"` and use
+   `read_skill` to load relevant capsule-contributed workflows.
 3. Notice missing abilities, repeated work, recurring failures, and improvements
    that would compound across future tasks.
 4. Decide whether the extension is needed inline, belongs immediately after the

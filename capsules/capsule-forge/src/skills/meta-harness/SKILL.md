@@ -55,6 +55,13 @@ to learn the installed composition and typed contracts. Inspect relevant
 skills, memory, harness files, traces, and evaluations rather than reasoning
 from names alone.
 
+When `list_skills` is available, call it with `dir_path` set to `skills` to
+discover workflows contributed by any installed capsule. Load a relevant entry
+with `read_skill` using the same directory and its skill ID. This is the dynamic
+AOS skill path: the skill remains durable in the principal's `home://skills/`
+across sessions without requiring a host-plugin release. Reading it supplies
+instructions; capsule grants and AOS policy still supply authority.
+
 Tool availability is part of the world. Discover it. If an AOS surface is not
 present, continue with the parts of the work that are possible and identify the
 missing substrate precisely.
@@ -125,6 +132,11 @@ the reason it exists, its validation evidence, and the traces that explain it.
 When the user approves a standing preference such as “think broadly and improve
 your setup when useful” or “bring me proposals,” preserve that instruction in
 the available principal-scoped memory or configuration.
+
+A capsule that contributes a valid `home://skills/<id>/SKILL.md` joins the same
+skills index as first-party capsules. Host plugins may also vendor important
+skills for native startup discovery and offline use, but that snapshot is a
+distribution adapter rather than the only durable copy.
 
 Memory carries intent and continuity. AOS capabilities carry operational
 authority. Together they let the agent remain itself across sessions while

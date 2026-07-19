@@ -545,6 +545,8 @@ mod tests {
             "Decide whether the extension is needed inline",
             "Not every agent has subagents",
             "capabilities remain the operational boundary",
+            "list_skills",
+            "read_skill",
         ] {
             assert!(
                 META_HARNESS_QUICKSTART_MD.contains(required),
@@ -564,6 +566,8 @@ mod tests {
             "Worker or subagent",
             "optional pattern, not a prerequisite",
             "Improve harness code from experience",
+            "workflows contributed by any installed capsule",
+            "instructions; capsule grants and AOS policy still supply authority",
             "Definition of done",
         ] {
             assert!(
