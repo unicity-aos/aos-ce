@@ -1,0 +1,247 @@
+#define _GNU_SOURCE
+
+#include <errno.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/reboot.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/mount.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <termios.h>
+#include <unistd.h>
+
+#define PROTOCOL_PREFIX "AOS/1 "
+#define TOKEN_BYTES 16
+#define TOKEN_HEX_BYTES (TOKEN_BYTES * 2)
+#define MAX_COMMAND_BYTES 1024
+#define AGENT_UID 1000
+#define AGENT_GID 1000
+
+static uint64_t command_count;
+
+static int set_limit(int resource, rlim_t value)
+{
+    struct rlimit limit = { .rlim_cur = value, .rlim_max = value };
+
+    return setrlimit(resource, &limit);
+}
+
+static void write_all(const char *bytes, size_t length)
+{
+    while (length > 0) {
+        ssize_t written = write(STDOUT_FILENO, bytes, length);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return;
+        bytes += (size_t)written;
+        length -= (size_t)written;
+    }
+}
+
+static void write_text(const char *text)
+{
+    write_all(text, strlen(text));
+}
+
+static bool valid_token(const char *token)
+{
+    for (size_t index = 0; index < TOKEN_HEX_BYTES; index++) {
+        char byte = token[index];
+        if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f')))
+            return false;
+    }
+    return token[TOKEN_HEX_BYTES] == ' ';
+}
+
+static void emit_begin(const char *token)
+{
+    write_text("AOS BEGIN ");
+    write_all(token, TOKEN_HEX_BYTES);
+    write_text("\n");
+}
+
+static void emit_end(const char *token, int status)
+{
+    char status_text[16];
+    int length = snprintf(status_text, sizeof(status_text), "%d", status);
+
+    write_text("\nAOS END ");
+    write_all(token, TOKEN_HEX_BYTES);
+    write_text(" ");
+    if (length > 0)
+        write_all(status_text, (size_t)length);
+    write_text("\n");
+}
+
+static int shell_status(const char *script)
+{
+    pid_t child = fork();
+    if (child < 0)
+        return 70;
+
+    if (child == 0) {
+        char *const argv[] = { "sh", "-c", (char *)script, NULL };
+        static char *const environment[] = {
+            "HOME=/home/agent",
+            "PATH=/bin:/usr/bin",
+            "USER=agent",
+            "LOGNAME=agent",
+            "SHELL=/bin/sh",
+            "TERM=dumb",
+            NULL,
+        };
+        int null_fd;
+        int output_fd;
+
+        (void)setpgid(0, 0);
+        null_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        output_fd = open("/dev/console", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+        if (null_fd < 0 || output_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0 ||
+            dup2(output_fd, STDOUT_FILENO) < 0 ||
+            dup2(output_fd, STDERR_FILENO) < 0)
+            _exit(126);
+        if (null_fd != STDIN_FILENO)
+            close(null_fd);
+        if (output_fd != STDOUT_FILENO && output_fd != STDERR_FILENO)
+            close(output_fd);
+        if (chdir("/home/agent") < 0 || setgroups(0, NULL) < 0 ||
+            setgid(AGENT_GID) < 0 || setuid(AGENT_UID) < 0)
+            _exit(126);
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 ||
+            set_limit(RLIMIT_CORE, 0) < 0 || set_limit(RLIMIT_NOFILE, 64) < 0 ||
+            set_limit(RLIMIT_NPROC, 32) < 0 ||
+            set_limit(RLIMIT_FSIZE, 8 * 1024 * 1024) < 0)
+            _exit(126);
+        execve("/bin/sh", argv, environment);
+        _exit(127);
+    }
+
+    (void)setpgid(child, child);
+    int child_status;
+    while (waitpid(child, &child_status, 0) < 0) {
+        if (errno != EINTR)
+            return 70;
+    }
+
+    /* PID 1 owns the whole guest process lane. Kill and reap every orphan
+     * before emitting the result frame so background output cannot cross a
+     * command boundary. */
+    (void)kill(-1, SIGKILL);
+    int orphan_status;
+    while (waitpid(-1, &orphan_status, 0) > 0)
+        ;
+
+    if (WIFEXITED(child_status))
+        return WEXITSTATUS(child_status);
+    if (WIFSIGNALED(child_status))
+        return 128 + WTERMSIG(child_status);
+    return 70;
+}
+
+static int execute_command(const char *command)
+{
+    if (strcmp(command, "ping") == 0) {
+        write_text("pong\n");
+        return 0;
+    }
+    if (strcmp(command, "counter") == 0) {
+        char number[32];
+        int length = snprintf(number, sizeof(number), "counter=%llu\n",
+                              (unsigned long long)command_count);
+        if (length > 0)
+            write_all(number, (size_t)length);
+        return 0;
+    }
+    if (strncmp(command, "echo ", 5) == 0) {
+        write_text(command + 5);
+        write_text("\n");
+        return 0;
+    }
+    if (strncmp(command, "sh ", 3) == 0 && command[3] != '\0')
+        return shell_status(command + 3);
+    write_text("unknown command\n");
+    return 64;
+}
+
+static void configure_console(void)
+{
+    int console = open("/dev/console", O_RDWR | O_NOCTTY);
+    if (console >= 0) {
+        (void)dup2(console, STDIN_FILENO);
+        (void)dup2(console, STDOUT_FILENO);
+        (void)dup2(console, STDERR_FILENO);
+        if (console > STDERR_FILENO)
+            close(console);
+    }
+
+    struct termios attributes;
+    if (tcgetattr(STDIN_FILENO, &attributes) == 0) {
+        attributes.c_lflag &= (tcflag_t)~(ECHO | ECHONL);
+        (void)tcsetattr(STDIN_FILENO, TCSANOW, &attributes);
+    }
+}
+
+int main(void)
+{
+    char line[MAX_COMMAND_BYTES + sizeof(PROTOCOL_PREFIX) + TOKEN_HEX_BYTES + 2];
+
+    configure_console();
+    (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+    (void)mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, "");
+    (void)mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "");
+    umask(0077);
+    write_text("AOS LINUX /init\n");
+    write_text("AOS USERLAND buildroot-2026.05.1 busybox-1.38.0\n");
+
+    for (;;) {
+        write_text("AOS READY\n");
+        ssize_t length;
+        do {
+            length = read(STDIN_FILENO, line, sizeof(line) - 1);
+        } while (length < 0 && errno == EINTR);
+        if (length <= 0)
+            continue;
+        line[length] = '\0';
+        while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r'))
+            line[--length] = '\0';
+
+        size_t prefix_length = strlen(PROTOCOL_PREFIX);
+        if ((size_t)length <= prefix_length + TOKEN_HEX_BYTES ||
+            memcmp(line, PROTOCOL_PREFIX, prefix_length) != 0 ||
+            !valid_token(line + prefix_length)) {
+            write_text("AOS PROTOCOL ERROR\n");
+            continue;
+        }
+
+        char *token = line + prefix_length;
+        char *command = token + TOKEN_HEX_BYTES + 1;
+        if (*command == '\0') {
+            write_text("AOS PROTOCOL ERROR\n");
+            continue;
+        }
+
+        command_count++;
+        emit_begin(token);
+        if (strcmp(command, "shutdown") == 0) {
+            write_text("shutting down\n");
+            emit_end(token, 0);
+            sync();
+            (void)reboot(RB_POWER_OFF);
+            continue;
+        }
+
+        int status = execute_command(command);
+        emit_end(token, status);
+    }
+}

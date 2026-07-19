@@ -1,17 +1,30 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-    echo "usage: $0 LINUX_SOURCE BUILD_DIR [OUTPUT_IMAGE]" >&2
+if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
+    echo "usage: $0 LINUX_SOURCE ROOTFS_CPIO BUILD_DIR [OUTPUT_IMAGE]" >&2
     exit 64
 fi
 
-kernel_source=$1
-build_dir=$2
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-output_image=${3:-"$script_dir/Image"}
-expected_init=7d2341377ba960cb3db791096e6746b025b0c65be02e21fc5e279605ae0dc61c
-expected_image=fd81101a96b7bccfdaa1a0f451cf828df3126f337e0dfbd13db37495cf206982
+caller_dir=$(pwd)
+kernel_source=$(CDPATH='' cd -- "$1" && pwd)
+rootfs_dir=$(CDPATH='' cd -- "$(dirname -- "$2")" && pwd)
+rootfs_cpio=$rootfs_dir/$(basename -- "$2")
+case $3 in
+    /*) build_dir=$3 ;;
+    *) build_dir=$caller_dir/$3 ;;
+esac
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+if [ "$#" -eq 4 ]; then
+    case $4 in
+        /*) output_image=$4 ;;
+        *) output_image=$caller_dir/$4 ;;
+    esac
+else
+    output_image=$script_dir/Image
+fi
+expected_rootfs=84d4edfc386be77369121f109ce180566f02393f8a314c8054787a27071a7bee
+expected_image=fadd0391fb17e54fc4831999a3a0ba87fffd51a14f84a3b6cc0b836cb8a15476
 record_image=${AOS_RECORD_IMAGE:-0}
 
 if [ "$record_image" != 0 ] && [ "$record_image" != 1 ]; then
@@ -27,6 +40,10 @@ if [ ! -x "$kernel_source/scripts/config" ]; then
     echo "not an extracted Linux source tree: $kernel_source" >&2
     exit 66
 fi
+if [ ! -f "$rootfs_cpio" ]; then
+    echo "rootfs cpio does not exist: $rootfs_cpio" >&2
+    exit 66
+fi
 if [ "$(make -s -C "$kernel_source" kernelversion)" != "6.18.39" ]; then
     echo "build-image.sh requires exact Linux 6.18.39 sources" >&2
     exit 66
@@ -40,21 +57,13 @@ if ! ld.lld --version | head -n 1 | grep -q '18\.1\.3'; then
     exit 69
 fi
 
-mkdir -p "$build_dir"
-init="$build_dir/aos-init"
-initramfs="$build_dir/initramfs.list"
-
-clang --target=riscv64-unknown-linux-gnu \
-    -march=rv64ima_zicsr_zifencei -mabi=lp64 \
-    -nostdlib -static -fuse-ld=lld \
-    -Wl,--build-id=none -Wl,-Ttext=0x10000 \
-    -o "$init" "$script_dir/init.S"
-actual_init=$(sha256sum "$init" | cut -d ' ' -f 1)
-if [ "$record_image" = 0 ] && [ "$actual_init" != "$expected_init" ]; then
-    echo "init digest mismatch: expected $expected_init, got $actual_init" >&2
+actual_rootfs=$(sha256sum "$rootfs_cpio" | cut -d ' ' -f 1)
+if [ "$record_image" = 0 ] && [ "$actual_rootfs" != "$expected_rootfs" ]; then
+    echo "rootfs digest mismatch: expected $expected_rootfs, got $actual_rootfs" >&2
     exit 70
 fi
-sed "s|@AOS_INIT@|$init|" "$script_dir/initramfs.list" > "$initramfs"
+
+mkdir -p "$build_dir"
 
 make -C "$kernel_source" O="$build_dir/kernel" \
     ARCH=riscv LLVM=1 LLVM_IAS=1 tinyconfig
@@ -72,15 +81,29 @@ make -C "$kernel_source" O="$build_dir/kernel" \
     --disable HIBERNATION \
     --disable CPU_IDLE \
     --enable PRINTK \
+    --enable MULTIUSER \
+    --enable POSIX_TIMERS \
     --enable TTY \
+    --disable VT \
+    --disable LEGACY_TIOCSTI \
+    --disable UNIX98_PTYS \
+    --disable LEGACY_PTYS \
     --enable HVC_DRIVER \
     --enable HVC_RISCV_SBI \
     --enable SERIAL_EARLYCON_RISCV_SBI \
+    --disable DEVMEM \
+    --disable DEVPORT \
+    --disable INPUT \
+    --disable MEDIA_SUPPORT \
+    --disable NET \
     --enable BINFMT_ELF \
+    --enable BINFMT_SCRIPT \
+    --enable PROC_FS \
+    --enable SYSFS \
     --enable DEVTMPFS \
     --enable DEVTMPFS_MOUNT \
     --enable BLK_DEV_INITRD \
-    --set-str INITRAMFS_SOURCE "$initramfs" \
+    --set-str INITRAMFS_SOURCE "$rootfs_cpio" \
     --enable INITRAMFS_COMPRESSION_NONE \
     --disable INITRAMFS_COMPRESSION_GZIP \
     --disable DEBUG_INFO \
@@ -106,6 +129,6 @@ if [ "$record_image" = 0 ] && [ "$actual_image" != "$expected_image" ]; then
 fi
 cp "$image" "$output_image"
 if [ "$record_image" = 1 ]; then
-    printf 'init_elf_sha256=%s\nimage_sha256=%s\n' "$actual_init" "$actual_image"
+    printf 'rootfs_cpio_sha256=%s\nimage_sha256=%s\n' "$actual_rootfs" "$actual_image"
 fi
 printf '%s  %s\n' "$actual_image" "$output_image"

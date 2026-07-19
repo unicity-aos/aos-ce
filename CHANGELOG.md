@@ -49,6 +49,10 @@
   commands across separately metered tool invocations, preserves userspace state,
   shuts down cleanly through SBI, and restarts lazily without host-process
   authority.
+- A reproducibly pinned Buildroot 2026.05.1, static musl, and BusyBox `ash`
+  workbench for the resident Linux guest, with an unprivileged `agent` shell,
+  token-bound command framing, bounded process resources, descendant cleanup,
+  exact exit-status propagation, and a deliberately explicit `linux-sh` surface.
 - A private Realm `pipe`/`spawn-signed`/`wait`/`signal` ABI and signed
   `guest-pipe-echo` workload, with generation-checked process handles, bounded
   descendant admission, pre-partitioned request budgets, unified file/pipe

@@ -2,7 +2,7 @@
 
 Status: active implementation programme; bounded RV64IMA/Sv39 machine core live
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-07-19
 
 ## 1. Decision
 
@@ -168,12 +168,16 @@ The pinned Linux longterm 6.18.39 image now reaches the AOS-controlled `/init`
 inside a 32 MiB machine and remains alive in a framed console command loop. Its
 source archive matches kernel.org SHA-256
 `a7a7e3d2ae9d95e74197223a8d4eb5f6be7aac21b6e6de27e9685d001c1f8cb0`;
-the deterministic raw `Image` is
-`fd81101a96b7bccfdaa1a0f451cf828df3126f337e0dfbd13db37495cf206982`.
-An independent clean rebuild in the recorded OCI builder produces the same
-digest. The checked-in capsule regression asserts the exact kernel version, AOS
-machine model, `/init` launch and ready markers, userspace state continuity over
-separate calls, clean SBI shutdown, RAM release, and fresh restart.
+the Buildroot 2026.05.1 rootfs is
+`84d4edfc386be77369121f109ce180566f02393f8a314c8054787a27071a7bee`,
+and the deterministic raw `Image` is
+`fadd0391fb17e54fc4831999a3a0ba87fffd51a14f84a3b6cc0b836cb8a15476`.
+The checked-in capsule regression asserts the exact kernel and userland
+versions, AOS machine model, PID 1 launch and ready markers, diagnostic state
+continuity, real UID-1000 BusyBox shell execution, warm in-RAM file continuity,
+nonzero exit propagation, forged-frame rejection, background descendant cleanup,
+the exact five-device surface and unreadable PID-1 console descriptors, clean SBI
+shutdown, RAM release, and fresh restart.
 
 The earlier cold-boot artifact ran through AOS Runtime 0.10.1 as an installed
 `wasm32-unknown-unknown` component and established the live tool path. The
@@ -184,11 +188,16 @@ each 100,000-step RV64 slice. The 32 MiB guest limit is deliberately below
 Astrid's independently enforced 64 MiB component linear-memory ceiling, leaving
 room for the embedded image, interpreter, stack, and capsule state.
 
-This is resident Linux, but it is not yet the agent workbench. The initramfs has
-only the static AOS `/init` and `/dev/console`; its commands are protocol probes,
-not shell built-ins. It has no shell, libc, packages, writable root, or workspace
-mount. A PLIC, compressed instructions, and virtio block also remain absent and
-will be added only when an admitted device requires them.
+This is now the first useful agent-workbench slice: static musl 1.2.6, BusyBox
+1.38.0, `ash`, `/proc`, `/sys`, and a UID/GID-1000 agent home execute inside the
+measured RV64 guest. It is not Bash, Debian, or the completed distribution. It
+has no Python, in-guest compiler, package manager, network, PTY, durable disk, or
+workspace mount. Its static `/dev` contract is only console, null, zero, random,
+and urandom: there are no raw-memory, block, network, graphics, additional TTY,
+or PTY nodes. The kernel disables legacy `TIOCSTI`, both PTY families,
+networking, raw memory/port devices, input, and media support.
+A PLIC, compressed instructions, and virtio block also remain absent and will be
+added only when an admitted device requires them.
 
 ### 2.5 Privileged-machine component sketch and invariant ledger
 
@@ -238,10 +247,9 @@ an implicit RISC-V device.
 | Linux placement | Kernel, initramfs, and FDT ranges are checked before mutation; Linux receives the standard RV64 register handoff in S-mode | exact RAM-byte, FDT-header, layout, register, CSR, and privilege assertions |
 | SBI boundary | Firmware sees only admitted RAM, deterministic time, and bounded console/reset devices; unsupported extensions fail closed | Base 3.0 probe, DBCN write, TIME interrupt, SRST halt, and invalid-address regressions |
 
-The table is also the review boundary: resident Linux does not mean a useful
-Linux environment. The next increment replaces the proof initramfs with a pinned
-Buildroot AOS userland, then connects a durable block overlay to the principal
-Realm filesystem contract.
+The table is also the review boundary: a useful static shell does not imply a
+durable distribution. The next increment connects a durable block overlay to
+the principal Realm filesystem contract and projects an admitted workspace.
 
 ## 3. The system seen from each side
 
@@ -703,12 +711,22 @@ machine and every CPU, memory, storage, network, and device charge rolls up to
 that owner.
 
 The current Linux adapter is lazy and principal-resident. The affined Store owns
-one optional 32 MiB single-hart machine. `linux-boot` or `linux-console` creates
-it when cold, advances Linux in bounded slices until the controlled `/init`
-reports ready, and retains its CPU and RAM for later invocations. A `counter`
-probe reaches 1 and then 2 across separate calls. No CPU runs while the Store is
-idle: every guest step occurs inside an admitted outer tool invocation and is
-charged to the verified principal.
+one optional 32 MiB single-hart machine. `linux-boot`, `linux-console`, or
+`linux-sh` creates it when cold, advances Linux in bounded 100,000-step slices
+until the controlled `/init` reports ready, and retains its CPU and RAM for later
+invocations. A `counter` probe reaches 1 and then 2 across separate calls, and a
+file written by UID 1000 under `/home/agent` is readable by a later shell call.
+No CPU runs while the Store is idle: every guest step occurs inside an admitted
+outer tool invocation and is charged to the verified principal.
+
+Every non-boot command uses a fresh 128-bit host-CSPRNG token. PID 1 disables
+console echo and emits token-bound begin/end frames; the host accepts the final
+matching status only before the next ready marker. The shell never receives the
+token, reads stdin from `/dev/null`, receives separately reopened write-only
+stdout/stderr, cannot reopen the root-only console, runs with `no_new_privs` and
+resource limits, and has all surviving descendants killed and reaped before the
+result frame. A forged marker and delayed background writer are executable
+regressions, not assumptions.
 
 `linux-shutdown` asks PID 1 to power down through SRST and releases the machine;
 stopping an already-cold Realm is idempotent. A guest trap, fuel exhaustion,
@@ -772,9 +790,10 @@ Its non-negotiable rules are:
    charged guest steps, charged outer fuel, peak memory, and lifecycle reason.
 
 Principal-affine residency, idle Store eviction, the persistent Linux supervisor,
-bounded console transport, and clean shutdown are now implemented. The next order
-is the Buildroot AOS userland, durable block device, explicit disabled-vs-evicted
-lifecycle policy, then deterministic virtual SMP. Initial SMP can interleave
+token-bound console transport, bounded BusyBox shell, and clean shutdown are
+now implemented. The next order is the durable block device and workspace
+projection, explicit disabled-vs-evicted lifecycle policy, then deterministic
+virtual SMP. Initial SMP can interleave
 harts in one host thread with a fixed scheduling quantum. True host-parallel harts
 remain optional because they add races to snapshots, metering, devices, and
 reproducibility without improving cross-principal isolation.
@@ -1373,11 +1392,14 @@ CE set rather than test-installed companions.
 - [x] keep one RV64 machine in the affined Store, leave PID 1 alive, and add a
   bounded framed console command transport with cross-invocation userspace-state
   proof, clean shutdown, restart, and fail-closed RAM destruction;
+- [x] replace the proof initramfs with pinned Buildroot 2026.05.1, static musl
+  1.2.6 and BusyBox 1.38.0; execute `ash` as UID 1000 through token-bound
+  frames, strip privilege bits, close console input, bound descendants and prove
+  warm file continuity plus exact exit status;
 - add explicit Realm `start`, `stop`, and status transitions plus bounded idle
   eviction after that Store is kernel-metered to its verified principal;
 - add deterministic multi-hart scheduling, SBI HSM/IPI support, per-hart CLINT
   state, and an SMP-enabled kernel only after the principal residency boundary;
-- replace the proof initramfs with a pinned Buildroot 2026.05.1 AOS userland;
 - add virtio-block behind an immutable base plus principal-private COW block
   overlay before making the root filesystem writable;
 - replace the probe-only execution adapter with a Realm process/job record whose
@@ -1657,17 +1679,17 @@ explicit restart.
 - [ ] defer public WIT, Debian naming, arbitrary package claims, and native-kernel
     coupling until evidence requires them.
 
-The Linux-bearing executable artifact is now resident: pinned Linux 6.18.39
-serial-boots to an AOS-controlled `/init`, serves bounded commands across
-separate invocations, preserves userspace RAM, powers down cleanly, and restarts.
-The next artifact is the Buildroot 2026.05.1 AOS userland, followed by a durable
+The Linux-bearing executable artifact is now a useful static workbench: pinned
+Linux 6.18.39 serial-boots the Buildroot 2026.05.1 rootfs, executes token-bound
+BusyBox `ash` commands as UID 1000 across separate invocations, preserves warm
+userspace RAM, powers down cleanly, and restarts. The next artifact is a durable
 virtio-block projection of the principal home and workspace. The firmware
 contract beneath it is executable: exact image/initramfs placement, generated
 FDT bytes, S-mode register state, and bounded SBI 3.0 Base/TIME/DBCN/SRST
 handling.
 Every artifact must run in bounded slices and
 fail with an exact architectural trap before virtio block, persistence,
-networking, or a shell are added. The parallel process track still needs
+networking or broader distribution packages are added. The parallel process track still needs
 guest-visible executable lookup, the realm-wide open-file-description table,
 sequential spawn actions, and explicit foreground job records. The storage track
 adds named checkpoint/diff/reset and outer workspace promotion. Bash and a

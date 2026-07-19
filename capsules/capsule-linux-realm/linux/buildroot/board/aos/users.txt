@@ -1,0 +1,1 @@
+agent 1000 agent 1000 * /home/agent /bin/sh - AOS agent
