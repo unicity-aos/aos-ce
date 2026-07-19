@@ -658,7 +658,6 @@ struct Devices {
     msip: bool,
     console_input: VecDeque<u8>,
     console_output: Vec<u8>,
-    console_reported: usize,
     max_console_bytes: usize,
 }
 
@@ -718,7 +717,6 @@ impl Devices {
             msip: false,
             console_input: VecDeque::new(),
             console_output: Vec::new(),
-            console_reported: 0,
             max_console_bytes: config.max_console_bytes,
         }
     }
@@ -730,7 +728,6 @@ impl Devices {
         self.msip = false;
         self.console_input.clear();
         self.console_output.clear();
-        self.console_reported = 0;
     }
 
     fn load_program(&mut self, program: &[u8]) {
@@ -738,9 +735,7 @@ impl Devices {
     }
 
     fn take_new_console(&mut self) -> Vec<u8> {
-        let bytes = self.console_output[self.console_reported..].to_vec();
-        self.console_reported = self.console_output.len();
-        bytes
+        std::mem::take(&mut self.console_output)
     }
 
     fn read(&mut self, address: u64, bytes: u8) -> Result<u64, MachineTrap> {

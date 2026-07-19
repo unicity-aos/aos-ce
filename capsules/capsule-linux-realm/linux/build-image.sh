@@ -10,8 +10,14 @@ kernel_source=$1
 build_dir=$2
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 output_image=${3:-"$script_dir/Image"}
-expected_init=24ba7748ca40285eb5a00e61b8f26e0f0058f7de50a1a203c863a92f74b4e8a5
-expected_image=0dd20934e7c1b54484803a9a474a35e931f26dd881b280178d3e4fe937595852
+expected_init=7d2341377ba960cb3db791096e6746b025b0c65be02e21fc5e279605ae0dc61c
+expected_image=fd81101a96b7bccfdaa1a0f451cf828df3126f337e0dfbd13db37495cf206982
+record_image=${AOS_RECORD_IMAGE:-0}
+
+if [ "$record_image" != 0 ] && [ "$record_image" != 1 ]; then
+    echo "AOS_RECORD_IMAGE must be 0 or 1" >&2
+    exit 64
+fi
 
 if [ -e "$build_dir" ]; then
     echo "BUILD_DIR must not already exist: $build_dir" >&2
@@ -44,7 +50,7 @@ clang --target=riscv64-unknown-linux-gnu \
     -Wl,--build-id=none -Wl,-Ttext=0x10000 \
     -o "$init" "$script_dir/init.S"
 actual_init=$(sha256sum "$init" | cut -d ' ' -f 1)
-if [ "$actual_init" != "$expected_init" ]; then
+if [ "$record_image" = 0 ] && [ "$actual_init" != "$expected_init" ]; then
     echo "init digest mismatch: expected $expected_init, got $actual_init" >&2
     exit 70
 fi
@@ -94,9 +100,12 @@ make -j8 -C "$kernel_source" O="$build_dir/kernel" \
 
 image="$build_dir/kernel/arch/riscv/boot/Image"
 actual_image=$(sha256sum "$image" | cut -d ' ' -f 1)
-if [ "$actual_image" != "$expected_image" ]; then
+if [ "$record_image" = 0 ] && [ "$actual_image" != "$expected_image" ]; then
     echo "image digest mismatch: expected $expected_image, got $actual_image" >&2
     exit 70
 fi
 cp "$image" "$output_image"
+if [ "$record_image" = 1 ]; then
+    printf 'init_elf_sha256=%s\nimage_sha256=%s\n' "$actual_init" "$actual_image"
+fi
 printf '%s  %s\n' "$actual_image" "$output_image"

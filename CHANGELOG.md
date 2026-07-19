@@ -44,6 +44,11 @@
   process identities, CAS-allocated boot sequences, an inner owner guard,
   foreground resource reaping, and live process/pipe accounting through direct
   metered tool entry points.
+- A principal-resident Linux lifecycle inside `aos-linux-realm`: Linux 6.18.39
+  remains alive in evictable per-principal RAM, accepts bounded framed console
+  commands across separately metered tool invocations, preserves userspace state,
+  shuts down cleanly through SBI, and restarts lazily without host-process
+  authority.
 - A private Realm `pipe`/`spawn-signed`/`wait`/`signal` ABI and signed
   `guest-pipe-echo` workload, with generation-checked process handles, bounded
   descendant admission, pre-partitioned request budgets, unified file/pipe

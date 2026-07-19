@@ -4,11 +4,13 @@ This directory contains the executable seed of AOS Realm: a principal-owned
 agent workbench whose guest interface is Linux-shaped and whose outer authority
 is an ordinary Astrid capsule.
 
-It now boots Linux, but it is not yet the useful AOS Realm distribution. The
-capsule runs signed, embedded core WebAssembly command modules under Wasmi and a
-pinned Linux 6.18.39 image inside the bounded `aos-rv64-virt-v0` machine. The
-first Linux image reaches an AOS-controlled `/init`, retains its serial trace,
-and powers down through SBI. It does not yet contain a shell or general userland.
+It now keeps Linux resident for each active principal, but it is not yet the
+useful AOS Realm distribution. The capsule runs signed, embedded core WebAssembly
+command modules under Wasmi and a pinned Linux 6.18.39 image inside the bounded
+`aos-rv64-virt-v0` machine. The first Linux image reaches an AOS-controlled
+`/init`, accepts a bounded serial command protocol, and remains alive until an
+explicit shutdown or runtime eviction. It does not yet contain a shell or general
+userland.
 Commands receive structured `argv` and an explicit current directory; there is
 no host shell command line and the manifest requests no `host_process`
 capability.
@@ -21,8 +23,8 @@ agent -> realm tool -> signed nested WASM command -> private realm ABI
 
 ## What works
 
-`linux_realm_exec` currently admits eight signed core-WASM workloads, two
-diagnostic RV64 instruction images, and the first full Linux boot image:
+`linux_realm_exec` currently admits signed core-WASM workloads, two diagnostic
+RV64 instruction images, and the first resident Linux boot image:
 
 - `pwd`
 - `echo`
@@ -38,10 +40,15 @@ diagnostic RV64 instruction images, and the first full Linux boot image:
   mode with `mret`, delegates a Supervisor `ecall` through `stvec`, returns with
   `sret`, writes `STR\n`, and halts from Supervisor mode. It charges 31 bounded
   steps while retiring 30 instructions because `ecall` does not retire
-- `linux-boot`, which boots the embedded, reproducibly built Linux 6.18.39
-  `Image` in a 32 MiB guest, reaches `AOS LINUX /init`, and powers down after
-  14,823,384 bounded machine steps. The packaged WASM path yields to Astrid
-  between each 100,000-step slice
+- `linux-boot`, which lazily boots the embedded, reproducibly built Linux 6.18.39
+  `Image` in a 32 MiB guest and returns when `/init` reports `AOS READY`; calling
+  it again while warm is a zero-step readiness check
+- `linux-console`, which lazily boots if needed, sends one validated line to the
+  resident `/init`, and returns one framed result while preserving Linux RAM;
+  the proof commands are `ping`, `counter`, and `echo ...`
+- `linux-shutdown`, which cleanly powers a warm guest down through SBI and
+  releases its RAM; stopping an already-cold realm is an idempotent zero-step
+  operation
 - `write-file`
 - `cat`
 - `smoke-write`, the original interpreter smoke test
@@ -49,12 +56,13 @@ diagnostic RV64 instruction images, and the first full Linux boot image:
 `linux_realm_status` reports the guest-visible mount and command surface without
 exposing physical host paths. It also reports the caller's actor boot sequence,
 completed-command count, next process identifier, and live process/pipe resource
-accounting. Linux-specific fields state that the current adapter is an on-demand
-cold boot with one vCPU, request-scoped RAM, no Linux-attached persistent storage,
-exact per-principal guest-step totals for the current resident Store, and outer
-Wasm metering charged to the verified invoking principal. The separate Realm home is durable
-but does not become a Linux mount until the virtio-block/COW path exists. Every execution result identifies
-the kernel-stamped owner principal and exact execution backend, and includes the
+accounting. Linux-specific fields state whether the one-vCPU guest is cold or
+running, whether RAM is currently resident, the number of boots, completed
+commands, clean shutdowns, and exact guest-step totals for the current
+principal-affine Store. Outer Wasm metering is charged to the verified invoking
+principal. The separate Realm home is durable but does not become a Linux mount
+until the virtio-block/COW path exists. Every execution result identifies the
+kernel-stamped owner principal and exact execution backend, and includes the
 outcome, exit status, stdout, stderr, fuel or instruction accounting, memory
 ceiling, and process identifiers where the semantic process kernel allocated
 them.
@@ -151,11 +159,11 @@ it is not presented as an assigned RISC-V SBI implementation ID. The machine has
 no browser, JavaScript, JIT, host process, host filesystem, or network dependency
 and compiles for the capsule's `wasm32-unknown-unknown` target.
 
-The pinned kernel and AOS-controlled `/init` now produce a retained serial trace
-inside this machine. That is a Linux boot claim, not yet a Linux-workbench claim:
-the initramfs has only `/init` and `/dev/console`. Compressed instructions, PLIC,
-and virtio block are deliberately deferred until the selected kernel/device
-profile requires them.
+The pinned kernel and AOS-controlled `/init` now provide a framed serial command
+channel inside this machine. That is a resident-Linux claim, not yet a
+Linux-workbench claim: the initramfs has only `/init` and `/dev/console`.
+Compressed instructions, PLIC, and virtio block are deliberately deferred until
+the selected kernel/device profile requires them.
 
 The private ABI exposes bounded `pipe`, compatibility `spawn-signed`, record-based
 `spawn-signed-record`, `wait`, and `signal` operations. The record form selects an
@@ -189,15 +197,18 @@ and inspect state before retrying.
 
 ## Linux lifecycle and metering
 
-The principal-affine component Store and semantic Realm machine remain resident
-while idle, but the Linux machine does not. Each `linux-boot` request allocates
-admitted RV64 RAM, boots the pinned
-kernel, runs `/init`, powers down, and destroys the machine. The durable guarantee
-will be the principal filesystem, not RAM or process state. The existing durable
-Realm home is not yet attached to the Linux guest. Status therefore returns
-`linux_state=cold`, `linux_residency=request-scoped`, and
-`linux_ram_persistent=false` plus `linux_storage_persistent=false` even after a
-successful boot.
+The principal-affine component Store owns one optional `Rv64Machine`. The first
+`linux-boot` or `linux-console` allocates admitted RAM and advances the guest in
+bounded 100,000-step slices until `/init` is ready. Later calls resume the same
+kernel and userspace memory, so the `counter` proof advances across separate tool
+invocations. There is no background CPU: Linux advances only inside an admitted,
+metered invocation. A clean `linux-shutdown`, execution failure, output-limit
+failure, runtime eviction, daemon restart, or capsule unload destroys RAM.
+
+RAM residency is therefore an evictable cache, not durable process state. The
+existing durable Realm home is not yet attached to Linux, and status continues to
+return `linux_storage_persistent=false`. The first durable guarantee remains the
+principal filesystem rather than an implicit VM snapshot.
 
 Astrid Runtime now has the experimental primitive required to make this boundary
 honest: an opt-in Store permanently keyed by `(capsule, component, verified
@@ -207,12 +218,12 @@ eviction. `Capsule.toml` requests it through fail-closed package metadata and
 requires Astrid `>=0.10.2`; 0.10.1 must not silently run this capsule with its old
 free-pool or shared-run-loop semantics.
 
-This closes outer component affinity, not the inner Linux lifecycle. Linux
-remains cold/on-demand and its exact RV64 step count is retained as a separate
-principal-local record for the current Store residency. The next proof is to keep
-one `Rv64Machine` in that Store, leave `/init` alive, and route bounded commands
-through a virtual console or mailbox. Durable disk remains an independent
-virtio-block/COW device problem rather than a promise made by resident RAM.
+This closes both outer component affinity and the first inner Linux lifecycle:
+lazy boot, ready, bounded command, clean stop, and restart are executable. Exact
+RV64 step counts remain separate principal-local records for the current Store
+residency. Durable disk remains an independent virtio-block/COW device problem
+rather than a promise made by resident RAM. The next distribution increment is a
+pinned Buildroot 2026.05.1 userland behind this same lifecycle.
 
 ## Build and install
 
@@ -250,6 +261,10 @@ Example tool arguments:
 {"command":"rv64-smoke"}
 {"command":"rv64-supervisor"}
 {"command":"linux-boot"}
+{"command":"linux-console","args":["ping"]}
+{"command":"linux-console","args":["counter"]}
+{"command":"linux-console","args":["echo","hello from Linux"]}
+{"command":"linux-shutdown"}
 {"command":"write-file","args":["notes.txt","durable\n"],"cwd":"/home/agent"}
 {"command":"cat","args":["notes.txt"],"cwd":"/home/agent"}
 {"command":"write-file","args":["candidate.rs","..."],"cwd":"/workspace"}
@@ -273,8 +288,8 @@ file. Durable-home closes select a content-addressed generation with a KV CAS;
 workspace and temporary files retain their outer mount semantics.
 
 The embedded kernel does execute general RV64 Linux syscalls, including the
-minimal init's `write` and `reboot`; the earlier nested core-WASM process lane
-still uses the private Realm ABI. This slice does not yet provide arbitrary
+minimal init's console `read`/`write` loop and `reboot`; the earlier nested
+core-WASM process lane still uses the private Realm ABI. This slice does not yet provide arbitrary
 executable resolution, shared or inherited open-file descriptions, sequential
 POSIX file actions, `execve`, Bash, a libc, package management, networking, PTYs,
 background jobs, or a compiler. Those belong behind the same realm boundary;

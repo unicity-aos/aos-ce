@@ -60,7 +60,9 @@ impl PrincipalRealm {
 
 #[derive(Default)]
 struct LinuxActivity {
+    machine: Option<Rv64Machine>,
     boot_executions: u64,
+    commands_completed: u64,
     clean_shutdowns: u64,
     guest_steps: u64,
     last_outcome: Option<&'static str>,
@@ -68,30 +70,79 @@ struct LinuxActivity {
 }
 
 impl LinuxActivity {
-    fn record(&mut self, response: &ExecResponse) {
-        if response.execution_backend != "aos-rv64-linux" {
-            return;
+    fn execute(
+        &mut self,
+        args: ExecArgs,
+        principal: &str,
+        boot_sequence: u64,
+        next_process_id: Option<u64>,
+    ) -> Result<ExecResponse, SysError> {
+        let selected = select_program(&args)?;
+        let SelectedExecution::Linux(action) = selected.execution else {
+            return Err(SysError::ApiError(
+                "non-Linux command reached the Linux supervisor".to_string(),
+            ));
+        };
+        let hard_fuel = selected.execution.hard_fuel();
+        let limits = RunLimits {
+            fuel: args.fuel.unwrap_or(hard_fuel).min(hard_fuel),
+            memory_bytes: selected.execution.memory_bytes(),
+            output_bytes: args
+                .max_output_bytes
+                .unwrap_or(HARD_MAX_OUTPUT_BYTES)
+                .min(HARD_MAX_OUTPUT_BYTES),
+        };
+        let command = selected.argv.get(1).map(String::as_str);
+        let report = execute_linux_resident(&mut self.machine, action, command, limits)?;
+
+        if report.booted {
+            self.boot_executions = self.boot_executions.saturating_add(1);
         }
-        self.boot_executions = self.boot_executions.saturating_add(1);
-        self.guest_steps = self.guest_steps.saturating_add(response.fuel_consumed);
-        self.last_outcome = Some(response.outcome);
-        self.last_exit_status = response.exit_status;
-        if response.outcome == "exited" && response.exit_status == Some(0) {
+        if report.command_completed {
+            self.commands_completed = self.commands_completed.saturating_add(1);
+        }
+        if report.clean_shutdown {
             self.clean_shutdowns = self.clean_shutdowns.saturating_add(1);
         }
+        self.guest_steps = self.guest_steps.saturating_add(report.fuel_consumed);
+        self.last_outcome = Some(report.outcome);
+        self.last_exit_status = report.exit_status;
+
+        Ok(ExecResponse {
+            realm: REALM_NAME,
+            owner_principal: principal.to_string(),
+            program: selected.name.to_string(),
+            execution_backend: selected.execution.backend(),
+            argv: selected.argv,
+            cwd: args.cwd.unwrap_or_else(|| DEFAULT_CWD.to_string()),
+            outcome: report.outcome,
+            exit_status: report.exit_status,
+            fault: report.fault,
+            stdout: String::from_utf8_lossy(&report.stdout).into_owned(),
+            stderr: String::new(),
+            fuel_consumed: report.fuel_consumed,
+            memory_limit_bytes: limits.memory_bytes,
+            suspensions: report.suspensions,
+            processes: 0,
+            realm_boot_sequence: boot_sequence,
+            process_ids: Vec::new(),
+            next_process_id,
+        })
     }
 
     const fn snapshot(&self) -> LinuxSnapshot {
         LinuxSnapshot {
-            // The current adapter destroys RV64 RAM after every request. A
-            // completed, failed, or exhausted boot therefore always returns
-            // to cold; durable storage is a separate principal-owned concern.
-            state: "cold",
+            state: if self.machine.is_some() {
+                "running"
+            } else {
+                "cold"
+            },
             boot_executions: self.boot_executions,
             clean_shutdowns: self.clean_shutdowns,
             guest_steps: self.guest_steps,
             last_outcome: self.last_outcome,
             last_exit_status: self.last_exit_status,
+            commands_completed: self.commands_completed,
         }
     }
 }
@@ -144,14 +195,23 @@ impl ResidentRealm {
         load_boot: impl FnOnce() -> Result<u64, SysError>,
     ) -> Result<ExecResponse, SysError> {
         let realm = self.realm_with_boot(principal, load_boot)?;
-        let response = run_command_in_machine(
-            args,
-            principal.to_string(),
-            realm_host,
-            &mut realm.machine,
-            realm.boot_sequence,
-        )?;
-        realm.linux.record(&response);
+        let selected = select_program(&args)?;
+        let response = if matches!(selected.execution, SelectedExecution::Linux(_)) {
+            realm.linux.execute(
+                args,
+                principal,
+                realm.boot_sequence,
+                realm.machine.status().next_process_id.map(|id| id.get()),
+            )?
+        } else {
+            run_command_in_machine(
+                args,
+                principal.to_string(),
+                realm_host,
+                &mut realm.machine,
+                realm.boot_sequence,
+            )?
+        };
         realm.commands_completed = realm.commands_completed.saturating_add(1);
         Ok(response)
     }
@@ -360,41 +420,23 @@ mod tests {
     }
 
     #[test]
-    fn linux_activity_is_principal_local_and_counts_only_completed_linux_execution() {
+    fn linux_activity_is_principal_local() {
         let mut alice = PrincipalRealm::new(7);
         let bob = PrincipalRealm::new(11);
-        let mut response = ExecResponse {
-            realm: REALM_NAME,
-            owner_principal: "alice".to_string(),
-            program: "linux-boot".to_string(),
-            execution_backend: "aos-rv64-linux",
-            argv: vec!["linux-boot".to_string()],
-            cwd: DEFAULT_CWD.to_string(),
-            outcome: "exited",
-            exit_status: Some(0),
-            fault: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            fuel_consumed: 14_823_384,
-            memory_limit_bytes: HARD_LINUX_MEMORY_BYTES,
-            suspensions: 148,
-            processes: 0,
-            realm_boot_sequence: 7,
-            process_ids: Vec::new(),
-            next_process_id: Some(1),
-        };
-
-        alice.linux.record(&response);
-        response.execution_backend = "nested-core-wasm";
-        response.fuel_consumed = 9;
-        alice.linux.record(&response);
+        alice.linux.boot_executions = 1;
+        alice.linux.commands_completed = 2;
+        alice.linux.clean_shutdowns = 1;
+        alice.linux.guest_steps = 14_823_384;
+        alice.linux.last_outcome = Some("stopped");
+        alice.linux.last_exit_status = Some(0);
 
         let snapshot = alice.linux.snapshot();
         assert_eq!(snapshot.state, "cold");
         assert_eq!(snapshot.boot_executions, 1);
+        assert_eq!(snapshot.commands_completed, 2);
         assert_eq!(snapshot.clean_shutdowns, 1);
         assert_eq!(snapshot.guest_steps, 14_823_384);
-        assert_eq!(snapshot.last_outcome, Some("exited"));
+        assert_eq!(snapshot.last_outcome, Some("stopped"));
         assert_eq!(snapshot.last_exit_status, Some(0));
         assert_eq!(bob.linux.snapshot().boot_executions, 0);
         assert_eq!(bob.linux.snapshot().guest_steps, 0);
