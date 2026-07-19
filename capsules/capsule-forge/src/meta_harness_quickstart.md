@@ -1,13 +1,18 @@
-# Unicity AOS Meta Harness
+# Build a Meta Harness on Unicity AOS
 
-Unicity AOS is already an agent harness: it supplies the model loop, sessions,
-context, tools, policies, and sandboxed execution. It becomes a **meta harness**
-when it can supervise durable platform workers and improve that harness from
-evidence without allowing a model to grant itself power.
+Unicity AOS is the operating system for agents. It hosts agents, capsules,
+harnesses, connectors, services, and other agent-native software. It is not
+itself a harness. A **meta-harness** is one user-space system that can run on
+AOS: it supervises durable workers or harnesses and improves their composition
+from evidence without allowing a model to grant itself power.
 
-Forge is part of the meta harness. It is the construction arm:
+Forge is OS-provided construction tooling. A meta-harness can use Forge to
+create or repair a capability, but Forge is not inherently the meta-harness and
+does not supervise workers:
 
 ```text
+meta-harness running on AOS
+  |
 authorized platform event
   -> worker scoped to (principal, platform, account)
   -> use installed capabilities

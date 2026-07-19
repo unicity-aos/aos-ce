@@ -1,28 +1,38 @@
 ---
 name: meta-harness
-description: Build and operate a governed Unicity AOS meta-harness. Use when connecting an external platform, creating or supervising a background worker, responding to a repeated capability gap, composing installed capsules, extending AOS through Forge, or improving an agent harness from traces and evaluations.
+description: Build and operate a governed meta-harness on Unicity AOS. Use when connecting an external platform, creating or supervising a background worker, responding to a repeated capability gap, composing installed capsules, extending a user-space harness through Forge, or improving an agent harness from traces and evaluations.
 ---
 
-# Unicity AOS Meta Harness
+# Build a Meta Harness on Unicity AOS
 
-Treat Unicity AOS as the governed environment around agents, not as a prompt
-wrapper. Compose existing capsules first. Use Forge only when evidence shows a
-real capability is missing. Never let a candidate capability promote itself.
+Treat Unicity AOS as the operating system for agents, not as a harness or prompt
+wrapper. Build the meta-harness as a user-space system from agents, capsules,
+skills, state, models, providers, connectors, and tools. Compose existing
+capsules first. Use Forge only when evidence shows a real capability is
+missing. Never let a candidate capability promote itself.
 
 ## Know the system
 
 - **Astrid Runtime** is the mechanism: route IPC, enforce manifest capability
-  allowlists, isolate WASM components, meter resources, and audit actions.
-- **Unicity AOS** is the product harness: agent loop, sessions, context, models,
-  tools, skills, platform uplinks, distribution, and operator experience.
-- **The meta harness** is the control loop above those parts: give each
-  authorized platform a durable worker, detect gaps, reuse or compose existing
-  capabilities, ask Forge to build what is missing, verify the candidate, and
-  promote it only through policy and approval.
-- **Forge is the construction arm, not the supervisor.** It explains contracts,
-  scaffolds capsules, suggests manifest capabilities, validates manifests, and
-  diagnoses installations. It must not choose user goals, grant itself power,
-  or install an unverified candidate.
+  allowlists, isolate WASM components, meter resources, and audit actions. AOS
+  pins and distributes it as the low-level security and execution mechanism.
+- **Unicity AOS is the operating system for agents.** It supplies the product
+  environment in which agents, capsules, harnesses, connectors, services, and
+  other agent-native software run.
+- **A harness** is a user-space system built on AOS. It can combine an agent
+  loop, sessions, context, models, tools, skills, state, and platform uplinks.
+- **A meta-harness** is a user-space harness that governs workers or other
+  harnesses and can improve harness composition from evidence. It gives each
+  authorized platform a durable worker, detects gaps, reuses or composes
+  installed capabilities, verifies candidates, and promotes them only through
+  policy and approval.
+- **Forge is OS construction tooling, not the supervisor.** A meta-harness may
+  use it to explain contracts, scaffold capsules, suggest manifest
+  capabilities, validate manifests, and diagnose installations. Forge must not
+  choose user goals, grant itself power, or install an unverified candidate.
+
+AOS can host harnesses and other agent-native software. Do not force every
+workload into a harness or describe AOS itself as one.
 
 The kernel stays tool-blind and free of business logic. Put reasoning in agent
 workers, platform protocol handling in connector capsules, and lifecycle policy

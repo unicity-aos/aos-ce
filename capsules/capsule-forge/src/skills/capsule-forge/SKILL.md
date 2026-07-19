@@ -1,13 +1,13 @@
 ---
-name: Capsule Forge
-description: The complete, self-contained guide to authoring a Unicity AOS capsule — WIT interfaces, Capsule.toml, the SDK, the build/install loop, and every footgun. A Claude reading this needs nothing else to ship a capsule.
+name: capsule-forge
+description: Author a Unicity AOS capsule from zero. Use when creating, building, scaffolding, or debugging a sandboxed WASM capsule, its Rust SDK code, Capsule.toml capability and bus ACL, WIT contracts, installable artifact, or Forge workflow.
 ---
 
 # Capsule Forge — Author a Unicity AOS Capsule From Zero
 
 You are about to write a **capsule**: a small WebAssembly Component, compiled
 from Rust, that Astrid Runtime loads into a sandbox and lets it expose
-**tools** to the LLM over an event bus. You need no prior runtime knowledge —
+**tools** to the LLM over an event bus. You need no prior AOS knowledge —
 **this page is the whole map.** Everything you need to write the WIT references,
 the `Capsule.toml`, and the Rust is here. You should never have to leave it.
 
@@ -850,8 +850,9 @@ the above without leaving the chat:
 | `validate_manifest { toml }` | You want your `Capsule.toml` linted for the common mistakes before you build. |
 | `capsule_doctor { name }` | A capsule loaded but its tools don't appear, or an import is unsatisfied — diagnose it. |
 
-Load the `meta-harness` skill before building a capability on an agent's own
-initiative. It defines the evidence, quarantine, evaluation, approval, and
-rollback gates around this authoring loop.
+Load the `meta-harness` skill before building a user-space meta-harness on AOS
+or extending one on an agent's own initiative. It defines the evidence,
+quarantine, evaluation, approval, and rollback gates around this authoring
+loop.
 
 Welcome to capsule authoring. Scaffold one and ship it.

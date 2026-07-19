@@ -64,17 +64,21 @@ astrid status
 astrid init --help
 ```
 
-## Meta harness
+## Build on AOS
 
-Unicity AOS is the governed harness around its agents. Community Edition ships
-Forge as its capability-construction arm: a fresh agent can inspect the running
-system, learn the capsule model, identify a real capability gap, and build and
-verify a least-privilege capsule. Forge also installs the `meta-harness` skill,
-which defines platform-scoped background workers and prevents generated
-capabilities from granting or promoting themselves.
+Unicity AOS is the operating system in which agents and agent-native software
+run. Capsules are general user-space building blocks: users can compose them
+into harnesses, meta-harnesses, connectors, services, or other systems.
+Community Edition ships Forge as OS construction tooling so a fresh agent can
+inspect the running system, learn the capsule model, identify a real capability
+gap, and build and verify a least-privilege capsule. Forge also installs the
+`meta-harness` skill, which teaches an agent how to build a governed
+meta-harness on AOS without letting generated capabilities grant or promote
+themselves.
 
-See [Meta-harness architecture](docs/meta-harness.md) for the worker lifecycle,
-Forge boundary, safety gates, and representative user experiences.
+See [Building a meta-harness on AOS](docs/meta-harness.md) for the user-space
+architecture, worker lifecycle, Forge boundary, safety gates, and
+representative user experiences.
 
 Provisioning another principal keeps the authenticated operator separate from
 the target environment:

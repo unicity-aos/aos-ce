@@ -1,18 +1,25 @@
-# Meta-harness architecture
+# Building a meta-harness on Unicity AOS
 
 ## Decision
 
-Unicity AOS is the user-facing agent harness. Astrid Runtime supplies the
-security and execution substrate beneath it. AOS becomes a meta harness by
-adding a governed control loop that supervises platform-scoped agents and can
-improve its own composition from measured failures.
+Unicity AOS is an operating system for agents. It is not itself a harness.
+Harnesses are user-space systems built and run on AOS from agents, capsules,
+skills, state, models, providers, connectors, and tools. AOS can host harnesses,
+meta-harnesses, and other agent-native software; a workload does not have to be
+a harness to belong on AOS.
 
-Forge is necessary but is not the whole meta harness. Forge is the capability
-construction subsystem. It gives an agent the knowledge and tools to inspect
-contracts, scaffold a capsule, select manifest capabilities, validate the
-manifest, and diagnose the installed artifact. The surrounding control plane
-owns worker lifecycle, gap evidence, evaluation, approval, promotion, audit,
-and rollback.
+Astrid Runtime is the low-level security and execution mechanism pinned and
+distributed by AOS. It routes IPC, enforces capabilities, manages the WASM
+sandbox, meters resources, and audits actions. Unicity AOS is the operating
+system and product environment around that mechanism.
+
+A meta-harness is one kind of user-space harness. It governs other workers or
+harnesses and can improve harness composition from measured failures. Forge is
+OS-provided construction tooling available to user-space workloads. A
+meta-harness can use Forge to inspect contracts, scaffold a capsule, select
+manifest capabilities, validate the manifest, and diagnose an installed
+artifact. Forge is not inherently the meta-harness and does not own worker
+lifecycle, evaluation, approval, promotion, audit, or rollback.
 
 This terminology combines two established uses of “meta-harness”:
 
@@ -27,11 +34,23 @@ This terminology combines two established uses of “meta-harness”:
   agent implementations. [Omnigent][omnigent] is a current example.
 
 Unicity should support heterogeneous models and frontends, but its distinctive
-advantage is stronger: generated capabilities remain ordinary AOS capsules
-behind kernel-enforced identities, manifests, IPC ACLs, budgets, approvals, and
-audit.
+advantage is stronger: a user-space meta-harness can produce capabilities that
+remain ordinary AOS capsules behind kernel-enforced identities, manifests, IPC
+ACLs, budgets, approvals, and audit.
 
 ## System boundary
+
+```text
+Unicity AOS
+|-- Astrid Runtime: kernel security and execution mechanism
+|-- OS services and capsules: identity, sessions, registry, policy
+|-- Forge: general construction tooling
+`-- user space
+    |-- harnesses and meta-harnesses
+    `-- connectors, services, and other agent-native systems
+```
+
+One reference meta-harness running in AOS user space looks like this:
 
 ```text
 Platform API / local event source
@@ -178,8 +197,8 @@ own permissions, or weakening approvals.
 
 ## Harness improvement loop
 
-Once the operational control plane produces trustworthy episode traces, AOS can
-apply the research meaning of Meta-Harness:
+Once the operational control plane produces trustworthy episode traces, a
+meta-harness running on AOS can apply the research meaning of Meta-Harness:
 
 ```text
 baseline harness + episode archive + objective
@@ -236,12 +255,14 @@ considered.
 
 A user opts into improvement experiments. Redacted episodes show the email
 worker repeatedly retrieves too much history. A proposer changes retrieval and
-compaction, an independent evaluator runs held-out mailboxes, and AOS rolls out
-only if task quality improves without increasing disclosure, cost, or authority.
+compaction, an independent evaluator runs held-out mailboxes, and the
+meta-harness asks AOS to roll out only if task quality improves without
+increasing disclosure, cost, or authority.
 
 ## Delivery sequence
 
-This implementation establishes the discoverable foundation:
+This implementation establishes the discoverable foundation for building a
+meta-harness on AOS. It does not turn AOS into one:
 
 1. Ship Forge in Community Edition rather than leaving it source-only.
 2. Install the `meta-harness` skill and expose `meta_harness_quickstart`.

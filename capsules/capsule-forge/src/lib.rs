@@ -6,9 +6,9 @@
 //! Capsule-authoring forge for Unicity AOS.
 //!
 //! Gives a fresh LLM the tools and Skills to understand Unicity AOS, build
-//! capsules from zero knowledge, and participate safely in the AOS meta-harness:
-//! inspect contracts, scaffold a compiling skeleton, map an intent to manifest
-//! capabilities, validate a `Capsule.toml`, and diagnose an installation.
+//! capsules and harnesses safely on AOS from zero knowledge: inspect contracts,
+//! scaffold a compiling skeleton, map an intent to manifest capabilities,
+//! validate a `Capsule.toml`, and diagnose an installation.
 //!
 //! All operations go through the kernel's VFS and capability system — the
 //! capsule cannot bypass sandbox boundaries.
@@ -16,7 +16,7 @@
 //! # Tools
 //!
 //! - `forge_quickstart` — the inline build-your-first-capsule guide
-//! - `meta_harness_quickstart` — the governed capability-acquisition loop
+//! - `meta_harness_quickstart` — how to build a governed meta-harness on AOS
 //! - `scaffold_capsule` — a complete compiling tool-capsule skeleton as JSON
 //! - `explain_interface` — read a WIT contract + a prose summary
 //! - `suggest_capabilities` — map an intent to the exact manifest lines
@@ -536,9 +536,10 @@ mod tests {
     use super::{META_HARNESS_QUICKSTART_MD, META_HARNESS_SKILL};
 
     #[test]
-    fn meta_harness_bootstrap_preserves_authority_boundaries() {
+    fn meta_harness_bootstrap_preserves_os_and_authority_boundaries() {
         for required in [
-            "Forge is part of the meta harness",
+            "Unicity AOS is the operating system for agents",
+            "A meta-harness can use Forge",
             "(principal, platform, account)",
             "Do not invent scopes, permissions, numeric budgets",
             "A shell process is not an agent",
@@ -555,7 +556,8 @@ mod tests {
     fn meta_harness_skill_teaches_discovery_before_generation() {
         for required in [
             "name: meta-harness",
-            "Forge is the construction arm, not the supervisor",
+            "Unicity AOS is the operating system for agents",
+            "Forge is OS construction tooling",
             "Reuse an installed tool or capsule",
             "Do not invent repository/account scope",
             "Never let a candidate capability promote itself",
