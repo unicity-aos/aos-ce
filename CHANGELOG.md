@@ -37,6 +37,10 @@
   then resolves only the current invocation's Astrid `cwd://` COW capability.
   PID 1 remounts it before every shell call so FIDs cannot cross invocation
   boundaries.
+- Resource-backed Linux workspace I/O over the frozen `astrid:fs@1.0.0`
+  handle contract, replacing whole-file read/modify/write with bounded
+  positional streaming, real truncate and sync, host mode reporting, and
+  same-workspace rename without the former 10 MiB compatibility ceiling.
 - Crash-consistent `aos-linux-realm` home generations: a principal-scoped atomic
   KV head selects immutable BLAKE3-addressed file and manifest blobs, with
   concurrent-writer retry, corruption checks, daemon-restart recovery, and
@@ -64,8 +68,10 @@
   shuts down cleanly through SBI, and restarts lazily without host-process
   authority.
 - Principal-resolved AOS Realm resource envelopes for guest RAM, interpreted
-  steps, and captured output, bounded by Astrid's admin-owned principal profile;
-  status distinguishes configured and active limits, while a changed envelope
+  steps, captured output, and an optional guest per-file ceiling, bounded by
+  Astrid's admin-owned principal profile. Zero step or file ceilings delegate
+  to the mandatory outer CPU/timeout or storage controls, respectively. Status
+  distinguishes configured and active limits, while a changed envelope
   cold-reconfigures only that principal's warm Linux machine.
 - A reproducibly pinned Buildroot 2026.05.1, static musl, and BusyBox `ash`
   workbench for the resident Linux guest, with an unprivileged `agent` shell,

@@ -2,7 +2,7 @@
 
 Status: active implementation programme; bounded Linux guest and workspace portal live
 
-Last reviewed: 2026-07-20
+Last reviewed: 2026-07-21
 
 ## 1. Decision
 
@@ -219,9 +219,9 @@ inside a 32 MiB machine and remains alive in a framed console command loop. Its
 source archive matches kernel.org SHA-256
 `a7a7e3d2ae9d95e74197223a8d4eb5f6be7aac21b6e6de27e9685d001c1f8cb0`;
 the Buildroot 2026.05.1 rootfs is
-`e31a684bb547676654bf79ef36753174108d9a96d003a0b5e0aa0022d6c46e96`,
+`10d26184e85add731208050fb3da9fed5e1dda7475b6e66e0d9814a221ecf3f4`,
 and the deterministic raw `Image` is
-`6b888939b27c813eb9bc7c4d52ba23cd4f451658ef197777757e2b7c859d226a`.
+`fd394b7e5b09638d52483fe2f417985ae1af6a730eea5bc3e415b97262f863de`.
 The checked-in capsule regression asserts the exact kernel and userland
 versions, AOS machine model, PID 1 launch and ready markers, diagnostic state
 continuity, real UID-1000 BusyBox shell execution, warm file continuity,
@@ -935,6 +935,24 @@ eviction must refuse or deliberately cancel them according to their recorded
 lifecycle. The current implementation intentionally supports foreground work
 only.
 
+There are presently three independent foreground clocks: the MCP shim's broker
+round-trip deadline, the broker capsule's result-drain deadline, and Astrid's
+principal invocation timeout. The first two are transport policy; neither turns
+a running Realm command into a background job. If either transport clock closes
+without publishing cancellation, the original invocation remains foreground in
+the runtime until it returns or the outer principal timeout interrupts it. The
+safe temporary configuration is therefore:
+
+```text
+broker result drain < principal invocation timeout < MCP shim request timeout
+```
+
+This ordering bounds any uncancelled tail and preserves the broker's terminal
+reply. It is not the final contract. Proper cancellation requires a
+correlation-preserving cancel path from MCP request token through broker call ID
+to the exact target invocation; proper continued work requires the explicit job
+record above.
+
 The earlier manual actor could see the broker call ID and held a bounded replay
 window. The SDK's direct tool method currently receives only deserialized tool
 arguments, so that cache is not present in the principal-affine path. This is an
@@ -991,8 +1009,10 @@ Astrid administrator's principal profile
 
 The outer principal profile remains authoritative for Wasmtime memory, CPU rate,
 storage, processes, and timeout. The inner configuration currently selects guest
-RAM, interpreted steps, and captured output. It is read for every invocation and
-never cached across principals. A changed envelope destroys only that
+RAM, interpreted steps, captured output, and an optional per-file ceiling. Zero
+step or file ceilings delegate only those dimensions to the outer CPU/timeout or
+storage policy. The envelope is read for every invocation and never cached across principals. A
+changed envelope destroys only that
 principal's warm RAM before the next execution; durable home and workspace
 authority are reattached, and another principal's Store is untouched. Status is
 read-only and reports configured versus active values plus a pending-change bit.
@@ -1587,10 +1607,10 @@ compatibility.
   the tool response deliberately reports the bounded work charge rather than
   mislabeling ECALL as retired;
 - the initial live run discovered two integration constraints rather than hiding
-  them: Astrid's component FileHandle methods are not implemented, so the adapter
-  uses bounded whole-file I/O; workspace rename remains unavailable until its
-  host operation is implemented. `/tmp` must be authorized through the dynamic
-  principal-home scheme so the manifest gate checks the resolved principal path.
+  them: Astrid's component FileHandle methods and workspace rename were not yet
+  implemented. The resource-backed storage increment recorded below closes both;
+  `/tmp` still must be authorized through the dynamic principal-home scheme so
+  the manifest gate checks the resolved principal path.
 - the normal `astrid start` path selected an installed 0.10.0 companion daemon even
   though the invoking CLI, builder, and realm requirement were 0.10.1; that daemon
   correctly rejected the `astrid-version >=0.10.1` capsule. Running the locally
@@ -1640,10 +1660,67 @@ compatibility.
   explicit guest power-down and a fresh Linux kernel boot, the new guest read
   the exact bytes from generation 4. The proof marker was then removed and the
   home advanced to generation 6;
-- the compatibility workspace adapter currently uses synchronous whole-file
-  reads and read-modify-writes under the `astrid:fs` 10 MiB file ceiling because
-  component `FileHandle` methods are not live. Workspace rename and portable
-  mode mutation remain explicit prerequisites for compiler-heavy workloads.
+- this proof used the former compatibility workspace adapter. The later
+  resource-backed increment removes its 10 MiB whole-file ceiling and makes
+  workspace rename live; portable mode mutation remains separate because the
+  frozen `astrid:fs@1.0.0` contract exposes mode observation but not `chmod`.
+
+### Resource-backed workspace evidence recorded on 2026-07-21
+
+- Astrid Runtime commit `1fc34bc7` implements the frozen
+  `astrid:fs@1.0.0` resource lane with exact open modes, bounded positional
+  read/write, truncate, data/all sync, mode reporting, same-VFS rename,
+  invocation-scoped handle cleanup, principal affinity, and per-call capability,
+  audit, and quota checks. Its full workspace tests and deny-warnings clippy
+  pass, and the public API comparison against 0.10.4 reports additive VFS
+  methods only;
+- two independent clean Buildroot 2026.05.1 output trees produced byte-identical
+  rootfs CPIO
+  `10d26184e85add731208050fb3da9fed5e1dda7475b6e66e0d9814a221ecf3f4`.
+  The AOS PID 1 ELF is
+  `0a70920cd01dbab74c5b63d614b8a53b07a5bcb18d18a569728a1346c52e262c`,
+  and unchanged BusyBox 1.38.0 is
+  `ce034f1e35d22be85de0dbe4e63aafa32c284c669568e62cb0d61517e250e56f`;
+- two independent clean Linux 6.18.39 output trees embedded that rootfs and
+  produced the byte-identical checked-in raw Image
+  `fd394b7e5b09638d52483fe2f417985ae1af6a730eea5bc3e415b97262f863de`;
+- the real native Linux regression passes in 43.15 seconds, including cold
+  boot, home/workspace 9P, exact nonzero status propagation, forged-frame
+  rejection, descendant kill/reap, clean remount, and a four-byte
+  `RLIMIT_FSIZE` proof whose five-byte truncate exits with status 153;
+- `astrid capsule check` reports both tools wired. The installable capsule is
+  `ae527591ec0c5e1d32c73aa6fd65fa337a60f98651e910a921c74c84be99c38a`
+  and its raw component is
+  `63d7d89db87a9c5276d1244380ac8414777b83724f40182b984150da2a2fc1a4`;
+- an isolated Astrid 0.10.4 daemon loaded that artifact for `codex-code` with
+  `linux_max_steps=0`, `linux_max_file_bytes=0`, 32 MiB guest RAM, 64 KiB
+  captured output, and one vCPU. Through the actual MCP front door, Linux
+  created an 11 MiB workspace file, renamed it, later used a seek-only tail to
+  return exact final byte `Z`, and removed it. This proves the former 10 MiB
+  whole-file ceiling and rename stub are gone;
+- deliberately reading all 11 MiB with BusyBox `wc` exposed two independent
+  production limits rather than a correctness failure in the file-handle lane:
+  the current SurrealKV-backed workspace path generates excessive WAL/manifest
+  churn for sequential 9P reads, and the released MCP broker returns after 50
+  seconds while the target invocation continues. Astrid interrupted the still
+  running Realm at the principal's 300-second timeout, after which the next
+  status call succeeded and reported the Realm cold. This is explicit evidence
+  that a broker timeout is not background execution and does not currently
+  cancel the target;
+- the broker follow-up makes its result-drain window a per-principal
+  `tool_execute_timeout_ms` setting (50-second compatibility default), and the
+  runtime CLI follow-up adds `aos mcp serve --request-timeout <duration>`.
+  These knobs enable aligned long foreground calls; cancellation propagation
+  and durable job handles remain required before an abandoned call can be
+  represented as safely cancelled or intentionally background;
+- the isolated runtime then configured `aos-mcp` to 240 seconds and the MCP shim
+  to 310 seconds under the principal's 300-second outer timeout. One warm Linux
+  foreground call ran `sleep 90` between exact start/finish markers, remained in
+  the same MCP request for more than 55 observed wall-clock seconds, returned
+  exit status 0 with 901,476,732 charged guest steps and 9,019 cooperative
+  suspensions, and reported zero surviving processes. This directly proves the
+  configured foreground path crosses the former 50/55-second transport limit
+  without converting the command into background work.
 
 The earlier persistence E2E run used the then-current `astrid-mcp` capsule as its
 front door. The actor E2E used the product `aos-cli` proxy and current `sage-mcp`
@@ -1686,9 +1763,10 @@ CE set rather than test-installed companions.
 - [x] implement bounded positional I/O, stat, create, truncate, unlink, and
   synchronous flush for the invocation workspace through Astrid's whole-file
   imports, including Linux's size-plus-implicit-times truncate request;
-- [ ] replace the 10 MiB whole-file compatibility adapter with Astrid
-  resource-backed file handles and implement workspace rename plus portable mode
-  mutation before claiming compiler-cache and large-build-tree support;
+- [x] replace the 10 MiB whole-file compatibility adapter with bounded Astrid
+  resource-backed file handles and implement workspace rename;
+- [ ] add portable mode mutation through a canonical filesystem WIT and SDK
+  revision before claiming a complete compiler-cache contract across hosts;
 - [x] implement positional write/truncate, directory operations, rename, unlink,
   permission metadata, and synchronous flush semantics for the versioned
   principal-home store before presenting it as Linux storage;
@@ -2068,6 +2146,28 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   SBI host-request boundary, GPL Linux transport, per-call remount, and exact
   Linux read/write/rename/remount regression without adding virtio, PLIC, sockets,
   DMA, or host-process authority;
+- [x] move the workspace adapter onto invocation-scoped `astrid:fs` file
+  resources with bounded positional I/O, truncate, sync, mode reporting, and
+  same-VFS rename, removing the 10 MiB whole-file compatibility ceiling;
+- [x] replace PID 1's fixed 8 MiB `RLIMIT_FSIZE` with the principal-resolved
+  `linux_max_file_bytes` envelope; zero removes only the inner per-file ceiling
+  and leaves Astrid's outer principal storage quota mandatory;
+- [x] make `linux_max_steps=0` delegate to Astrid's outer principal CPU and
+  timeout policy so local foreground builds have no hidden 50-million-step
+  ceiling, while shared services can configure a finite exact instruction cap;
+- [x] make the AOS MCP broker result drain principal-configurable and add an
+  explicit MCP shim request-timeout flag so long foreground calls can align
+  their transport windows with the outer principal profile;
+- [ ] propagate correlated MCP cancellation through the broker to the exact
+  target invocation, and prove timeout/disconnect cannot leave an unobserved
+  Realm consuming the principal's budget;
+- [ ] add principal-owned background job handles with status, logs, wait,
+  cancel, deadline, output sink, and eviction policy before allowing any guest
+  process to survive a foreground result;
+- [ ] stream outer workspace COW copy-up and promotion so modifying a lower
+  file is no longer subject to the runtime's separate 50 MiB transition limit;
+- [ ] specify portable workspace mode mutation in the canonical filesystem WIT
+  and SDK rather than inventing a Linux-Realm-only host call;
 - [x] attach Linux `/home/agent` over a second 9P channel to the selected
   principal generation; implement file, directory, positional, rename, unlink,
   and flush semantics; and prove cold-boot persistence separately from RAM;

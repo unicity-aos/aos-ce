@@ -136,7 +136,10 @@ impl LinuxActivity {
             action,
             command,
             &cwd,
-            limits,
+            LinuxInvocationLimits {
+                run: limits,
+                max_file_bytes: resources.linux_max_file_bytes,
+            },
         )?;
 
         if report.booted {
