@@ -228,13 +228,20 @@ fn check_tool_bus(sub_keys: &[String], pub_keys: &[String], root: &Toml, out: &m
                     "Add a real handler binding or remove priority from the ACL-only subscription.",
                 ));
             }
-            if let Some(priority) = entry.get("priority").and_then(Toml::as_integer)
-                && !(0..=u32::MAX.into()).contains(&priority)
-            {
-                out.push(Finding::err(
-                    format!("Subscribe `{key}` has priority outside the u32 range."),
-                    "Use an integer from 0 through 4294967295; lower values run first.",
-                ));
+            if let Some(priority) = entry.get("priority") {
+                if let Some(priority) = priority.as_integer() {
+                    if !(0..=u32::MAX.into()).contains(&priority) {
+                        out.push(Finding::err(
+                            format!("Subscribe `{key}` has priority outside the u32 range."),
+                            "Use an integer from 0 through 4294967295; lower values run first.",
+                        ));
+                    }
+                } else {
+                    out.push(Finding::err(
+                        format!("Subscribe `{key}` priority must be an integer."),
+                        "Use an integer from 0 through 4294967295; lower values run first.",
+                    ));
+                }
             }
         }
 
@@ -361,5 +368,27 @@ file = "example.wasm"
                 .message
                 .contains("sets `priority` without a `handler`")
         }));
+    }
+
+    #[test]
+    fn priority_must_be_an_integer() {
+        let findings = validate_manifest(
+            r#"
+[package]
+name = "example"
+version = "0.1.0"
+[[component]]
+id = "example"
+file = "example.wasm"
+[subscribe]
+"events.v1.string" = { wit = "opaque", handler = "string_event", priority = "10" }
+"events.v1.float" = { wit = "opaque", handler = "float_event", priority = 10.0 }
+"#,
+        );
+        let type_errors = findings
+            .iter()
+            .filter(|finding| finding.message.contains("priority must be an integer"))
+            .count();
+        assert_eq!(type_errors, 2);
     }
 }
