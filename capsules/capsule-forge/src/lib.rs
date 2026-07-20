@@ -291,7 +291,9 @@ impl ForgeTools {
             Ok(wit) => Ok(format_wit(&filename, &wit)),
             Err(_) => {
                 let available = list_entries(WIT_DIR).unwrap_or_default();
-                if let Some((bundle, wit)) = find_declared_interface(name, &available) {
+                if let Some((bundle, wit)) =
+                    find_declared_interface(interface_lookup_name(name), &available)
+                {
                     return Ok(format!(
                         "Interface '{name}' is declared inside bundled file '{bundle}'.\n\n{}",
                         format_wit(&bundle, &wit)
@@ -378,6 +380,10 @@ fn find_declared_interface(name: &str, available: &[String]) -> Option<(String, 
         }
     }
     None
+}
+
+fn interface_lookup_name(name: &str) -> &str {
+    name.strip_suffix(".wit").unwrap_or(name)
 }
 
 fn wit_declares(wit: &str, name: &str) -> bool {
@@ -746,11 +752,18 @@ fn collect_export_keys(map: &serde_json::Map<String, Value>, out: &mut Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        GUIDE_CHAPTERS, META_HARNESS_QUICKSTART_MD, guide_index, suggest_from_intent, wit_declares,
+        GUIDE_CHAPTERS, META_HARNESS_QUICKSTART_MD, guide_index, interface_lookup_name,
+        suggest_from_intent, wit_declares,
     };
 
     const CAPSULE_FORGE_SKILL: &str = include_str!("skills/capsule-forge/SKILL.md");
     const META_HARNESS_SKILL: &str = include_str!("skills/meta-harness/SKILL.md");
+
+    #[test]
+    fn interface_lookup_accepts_bare_and_wit_names() {
+        assert_eq!(interface_lookup_name("tool"), "tool");
+        assert_eq!(interface_lookup_name("tool.wit"), "tool");
+    }
 
     #[test]
     fn author_manual_is_progressive_and_complete() {
