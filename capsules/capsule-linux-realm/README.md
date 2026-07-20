@@ -107,6 +107,20 @@ outlive the invocation. The home session is principal-resident, while its
 authoritative generation survives guest shutdown, component eviction, and
 daemon restart. Linux `/tmp` and the initramfs root remain guest RAM.
 
+Astrid filesystem metadata may report mode `0` on hosts without a portable
+POSIX-mode projection. In that case the workspace bridge exposes directories
+as `0755` and regular files as `0644` inside the already capability-confined
+mount; nonzero host modes are preserved.
+
+The current Astrid runtime does not yet implement component `FileHandle`
+operations or workspace rename. Until it does, the workspace bridge provides
+positional access with bounded whole-file reads and read-modify-writes. A single
+workspace file is therefore limited to the published `astrid:fs` whole-file
+ceiling of 10 MiB, successful writes are already synchronous when 9P `fsync`
+returns, and workspace rename reports `EOPNOTSUPP`. This is sufficient for the
+live shell and ordinary small source-file editing, but it is deliberately not
+presented as the final storage path for compiler caches or large build trees.
+
 The default realm name is `default`, giving one durable home per principal. The
 principal is never accepted from tool input. It comes from the kernel-stamped
 invocation, so two principals using the same capsule bytes receive different

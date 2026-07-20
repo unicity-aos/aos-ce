@@ -2,7 +2,7 @@
 
 Status: active implementation programme; bounded Linux guest and workspace portal live
 
-Last reviewed: 2026-07-19
+Last reviewed: 2026-07-20
 
 ## 1. Decision
 
@@ -36,6 +36,45 @@ which later Astrid hosts can be tested.
 The first proof must be a real installable capsule. It must not claim Debian
 binary compatibility, Bash compatibility, or arbitrary package installation until
 those programs actually run under the measured implementation.
+
+### 1.1 Architectural lineage
+
+Astrid should inherit Plan 9's compositional principle without making its file
+protocol the universal native ABI. Plan 9 gives each process a private namespace
+assembled from local, remote, and synthetic services. Astrid generalizes that
+idea into a principal-scoped graph of typed interfaces, where every edge also
+carries authority, provenance, budget, lifecycle, and audit semantics:
+
+```text
+Plan 9 process namespace     -> Astrid principal capability graph
+file server plus 9P          -> capsule plus typed WIT/IPC/resource interface
+mount and bind               -> Dock compatible typed inputs and outputs
+path-mediated access         -> explicit capability-mediated access
+```
+
+The native rule is therefore “everything is an explicitly governed interface,”
+not “everything is a file.” Filesystem, command, graphical, model, stream, and
+device views are projections of typed capabilities for particular consumers.
+Linux legitimately uses a 9P projection because its in-kernel v9fs client already
+turns that protocol into ordinary POSIX operations; native capsules should retain
+their richer types rather than being forced through byte streams and pathnames.
+
+Other lineages supply properties Plan 9 did not attempt to provide alone:
+
+- object-capability systems and seL4-style boundary reasoning for narrow,
+  possession-based authority and testable isolation claims;
+- Erlang/OTP for supervision trees, mailboxes, restart policy, and durable versus
+  ephemeral service lifecycle;
+- exokernels and unikernels for principal- and workload-specific mechanisms;
+- content-addressed systems for reproducible capsules, toolchains, package state,
+  and Linux images;
+- the WebAssembly Component Model for the typed, portable ABI between capsules.
+
+Tensor Logic is reserved as a later reasoning and composition language over the
+typed interface graph. It is not a knowledge graph and is not required for the
+current execution path. The present design records enough typed input/output,
+authority, resource, and lifecycle information for that algebra to be added
+without changing the capsule boundary.
 
 ## 2. What WebVM, BrowserPod, and BrowserCode establish
 
@@ -1549,9 +1588,9 @@ compatibility.
   mislabeling ECALL as retired;
 - the initial live run discovered two integration constraints rather than hiding
   them: Astrid's component FileHandle methods are not implemented, so the adapter
-  uses bounded whole-file I/O and commits on descriptor close; `/tmp` must be
-  authorized through the dynamic principal-home scheme so the manifest gate checks
-  the resolved principal path.
+  uses bounded whole-file I/O; workspace rename remains unavailable until its
+  host operation is implemented. `/tmp` must be authorized through the dynamic
+  principal-home scheme so the manifest gate checks the resolved principal path.
 - the normal `astrid start` path selected an installed 0.10.0 companion daemon even
   though the invoking CLI, builder, and realm requirement were 0.10.1; that daemon
   correctly rejected the `astrid-version >=0.10.1` capsule. Running the locally
@@ -1584,6 +1623,27 @@ compatibility.
   available released/local runtime identity is older than 0.10.2; weakening the
   manifest gate or relabeling experimental runtime bytes would invalidate the
   principal-affinity guarantee this capsule depends on.
+
+### Installed Linux evidence recorded on 2026-07-20
+
+- a locally built Astrid 0.10.4 daemon loaded the packaged capsule with an
+  unlimited operator interceptor-fuel ceiling while retaining the Realm's own
+  50,000,000-step, 32 MiB, 64 KiB-output, and one-vCPU envelope;
+- Linux 6.18.39 cold-booted as RV64, mounted the invocation's `cwd://` projection
+  at `/workspace`, read the repository's `Cargo.toml`, then created, read, and
+  removed a previously absent workspace file through the audited 9P bridge;
+- the live integration exposed three host-boundary mismatches and fixed each at
+  its owning edge: component `lstat` was still stubbed, zero host mode bits made
+  the guest projection unusable, and a missing 9P walk surfaced as `EIO` instead
+  of `ENOENT` before create;
+- `/home/agent` selected generation 4 after writing `durable-live`; after an
+  explicit guest power-down and a fresh Linux kernel boot, the new guest read
+  the exact bytes from generation 4. The proof marker was then removed and the
+  home advanced to generation 6;
+- the compatibility workspace adapter currently uses synchronous whole-file
+  reads and read-modify-writes under the `astrid:fs` 10 MiB file ceiling because
+  component `FileHandle` methods are not live. Workspace rename and portable
+  mode mutation remain explicit prerequisites for compiler-heavy workloads.
 
 The earlier persistence E2E run used the then-current `astrid-mcp` capsule as its
 front door. The actor E2E used the product `aos-cli` proxy and current `sage-mcp`
@@ -1623,8 +1683,12 @@ CE set rather than test-installed companions.
   invocation workspace or warm guest RAM;
 - [x] implement bounded sequential open/read/write/close using whole-file Astrid
   VFS calls;
-- [x] implement positional I/O, stat, rename, unlink, and file flush for the
-  invocation workspace through Astrid's resource-backed file handles;
+- [x] implement bounded positional I/O, stat, create, truncate, unlink, and
+  synchronous flush for the invocation workspace through Astrid's whole-file
+  imports, including Linux's size-plus-implicit-times truncate request;
+- [ ] replace the 10 MiB whole-file compatibility adapter with Astrid
+  resource-backed file handles and implement workspace rename plus portable mode
+  mutation before claiming compiler-cache and large-build-tree support;
 - [x] implement positional write/truncate, directory operations, rename, unlink,
   permission metadata, and synchronous flush semantics for the versioned
   principal-home store before presenting it as Linux storage;

@@ -195,6 +195,13 @@ fn map_vfs_9p_error(error: FsError) -> Plan9Errno {
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) struct AstridWorkspace9p;
 
+// `astrid:fs@1.0.0` whole-file calls are capped at 10 MiB. Until the runtime's
+// resource-backed FileHandle lane is live, keep the 9P adapter inside that
+// published boundary instead of pretending that unbounded positional I/O is
+// available.
+#[cfg_attr(test, allow(dead_code))]
+const ASTRID_WHOLE_FILE_LIMIT: usize = 10 * 1024 * 1024;
+
 impl Plan9FileSystem for AstridWorkspace9p {
     fn metadata(&mut self, path: &str) -> Result<Plan9Metadata, Plan9Errno> {
         plan9_metadata(&workspace_path(path)?)
@@ -214,14 +221,32 @@ impl Plan9FileSystem for AstridWorkspace9p {
     }
 
     fn read(&mut self, path: &str, offset: u64, count: u32) -> Result<Vec<u8>, Plan9Errno> {
-        let file = fs::File::open(&workspace_path(path)?).map_err(map_sdk_9p_error)?;
-        file.read_at(offset, count).map_err(map_sdk_9p_error)
+        let bytes = fs::read(&workspace_path(path)?).map_err(map_sdk_9p_error)?;
+        let offset = usize::try_from(offset).map_err(|_| Plan9Errno::InvalidArgument)?;
+        if offset >= bytes.len() {
+            return Ok(Vec::new());
+        }
+        let end = offset
+            .checked_add(usize::try_from(count).map_err(|_| Plan9Errno::MessageTooLarge)?)
+            .ok_or(Plan9Errno::MessageTooLarge)?
+            .min(bytes.len());
+        Ok(bytes[offset..end].to_vec())
     }
 
     fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<u32, Plan9Errno> {
-        let file = fs::File::open_mode(&workspace_path(path)?, fs::OpenMode::ReadWrite)
-            .map_err(map_sdk_9p_error)?;
-        file.write_at(offset, data).map_err(map_sdk_9p_error)
+        let path = workspace_path(path)?;
+        let offset = usize::try_from(offset).map_err(|_| Plan9Errno::NoSpace)?;
+        let end = offset.checked_add(data.len()).ok_or(Plan9Errno::NoSpace)?;
+        if end > ASTRID_WHOLE_FILE_LIMIT {
+            return Err(Plan9Errno::NoSpace);
+        }
+        let mut bytes = fs::read(&path).map_err(map_sdk_9p_error)?;
+        if bytes.len() < end {
+            bytes.resize(end, 0);
+        }
+        bytes[offset..end].copy_from_slice(data);
+        fs::write(&path, &bytes).map_err(map_sdk_9p_error)?;
+        u32::try_from(data.len()).map_err(|_| Plan9Errno::MessageTooLarge)
     }
 
     fn create_file(
@@ -242,10 +267,10 @@ impl Plan9FileSystem for AstridWorkspace9p {
                 return Err(Plan9Errno::IsDirectory);
             }
             if truncate {
-                drop(fs::File::create(&path).map_err(map_sdk_9p_error)?);
+                fs::write(&path, &[]).map_err(map_sdk_9p_error)?;
             }
         } else {
-            drop(fs::File::create(&path).map_err(map_sdk_9p_error)?);
+            fs::write(&path, &[]).map_err(map_sdk_9p_error)?;
         }
         Ok(())
     }
@@ -255,9 +280,14 @@ impl Plan9FileSystem for AstridWorkspace9p {
     }
 
     fn set_len(&mut self, path: &str, len: u64) -> Result<(), Plan9Errno> {
-        let file = fs::File::open_mode(&workspace_path(path)?, fs::OpenMode::ReadWrite)
-            .map_err(map_sdk_9p_error)?;
-        file.set_len(len).map_err(map_sdk_9p_error)
+        let len = usize::try_from(len).map_err(|_| Plan9Errno::NoSpace)?;
+        if len > ASTRID_WHOLE_FILE_LIMIT {
+            return Err(Plan9Errno::NoSpace);
+        }
+        let path = workspace_path(path)?;
+        let mut bytes = fs::read(&path).map_err(map_sdk_9p_error)?;
+        bytes.resize(len, 0);
+        fs::write(&path, &bytes).map_err(map_sdk_9p_error)
     }
 
     fn remove_file(&mut self, path: &str) -> Result<(), Plan9Errno> {
@@ -273,9 +303,10 @@ impl Plan9FileSystem for AstridWorkspace9p {
         {
             return Err(Plan9Errno::NotEmpty);
         }
-        fs::remove_dir_all(&path)
-            .map(|_| ())
-            .map_err(map_sdk_9p_error)
+        // Astrid's live `fs-unlink` host operation inspects the admitted node
+        // and removes either a file or an empty directory. The SDK's historical
+        // function name is narrower than that host behavior.
+        fs::remove_file(&path).map_err(map_sdk_9p_error)
     }
 
     fn rename(&mut self, source: &str, destination: &str) -> Result<(), Plan9Errno> {
@@ -288,13 +319,10 @@ impl Plan9FileSystem for AstridWorkspace9p {
         if plan9_metadata(&path)?.kind == Plan9NodeKind::Directory {
             return Err(Plan9Errno::NotSupported);
         }
-        let file = fs::File::open_mode(&path, fs::OpenMode::ReadWrite).map_err(map_sdk_9p_error)?;
-        if data_only {
-            file.sync_data()
-        } else {
-            file.sync_all()
-        }
-        .map_err(map_sdk_9p_error)
+        let _ = data_only;
+        // `fs::write` does not return until HostVfs has written and flushed the
+        // complete buffer, so there is no deferred capsule-side state to sync.
+        Ok(())
     }
 
     fn statfs(&mut self) -> Result<Plan9FileSystemStats, Plan9Errno> {
@@ -325,6 +353,13 @@ fn workspace_path(relative: &str) -> Result<String, Plan9Errno> {
 
 #[cfg_attr(test, allow(dead_code))]
 fn plan9_metadata(path: &str) -> Result<Plan9Metadata, Plan9Errno> {
+    // The current Astrid lstat host path can collapse a missing cap-std node
+    // into a backend error. Linux needs the stable ENOENT distinction during
+    // a 9P walk so it can follow with Tlcreate. `fs::exists` crosses the same
+    // capability gate and VFS root, then lets us normalize only true absence.
+    if !fs::exists(path).map_err(map_sdk_9p_error)? {
+        return Err(Plan9Errno::NotFound);
+    }
     let metadata = fs::symlink_metadata(path).map_err(map_sdk_9p_error)?;
     let kind = if metadata.is_file() {
         Plan9NodeKind::File
@@ -342,12 +377,27 @@ fn plan9_metadata(path: &str) -> Result<Plan9Metadata, Plan9Errno> {
     Ok(Plan9Metadata {
         kind,
         len: metadata.len(),
-        mode: metadata.mode(),
+        mode: workspace_projection_mode(kind, metadata.mode()),
         modified_seconds: modified.as_ref().map_or(0, std::time::Duration::as_secs),
         generation: modified
             .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
             .unwrap_or(0),
     })
+}
+
+/// Supply usable guest permissions when Astrid's cross-platform filesystem
+/// metadata cannot report POSIX mode bits. The capability gate remains the
+/// authority boundary; these bits govern only access by uid 1000 inside the
+/// already-confined Linux mount.
+const fn workspace_projection_mode(kind: Plan9NodeKind, advertised: u32) -> u32 {
+    if advertised & 0o7777 != 0 {
+        advertised
+    } else {
+        match kind {
+            Plan9NodeKind::Directory => 0o755,
+            Plan9NodeKind::File => 0o644,
+        }
+    }
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -1094,6 +1144,19 @@ mod tests {
         for rejected in ["/etc/passwd", "../escape", "a//b", "a/./b", "line\nbreak"] {
             assert_eq!(workspace_path(rejected), Err(Plan9Errno::InvalidArgument));
         }
+    }
+
+    #[test]
+    fn linux_workspace_supplies_modes_when_host_metadata_has_none() {
+        assert_eq!(
+            workspace_projection_mode(Plan9NodeKind::Directory, 0),
+            0o755
+        );
+        assert_eq!(workspace_projection_mode(Plan9NodeKind::File, 0), 0o644);
+        assert_eq!(
+            workspace_projection_mode(Plan9NodeKind::File, 0o100755),
+            0o100755
+        );
     }
 
     #[test]

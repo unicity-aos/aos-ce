@@ -970,6 +970,7 @@ fn drive_linux_until(
                         .as_mut()
                         .expect("home session inserted")
                         .serve(&request.message);
+                    log_plan9_failure("home", &request.message, &response);
                     machine
                         .complete_9p_request(request.id, &response)
                         .map_err(|error| SysError::ApiError(error.to_string()))?;
@@ -982,6 +983,7 @@ fn drive_linux_until(
                         .as_mut()
                         .expect("workspace session inserted")
                         .serve(&request.message);
+                    log_plan9_failure("workspace", &request.message, &response);
                     machine
                         .complete_9p_request(request.id, &response)
                         .map_err(|error| SysError::ApiError(error.to_string()))?;
@@ -1003,6 +1005,40 @@ fn drive_linux_until(
             }
         }
     }
+}
+
+fn log_plan9_failure(channel: &str, request: &[u8], response: &[u8]) {
+    // 9P2000.L Rlerror is a seven-byte header followed by a little-endian
+    // errno. Keep diagnostics path-free: the operation number, channel, and
+    // stable errno are enough to identify an incomplete adapter boundary.
+    if response.get(4) != Some(&7) || response.len() < 11 {
+        return;
+    }
+    let Some(errno_bytes) = response.get(7..11).and_then(|bytes| bytes.try_into().ok()) else {
+        return;
+    };
+    let operation = request.get(4).copied().unwrap_or_default();
+    let errno = u32::from_le_bytes(errno_bytes);
+    let detail = if operation == 26 {
+        request
+            .get(11..15)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+            .map(|valid| format!(" valid={valid:#x}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let message = format!(
+        "Linux 9P request failed: channel={channel} operation={operation} errno={errno}{detail}"
+    );
+    #[cfg(target_arch = "wasm32")]
+    astrid_sdk::log::warn(message);
+    // Native Linux-machine tests exercise the same parser and 9P response
+    // path without an Astrid host. Never cross a component import from those
+    // tests merely to emit diagnostics.
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = message;
 }
 
 fn linux_failure_report(

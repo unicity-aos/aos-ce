@@ -58,6 +58,9 @@ const OPEN_EXCLUSIVE: u32 = 0o200;
 const OPEN_TRUNCATE: u32 = 0o1000;
 const AT_REMOVE_DIR: u32 = 0x200;
 const ATTR_SIZE: u32 = 1 << 3;
+const ATTR_MTIME: u32 = 1 << 5;
+const ATTR_CTIME: u32 = 1 << 6;
+const TRUNCATE_ATTRIBUTES: u32 = ATTR_SIZE | ATTR_MTIME | ATTR_CTIME;
 const STATS_BASIC: u64 = 0x7ff;
 
 /// Stable protocol error classes converted directly to Linux errno values.
@@ -634,7 +637,14 @@ impl<F: FileSystem> Session<F> {
         let _mtime_seconds = reader.u64()?;
         let _mtime_nanoseconds = reader.u64()?;
         reader.finish()?;
-        if valid & !ATTR_SIZE != 0 {
+        // Linux reports an O_TRUNC metadata change as size + implicit mtime
+        // and ctime (0x68). The backing `set_len` mutation naturally advances
+        // those host-managed timestamps. Continue to reject chmod/chown,
+        // explicit timestamp values, and timestamp-only requests because this
+        // minimal filesystem cannot preserve those semantics yet.
+        if valid & !TRUNCATE_ATTRIBUTES != 0
+            || valid & (ATTR_MTIME | ATTR_CTIME) != 0 && valid & ATTR_SIZE == 0
+        {
             return Err(Errno::NotSupported);
         }
         if valid & ATTR_SIZE != 0 {
@@ -1492,6 +1502,66 @@ mod tests {
         assert_eq!(
             session.fids.get(&2).map(|fid| fid.path.as_str()),
             Some("present")
+        );
+    }
+
+    #[test]
+    fn linux_truncate_metadata_flags_are_admitted_without_broad_setattr_support() {
+        let mut filesystem = MemoryFileSystem::new();
+        filesystem
+            .create_file("output", 0o644, true, false)
+            .expect("seed file");
+        filesystem
+            .write("output", 0, b"previous")
+            .expect("seed bytes");
+        let mut session = Session::new(filesystem, "home").expect("session");
+        negotiate_and_attach(&mut session);
+
+        let walk = message(TWALK, 50, |writer| {
+            writer.u32(1);
+            writer.u32(2);
+            writer.u16(1);
+            writer.string("output").expect("name");
+        });
+        assert_success(&session.serve(&walk), TWALK);
+
+        let truncate = message(TSETATTR, 51, |writer| {
+            writer.u32(2);
+            writer.u32(TRUNCATE_ATTRIBUTES);
+            writer.u32(0);
+            writer.u32(u32::MAX);
+            writer.u32(u32::MAX);
+            writer.u64(0);
+            for _ in 0..4 {
+                writer.u64(0);
+            }
+        });
+        assert_success(&session.serve(&truncate), TSETATTR);
+        assert_eq!(
+            session
+                .filesystem_mut()
+                .metadata("output")
+                .expect("metadata")
+                .len,
+            0
+        );
+
+        let chmod = message(TSETATTR, 52, |writer| {
+            writer.u32(2);
+            writer.u32(1);
+            writer.u32(0o755);
+            writer.u32(u32::MAX);
+            writer.u32(u32::MAX);
+            writer.u64(0);
+            for _ in 0..4 {
+                writer.u64(0);
+            }
+        });
+        let response = session.serve(&chmod);
+        assert_eq!(response_type(&response), RLERROR);
+        assert_eq!(
+            response_body(&response).u32(),
+            Ok(Errno::NotSupported.code())
         );
     }
 
