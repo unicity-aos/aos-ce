@@ -19,7 +19,7 @@ import release_metadata
 import release_publication
 
 
-VERSION = "2026.1.2"
+VERSION = "2026.1.3"
 SOURCE_COMMIT = "a" * 40
 
 

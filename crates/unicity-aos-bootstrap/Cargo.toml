@@ -1,6 +1,6 @@
 [package]
 name = "unicity-aos-bootstrap"
-version = "2026.1.2"
+version = "2026.1.3"
 edition = "2024"
 license = "Apache-2.0"
 description = "Product-owned runtime layout and launcher for Unicity AOS."
