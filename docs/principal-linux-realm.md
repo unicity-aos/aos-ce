@@ -1707,9 +1707,10 @@ compatibility.
   status call succeeded and reported the Realm cold. This is explicit evidence
   that a broker timeout is not background execution and does not currently
   cancel the target;
-- the broker follow-up makes its result-drain window a per-principal
-  `tool_execute_timeout_ms` setting (50-second compatibility default), and the
-  runtime CLI follow-up adds `aos mcp serve --request-timeout <duration>`.
+- Oracles commit `1bb637f` makes the broker result-drain window a per-principal
+  `tool_execute_timeout_ms` setting (50-second compatibility default, 23-hour
+  55-minute ceiling), and Astrid Runtime commit `ed0ea4e2` adds
+  `aos mcp serve --request-timeout <duration>` with a 24-hour 5-minute ceiling.
   These knobs enable aligned long foreground calls; cancellation propagation
   and durable job handles remain required before an abandoned call can be
   represented as safely cancelled or intentionally background;
@@ -1721,6 +1722,16 @@ compatibility.
   suspensions, and reported zero surviving processes. This directly proves the
   configured foreground path crosses the former 50/55-second transport limit
   without converting the command into background work.
+- after those commits were signed and pushed, a fresh isolated daemon loaded
+  final `aos-mcp` component hash
+  `8f530a45183f0eaf3e91a4bdea4d5c5c36dda8b3cff2077842e46a4b752f55e1`
+  (raw SHA-256
+  `d2d0f5fbfbadda050f4fc0ce81f01899f438d530873a5eb79865879be7d177fb`).
+  MCP 2025-11-25 enumerated both Realm tools; a cold Linux 6.18.39 invocation
+  returned `final-linux-live`, exit status 0, 17,362,940 charged guest steps,
+  181 cooperative suspensions, and zero surviving processes. The following
+  status call reported the Linux machine warm with one completed command and
+  no process or pipe records.
 
 The earlier persistence E2E run used the then-current `astrid-mcp` capsule as its
 front door. The actor E2E used the product `aos-cli` proxy and current `sage-mcp`
