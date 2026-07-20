@@ -1,11 +1,11 @@
 # Changelog
 
-## [2026.1.1] - Unreleased
+## [2026.1.3] - Unreleased
 
 ### Added
 
 - The `aos` product command and product-owned `~/.aos` state boundary.
-- A pinned Unicity CE distribution manifest over Astrid Runtime 0.10.1, emplaced
+- A pinned Unicity CE distribution manifest over Astrid Runtime 0.10.4, emplaced
   as the bundled runtime's operator-enforced distro.
 - Reproducible macOS and Linux release bundles with primary BLAKE3 and
   Homebrew-compatible SHA-256 checksum manifests, Sigstore bundles, GitHub
@@ -19,7 +19,7 @@
 - Runtime import holds the standalone daemon's existing singleton lock without
   changing the source, and interrupted unreceipted cutovers always roll back
   before recopying the current locked source.
-- A signed release path for the 18 installable `aos-*` artifacts
+- A signed release path for the 19 installable `aos-*` artifacts
   built from this source tree and selected locally by Community Edition, with
   exact source/manifest identity checks, product-archive inclusion, offline
   provisioning, archive safety validation, BLAKE3 checksums, SHA-256
@@ -87,13 +87,19 @@
   descriptor mappings, atomic parent-endpoint close actions, kernel-owned file
   and pipe descriptor allocation, and the guest-side `realm-sh` workload for
   direct `echo`, environment, `echo | cat`, and file-backed `echo > PATH` jobs.
+- Forge in the default Community Edition distribution, including a discoverable
+  bootstrap and skill that teach fresh agents to build a user-space
+  meta-harness on AOS by seeing instructions, memory, skills, harness code,
+  tools, capsules, traces, and evaluations as an improvable world. Agents reach
+  for Forge proactively when real work reveals a useful new capability, while
+  optional workers remain a use-case choice rather than a prerequisite.
 - Homebrew formula updates initiated by the tap's authenticated stable-release
   poll, eliminating the cross-repository dispatch credential.
 - Strict, signed stable/dev/nightly channel and immutable release metadata
   contracts with exact workflow identities, expiry, replay-resistant generation
   state, and fail-closed direct installer resolution.
 - A native release gate that initializes a clean AOS home, verifies the exact
-  18-capsule CE lock, grants, and ready set, repeats initialization without
+  19-capsule CE lock, grants, and ready set, repeats initialization without
   changing runtime state, and proves clean daemon shutdown before publication.
 - Native `aos status` output for authenticated running state and verified
   stopped state without invoking the runtime CLI.
@@ -104,6 +110,18 @@
 
 ### Changed
 
+- Keep agent Skills out of `Capsule.toml` and the generic capsule release
+  contract. Host plugins may vendor trigger Skills, the AOS Skills service
+  indexes workspace and principal-home entries, and capsules expose detailed
+  guidance over ordinary IPC tools without teaching the runtime an AI-specific
+  file protocol.
+- Make Capsule Forge a progressively disclosed, exhaustive AOS author manual:
+  its compact Skill now routes fresh agents into installed reference chapters
+  covering portable source placement, all manifest capabilities, IPC
+  layering/priority, WIT, Skills and host plugins, construction-versus-activation
+  authority, build/release practice, security, and proactive meta-harness design.
+- Target the Telegram capsule's actual `aos-telegram` package name in CI so the
+  WASI job and target-specific workspace exclusions run as intended.
 - Parse AOS-owned commands with Clap-generated validation and help while
   preserving byte-for-byte delegation of inherited runtime commands and their
   help surfaces.

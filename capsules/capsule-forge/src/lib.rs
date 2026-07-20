@@ -5,10 +5,10 @@
 
 //! Capsule-authoring forge for Unicity AOS.
 //!
-//! Gives a fresh LLM the tools and a Skill to build capsules from zero
-//! knowledge: scaffold a compiling skeleton, read WIT contracts, map an intent
-//! to the exact manifest capabilities, validate a `Capsule.toml`, and diagnose a
-//! capsule that loaded but whose tools don't appear.
+//! Gives a fresh LLM the tools and Skills to understand Unicity AOS, build
+//! capsules and harnesses safely on AOS from zero knowledge: inspect contracts,
+//! scaffold a compiling skeleton, map an intent to manifest capabilities,
+//! validate a `Capsule.toml`, and diagnose an installation.
 //!
 //! All operations go through the kernel's VFS and capability system — the
 //! capsule cannot bypass sandbox boundaries.
@@ -16,6 +16,8 @@
 //! # Tools
 //!
 //! - `forge_quickstart` — the inline build-your-first-capsule guide
+//! - `forge_guide` — progressively load the exhaustive author reference
+//! - `meta_harness_quickstart` — how to build a governed meta-harness on AOS
 //! - `scaffold_capsule` — a complete compiling tool-capsule skeleton as JSON
 //! - `explain_interface` — read a WIT contract + a prose summary
 //! - `suggest_capabilities` — map an intent to the exact manifest lines
@@ -36,13 +38,83 @@ const CAPSULES_DIR: &str = "home://.local/capsules";
 /// Standard WIT interface directory — per-principal, accessible via `home://wit/`.
 const WIT_DIR: &str = "home://wit";
 
-/// Skill installed to `home://skills/capsule-forge/SKILL.md` on install.
-/// Named `capsule-forge` (not `capsule-development`) to avoid colliding with
-/// the skill the system capsule already ships.
-const CAPSULE_FORGE_SKILL: &str = include_str!("skills/capsule-forge/SKILL.md");
-
 /// Inline quickstart returned by `forge_quickstart` — the condensed front door.
 const QUICKSTART_MD: &str = include_str!("quickstart.md");
+
+/// Inline meta-harness bootstrap returned by `meta_harness_quickstart`.
+const META_HARNESS_QUICKSTART_MD: &str = include_str!("meta_harness_quickstart.md");
+
+/// One progressively disclosed chapter of the author manual.
+struct GuideChapter {
+    topic: &'static str,
+    summary: &'static str,
+    content: &'static str,
+}
+
+/// The authoritative agent-facing author manual. Keep the trigger Skill short;
+/// Forge serves these chapters only when the current work reaches them.
+const GUIDE_CHAPTERS: &[GuideChapter] = &[
+    GuideChapter {
+        topic: "foundations",
+        summary: "AOS, Astrid Runtime, capsules, skills, harnesses, plugins, and artifact choice",
+        content: include_str!("guides/foundations.md"),
+    },
+    GuideChapter {
+        topic: "workspace",
+        summary: "portable source locations, repository discovery, scratch candidates, and ownership",
+        content: include_str!("guides/workspace.md"),
+    },
+    GuideChapter {
+        topic: "capsule",
+        summary: "project anatomy, Rust macros, SDK modules, lifecycle, state, and principals",
+        content: include_str!("guides/capsule.md"),
+    },
+    GuideChapter {
+        topic: "manifest",
+        summary: "complete Capsule.toml surface, packaging, environment, commands, and MCP",
+        content: include_str!("guides/manifest.md"),
+    },
+    GuideChapter {
+        topic: "capabilities",
+        summary: "all capability fields, least authority, VFS paths, and host-call gates",
+        content: include_str!("guides/capabilities.md"),
+    },
+    GuideChapter {
+        topic: "ipc",
+        summary: "tool flow, topics, ACL matching, handlers, fan-out, layering, and priority",
+        content: include_str!("guides/ipc.md"),
+    },
+    GuideChapter {
+        topic: "wit",
+        summary: "typed contracts, imports, exports, composition, and interface inspection",
+        content: include_str!("guides/wit.md"),
+    },
+    GuideChapter {
+        topic: "skills",
+        summary: "natural Skill design, capsule distribution, host plugins, precedence, and references",
+        content: include_str!("guides/skills.md"),
+    },
+    GuideChapter {
+        topic: "authority",
+        summary: "initiative, presentation, source changes, install, grants, consent, and activation",
+        content: include_str!("guides/authority.md"),
+    },
+    GuideChapter {
+        topic: "build",
+        summary: "scaffold, build, install, grant, test, diagnose, upgrade, and release loops",
+        content: include_str!("guides/build.md"),
+    },
+    GuideChapter {
+        topic: "security",
+        summary: "untrusted inputs, failure semantics, limits, reliability, evaluation, and review",
+        content: include_str!("guides/security.md"),
+    },
+    GuideChapter {
+        topic: "meta-harness",
+        summary: "proactive world extension and building a meta-harness from first principles",
+        content: include_str!("guides/meta-harness.md"),
+    },
+];
 
 /// Guidance appended to every `capsule_doctor` result. The describe fan-out
 /// race (incomplete on first prompt after boot) is fixed in the current kernel,
@@ -64,6 +136,15 @@ pub struct ForgeTools;
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct EmptyArgs {}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct ForgeGuideArgs {
+    /// Manual topic to read. Omit it, or use `index`, to list every topic.
+    /// Topics: foundations, workspace, capsule, manifest, capabilities, ipc,
+    /// wit, skills, authority, build, security, meta-harness.
+    #[serde(default)]
+    pub topic: Option<String>,
+}
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct ScaffoldArgs {
@@ -134,26 +215,42 @@ fn list_entries(path: &str) -> Result<Vec<String>, SysError> {
 
 #[capsule]
 impl ForgeTools {
-    /// Write the capsule-forge Skill to `home://skills/capsule-forge/SKILL.md`
-    /// so the skills capsule can surface it to the LLM.
-    #[astrid::install]
-    pub fn on_install(&self) -> Result<(), SysError> {
-        // home:// may be unavailable during lifecycle dispatch when installing
-        // without a running daemon; ignore host errors so the skill is written
-        // on the next full boot once the principal home is mounted.
-        let _ = astrid_sdk::fs::create_dir_all("home://skills/capsule-forge");
-        let _ = astrid_sdk::fs::write(
-            "home://skills/capsule-forge/SKILL.md",
-            CAPSULE_FORGE_SKILL.as_bytes(),
-        );
-        Ok(())
-    }
-
     /// Get the build-your-first-capsule guide: the minimal file set, the
     /// build→install→verify loop, and the top footguns. Start here.
     #[astrid::tool("forge_quickstart")]
     pub fn forge_quickstart(&self, _args: EmptyArgs) -> Result<String, SysError> {
         Ok(QUICKSTART_MD.to_string())
+    }
+
+    /// Read one chapter of the exhaustive AOS author manual. Omit `topic` or
+    /// pass `index` to list the chapters, then load only what the current work
+    /// needs. This is the detailed reference behind the capsule-forge Skill.
+    #[astrid::tool("forge_guide")]
+    pub fn forge_guide(&self, args: ForgeGuideArgs) -> Result<String, SysError> {
+        let topic = args.topic.as_deref().unwrap_or("index").trim();
+        let normalized = topic.to_ascii_lowercase().replace(['_', ' '], "-");
+        if normalized.is_empty() || matches!(normalized.as_str(), "index" | "list" | "help") {
+            return Ok(guide_index());
+        }
+
+        if let Some(chapter) = GUIDE_CHAPTERS
+            .iter()
+            .find(|chapter| chapter.topic == normalized)
+        {
+            return Ok(chapter.content.to_string());
+        }
+
+        Ok(format!(
+            "Unknown Forge guide topic '{topic}'.\n\n{}",
+            guide_index()
+        ))
+    }
+
+    /// Explain how AOS supervises platform workers, handles capability gaps,
+    /// and uses Forge without allowing generated code to self-promote.
+    #[astrid::tool("meta_harness_quickstart")]
+    pub fn meta_harness_quickstart(&self, _args: EmptyArgs) -> Result<String, SysError> {
+        Ok(META_HARNESS_QUICKSTART_MD.to_string())
     }
 
     /// Scaffold a complete, compiling tool-capsule skeleton. Returns a JSON
@@ -191,18 +288,21 @@ impl ForgeTools {
         let path = format!("{WIT_DIR}/{filename}");
 
         match astrid_sdk::fs::read_to_string(&path) {
-            Ok(wit) => {
-                let summary = summarize_wit(&wit);
-                Ok(format!(
-                    "=== {filename} ===\n{wit}\n\n=== summary ===\n{summary}"
-                ))
-            }
+            Ok(wit) => Ok(format_wit(&filename, &wit)),
             Err(_) => {
                 let available = list_entries(WIT_DIR).unwrap_or_default();
+                if let Some((bundle, wit)) =
+                    find_declared_interface(interface_lookup_name(name), &available)
+                {
+                    return Ok(format!(
+                        "Interface '{name}' is declared inside bundled file '{bundle}'.\n\n{}",
+                        format_wit(&bundle, &wit)
+                    ));
+                }
                 Ok(format!(
                     "Interface '{filename}' not found.\nAvailable interfaces:\n{}",
                     if available.is_empty() {
-                        "(none — the WIT store fills as capsules are installed; run `aos init` to install Unicity CE)".to_string()
+                        "(none — the WIT store fills from installed capsules; inspect the project's pinned WIT source or install the required provider)".to_string()
                     } else {
                         available.join("\n")
                     }
@@ -260,6 +360,49 @@ impl ForgeTools {
             "guidance": DOCTOR_GUIDANCE,
         }))
     }
+}
+
+fn format_wit(filename: &str, wit: &str) -> String {
+    let summary = summarize_wit(wit);
+    format!("=== {filename} ===\n{wit}\n\n=== summary ===\n{summary}")
+}
+
+/// Find an interface by declaration when the installed WIT mirror uses a
+/// bundle filename rather than one file per interface.
+fn find_declared_interface(name: &str, available: &[String]) -> Option<(String, String)> {
+    for filename in available.iter().filter(|file| file.ends_with(".wit")) {
+        let path = format!("{WIT_DIR}/{filename}");
+        let Ok(wit) = astrid_sdk::fs::read_to_string(&path) else {
+            continue;
+        };
+        if wit_declares(&wit, name) {
+            return Some((filename.clone(), wit));
+        }
+    }
+    None
+}
+
+fn interface_lookup_name(name: &str) -> &str {
+    name.strip_suffix(".wit").unwrap_or(name)
+}
+
+fn wit_declares(wit: &str, name: &str) -> bool {
+    wit.lines().any(|line| {
+        let line = line.trim();
+        ["interface ", "world "]
+            .iter()
+            .any(|keyword| wit_decl_name(line, keyword).as_deref() == Some(name))
+    })
+}
+
+fn guide_index() -> String {
+    let mut index = String::from(
+        "# Unicity AOS Author Manual\n\nCall `forge_guide` again with one `topic`. Load only the chapters relevant to the current decision.\n\n",
+    );
+    for chapter in GUIDE_CHAPTERS {
+        index.push_str(&format!("- `{}` — {}\n", chapter.topic, chapter.summary));
+    }
+    index
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +471,7 @@ fn wit_decl_name(line: &str, keyword: &str) -> Option<String> {
 /// `{ match, manifest, note }`.
 fn suggest_from_intent(intent: &str) -> Vec<Value> {
     let mut out = Vec::new();
-    let any = |needles: &[&str]| needles.iter().any(|n| intent.contains(n));
+    let any = |needles: &[&str]| mentions_positive(intent, needles);
 
     if any(&["read file", "read files", "read a file", "load file"]) {
         out.push(cap(
@@ -338,8 +481,11 @@ fn suggest_from_intent(intent: &str) -> Vec<Value> {
         ));
     }
     if any(&["write file", "write files", "save file", "write to disk"]) {
-        out.push(cap("write files", "[capabilities]\nfs_write = [\"home://data/\"]",
-            "Write under a narrow prefix. fs_write to home://skills/ is how a capsule ships a Skill."));
+        out.push(cap(
+            "write files",
+            "[capabilities]\nfs_write = [\"home://data/\"]",
+            "Write under the narrowest prefix that contains the capsule's mutable data.",
+        ));
     }
     if any(&[
         "http",
@@ -368,8 +514,8 @@ fn suggest_from_intent(intent: &str) -> Vec<Value> {
         "persist state",
         "store state",
     ]) {
-        out.push(cap("kv store", "[capabilities]\nkv = [\"mystore\"]",
-            "Reserved (not yet gate-enforced): per-capsule KV via astrid_sdk::kv already works without declaring it (auto-scoped per capsule + principal). Stateful tools also auto-persist self."));
+        out.push(cap("kv store", "# No capability entry required for ordinary capsule KV.",
+            "The kv manifest field is reserved and not the active gate. astrid_sdk::kv is already scoped per capsule and principal; stateful tools also auto-persist self."));
     }
     if any(&["spawn", "run a process", "subprocess", "shell out", "exec"]) {
         out.push(cap("spawn a process", "[capabilities]\nhost_process = [\"git\", \"cargo\"]\n# add allow_persistent = true for reattachable persistent processes",
@@ -392,30 +538,121 @@ fn suggest_from_intent(intent: &str) -> Vec<Value> {
             "Identity operations via astrid_sdk::identity. A list of resolve < link < admin (each implies the lesser).",
         ));
     }
+    if any(&[
+        "persistent process",
+        "process survives",
+        "outlive the capsule",
+        "reattachable process",
+    ]) {
+        out.push(cap(
+            "persistent host process",
+            "[capabilities]\nhost_process = [\"program\"]\nallow_persistent = true",
+            "Persistent process authority is an explicit boolean sub-grant on top of the executable allowlist.",
+        ));
+    }
+    if any(&[
+        "uplink",
+        "platform bridge",
+        "external message bridge",
+        "publish as another principal",
+    ]) {
+        out.push(cap(
+            "uplink",
+            "[capabilities]\nuplink = true",
+            "Uplink authority enables attributed publishing and long-lived execution semantics. Use it only for a real protocol edge.",
+        ));
+    }
+    if any(&[
+        "inject system prompt",
+        "modify system prompt",
+        "prompt injection hook",
+    ]) {
+        out.push(cap(
+            "system prompt injection",
+            "[capabilities]\nallow_prompt_injection = true",
+            "This permits hook output to affect system-prompt construction. Ordinary tool responses do not need it.",
+        ));
+    }
     suggest_llm(intent, &mut out);
     out
 }
 
+/// Match an intent keyword unless the occurrence is in a plainly negated
+/// clause. Suggestions are candidates, but common phrases such as "no identity
+/// operations" must not manufacture an authority request.
+fn mentions_positive(intent: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| {
+        intent
+            .match_indices(needle)
+            .any(|(index, _)| !occurrence_is_negated(intent, index))
+    })
+}
+
+fn occurrence_is_negated(intent: &str, index: usize) -> bool {
+    let before = &intent[..index];
+    let clause_start = [
+        before.rfind('.').map_or(0, |value| value + 1),
+        before.rfind(',').map_or(0, |value| value + 1),
+        before.rfind(';').map_or(0, |value| value + 1),
+        before.rfind('\n').map_or(0, |value| value + 1),
+        before.rfind(" but ").map_or(0, |value| value + 5),
+        before.rfind(" however ").map_or(0, |value| value + 9),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    let clause = before[clause_start..].trim();
+    [
+        "no",
+        "not",
+        "never",
+        "without",
+        "avoid",
+        "avoids",
+        "avoiding",
+        "exclude",
+        "excluding",
+        "don't",
+        "doesn't",
+        "do not",
+        "does not",
+        "will not",
+        "won't",
+    ]
+    .iter()
+    .any(|negation| {
+        clause == *negation
+            || clause
+                .strip_prefix(negation)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+            || clause
+                .strip_suffix(negation)
+                .is_some_and(|rest| rest.ends_with(char::is_whitespace))
+    })
+}
+
 /// LLM provider / consumer suggestion, grounded in the real openai-compat topics.
 fn suggest_llm(intent: &str, out: &mut Vec<Value>) {
-    let provider = [
-        "be a provider",
-        "llm provider",
-        "serve an llm",
-        "expose a model",
-        "provide a model",
-    ]
-    .iter()
-    .any(|n| intent.contains(n));
-    let consumer = [
-        "call an llm",
-        "call the llm",
-        "use an llm",
-        "ask the model",
-        "generate text",
-    ]
-    .iter()
-    .any(|n| intent.contains(n));
+    let provider = mentions_positive(
+        intent,
+        &[
+            "be a provider",
+            "llm provider",
+            "serve an llm",
+            "expose a model",
+            "provide a model",
+        ],
+    );
+    let consumer = mentions_positive(
+        intent,
+        &[
+            "call an llm",
+            "call the llm",
+            "use an llm",
+            "ask the model",
+            "generate text",
+        ],
+    );
 
     if provider {
         out.push(cap(
@@ -508,6 +745,178 @@ fn collect_export_keys(map: &serde_json::Map<String, Value>, out: &mut Vec<Strin
             for name in obj.keys() {
                 out.push(format!("{ns}:{name}"));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ForgeGuideArgs, ForgeTools, GUIDE_CHAPTERS, META_HARNESS_QUICKSTART_MD, guide_index,
+        interface_lookup_name, suggest_from_intent, wit_declares,
+    };
+
+    const CAPSULE_FORGE_SKILL: &str = include_str!("skills/capsule-forge/SKILL.md");
+    const META_HARNESS_SKILL: &str = include_str!("skills/meta-harness/SKILL.md");
+
+    #[test]
+    fn interface_lookup_accepts_bare_and_wit_names() {
+        assert_eq!(interface_lookup_name("tool"), "tool");
+        assert_eq!(interface_lookup_name("tool.wit"), "tool");
+    }
+
+    #[test]
+    fn guide_index_aliases_are_case_insensitive() {
+        let forge = ForgeTools;
+        for topic in ["Index", "LIST", "Help"] {
+            let guide = forge
+                .forge_guide(ForgeGuideArgs {
+                    topic: Some(topic.to_string()),
+                })
+                .unwrap();
+            assert!(guide.contains("# Unicity AOS Author Manual"));
+        }
+    }
+
+    #[test]
+    fn author_manual_is_progressive_and_complete() {
+        assert!(CAPSULE_FORGE_SKILL.lines().count() < 500);
+        assert!(CAPSULE_FORGE_SKILL.contains("Call `forge_guide`"));
+        assert!(CAPSULE_FORGE_SKILL.contains("`references/<topic>.md`"));
+        assert!(!CAPSULE_FORGE_SKILL.contains("this page is the whole map"));
+
+        let index = guide_index();
+        for chapter in GUIDE_CHAPTERS {
+            assert!(index.contains(&format!("`{}`", chapter.topic)));
+            assert!(
+                chapter.content.lines().count() >= 35,
+                "{} is too thin",
+                chapter.topic
+            );
+        }
+    }
+
+    #[test]
+    fn capability_manual_names_the_complete_current_surface() {
+        let chapter = GUIDE_CHAPTERS
+            .iter()
+            .find(|chapter| chapter.topic == "capabilities")
+            .unwrap()
+            .content;
+        for field in [
+            "`uplink`",
+            "`net`",
+            "`kv`",
+            "`fs_read`",
+            "`fs_write`",
+            "`host_process`",
+            "`allow_persistent`",
+            "`net_bind`",
+            "`net_connect`",
+            "`identity`",
+            "`allow_prompt_injection`",
+        ] {
+            assert!(chapter.contains(field), "capability guide lost {field}");
+        }
+    }
+
+    #[test]
+    fn authority_manual_separates_construction_from_activation() {
+        let chapter = GUIDE_CHAPTERS
+            .iter()
+            .find(|chapter| chapter.topic == "authority")
+            .unwrap()
+            .content;
+        for required in [
+            "create or edit a candidate",
+            "compile the candidate",
+            "install or replace the capsule",
+            "principal use the capsule",
+            "runtime effect",
+            "Generated code cannot self-promote",
+        ] {
+            assert!(
+                chapter.contains(required),
+                "authority guide lost {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipc_manual_explains_priority_mode_switch_and_fail_open_errors() {
+        let chapter = GUIDE_CHAPTERS
+            .iter()
+            .find(|chapter| chapter.topic == "ipc")
+            .unwrap()
+            .content;
+        for required in [
+            "concurrent fan-out",
+            "ordered middleware chain",
+            "ordinary handler error is logged and the chain continues",
+            "must return `Deny`, not `Err`",
+        ] {
+            assert!(chapter.contains(required), "IPC guide lost {required}");
+        }
+    }
+
+    #[test]
+    fn capability_suggestions_ignore_plain_negation() {
+        let suggestions = suggest_from_intent(
+            "read files from the principal home, with no identity operations and without http.",
+        );
+        let rendered = serde_json::to_string(&suggestions).unwrap();
+        assert!(rendered.contains("fs_read"));
+        assert!(!rendered.contains("identity ="));
+        assert!(!rendered.contains("net ="));
+    }
+
+    #[test]
+    fn bundled_wit_can_be_found_by_declared_interface() {
+        let bundle = "package astrid:contracts;\ninterface tool { run: func(); }\nworld capsule {}";
+        assert!(wit_declares(bundle, "tool"));
+        assert!(wit_declares(bundle, "capsule"));
+        assert!(!wit_declares(bundle, "missing"));
+    }
+
+    #[test]
+    fn meta_harness_bootstrap_teaches_proactive_world_extension() {
+        for required in [
+            "Unicity AOS is the operating system for agents",
+            "your user-space world",
+            "Reach for it proactively",
+            "current objective and instructions as the anchor",
+            "Decide whether the extension is needed inline",
+            "Not every agent has subagents",
+            "capabilities remain the operational boundary",
+            "list_skills",
+            "read_skill",
+        ] {
+            assert!(
+                META_HARNESS_QUICKSTART_MD.contains(required),
+                "meta-harness quickstart lost required boundary: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn meta_harness_skill_teaches_reflexive_agent_judgment() {
+        for required in [
+            "name: meta-harness",
+            "Treat the AOS user-space environment",
+            "Exercise initiative",
+            "Reach for the ability proactively",
+            "The user's instruction sets the degree of freedom",
+            "Worker or subagent",
+            "optional pattern, not a prerequisite",
+            "Improve harness code from experience",
+            "Capsule-owned",
+            "instructions; capsule grants and AOS policy still supply authority",
+            "Definition of done",
+        ] {
+            assert!(
+                META_HARNESS_SKILL.contains(required),
+                "meta-harness skill lost required instruction: {required}"
+            );
         }
     }
 }

@@ -12,7 +12,6 @@ type = "executable"
 
 [capabilities]
 fs_read  = ["home://"]
-fs_write = ["home://skills/"]
 
 # Publish ACL: the [publish] keys are the only IPC-publish declaration.
 [publish]

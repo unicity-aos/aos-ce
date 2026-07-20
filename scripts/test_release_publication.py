@@ -19,7 +19,7 @@ import release_metadata
 import release_publication
 
 
-VERSION = "2026.1.1"
+VERSION = "2026.1.3"
 SOURCE_COMMIT = "a" * 40
 
 
@@ -113,7 +113,7 @@ class ReleasePublicationTests(unittest.TestCase):
             artifacts, compatibility = self.fixture(Path(temp))
             payloads = self.validate(artifacts, compatibility)
             self.assertIn(f"unicity-aos-{VERSION}-release.toml", payloads)
-            self.assertEqual(len([name for name in payloads if name.endswith(".capsule")]), 18)
+            self.assertEqual(len([name for name in payloads if name.endswith(".capsule")]), 19)
 
     def test_rejects_missing_asset(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -74,6 +74,8 @@ impl SkillsLoader {
         let home_dir = format!("{HOME_SCHEME}{bare_dir}");
         collect_skills_from(&home_dir, &mut skills, &mut seen_ids);
 
+        skills.sort_by(|left, right| left.id.cmp(&right.id));
+
         let json = serde_json::to_string(&skills)?;
         Ok(json)
     }
@@ -104,15 +106,20 @@ impl SkillsLoader {
         let home_skill_path =
             resolve_skill_path(&format!("{HOME_SCHEME}{bare_dir}"), &args.skill_id)?;
         match read_file_string(&home_skill_path) {
-            Ok(content) => Ok(content),
-            Err(e) => {
-                log::warn(format!("failed to read skill '{}': {:?}", args.skill_id, e));
-                Err(SysError::ApiError(format!(
-                    "Skill '{}' could not be read",
+            Ok(content) => return Ok(content),
+            Err(wit_fs::ErrorCode::NotFound) => {}
+            Err(error) => {
+                return Err(SysError::ApiError(format!(
+                    "Failed to read skill '{}' from principal home: {error:?}",
                     args.skill_id
-                )))
+                )));
             }
         }
+
+        Err(SysError::ApiError(format!(
+            "Skill '{}' could not be read",
+            args.skill_id
+        )))
     }
 }
 

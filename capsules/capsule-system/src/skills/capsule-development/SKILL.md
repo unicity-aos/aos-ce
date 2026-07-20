@@ -117,6 +117,12 @@ fs_write = ["home://data/my-capsule/"]
 "tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }
 ```
 
+Skills are agent user-space instructions, not a Capsule.toml protocol. Ship a
+trigger Skill through the host plugin or the agent-level Skills service, and
+expose capsule-owned reference material through typed IPC tools when useful.
+Do not add an agent Skill section to the manifest or request filesystem write
+authority merely to modify a host's instruction directory.
+
 The published `@unicity-astrid/wit/...` strings and `astrid:*` WIT namespaces
 are stable runtime identifiers. Keep them exact even though the product CLI is
 `aos`.
