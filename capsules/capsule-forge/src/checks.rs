@@ -79,7 +79,14 @@ pub(crate) fn validate_manifest(toml_src: &str) -> Vec<Finding> {
 }
 
 fn check_capabilities(root: &Toml, out: &mut Vec<Finding>) {
-    let Some(capabilities) = root.get("capabilities").and_then(Toml::as_table) else {
+    let Some(capabilities) = root.get("capabilities") else {
+        return;
+    };
+    let Some(capabilities) = capabilities.as_table() else {
+        out.push(Finding::err(
+            "`capabilities` must be a TOML table.",
+            "Use a [capabilities] table with only the fields required by the capsule.",
+        ));
         return;
     };
     const LIST_FIELDS: &[&str] = &[
@@ -347,6 +354,26 @@ imaginary = true
                 .iter()
                 .any(|message| message.contains("Unknown capability field `imaginary`"))
         );
+    }
+
+    #[test]
+    fn capabilities_must_be_a_table() {
+        let findings = validate_manifest(
+            r#"
+capabilities = true
+[package]
+name = "example"
+version = "0.1.0"
+[[component]]
+id = "example"
+file = "example.wasm"
+"#,
+        );
+        assert!(findings.iter().any(|finding| {
+            finding
+                .message
+                .contains("`capabilities` must be a TOML table")
+        }));
     }
 
     #[test]
