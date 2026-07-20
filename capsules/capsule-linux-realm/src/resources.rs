@@ -6,15 +6,22 @@ use serde::Serialize;
 pub(crate) const DEFAULT_LINUX_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_LINUX_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const MIN_LINUX_MEMORY_BYTES: usize = 32 * 1024 * 1024;
-pub(crate) const DEFAULT_LINUX_MAX_STEPS: u64 = 50_000_000;
-pub(crate) const MAX_LINUX_MAX_STEPS: u64 = 50_000_000;
+/// No additional inner instruction ceiling; Astrid's principal CPU and timeout
+/// policy remains the outer enforcement boundary.
+pub(crate) const DEFAULT_LINUX_MAX_STEPS: u64 = 0;
+pub(crate) const MAX_LINUX_MAX_STEPS: u64 = 1_000_000_000_000;
 pub(crate) const DEFAULT_LINUX_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_LINUX_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+/// No additional guest `RLIMIT_FSIZE`; Astrid's principal storage quota remains
+/// the outer enforcement boundary.
+pub(crate) const DEFAULT_LINUX_MAX_FILE_BYTES: u64 = 0;
+pub(crate) const MAX_LINUX_MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const GUEST_PAGE_BYTES: usize = 4096;
 
 const LINUX_MEMORY_BYTES_KEY: &str = "linux_memory_bytes";
 const LINUX_MAX_STEPS_KEY: &str = "linux_max_steps";
 const LINUX_MAX_OUTPUT_BYTES_KEY: &str = "linux_max_output_bytes";
+const LINUX_MAX_FILE_BYTES_KEY: &str = "linux_max_file_bytes";
 
 /// Inner resources admitted to one principal-affine Realm machine.
 ///
@@ -25,8 +32,13 @@ const LINUX_MAX_OUTPUT_BYTES_KEY: &str = "linux_max_output_bytes";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct RealmResources {
     pub(crate) linux_memory_bytes: usize,
+    /// Per-invocation guest step limit. Zero delegates to Astrid's outer CPU
+    /// and timeout policy.
     pub(crate) linux_max_steps: u64,
     pub(crate) linux_max_output_bytes: usize,
+    /// Per-file guest limit. Zero means no inner limit; it never disables the
+    /// outer principal storage quota enforced by Astrid.
+    pub(crate) linux_max_file_bytes: u64,
     pub(crate) linux_vcpus: u32,
 }
 
@@ -36,12 +48,21 @@ impl Default for RealmResources {
             linux_memory_bytes: DEFAULT_LINUX_MEMORY_BYTES,
             linux_max_steps: DEFAULT_LINUX_MAX_STEPS,
             linux_max_output_bytes: DEFAULT_LINUX_MAX_OUTPUT_BYTES,
+            linux_max_file_bytes: DEFAULT_LINUX_MAX_FILE_BYTES,
             linux_vcpus: 1,
         }
     }
 }
 
 impl RealmResources {
+    pub(crate) const fn effective_max_steps(self) -> u64 {
+        if self.linux_max_steps == 0 {
+            u64::MAX
+        } else {
+            self.linux_max_steps
+        }
+    }
+
     pub(crate) fn load() -> Result<Self, SysError> {
         Self::from_values(env::var_opt)
     }
@@ -68,7 +89,7 @@ impl RealmResources {
                 LINUX_MAX_STEPS_KEY,
                 read(LINUX_MAX_STEPS_KEY)?,
                 DEFAULT_LINUX_MAX_STEPS,
-                1,
+                0,
                 MAX_LINUX_MAX_STEPS,
             )?,
             linux_max_output_bytes: parse_usize(
@@ -77,6 +98,13 @@ impl RealmResources {
                 DEFAULT_LINUX_MAX_OUTPUT_BYTES,
                 1,
                 MAX_LINUX_MAX_OUTPUT_BYTES,
+            )?,
+            linux_max_file_bytes: parse_u64(
+                LINUX_MAX_FILE_BYTES_KEY,
+                read(LINUX_MAX_FILE_BYTES_KEY)?,
+                DEFAULT_LINUX_MAX_FILE_BYTES,
+                0,
+                MAX_LINUX_MAX_FILE_BYTES,
             )?,
             linux_vcpus: 1,
         })
@@ -145,8 +173,12 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_the_current_proven_envelope() {
-        assert_eq!(resources(&[]).expect("defaults"), RealmResources::default());
+    fn defaults_delegate_optional_step_and_file_ceilings_to_outer_policy() {
+        let defaults = resources(&[]).expect("defaults");
+        assert_eq!(defaults, RealmResources::default());
+        assert_eq!(defaults.linux_max_steps, 0);
+        assert_eq!(defaults.effective_max_steps(), u64::MAX);
+        assert_eq!(defaults.linux_max_file_bytes, 0);
     }
 
     #[test]
@@ -155,12 +187,14 @@ mod tests {
             (LINUX_MEMORY_BYTES_KEY, "67108864"),
             (LINUX_MAX_STEPS_KEY, "25000000"),
             (LINUX_MAX_OUTPUT_BYTES_KEY, "32768"),
+            (LINUX_MAX_FILE_BYTES_KEY, "268435456"),
         ])
         .expect("bounded envelope");
 
         assert_eq!(selected.linux_memory_bytes, 64 * 1024 * 1024);
         assert_eq!(selected.linux_max_steps, 25_000_000);
         assert_eq!(selected.linux_max_output_bytes, 32 * 1024);
+        assert_eq!(selected.linux_max_file_bytes, 256 * 1024 * 1024);
         assert_eq!(selected.linux_vcpus, 1);
     }
 
@@ -170,8 +204,9 @@ mod tests {
             vec![(LINUX_MEMORY_BYTES_KEY, "unbounded")],
             vec![(LINUX_MEMORY_BYTES_KEY, "33554433")],
             vec![(LINUX_MEMORY_BYTES_KEY, "536870912")],
-            vec![(LINUX_MAX_STEPS_KEY, "50000001")],
+            vec![(LINUX_MAX_STEPS_KEY, "1000000000001")],
             vec![(LINUX_MAX_OUTPUT_BYTES_KEY, "0")],
+            vec![(LINUX_MAX_FILE_BYTES_KEY, "1099511627777")],
         ] {
             assert!(resources(&values).is_err(), "accepted {values:?}");
         }

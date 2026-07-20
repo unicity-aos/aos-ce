@@ -195,13 +195,6 @@ fn map_vfs_9p_error(error: FsError) -> Plan9Errno {
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) struct AstridWorkspace9p;
 
-// `astrid:fs@1.0.0` whole-file calls are capped at 10 MiB. Until the runtime's
-// resource-backed FileHandle lane is live, keep the 9P adapter inside that
-// published boundary instead of pretending that unbounded positional I/O is
-// available.
-#[cfg_attr(test, allow(dead_code))]
-const ASTRID_WHOLE_FILE_LIMIT: usize = 10 * 1024 * 1024;
-
 impl Plan9FileSystem for AstridWorkspace9p {
     fn metadata(&mut self, path: &str) -> Result<Plan9Metadata, Plan9Errno> {
         plan9_metadata(&workspace_path(path)?)
@@ -221,32 +214,17 @@ impl Plan9FileSystem for AstridWorkspace9p {
     }
 
     fn read(&mut self, path: &str, offset: u64, count: u32) -> Result<Vec<u8>, Plan9Errno> {
-        let bytes = fs::read(&workspace_path(path)?).map_err(map_sdk_9p_error)?;
-        let offset = usize::try_from(offset).map_err(|_| Plan9Errno::InvalidArgument)?;
-        if offset >= bytes.len() {
-            return Ok(Vec::new());
-        }
-        let end = offset
-            .checked_add(usize::try_from(count).map_err(|_| Plan9Errno::MessageTooLarge)?)
-            .ok_or(Plan9Errno::MessageTooLarge)?
-            .min(bytes.len());
-        Ok(bytes[offset..end].to_vec())
+        fs::File::open(&workspace_path(path)?)
+            .map_err(map_sdk_9p_error)?
+            .read_at(offset, count)
+            .map_err(map_sdk_9p_error)
     }
 
     fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<u32, Plan9Errno> {
-        let path = workspace_path(path)?;
-        let offset = usize::try_from(offset).map_err(|_| Plan9Errno::NoSpace)?;
-        let end = offset.checked_add(data.len()).ok_or(Plan9Errno::NoSpace)?;
-        if end > ASTRID_WHOLE_FILE_LIMIT {
-            return Err(Plan9Errno::NoSpace);
-        }
-        let mut bytes = fs::read(&path).map_err(map_sdk_9p_error)?;
-        if bytes.len() < end {
-            bytes.resize(end, 0);
-        }
-        bytes[offset..end].copy_from_slice(data);
-        fs::write(&path, &bytes).map_err(map_sdk_9p_error)?;
-        u32::try_from(data.len()).map_err(|_| Plan9Errno::MessageTooLarge)
+        fs::File::open_mode(&workspace_path(path)?, fs::OpenMode::ReadWrite)
+            .map_err(map_sdk_9p_error)?
+            .write_at(offset, data)
+            .map_err(map_sdk_9p_error)
     }
 
     fn create_file(
@@ -280,14 +258,10 @@ impl Plan9FileSystem for AstridWorkspace9p {
     }
 
     fn set_len(&mut self, path: &str, len: u64) -> Result<(), Plan9Errno> {
-        let len = usize::try_from(len).map_err(|_| Plan9Errno::NoSpace)?;
-        if len > ASTRID_WHOLE_FILE_LIMIT {
-            return Err(Plan9Errno::NoSpace);
-        }
-        let path = workspace_path(path)?;
-        let mut bytes = fs::read(&path).map_err(map_sdk_9p_error)?;
-        bytes.resize(len, 0);
-        fs::write(&path, &bytes).map_err(map_sdk_9p_error)
+        fs::File::open_mode(&workspace_path(path)?, fs::OpenMode::ReadWrite)
+            .map_err(map_sdk_9p_error)?
+            .set_len(len)
+            .map_err(map_sdk_9p_error)
     }
 
     fn remove_file(&mut self, path: &str) -> Result<(), Plan9Errno> {
@@ -319,10 +293,12 @@ impl Plan9FileSystem for AstridWorkspace9p {
         if plan9_metadata(&path)?.kind == Plan9NodeKind::Directory {
             return Err(Plan9Errno::NotSupported);
         }
-        let _ = data_only;
-        // `fs::write` does not return until HostVfs has written and flushed the
-        // complete buffer, so there is no deferred capsule-side state to sync.
-        Ok(())
+        let file = fs::File::open_mode(&path, fs::OpenMode::ReadWrite).map_err(map_sdk_9p_error)?;
+        if data_only {
+            file.sync_data().map_err(map_sdk_9p_error)
+        } else {
+            file.sync_all().map_err(map_sdk_9p_error)
+        }
     }
 
     fn statfs(&mut self) -> Result<Plan9FileSystemStats, Plan9Errno> {

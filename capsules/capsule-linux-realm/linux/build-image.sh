@@ -23,8 +23,8 @@ if [ "$#" -eq 4 ]; then
 else
     output_image=$script_dir/Image
 fi
-expected_rootfs=e31a684bb547676654bf79ef36753174108d9a96d003a0b5e0aa0022d6c46e96
-expected_image=6b888939b27c813eb9bc7c4d52ba23cd4f451658ef197777757e2b7c859d226a
+expected_rootfs=10d26184e85add731208050fb3da9fed5e1dda7475b6e66e0d9814a221ecf3f4
+expected_image=fd394b7e5b09638d52483fe2f417985ae1af6a730eea5bc3e415b97262f863de
 record_image=${AOS_RECORD_IMAGE:-0}
 
 if [ "$record_image" != 0 ] && [ "$record_image" != 1 ]; then

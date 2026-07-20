@@ -36,9 +36,9 @@ use paths::{
     MountContext, MountRole, PATH_CONTRACT_VERSION, PathConsumer, ProjectionState,
     ReferenceStability,
 };
-use resources::RealmResources;
 #[cfg(test)]
-use resources::{DEFAULT_LINUX_MAX_STEPS, DEFAULT_LINUX_MEMORY_BYTES};
+use resources::DEFAULT_LINUX_MEMORY_BYTES;
+use resources::RealmResources;
 use serde::{Deserialize, Serialize};
 
 const HARD_MAX_FUEL: u64 = 100_000;
@@ -333,7 +333,7 @@ impl SelectedExecution {
 
     const fn hard_fuel(self, resources: RealmResources) -> u64 {
         match self {
-            Self::Linux(_) => resources.linux_max_steps,
+            Self::Linux(_) => resources.effective_max_steps(),
             _ => HARD_MAX_FUEL,
         }
     }
@@ -630,7 +630,7 @@ fn execute_linux_resident(
     action: LinuxAction,
     command: Option<&str>,
     cwd: &str,
-    limits: RunLimits,
+    limits: LinuxInvocationLimits,
 ) -> Result<LinuxInvocationReport, SysError> {
     let frame_token =
         if action == LinuxAction::Boot || (action == LinuxAction::Shutdown && machine.is_none()) {
@@ -670,6 +670,20 @@ fn execute_linux_resident(
     )
 }
 
+struct LinuxInvocationLimits {
+    run: RunLimits,
+    max_file_bytes: u64,
+}
+
+impl From<RunLimits> for LinuxInvocationLimits {
+    fn from(run: RunLimits) -> Self {
+        Self {
+            run,
+            max_file_bytes: resources::DEFAULT_LINUX_MAX_FILE_BYTES,
+        }
+    }
+}
+
 struct LinuxResidentState<'a> {
     machine: &'a mut Option<Rv64Machine>,
     home_9p: &'a mut Option<HomePlan9Session>,
@@ -701,9 +715,13 @@ fn execute_linux_resident_cooperatively(
     command: Option<&str>,
     cwd: &str,
     frame_token: Option<&str>,
-    limits: RunLimits,
+    limits: impl Into<LinuxInvocationLimits>,
     mut cooperate: impl FnMut() -> Result<(), SysError>,
 ) -> Result<LinuxInvocationReport, SysError> {
+    let LinuxInvocationLimits {
+        run: limits,
+        max_file_bytes,
+    } = limits.into();
     let LinuxResidentState {
         machine,
         home_9p,
@@ -812,7 +830,7 @@ fn execute_linux_resident_cooperatively(
     })?;
     validate_linux_frame_token(frame_token)?;
     let framed_command = if action == LinuxAction::Shell {
-        format!("sh {} {cwd} {command}", cwd.len())
+        format!("sh {max_file_bytes} {} {cwd} {command}", cwd.len())
     } else {
         command.to_string()
     };
@@ -1756,7 +1774,7 @@ mod tests {
     #[test]
     fn linux_boot_and_console_preserve_userspace_across_invocations() {
         let limits = RunLimits {
-            fuel: DEFAULT_LINUX_MAX_STEPS,
+            fuel: RealmResources::default().effective_max_steps(),
             memory_bytes: DEFAULT_LINUX_MEMORY_BYTES,
             output_bytes: HARD_MAX_OUTPUT_BYTES,
         };
@@ -1787,7 +1805,7 @@ mod tests {
         assert!(stdout.contains("Run /init as init process"));
         assert!(contains_bytes(&boot.stdout, LINUX_INIT_MARKER));
         assert!(contains_bytes(&boot.stdout, LINUX_READY_MARKER));
-        assert!(boot.fuel_consumed < DEFAULT_LINUX_MAX_STEPS);
+        assert!(boot.fuel_consumed < limits.fuel);
         assert!(boot.suspensions > 100);
 
         let first = execute_linux_resident_cooperatively(
@@ -1849,6 +1867,33 @@ mod tests {
         .expect("resident shell reads its prior file");
         assert_eq!(persisted.exit_status, Some(0));
         assert!(String::from_utf8_lossy(&persisted.stdout).contains("persisted"));
+
+        let file_limited = execute_linux_resident_cooperatively(
+            LinuxResidentState::new(&mut machine, &mut home_9p, &mut workspace_9p),
+            LinuxAction::Shell,
+            Some("rm -f .config/aos/limited; truncate -s 5 .config/aos/limited"),
+            LINUX_DEFAULT_CWD,
+            Some("2a2a4455667788990011aabbccddeeff"),
+            LinuxInvocationLimits {
+                run: limits,
+                max_file_bytes: 4,
+            },
+            || Ok(()),
+        )
+        .expect("guest enforces the configured per-file ceiling");
+        assert_eq!(file_limited.exit_status, Some(153));
+
+        let file_limit_cleanup = execute_linux_resident_cooperatively(
+            LinuxResidentState::new(&mut machine, &mut home_9p, &mut workspace_9p),
+            LinuxAction::Shell,
+            Some("rm -f .config/aos/limited"),
+            LINUX_DEFAULT_CWD,
+            Some("2b2b4455667788990011aabbccddeeff"),
+            limits,
+            || Ok(()),
+        )
+        .expect("default envelope removes only the inner file ceiling");
+        assert_eq!(file_limit_cleanup.exit_status, Some(0));
 
         let workspace_write = execute_linux_resident_cooperatively(
             LinuxResidentState::new(&mut machine, &mut home_9p, &mut workspace_9p),
@@ -2022,7 +2067,7 @@ mod tests {
             LINUX_DEFAULT_CWD,
             None,
             RunLimits {
-                fuel: DEFAULT_LINUX_MAX_STEPS,
+                fuel: RealmResources::default().effective_max_steps(),
                 memory_bytes: DEFAULT_LINUX_MEMORY_BYTES,
                 output_bytes: HARD_MAX_OUTPUT_BYTES,
             },
@@ -2068,7 +2113,7 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
             LINUX_DEFAULT_CWD,
             None,
             RunLimits {
-                fuel: DEFAULT_LINUX_MAX_STEPS,
+                fuel: RealmResources::default().effective_max_steps(),
                 memory_bytes: DEFAULT_LINUX_MEMORY_BYTES,
                 output_bytes: HARD_MAX_OUTPUT_BYTES,
             },
@@ -2466,7 +2511,11 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
         );
         assert_eq!(
             manifest["env"]["linux_max_steps"]["default"].as_str(),
-            Some("50000000")
+            Some("0")
+        );
+        assert_eq!(
+            manifest["env"]["linux_max_file_bytes"]["default"].as_str(),
+            Some("0")
         );
         assert!(capabilities.contains_key("fs_read"));
         assert!(capabilities.contains_key("fs_write"));

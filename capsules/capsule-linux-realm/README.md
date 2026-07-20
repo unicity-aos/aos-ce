@@ -107,19 +107,22 @@ outlive the invocation. The home session is principal-resident, while its
 authoritative generation survives guest shutdown, component eviction, and
 daemon restart. Linux `/tmp` and the initramfs root remain guest RAM.
 
-Astrid filesystem metadata may report mode `0` on hosts without a portable
-POSIX-mode projection. In that case the workspace bridge exposes directories
-as `0755` and regular files as `0644` inside the already capability-confined
-mount; nonzero host modes are preserved.
+Astrid reports host POSIX mode bits through the workspace projection. On hosts
+without a portable POSIX-mode projection, mode `0` falls back to `0755` for
+directories and `0644` for regular files inside the already
+capability-confined mount. The frozen `astrid:fs@1.0.0` contract does not expose
+mode mutation, so portable guest `chmod` remains a future canonical WIT and SDK
+addition rather than a private capsule convention.
 
-The current Astrid runtime does not yet implement component `FileHandle`
-operations or workspace rename. Until it does, the workspace bridge provides
-positional access with bounded whole-file reads and read-modify-writes. A single
-workspace file is therefore limited to the published `astrid:fs` whole-file
-ceiling of 10 MiB, successful writes are already synchronous when 9P `fsync`
-returns, and workspace rename reports `EOPNOTSUPP`. This is sufficient for the
-live shell and ordinary small source-file editing, but it is deliberately not
-presented as the final storage path for compiler caches or large build trees.
+Workspace data uses resource-backed `FileHandle` operations: each bounded 9P
+frame maps to positional read or write, truncate maps to `set-len`, flush maps
+to the appropriate host sync operation, and rename is atomic inside the same
+workspace VFS. Large files therefore stream without the former 10 MiB
+whole-file compatibility ceiling. File handles are scoped to the admitted
+invocation and cannot become hidden durable state. Astrid's existing 50 MiB
+outer COW copy-up/promotion ceiling still applies when an operation must copy a
+lower-layer workspace file; removing that separate boundary requires a
+streaming COW implementation, not a larger capsule buffer.
 
 The default realm name is `default`, giving one durable home per principal. The
 principal is never accepted from tool input. It comes from the kernel-stamped
@@ -221,6 +224,22 @@ to zero while their identifiers are never reused during that Store residency. A
 principal-scoped boot sequence is advanced with KV compare-and-swap and makes PID
 reuse after eviction or restart explicit as `(boot sequence, PID)`.
 
+A foreground command keeps its Astrid tool invocation—and therefore the agent
+turn awaiting that tool result—open until the command exits, fails, is
+cancelled, times out, or exhausts an admitted budget. Shell `&` does not detach:
+PID 1 kills and reaps remaining descendants before returning. Durable continued
+work will be a separate job API that returns an opaque job handle and exposes
+explicit status, logs, wait, and cancel operations; warm Linux residency alone
+does not run CPU between invocations.
+
+The currently released AOS MCP path has its own shorter broker/shim deadlines.
+Those are transport policy, not Linux background execution: if either expires,
+the original Realm invocation can continue until Astrid's outer principal
+timeout because cancellation is not yet propagated across the tool bus. Long
+foreground builds therefore require explicitly aligned broker, shim, and
+principal deadlines. A future background operation must use the job API rather
+than relying on a timed-out or disconnected foreground call.
+
 `crates/realm-machine` is the host-testable full-system backend seed. It owns only
 admitted guest CPU/CSR state, contiguous RAM, bounded serial input/output, the
 standard test finisher, and slice execution. Its current surface is RV64IMA plus
@@ -303,12 +322,16 @@ per-capsule configuration on every operation:
 | Config key | Default | Admitted range | Meaning |
 | --- | ---: | ---: | --- |
 | `linux_memory_bytes` | 33554432 | 33554432–268435456, 4 KiB aligned | Guest-visible RV64 RAM |
-| `linux_max_steps` | 50000000 | 1–50000000 | Guest steps admitted per invocation |
+| `linux_max_steps` | 0 | 0–1000000000000 | Guest steps admitted per invocation; zero delegates to Astrid's outer principal CPU and timeout policy |
 | `linux_max_output_bytes` | 65536 | 1–65536 | Captured Linux output per invocation |
+| `linux_max_file_bytes` | 0 | 0–1099511627776 | Guest `RLIMIT_FSIZE`; zero applies no extra inner cap and leaves Astrid's principal storage quota in force |
 
 The effective boundary is the intersection of the Astrid principal profile, the
 capsule hard maximum, this configured envelope, and any lower per-command request.
-The guest cannot raise any of them. RAM above the proven 32 MiB default requires
+For the optional step and file-size limits, zero omits only that inner boundary;
+Astrid's outer CPU, timeout, and storage limits still apply. The guest cannot
+raise any boundary. RAM
+above the proven 32 MiB default requires
 the administrator to raise that principal's outer Wasmtime memory quota enough
 to contain both guest RAM and the capsule itself.
 

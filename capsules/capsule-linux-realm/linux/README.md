@@ -50,12 +50,14 @@ boot-local RAM.
 PID 1 disables terminal echo and accepts one canonical console line:
 
 ```text
-AOS/1 <32-lowercase-hex-token> sh <cwd-byte-length> <cwd> <script>\n
+AOS/1 <32-lowercase-hex-token> sh <max-file-bytes> <cwd-byte-length> <cwd> <script>\n
 ```
 
 Lifecycle and diagnostic commands retain their shorter fixed forms. The shell
-frame's length makes the absolute guest CWD unambiguous; only `/home/agent`,
-`/workspace`, and their normalized descendants are admitted.
+The per-file limit is a decimal byte count; zero means no additional inner
+`RLIMIT_FSIZE`, while Astrid's outer principal storage quota remains mandatory.
+The frame's CWD length makes the absolute guest CWD unambiguous; only
+`/home/agent`, `/workspace`, and their normalized descendants are admitted.
 
 PID 1 emits token-bound `AOS BEGIN` and `AOS END <token> <status>` frames followed
 by `AOS READY`. The capsule generates the 128-bit token from Astrid's host
@@ -64,14 +66,17 @@ the next ready marker. The shell receives the script, not the token. Its stdin
 is `/dev/null`; PID 1 reopens stdout and stderr as write-only console file
 descriptions before dropping credentials; and `/dev/console` is root-only. It
 runs as UID/GID 1000 with `no_new_privs`, no supplementary groups, no core
-dumps, 64 descriptors, at most 32 UID-owned processes, and an 8 MiB file-size
-limit.
+dumps, 64 descriptors, at most 32 UID-owned processes, and the principal's
+configured per-file limit. A zero per-file limit delegates capacity entirely to
+Astrid's outer storage boundary; it does not mean unmetered host storage.
 
 PID 1 kills and reaps every remaining descendant before it emits the result.
 Consequently a background process cannot survive a tool call or write into a
-later call's output. The outer capsule independently limits guest RAM, exact
-RV64 machine steps, output bytes, and cooperative scheduling slices. The guest
-advances only during a metered invocation.
+later call's output. The outer capsule independently limits guest RAM, output
+bytes, and cooperative scheduling slices, and can impose a finite exact RV64
+step ceiling. With the default zero inner step ceiling, Astrid's principal CPU
+and timeout policy remains authoritative. The guest advances only during a
+metered invocation.
 
 The diagnostic `linux-console` surface admits only `ping`, `counter`, and
 `echo`. Arbitrary shell text is sent only by the explicit `linux-sh` action.
