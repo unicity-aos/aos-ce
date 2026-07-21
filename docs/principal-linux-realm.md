@@ -140,9 +140,9 @@ The decision was made against current upstream state rather than project names:
 |---|---|---|
 | CheerpX 1.2.8 and WebVM commit [`007fedb`](https://github.com/leaningtech/webvm/tree/007fedb26946a8c31563dab2fed9d85bcd1f8963) | Strong x86 Linux userland, persistent overlay, excellent product proof | Requires a browser JavaScript environment, `SharedArrayBuffer`, workers, IndexedDB/WebSockets and CheerpX licensing; not a core-WASM library that can be linked into this capsule |
 | v86 tag `latest`, commit [`2f1346b`](https://github.com/copy/v86/tree/2f1346b0e7d88d4cbbbcc05fe15b4e369c3de23f) | BSD-licensed full x86 PC with Linux and virtio devices | Browser/JavaScript orchestration and runtime generation of new WebAssembly modules are fundamental to its fast path; Astrid's nested interpreter does not provide that host |
-| `rvemu` 0.0.11, current commit [`f55eb5b`](https://github.com/d0iasm/rvemu/tree/f55eb5b376f22a73c0cf2630848c03f8d5c93922) | MIT Rust RV64GC, Sv39, PLIC/CLINT/virtio, and a `wasm32-unknown-unknown` build | The Wasm UART calls the browser DOM, construction runs host `dtc`, RAM eagerly allocates 1 GiB, execution is unbounded, and its Linux recipe remains on 4.19; it is a reference donor, not a dependency |
+| `rvemu` 0.0.11, current commit [`f55eb5b`](https://github.com/d0iasm/rvemu/tree/f55eb5b376f22a73c0cf2630848c03f8d5c93922) | MIT Rust RV64GC, Sv39, PLIC/CLINT/virtio, and a `wasm32-unknown-unknown` build | The Wasm UART calls the browser DOM, construction runs host `dtc`, RAM eagerly allocates 1 GiB, execution is unbounded, and its Linux recipe remains on 4.19; it is comparison material, not a dependency or source donor |
 | `semu` commit [`fd08129`](https://github.com/sysprog21/semu/tree/fd0812970c3c934b46e4897284894e9705355b50) with rolling `prebuilt` tag [`c722c11`](https://github.com/sysprog21/semu/tree/c722c1140770a67e638fd8154446825563ebd738) | Active MIT full-system Linux proof with virtio block, filesystem, network, input, sound, and 2D GPU | It is an RV32IMA C host program with native host integrations, not an embeddable RV64 core-WASM component; its device behavior remains valuable comparison evidence |
-| `vpod` release [`v0.4.0`](https://github.com/capsulerun/vpod/tree/v0.4.0), tag commit `3e56b8b`, audited main `08bf0fb` | Apache-2.0 Rust RV64GC, decoded-block cache, copy-on-write RAM, virtio devices, delta snapshots, and a working Alpine 3.23 RV64 snapshot | Its shipped product wraps the machine in a WASI 0.2 component and Wasmtime CLI, and its filesystem/network devices currently own ambient host effects. Those wrappers are not an Astrid backend, but the engine-free core is a viable implementation donor |
+| `vpod` release [`v0.4.0`](https://github.com/capsulerun/vpod/tree/v0.4.0), tag commit `3e56b8b`, audited main `08bf0fb` | Apache-2.0 Rust RV64GC, decoded-block cache, copy-on-write RAM, virtio devices, delta snapshots, and a working Alpine 3.23 RV64 snapshot | Its shipped product wraps the machine in a WASI 0.2 component and Wasmtime CLI, and its filesystem/network devices currently own ambient host effects. It is comparison material only: AOS will not vendor, import, or depend on its machine crates |
 
 The first `aos-rv64-virt-v0` slice is intentionally smaller than all four. It has
 explicitly admitted contiguous RAM, a slice-driven interpreter for the initial
@@ -173,10 +173,12 @@ The official `vpod` v0.4.0 macOS launcher was used only as comparison evidence.
 Its snapshot booted Linux 6.18.0-3-lts and Alpine 3.23.0 as `riscv64`; it did not
 contain Rust, and package networking was not usable in that run. Separately, its
 unmodified `riscv-core` and `machine` crates both passed `cargo check` for
-`wasm32-unknown-unknown`. This proves that the useful CPU, memory, virtio, and
-snapshot layers do not require Wasmtime, a browser, JavaScript workers, or a WASI
-engine. It does not yet prove compiler performance, Astrid device integration, or
-semantic equivalence.
+`wasm32-unknown-unknown`. This is evidence that decoded execution, copy-on-write
+memory, virtio devices, and snapshots can be implemented without Wasmtime, a
+browser, JavaScript workers, or a WASI engine. It is not a source selection: AOS
+will implement applicable techniques within its own machine model. It does not
+yet prove compiler performance, Astrid device integration, or semantic
+equivalence.
 
 The adaptation boundary is strict:
 
@@ -210,18 +212,54 @@ their resource semantics are useful. Such a provider must be an Astrid provider:
 - implementing a WASI interface does not select Wasmtime, WASI Preview 2's
   reference host, or any other engine.
 
-For the first accelerated backend, the engine-free CPU/machine source should be
-isolated behind an AOS-owned backend interface and pinned to exact upstream bytes
-with its Apache-2.0 notices. Floating Git dependencies and the upstream WASI/CLI
-crates are not admissible distribution dependencies. The adapter must replace or
-disable upstream `std::fs`, socket, clock, terminal, registry, and snapshot-path
-behavior before the backend is allowed to serve a principal.
+For the first accelerated backend, AOS should implement only techniques justified
+by measurements and conformance tests, behind its AOS-owned backend interface.
+External implementations remain attributed, commit-pinned research evidence;
+they are not distribution dependencies or vendored source. Any future proposal
+to reuse literal third-party source requires a separate architecture, licence,
+provenance, and conformance decision. It is not part of the current plan.
 
 The backend interface is private until two implementations exist. It needs typed
 operations for admission, bounded execution, console input/output, device
 requests, clean shutdown, checkpoint/restore, and accounting. A backend result
 must carry the stable semantic outcome plus backend-specific counters; callers
 must never branch on an implementation's Rust type or ambient host feature.
+
+The first measured fast path remains inside the reference machine. A fixed-size,
+machine-local Sv39 translation cache keys entries by address space, virtual page,
+effective privilege, access type, and permission-relevant status. `sfence.vma`
+and accepted address-space changes conservatively flush the whole cache. Every
+guest instruction still crosses the existing one-step execution, interrupt,
+timer, fuel, trap, and host-suspension path.
+
+The host-side release measurement on 2026-07-21 used the checked-in Linux image
+and `cargo run --release -p aos-realm-machine --example boot_linux --
+capsules/capsule-linux-realm/linux/Image 250000000`. Both runs reached the first
+unwired 9P request after exactly 15,899,016 charged steps at the same PC:
+
+| Machine state | Steps/s | Sv39 walks | PTE reads | Meaning |
+|---|---:|---:|---:|---|
+| Instrumented interpreter before the cache | 35,355,391 | 21,809,261 | 43,624,126 | Immediate same-session baseline, not a cross-host benchmark |
+| AOS translation cache enabled | 51,270,155 | 58,484 | 117,122 | 21,750,777 cache hits, 58,484 misses, and 141 conservative flushes |
+
+That is about 45% more native-host steps per second and roughly 373 times fewer
+page walks for this boot. It selects address translation as a proven fast path;
+it does not predict core-WASM throughput. The measurement example now emits
+these counters so native and Astrid-hosted builds can be compared explicitly.
+
+The remaining performance routes are ordered by the boundary they remove:
+
+1. make RAM access and device dispatch cheap after translation;
+2. restore a signed prewarmed machine snapshot instead of replaying 15.9 million
+   boot steps for every cold principal;
+3. add decoded instruction or bounded basic-block caching only if post-TLB
+   measurements justify it, preserving an interrupt/fuel boundary per step;
+4. serve immutable distribution and toolchain bytes from shared content-addressed
+   pages with principal-local copy-on-write overlays;
+5. replace chatty file-at-a-time workspace traffic with metered bulk reads,
+   staging, diffs, and artifact promotion over Astrid resources;
+6. admit native virtualization as an optional host provider only where its state,
+   metering, and effects reproduce the Realm contract.
 
 Backend admission requires differential conformance against the reference
 machine:
@@ -2007,8 +2045,10 @@ CE set rather than test-installed companions.
 ### Milestone F: backend substitution
 
 - define the private backend interface at the principal-machine boundary;
-- isolate and pin an engine-free decoded-block RV64 candidate without its WASI
-  launcher or ambient host devices;
+- establish reference traces and measure the interpreter before choosing an
+  optimisation;
+- implement decoded execution, snapshot restore, or other justified fast paths
+  inside the AOS-owned machine without importing another runtime;
 - implement Astrid filesystem, block, console, clock, and optional network
   adapters over existing principal-scoped imports;
 - run the same Realm contract over the accelerated core-WASM backend;
@@ -2077,7 +2117,7 @@ Record rather than assume:
 - artifact export and verification time.
 
 The interpreter is now classified as the reference backend rather than the first
-compiler backend. A faster engine-free core-WASM backend is admitted only after it
+compiler backend. A faster AOS-owned core-WASM backend is admitted only after it
 reproduces the reference traces and preserves revocation and accounting. A quick
 shell boot from a prewarmed snapshot is evidence for snapshot design, not evidence
 that `rustc`, Cargo dependency traversal, linking, or large workspace I/O is
@@ -2236,9 +2276,9 @@ interfaces preserve every current capsule and let services opt in one at a time.
 
 The first implementation must resolve these with executable evidence:
 
-1. Which exact engine-free RV64 source subset should AOS pin or adapt, and should
-   its long-term ownership remain an in-tree backend or graduate to a separately
-   versioned machine crate after conformance is established?
+1. Which measured bottleneck should the first AOS-owned fast path address, and
+   when should the machine implementation graduate to a separately versioned
+   crate after conformance is established?
 2. Which WASI resource interfaces are useful enough to implement as Astrid host
    providers, without introducing a second engine, scheduler, or authority model?
 3. Which image shell should follow the WAT mini-shell once redirection and job
@@ -2249,9 +2289,9 @@ The first implementation must resolve these with executable evidence:
    single private block volume?
 6. How are guest continuations represented for `fork`, signals, and blocking calls?
 7. Which dynamic-code mechanism is allowed for Node and other JIT runtimes?
-8. Can BrowserPod/Cheerp technology be licensed or upstreamed usefully, or should
-   it remain comparison evidence only now that an Apache-2.0 engine-free RV64
-   candidate exists?
+8. Which ideas from BrowserPod, vpod, and other systems survive Astrid's exact
+   fuel, suspension, MMU, and governed-effect requirements when reimplemented in
+   the AOS-owned machine?
 9. Should binary compatibility target RV64, x86-64, or neither until the
    WASM-native package set is measured?
 10. At what stable boundary does a public realm WIT RFC become necessary?
@@ -2392,12 +2432,12 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   `riscv-core` and `machine` crates compile for `wasm32-unknown-unknown`, and run
   its official snapshot only as separately labelled RV64 Linux comparison
   evidence;
-- [ ] define and implement the private backend interface without changing the
+- [x] define and implement the private backend interface without changing the
   Realm tool schema, then keep `aos-rv64-interpreter` as its first production
   implementation;
-- [ ] pin or adapt the engine-free decoded-block CPU/machine subset, excluding
-  the upstream Wasmtime/WASI CLI and replacing ambient filesystem, socket, clock,
-  terminal, registry, and snapshot paths with Astrid-owned adapters;
+- [x] measure the reference interpreter, then implement the first justified fast
+  path in the AOS-owned machine without importing another runtime or authority
+  model;
 - [ ] pass reference-trace and denied-path conformance before selecting the
   accelerated backend for a principal;
 - [ ] build an immutable AOS Realm development generation with the current
