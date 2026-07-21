@@ -363,13 +363,16 @@ misaligned superpages; enforces U/S, R/W/X, SUM, and MXR; translates MPRV data
 accesses; and updates A/D bits in admitted RAM. `sfence.vma` is privilege checked
 and retires as a no-op because the interpreter has no software TLB.
 
-The fourth slice supplies the single-hart execution and time substrate. `misa`
+The fourth slice supplies the deterministic multi-hart execution and time
+substrate. `misa`
 reports RV64IMA plus S/U; all base M multiply/divide operations and W forms, LR/SC,
 and the W/D AMO set execute with architectural edge behavior. Reservations are
-physical, cleared by overlapping stores and traps, and never weaken the outer
-single-threaded machine boundary. Architectural cycle/time/instret counters are
-separate from unforgeable Realm fuel accounting, and `mcounteren`/`scounteren`
-gate lower-privilege reads.
+physical, cleared across every hart by overlapping stores and by local traps,
+and never weaken the outer principal boundary. Registers, CSRs, reservations,
+timers, software interrupts, counters, and translation caches are hart-local;
+RAM, guest time, UART, firmware and effects are machine-wide. Architectural
+cycle/time/instret counters are separate from unforgeable Realm fuel accounting,
+and `mcounteren`/`scounteren` gate lower-privilege reads.
 
 The deterministic CLINT exposes `msip`, `mtimecmp`, and `mtime`. Guest time advances
 once per charged machine step rather than from ambient host wall time. M/S
@@ -385,8 +388,8 @@ CPU interrupt controller, UART, boot arguments, and initramfs range without
 invoking `dtc` at build or runtime. Its bytes have also been independently parsed
 by DTC 1.8.1.
 
-The private firmware implements the SBI 3.0 Base, TIME, DBCN, and SRST subsets,
-plus one AOS experimental extension for bounded host requests.
+The private firmware implements the SBI 3.0 Base, TIME, IPI, RFENCE, HSM, DBCN,
+and SRST subsets, plus one AOS experimental extension for bounded host requests.
 Debug-console buffers are accepted only when their complete physical range lies
 in admitted RAM; timer requests map the machine timer into the delegated
 Supervisor timer line; a successful reset halts the bounded machine. The
@@ -409,8 +412,8 @@ source archive matches kernel.org SHA-256
 `a7a7e3d2ae9d95e74197223a8d4eb5f6be7aac21b6e6de27e9685d001c1f8cb0`;
 the Buildroot 2026.05.1 rootfs is
 `10d26184e85add731208050fb3da9fed5e1dda7475b6e66e0d9814a221ecf3f4`,
-and the deterministic raw `Image` is
-`fd394b7e5b09638d52483fe2f417985ae1af6a730eea5bc3e415b97262f863de`.
+and the deterministic SMP-enabled raw `Image` is
+`7cb62638de9f41c2fe2a237a1c46642189b6d97e373c8592cc931f74f88419ff`.
 The checked-in capsule regression asserts the exact kernel and userland
 versions, AOS machine model, PID 1 launch and ready markers, diagnostic state
 continuity, real UID-1000 BusyBox shell execution, warm file continuity,
@@ -1487,7 +1490,7 @@ Implementation and proof order:
 - [x] implement and negatively test SBI HSM, IPI, RFENCE, and per-hart TIME,
   including ordered S-mode secondary entry, non-returning stop, invalid targets,
   unsupported fences, restart reset state, and hart-local interrupts;
-- [ ] enable SMP in the pinned Linux build and prove two CPUs reach userspace,
+- [x] enable SMP in the pinned Linux build and prove two CPUs reach userspace,
   schedule work, receive interrupts, and remain within aggregate metering;
 - [ ] resolve `linux_vcpus` from principal and operator authority, with automatic
   local defaults and finite managed ceilings;
@@ -2078,7 +2081,7 @@ compatibility.
   and unchanged BusyBox 1.38.0 is
   `ce034f1e35d22be85de0dbe4e63aafa32c284c669568e62cb0d61517e250e56f`;
 - two independent clean Linux 6.18.39 output trees embedded that rootfs and
-  produced the byte-identical checked-in raw Image
+  produced the byte-identical then-checked-in single-hart raw Image
   `fd394b7e5b09638d52483fe2f417985ae1af6a730eea5bc3e415b97262f863de`;
 - the real native Linux regression passes in 43.15 seconds, including cold
   boot, home/workspace 9P, exact nonzero status propagation, forged-frame
@@ -2236,6 +2239,31 @@ CE set rather than test-installed companions.
   the complete audit chain before loading any capsule. This is recovery evidence,
   not permission to operate without a disk-capacity reserve.
 
+### Deterministic Linux SMP evidence recorded on 2026-07-22
+
+- the Linux 6.18.39 archive matched kernel.org SHA-256
+  `a7a7e3d2ae9d95e74197223a8d4eb5f6be7aac21b6e6de27e9685d001c1f8cb0`;
+  its detached signature verified against Greg Kroah-Hartman's published
+  `647F 2865 4894 E3BD 4571 99BE 38DB BDC8 6092 693E` fingerprint;
+- the pinned Ubuntu builder retained Clang and LLD 18.1.3, enabled
+  `CONFIG_SMP=y` and `CONFIG_NR_CPUS=64`, and produced raw Image SHA-256
+  `7cb62638de9f41c2fe2a237a1c46642189b6d97e373c8592cc931f74f88419ff`.
+  A second clean output tree produced a byte-identical Image;
+- the AOS-owned machine booted that image directly with two admitted harts.
+  Linux reported `#1 SMP`, detected SBI TIME, IPI, RFENCE, HSM, SRST and DBCN,
+  selected SBI IPIs, restricted `NR_CPUS=64` to two described CPUs, and printed
+  `smp: Brought up 1 node, 2 CPUs` before executing the controlled `/init`;
+- the first principal-owned 9P request was reached after 35,072,241 aggregate
+  charged steps and 35,067,215 retired instructions in 0.847 seconds on the
+  Apple M2 Ultra reference host. Those totals include both harts. The fixed
+  scheduler is time-sliced on one native thread; this proves Linux-visible SMP
+  correctness, not parallel speedup;
+- the format-1 prewarm remains deliberately one-hart and was regenerated against
+  the SMP-capable image and updated source lock. Its SHA-256 is
+  `3de27c49129483c34e5956d23f44fed87ea3d4876db3f30e2276a1662cc5800d`;
+  multi-hart machines cold boot until checkpoint format 2 binds every hart and
+  scheduler field.
+
 ## 16. Ordered implementation milestones
 
 ### Milestone A: nested process proof
@@ -2349,8 +2377,9 @@ CE set rather than test-installed companions.
   cold boot while guest RAM state resets;
 - add explicit Realm `start`, `stop`, and status transitions plus bounded idle
   eviction after that Store is kernel-metered to its verified principal;
-- add deterministic multi-hart scheduling, SBI HSM/IPI support, per-hart CLINT
-  state, and an SMP-enabled kernel only after the principal residency boundary;
+- [x] add deterministic multi-hart scheduling, SBI HSM/IPI/RFENCE support,
+  per-hart timer and interrupt state, aggregate metering, and an SMP-enabled
+  kernel after the principal residency boundary;
 - add virtio-block behind an immutable base plus principal-private COW block
   overlay before making the root filesystem writable;
 - replace the probe-only execution adapter with a Realm process/job record whose

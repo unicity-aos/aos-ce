@@ -26,7 +26,7 @@ fn run() -> Result<(), String> {
     let mut args = env::args_os().skip(1);
     let image_path = args
         .next()
-        .ok_or_else(|| "usage: boot_linux IMAGE [MAX_STEPS]".to_string())?;
+        .ok_or_else(|| "usage: boot_linux IMAGE [MAX_STEPS] [HARTS]".to_string())?;
     let max_steps = args
         .next()
         .map(|value| {
@@ -38,16 +38,30 @@ fn run() -> Result<(), String> {
         })
         .transpose()?
         .unwrap_or(DEFAULT_MAX_STEPS);
+    let hart_count = args
+        .next()
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| "HARTS must be UTF-8".to_string())?
+                .parse::<usize>()
+                .map_err(|error| format!("invalid HARTS: {error}"))
+        })
+        .transpose()?
+        .unwrap_or(1);
     if args.next().is_some() {
-        return Err("usage: boot_linux IMAGE [MAX_STEPS]".to_string());
+        return Err("usage: boot_linux IMAGE [MAX_STEPS] [HARTS]".to_string());
     }
 
     let image =
         fs::read(&image_path).map_err(|error| format!("could not read {image_path:?}: {error}"))?;
-    let mut machine = Machine::new(MachineConfig {
-        ram_bytes: RAM_BYTES,
-        max_console_bytes: CONSOLE_BYTES,
-    })
+    let mut machine = Machine::new_with_harts(
+        MachineConfig {
+            ram_bytes: RAM_BYTES,
+            max_console_bytes: CONSOLE_BYTES,
+        },
+        hart_count,
+    )
     .map_err(|error| format!("could not admit Linux machine: {error}"))?;
     machine
         .boot_linux(&image, &[], "earlycon=sbi console=hvc0 init=/init panic=-1")
@@ -90,12 +104,27 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
             SliceOutcome::HostRequest(request) => {
-                return Err(format!(
-                    "Linux requested unwired 9P host service {} at pc {:#x}; {}",
-                    request.id.get(),
-                    machine.pc(),
+                if !serial
+                    .windows(INIT_MARKER.len())
+                    .any(|bytes| bytes == INIT_MARKER)
+                {
+                    return Err(format!(
+                        "Linux requested host service {} before /init after {} steps",
+                        request.id.get(),
+                        report.total_steps_executed
+                    ));
+                }
+                if hart_count > 1 && !linux_reported_cpu_count(&serial, hart_count) {
+                    return Err(format!(
+                        "Linux reached /init without reporting {hart_count} active CPUs"
+                    ));
+                }
+                eprintln!(
+                    "AOS Linux boot reached its first governed host request with {hart_count} hart(s): {} retired instructions; {}",
+                    report.total_instructions_retired,
                     performance_summary(&machine, report.total_steps_executed, started.elapsed())
-                ));
+                );
+                return Ok(());
             }
             SliceOutcome::Trapped(trap) => {
                 return Err(format!(
@@ -113,6 +142,18 @@ fn run() -> Result<(), String> {
         machine.privilege(),
         performance_summary(&machine, total_steps, started.elapsed())
     ))
+}
+
+fn linux_reported_cpu_count(serial: &[u8], hart_count: usize) -> bool {
+    let markers = [
+        format!("{hart_count} CPUs"),
+        format!("{hart_count} processors activated"),
+    ];
+    markers.iter().any(|marker| {
+        serial
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+    })
 }
 
 fn performance_summary(machine: &Machine, steps: u64, elapsed: Duration) -> String {
