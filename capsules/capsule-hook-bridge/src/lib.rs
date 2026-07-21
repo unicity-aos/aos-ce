@@ -34,7 +34,7 @@
 
 use astrid_sdk::contracts::hook::HookEventRequest;
 use astrid_sdk::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Hard deadline for collecting hook responses, per dispatch.
 ///
@@ -44,6 +44,18 @@ use serde::Serialize;
 /// in this window, we return the merge of whatever did arrive (which
 /// may be the `MergeSemantics::None` result).
 const HOOK_COLLECT_DEADLINE_MS: u64 = 5_000;
+
+/// Once one responder has answered, allow a short window for peers in the
+/// same fan-out before returning. This avoids paying the full deadline after
+/// the common single-responder case.
+const HOOK_QUIESCENCE_MS: u64 = 25;
+
+/// Host prompt hooks are latency-sensitive and all expected responders are
+/// already-loaded local capsules.
+const HOST_HOOK_COLLECT_DEADLINE_MS: u64 = 1_000;
+
+const MAX_HOST_PAYLOAD_BYTES: usize = 1024 * 1024;
+const MAX_HOST_CONTEXT_BYTES: usize = 64 * 1024;
 
 /// Merged result from hook fan-out.
 ///
@@ -58,6 +70,50 @@ pub struct HookResult {
     skip: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OracleHookEvent {
+    schema_version: u8,
+    principal_id: String,
+    host: String,
+    session_id: String,
+    event: String,
+    correlation_id: String,
+    route_id: String,
+    delivery_id: String,
+    #[serde(default)]
+    turn_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct OracleHookResponse<'a> {
+    schema_version: u8,
+    principal_id: &'a str,
+    host: &'a str,
+    session_id: &'a str,
+    event: &'a str,
+    correlation_id: &'a str,
+    route_id: &'a str,
+    delivery_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CanonicalOraclePayload<'a> {
+    principal_id: &'a str,
+    host: &'a str,
+    session_id: &'a str,
+    source_event: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<&'a str>,
+    payload: &'a serde_json::Value,
 }
 
 // ── Merge Semantics ────────────────────────────────────────────────────────────────
@@ -306,7 +362,11 @@ fn dispatch_hook(
         if elapsed_ms >= HOOK_COLLECT_DEADLINE_MS {
             break;
         }
-        let remaining = HOOK_COLLECT_DEADLINE_MS - elapsed_ms;
+        let remaining = if responses.is_empty() {
+            HOOK_COLLECT_DEADLINE_MS - elapsed_ms
+        } else {
+            HOOK_QUIESCENCE_MS.min(HOOK_COLLECT_DEADLINE_MS - elapsed_ms)
+        };
 
         match sub.recv(remaining) {
             Ok(poll) => {
@@ -337,6 +397,224 @@ fn dispatch_hook(
     Ok(Some(apply_merge(&mapping.merge, &responses)))
 }
 
+fn canonical_hook_for_host_event(event: &str) -> Option<(&'static str, bool)> {
+    match event {
+        "session_start" => Some(("session_start", false)),
+        "user_prompt_submit" => Some(("message_received", true)),
+        "pre_tool_use" | "permission_request" => Some(("before_tool_call", false)),
+        "post_tool_use" => Some(("after_tool_call", false)),
+        "pre_compact" => Some(("on_compaction_started", false)),
+        "post_compact" => Some(("on_compaction_completed", false)),
+        "subagent_start" => Some(("subagent_start", false)),
+        "subagent_stop" => Some(("subagent_stop", false)),
+        "stop" | "session_end" => Some(("session_end", false)),
+        _ => None,
+    }
+}
+
+fn is_clean_segment(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn is_lower_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_oracle_hook(event: &OracleHookEvent) -> Result<(), &'static str> {
+    if event.schema_version != 1 {
+        return Err("unsupported schema version");
+    }
+    if !matches!(event.host.as_str(), "codex" | "claude" | "grok") {
+        return Err("unsupported host");
+    }
+    if canonical_hook_for_host_event(&event.event).is_none() {
+        return Err("unsupported host event");
+    }
+    if !is_clean_segment(&event.session_id, 128)
+        || !is_clean_segment(&event.event, 128)
+        || !is_clean_segment(&event.delivery_id, 128)
+    {
+        return Err("invalid routed segment");
+    }
+    if !is_lower_hex(&event.route_id, 64) || !is_lower_hex(&event.correlation_id, 32) {
+        return Err("invalid route identifier");
+    }
+    if event.delivery_id != format!("{}-{}", event.route_id, event.correlation_id) {
+        return Err("delivery identifier does not bind route and correlation");
+    }
+    if event
+        .turn_id
+        .as_deref()
+        .is_some_and(|value| value.is_empty() || value.len() > 256)
+        || event
+            .workspace_id
+            .as_deref()
+            .is_some_and(|value| !is_clean_segment(value, 128))
+    {
+        return Err("invalid optional routing metadata");
+    }
+    if serde_json::to_vec(&event.payload)
+        .map_or(true, |payload| payload.len() > MAX_HOST_PAYLOAD_BYTES)
+    {
+        return Err("host payload exceeds limit");
+    }
+    Ok(())
+}
+
+fn collect_additional_context(
+    subscription: &ipc::Subscription,
+    reply_topic: &str,
+) -> Result<Option<String>, SysError> {
+    let mut contexts = Vec::new();
+    let mut context_bytes = 0;
+    let start = time::monotonic();
+    loop {
+        let elapsed_ms = u64::try_from((time::monotonic().saturating_sub(start)).as_millis())
+            .unwrap_or(HOST_HOOK_COLLECT_DEADLINE_MS);
+        if elapsed_ms >= HOST_HOOK_COLLECT_DEADLINE_MS {
+            break;
+        }
+        let remaining = if contexts.is_empty() {
+            HOST_HOOK_COLLECT_DEADLINE_MS - elapsed_ms
+        } else {
+            HOOK_QUIESCENCE_MS.min(HOST_HOOK_COLLECT_DEADLINE_MS - elapsed_ms)
+        };
+        match subscription.recv(remaining) {
+            Ok(poll) if poll.messages.is_empty() => break,
+            Ok(poll) => {
+                for message in poll.messages {
+                    match serde_json::from_str::<serde_json::Value>(&message.payload) {
+                        Ok(value) => {
+                            if let Some(context) = value
+                                .get("additional_context")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|context| !context.trim().is_empty())
+                                && !push_context(&mut contexts, &mut context_bytes, context)
+                            {
+                                log::warn(format!(
+                                    "hook-bridge: dropping host-hook context that exceeds the {MAX_HOST_CONTEXT_BYTES}-byte response limit"
+                                ));
+                            }
+                        }
+                        Err(error) => log::warn(format!(
+                            "hook-bridge: dropping malformed host-hook reply on {reply_topic}: {error}"
+                        )),
+                    }
+                }
+            }
+            Err(SysError::HostError(message)) if message.contains("Timeout") => break,
+            Err(error) => return Err(error),
+        }
+    }
+    if contexts.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(contexts.join("\n\n")))
+    }
+}
+
+fn push_context(contexts: &mut Vec<String>, total: &mut usize, context: &str) -> bool {
+    let separator = usize::from(!contexts.is_empty()) * 2;
+    let Some(next_total) = total
+        .checked_add(separator)
+        .and_then(|value| value.checked_add(context.len()))
+    else {
+        return false;
+    };
+    if next_total > MAX_HOST_CONTEXT_BYTES {
+        return false;
+    }
+    contexts.push(context.to_owned());
+    *total = next_total;
+    true
+}
+
+fn dispatch_oracle_hook(event: &OracleHookEvent) -> Result<Option<String>, SysError> {
+    let Some((hook, expects_context)) = canonical_hook_for_host_event(&event.event) else {
+        return Ok(None);
+    };
+    let canonical_payload = CanonicalOraclePayload {
+        principal_id: &event.principal_id,
+        host: &event.host,
+        session_id: &event.session_id,
+        source_event: &event.event,
+        turn_id: event.turn_id.as_deref(),
+        workspace_id: event.workspace_id.as_deref(),
+        payload: &event.payload,
+    };
+    let event_topic = format!("hook.v1.event.{hook}");
+    if !expects_context {
+        let request = HookEventRequest {
+            hook: hook.to_owned(),
+            payload: serde_json::to_string(&canonical_payload)?,
+            correlation_id: None,
+        };
+        ipc::publish_json(&event_topic, &request)?;
+        return Ok(None);
+    }
+
+    let reply_topic = format!("hook.v1.response.{hook}.{}", event.correlation_id);
+    let subscription = ipc::subscribe(&reply_topic)?;
+    let request = HookEventRequest {
+        hook: hook.to_owned(),
+        payload: serde_json::to_string(&canonical_payload)?,
+        correlation_id: Some(event.correlation_id.clone()),
+    };
+    ipc::publish_json(&event_topic, &request)?;
+    collect_additional_context(&subscription, &reply_topic)
+}
+
+fn handle_oracle_hook(payload: serde_json::Value) -> Result<(), SysError> {
+    let event: OracleHookEvent = match serde_json::from_value(payload) {
+        Ok(event) => event,
+        Err(error) => {
+            log::warn(format!(
+                "hook-bridge: dropping malformed oracle hook: {error}"
+            ));
+            return Ok(());
+        }
+    };
+    if let Err(reason) = validate_oracle_hook(&event) {
+        log::warn(format!(
+            "hook-bridge: dropping invalid {} hook '{}': {reason}",
+            event.host, event.event
+        ));
+        return Ok(());
+    }
+    let caller = runtime::caller()?;
+    if caller.principal.as_deref() != Some(event.principal_id.as_str()) {
+        log::warn(format!(
+            "hook-bridge: dropping hook with principal mismatch for host {}",
+            event.host
+        ));
+        return Ok(());
+    }
+
+    let context = dispatch_oracle_hook(&event)?;
+    let response_topic = format!("oracle.v1.hook.response.{}", event.delivery_id);
+    ipc::publish_json(
+        &response_topic,
+        &OracleHookResponse {
+            schema_version: 1,
+            principal_id: &event.principal_id,
+            host: &event.host,
+            session_id: &event.session_id,
+            event: &event.event,
+            correlation_id: &event.correlation_id,
+            route_id: &event.route_id,
+            delivery_id: &event.delivery_id,
+            context,
+        },
+    )
+}
+
 // ── Capsule Implementation ─────────────────────────────────────────────────────────
 
 /// Hook Bridge capsule.
@@ -356,6 +634,24 @@ fn handle_lifecycle(
 
 #[capsule]
 impl HookBridge {
+    /// Normalize a token-validated Codex host hook onto the canonical hook bus.
+    #[astrid::interceptor("on_codex_hook")]
+    pub fn on_codex_hook(&self, payload: serde_json::Value) -> Result<(), SysError> {
+        handle_oracle_hook(payload)
+    }
+
+    /// Normalize a token-validated Claude host hook onto the canonical hook bus.
+    #[astrid::interceptor("on_claude_hook")]
+    pub fn on_claude_hook(&self, payload: serde_json::Value) -> Result<(), SysError> {
+        handle_oracle_hook(payload)
+    }
+
+    /// Normalize a token-validated Grok host hook onto the canonical hook bus.
+    #[astrid::interceptor("on_grok_hook")]
+    pub fn on_grok_hook(&self, payload: serde_json::Value) -> Result<(), SysError> {
+        handle_oracle_hook(payload)
+    }
+
     // ── Session lifecycle ──
 
     /// Handle `session_created` lifecycle event.
@@ -488,5 +784,72 @@ impl HookBridge {
     pub fn on_kernel_shutdown(&self, payload: serde_json::Value) -> Result<(), SysError> {
         let _ = handle_lifecycle("astrid.v1.lifecycle.kernel_shutdown", payload)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host_event() -> OracleHookEvent {
+        let route_id = "a".repeat(64);
+        let correlation_id = "b".repeat(32);
+        OracleHookEvent {
+            schema_version: 1,
+            principal_id: "codex-code".to_owned(),
+            host: "codex".to_owned(),
+            session_id: "codex-session".to_owned(),
+            event: "user_prompt_submit".to_owned(),
+            delivery_id: format!("{route_id}-{correlation_id}"),
+            correlation_id,
+            route_id,
+            turn_id: Some("turn-one".to_owned()),
+            workspace_id: Some("workspace-one".to_owned()),
+            payload: serde_json::json!({"prompt": "hello"}),
+        }
+    }
+
+    #[test]
+    fn prompt_event_maps_to_context_bearing_message_hook() {
+        assert_eq!(
+            canonical_hook_for_host_event("user_prompt_submit"),
+            Some(("message_received", true))
+        );
+        assert_eq!(
+            canonical_hook_for_host_event("stop"),
+            Some(("session_end", false))
+        );
+    }
+
+    #[test]
+    fn exact_delivery_binding_is_required() {
+        let mut event = host_event();
+        assert!(validate_oracle_hook(&event).is_ok());
+        event.delivery_id = format!("{}-{}", "c".repeat(64), event.correlation_id);
+        assert_eq!(
+            validate_oracle_hook(&event),
+            Err("delivery identifier does not bind route and correlation")
+        );
+    }
+
+    #[test]
+    fn event_and_session_cannot_add_topic_segments() {
+        let mut event = host_event();
+        event.session_id = "codex.other".to_owned();
+        assert_eq!(validate_oracle_hook(&event), Err("invalid routed segment"));
+    }
+
+    #[test]
+    fn combined_host_context_stays_inside_relay_limit() {
+        let mut contexts = Vec::new();
+        let mut total = 0;
+        assert!(push_context(
+            &mut contexts,
+            &mut total,
+            &"a".repeat(MAX_HOST_CONTEXT_BYTES - 3)
+        ));
+        assert!(push_context(&mut contexts, &mut total, "b"));
+        assert_eq!(contexts.join("\n\n").len(), MAX_HOST_CONTEXT_BYTES);
+        assert!(!push_context(&mut contexts, &mut total, "c"));
     }
 }

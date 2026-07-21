@@ -1,0 +1,20 @@
+[package]
+name = "aos-meta-harness"
+version = "0.1.0"
+description = "Prompts agents to notice and improve reusable capability gaps inside their own AOS world"
+authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
+astrid-version = ">=0.10.1"
+
+[[component]]
+id = "meta-harness"
+file = "aos_meta_harness.wasm"
+type = "executable"
+
+[publish]
+"hook.v1.response.message_received.*" = { wit = "opaque" }
+
+[subscribe]
+"hook.v1.event.message_received" = { wit = "@unicity-astrid/wit/hook/hook-event-request", handler = "on_message_received" }
+
+[env]
+activation = { type = "string", default = "adaptive", request = "Meta Harness activation: adaptive, propose, automatic, or off" }

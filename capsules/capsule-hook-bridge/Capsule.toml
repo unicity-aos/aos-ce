@@ -15,8 +15,13 @@ type = "executable"
 
 [publish]
 "hook.v1.event.*" = { wit = "@unicity-astrid/wit/hook/hook-event-request" }
+"oracle.v1.hook.response.*" = { wit = "opaque" }
 
 [subscribe]
+"oracle.v1.hook.validated.codex" = { wit = "opaque", handler = "on_codex_hook" }
+"oracle.v1.hook.validated.claude" = { wit = "opaque", handler = "on_claude_hook" }
+"oracle.v1.hook.validated.grok" = { wit = "opaque", handler = "on_grok_hook" }
+"hook.v1.response.message_received.*" = "opaque"
 "astrid.v1.lifecycle.session_created" = { wit = "@unicity-astrid/wit/hook/lifecycle-event", handler = "on_session_created" }
 "astrid.v1.lifecycle.session_ended" = { wit = "@unicity-astrid/wit/hook/lifecycle-event", handler = "on_session_ended" }
 "astrid.v1.lifecycle.tool_call_started" = { wit = "@unicity-astrid/wit/hook/lifecycle-event", handler = "on_tool_call_started" }

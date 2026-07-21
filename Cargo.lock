@@ -152,6 +152,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aos-meta-harness"
+version = "0.1.0"
+dependencies = [
+ "astrid-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aos-openai"
 version = "0.2.0"
 dependencies = [
@@ -1565,6 +1574,7 @@ name = "unicity-aos-bootstrap"
 version = "2026.1.3"
 dependencies = [
  "astrid-core",
+ "astrid-types 0.10.4",
  "astrid-uplink",
  "axum",
  "blake3",
@@ -1575,6 +1585,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+ "uuid",
 ]
 
 [[package]]
