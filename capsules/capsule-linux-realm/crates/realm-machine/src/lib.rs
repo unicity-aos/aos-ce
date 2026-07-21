@@ -52,6 +52,9 @@ const MAX_CONSOLE_BYTES: usize = 16 * 1024 * 1024;
 const MIN_LINUX_RAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BOOTARGS_BYTES: usize = 4096;
 const LINUX_FDT_MAX_BYTES: usize = 64 * 1024;
+const GUEST_PAGE_SHIFT: u32 = 12;
+const GUEST_PAGE_MASK: u64 = (1 << GUEST_PAGE_SHIFT) - 1;
+const TRANSLATION_CACHE_ENTRIES: usize = 1024;
 
 const MSTATUS_SIE: u64 = 1 << 1;
 const MSTATUS_MIE: u64 = 1 << 3;
@@ -570,6 +573,46 @@ pub struct SliceReport {
     pub console: Vec<u8>,
 }
 
+/// Cumulative hot-path measurements since the last image load.
+///
+/// These counters describe where the reference interpreter spends semantic
+/// work without changing its instruction-fuel contract. They are diagnostic,
+/// not guest-visible architectural counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MachineMetrics {
+    /// Instruction fetches attempted after interrupt and alignment checks.
+    pub instruction_fetches: u64,
+    /// Virtual-to-physical translations requested for instruction fetches.
+    pub instruction_translations: u64,
+    /// Virtual-to-physical translations requested for guest loads.
+    pub load_translations: u64,
+    /// Virtual-to-physical translations requested for guest stores.
+    pub store_translations: u64,
+    /// Sv39 page-table walks started after privilege and mode checks.
+    pub sv39_walks: u64,
+    /// Page-table entries read while walking Sv39 tables.
+    pub page_table_entries_read: u64,
+    /// Page-table entries written to establish accessed or dirty bits.
+    pub page_table_entries_written: u64,
+    /// Sv39 translations served by the fixed-size machine-local cache.
+    pub translation_cache_hits: u64,
+    /// Sv39 translations that required a page-table walk.
+    pub translation_cache_misses: u64,
+    /// Conservative whole-cache invalidations caused by architectural fences
+    /// or accepted address-space changes.
+    pub translation_cache_flushes: u64,
+}
+
+impl MachineMetrics {
+    /// Total virtual-to-physical translation requests of every access type.
+    #[must_use]
+    pub const fn translations(self) -> u64 {
+        self.instruction_translations
+            .saturating_add(self.load_translations)
+            .saturating_add(self.store_translations)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Cpu {
     registers: [u64; 32],
@@ -780,6 +823,70 @@ enum AccessType {
     Instruction,
     Load,
     Store,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TranslationContext {
+    satp: u64,
+    permission_context: u64,
+    privilege: Privilege,
+    access: AccessType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TranslationCacheEntry {
+    virtual_page: u64,
+    physical_page: u64,
+    context: TranslationContext,
+}
+
+#[derive(Debug)]
+struct TranslationCache {
+    entries: [Option<TranslationCacheEntry>; TRANSLATION_CACHE_ENTRIES],
+}
+
+impl Default for TranslationCache {
+    fn default() -> Self {
+        Self {
+            entries: [None; TRANSLATION_CACHE_ENTRIES],
+        }
+    }
+}
+
+impl TranslationCache {
+    fn lookup(&self, address: u64, context: TranslationContext) -> Option<u64> {
+        let virtual_page = address >> GUEST_PAGE_SHIFT;
+        let entry = self.entries[Self::index(virtual_page, context)]?;
+        (entry.virtual_page == virtual_page && entry.context == context)
+            .then_some(entry.physical_page | (address & GUEST_PAGE_MASK))
+    }
+
+    fn insert(&mut self, address: u64, physical: u64, context: TranslationContext) {
+        let virtual_page = address >> GUEST_PAGE_SHIFT;
+        self.entries[Self::index(virtual_page, context)] = Some(TranslationCacheEntry {
+            virtual_page,
+            physical_page: physical & !GUEST_PAGE_MASK,
+            context,
+        });
+    }
+
+    fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
+    fn index(virtual_page: u64, context: TranslationContext) -> usize {
+        let access = match context.access {
+            AccessType::Instruction => 0_u64,
+            AccessType::Load => 1,
+            AccessType::Store => 2,
+        };
+        let mixed = virtual_page
+            ^ context.satp.rotate_left(17)
+            ^ context.permission_context.rotate_left(31)
+            ^ ((context.privilege as u64) << 5)
+            ^ (access << 3);
+        mixed as usize & (TRANSLATION_CACHE_ENTRIES - 1)
+    }
 }
 
 impl AccessType {
@@ -1038,6 +1145,8 @@ pub struct Machine {
     firmware: SbiFirmware,
     next_host_request_id: u64,
     pending_9p_request: Option<PendingPlan9Request>,
+    metrics: MachineMetrics,
+    translation_cache: TranslationCache,
 }
 
 impl Machine {
@@ -1065,6 +1174,8 @@ impl Machine {
             firmware: SbiFirmware::default(),
             next_host_request_id: 1,
             pending_9p_request: None,
+            metrics: MachineMetrics::default(),
+            translation_cache: TranslationCache::default(),
         })
     }
 
@@ -1088,6 +1199,8 @@ impl Machine {
         self.reservation = None;
         self.firmware = SbiFirmware::default();
         self.pending_9p_request = None;
+        self.metrics = MachineMetrics::default();
+        self.translation_cache.clear();
         Ok(())
     }
 
@@ -1172,6 +1285,8 @@ impl Machine {
         self.reservation = None;
         self.firmware.enabled = true;
         self.pending_9p_request = None;
+        self.metrics = MachineMetrics::default();
+        self.translation_cache.clear();
 
         Ok(LinuxBootLayout {
             kernel_start: LINUX_KERNEL_BASE,
@@ -1283,6 +1398,12 @@ impl Machine {
         self.read_csr(csr)
     }
 
+    /// Return cumulative reference-interpreter measurements for this image.
+    #[must_use]
+    pub const fn metrics(&self) -> MachineMetrics {
+        self.metrics
+    }
+
     /// Run at most `instruction_budget` instructions and return control to the Realm.
     pub fn run_slice(&mut self, instruction_budget: u64) -> SliceReport {
         let mut steps = 0_u64;
@@ -1346,6 +1467,7 @@ impl Machine {
         if pc & 3 != 0 {
             return Err(MachineTrap::InstructionAddressMisaligned { address: pc });
         }
+        self.metrics.instruction_fetches = self.metrics.instruction_fetches.saturating_add(1);
         let physical_pc = self.translate(pc, AccessType::Instruction)?;
         let instruction = self
             .devices
@@ -1479,6 +1601,7 @@ impl Machine {
                             if self.cpu.privilege < Privilege::Supervisor {
                                 return Err(illegal(pc, instruction));
                             }
+                            self.flush_translation_cache();
                         }
                         0x1050_0073 => {
                             if self.cpu.privilege < Privilege::Supervisor {
@@ -1500,6 +1623,18 @@ impl Machine {
     }
 
     fn translate(&mut self, address: u64, access: AccessType) -> Result<u64, MachineTrap> {
+        match access {
+            AccessType::Instruction => {
+                self.metrics.instruction_translations =
+                    self.metrics.instruction_translations.saturating_add(1);
+            }
+            AccessType::Load => {
+                self.metrics.load_translations = self.metrics.load_translations.saturating_add(1);
+            }
+            AccessType::Store => {
+                self.metrics.store_translations = self.metrics.store_translations.saturating_add(1);
+            }
+        }
         let effective_privilege = if access != AccessType::Instruction
             && self.cpu.privilege == Privilege::Machine
             && self.csrs.mstatus & MSTATUS_MPRV != 0
@@ -1516,6 +1651,21 @@ impl Machine {
             return Err(access.page_fault(address));
         }
 
+        let context = TranslationContext {
+            satp: self.csrs.satp,
+            permission_context: self.csrs.mstatus & (MSTATUS_SUM | MSTATUS_MXR),
+            privilege: effective_privilege,
+            access,
+        };
+        if let Some(physical) = self.translation_cache.lookup(address, context) {
+            self.metrics.translation_cache_hits =
+                self.metrics.translation_cache_hits.saturating_add(1);
+            return Ok(physical);
+        }
+        self.metrics.translation_cache_misses =
+            self.metrics.translation_cache_misses.saturating_add(1);
+        self.metrics.sv39_walks = self.metrics.sv39_walks.saturating_add(1);
+
         let vpn = [
             (address >> 12) & 0x1ff,
             (address >> 21) & 0x1ff,
@@ -1526,6 +1676,8 @@ impl Machine {
             let pte_address = table
                 .checked_add(vpn[level] * 8)
                 .ok_or_else(|| access.access_fault(address, 8))?;
+            self.metrics.page_table_entries_read =
+                self.metrics.page_table_entries_read.saturating_add(1);
             let mut pte = self
                 .devices
                 .read_ram(pte_address, 8)
@@ -1562,6 +1714,8 @@ impl Machine {
                 };
             if pte & required_ad != required_ad {
                 pte |= required_ad;
+                self.metrics.page_table_entries_written =
+                    self.metrics.page_table_entries_written.saturating_add(1);
                 if !self.devices.write_ram(pte_address, pte, 8) {
                     return Err(access.access_fault(address, 8));
                 }
@@ -1574,7 +1728,9 @@ impl Machine {
             if level == 2 {
                 physical_ppn = (physical_ppn & !0x3_ffff) | (vpn[1] << 9) | vpn[0];
             }
-            return Ok((physical_ppn << 12) | (address & 0xfff));
+            let physical = (physical_ppn << GUEST_PAGE_SHIFT) | (address & GUEST_PAGE_MASK);
+            self.translation_cache.insert(address, physical, context);
+            return Ok(physical);
         }
         Err(access.page_fault(address))
     }
@@ -1752,8 +1908,21 @@ impl Machine {
         match csr {
             Csr::Mcycle => self.cycle = value,
             Csr::Minstret => self.instret = value,
+            Csr::Satp => {
+                let previous = self.csrs.satp;
+                self.csrs.write(csr, value);
+                if self.csrs.satp != previous {
+                    self.flush_translation_cache();
+                }
+            }
             _ => self.csrs.write(csr, value),
         }
+    }
+
+    fn flush_translation_cache(&mut self) {
+        self.translation_cache.clear();
+        self.metrics.translation_cache_flushes =
+            self.metrics.translation_cache_flushes.saturating_add(1);
     }
 
     fn refresh_hardware_interrupts(&mut self) {
@@ -2650,6 +2819,21 @@ mod tests {
         assert_eq!(repeated.outcome, final_report.outcome);
         assert_eq!(repeated.instructions_retired, 0);
         assert!(repeated.console.is_empty());
+
+        assert_eq!(
+            machine.metrics(),
+            MachineMetrics {
+                instruction_fetches: 23,
+                instruction_translations: 23,
+                store_translations: 10,
+                ..MachineMetrics::default()
+            }
+        );
+        assert_eq!(machine.metrics().translations(), 33);
+        machine
+            .load_program(&RV64_SMOKE_PROGRAM)
+            .expect("reload smoke program");
+        assert_eq!(machine.metrics(), MachineMetrics::default());
     }
 
     #[test]
@@ -3009,6 +3193,21 @@ mod tests {
         assert_eq!(machine.devices.read_ram(physical + 0x104, 4), Some(42));
         let pte = machine.devices.read_ram(leaf, 8).expect("leaf PTE");
         assert_eq!(pte & (PTE_ACCESSED | PTE_DIRTY), PTE_ACCESSED | PTE_DIRTY);
+        assert_eq!(
+            machine.metrics(),
+            MachineMetrics {
+                instruction_fetches: 4,
+                instruction_translations: 4,
+                load_translations: 1,
+                store_translations: 1,
+                sv39_walks: 3,
+                page_table_entries_read: 9,
+                page_table_entries_written: 2,
+                translation_cache_hits: 3,
+                translation_cache_misses: 3,
+                translation_cache_flushes: 0,
+            }
+        );
     }
 
     #[test]
@@ -3093,27 +3292,58 @@ mod tests {
     }
 
     #[test]
-    fn sfence_vma_is_privileged_and_retires_without_a_software_tlb() {
+    fn sfence_vma_is_privileged_and_conservatively_flushes_the_translation_cache() {
         let mut machine = paged_machine();
         let virtual_address = 0x4000_0000;
-        let physical = DRAM_BASE + 0x4000;
+        let first_physical = DRAM_BASE + 0x4000;
+        let second_physical = DRAM_BASE + 0x5000;
         let sfence_vma = 0x1200_0073_u32;
         assert!(
             machine
                 .devices
-                .write_ram(physical, u64::from(sfence_vma), 4)
+                .write_ram(first_physical, u64::from(sfence_vma), 4)
+        );
+        assert!(
+            machine
+                .devices
+                .write_ram(second_physical, u64::from(sfence_vma), 4)
         );
         let leaf = install_4k_mapping(
             &mut machine,
             virtual_address,
-            physical,
+            first_physical,
             PTE_VALID | PTE_READ | PTE_EXECUTE,
         );
         machine.cpu.pc = virtual_address;
         machine.cpu.privilege = Privilege::Supervisor;
+
+        assert_eq!(
+            machine.translate(virtual_address, AccessType::Instruction),
+            Ok(first_physical)
+        );
+        assert!(machine.devices.write_ram(
+            leaf,
+            ((second_physical >> GUEST_PAGE_SHIFT) << 10)
+                | PTE_VALID
+                | PTE_READ
+                | PTE_EXECUTE
+                | PTE_ACCESSED,
+            8,
+        ));
+        assert_eq!(
+            machine.translate(virtual_address, AccessType::Instruction),
+            Ok(first_physical),
+            "page-table changes remain cached until an architectural fence"
+        );
+
         let report = machine.run_slice(1);
         assert_eq!(report.instructions_retired, 1);
         assert_eq!(machine.pc(), virtual_address + 4);
+        assert_eq!(machine.metrics().translation_cache_flushes, 1);
+        assert_eq!(
+            machine.translate(virtual_address, AccessType::Instruction),
+            Ok(second_physical)
+        );
 
         let pte = machine.devices.read_ram(leaf, 8).expect("leaf PTE");
         assert!(machine.devices.write_ram(leaf, pte | PTE_USER, 8));

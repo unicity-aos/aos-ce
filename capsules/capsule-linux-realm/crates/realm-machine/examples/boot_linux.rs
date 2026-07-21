@@ -1,5 +1,10 @@
 use aos_realm_machine::{Machine, MachineConfig, SliceOutcome};
-use std::{env, fs, io::Write, process::ExitCode};
+use std::{
+    env, fs,
+    io::Write,
+    process::ExitCode,
+    time::{Duration, Instant},
+};
 
 const RAM_BYTES: usize = 32 * 1024 * 1024;
 const CONSOLE_BYTES: usize = 4 * 1024 * 1024;
@@ -48,6 +53,7 @@ fn run() -> Result<(), String> {
         .boot_linux(&image, &[], "earlycon=sbi console=hvc0 init=/init panic=-1")
         .map_err(|error| format!("could not admit Linux image: {error}"))?;
 
+    let started = Instant::now();
     let mut serial = Vec::new();
     let mut total_steps = 0;
     while total_steps < max_steps {
@@ -77,32 +83,53 @@ fn run() -> Result<(), String> {
                     ));
                 }
                 eprintln!(
-                    "AOS Linux boot passed: {} steps, {} retired instructions",
-                    report.total_steps_executed, report.total_instructions_retired
+                    "AOS Linux boot passed: {} retired instructions; {}",
+                    report.total_instructions_retired,
+                    performance_summary(&machine, report.total_steps_executed, started.elapsed())
                 );
                 return Ok(());
             }
             SliceOutcome::HostRequest(request) => {
                 return Err(format!(
-                    "Linux requested unwired 9P host service {} at pc {:#x} after {} steps",
+                    "Linux requested unwired 9P host service {} at pc {:#x}; {}",
                     request.id.get(),
                     machine.pc(),
-                    report.total_steps_executed
+                    performance_summary(&machine, report.total_steps_executed, started.elapsed())
                 ));
             }
             SliceOutcome::Trapped(trap) => {
                 return Err(format!(
-                    "Linux crossed the machine boundary at pc {:#x} after {} steps: {trap}",
+                    "Linux crossed the machine boundary at pc {:#x}: {trap}; {}",
                     machine.pc(),
-                    report.total_steps_executed
+                    performance_summary(&machine, report.total_steps_executed, started.elapsed())
                 ));
             }
         }
     }
 
     Err(format!(
-        "Linux did not halt within {max_steps} admitted steps; pc={:#x}, privilege={:?}",
+        "Linux did not halt within {max_steps} admitted steps; pc={:#x}, privilege={:?}; {}",
         machine.pc(),
-        machine.privilege()
+        machine.privilege(),
+        performance_summary(&machine, total_steps, started.elapsed())
     ))
+}
+
+fn performance_summary(machine: &Machine, steps: u64, elapsed: Duration) -> String {
+    let metrics = machine.metrics();
+    let steps_per_second = steps as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+    format!(
+        "{steps} steps in {:.3}s ({steps_per_second:.0} steps/s), translations={} (instruction={}, load={}, store={}), translation cache hits={}, misses={}, flushes={}, Sv39 walks={}, PTE reads={}, PTE writes={}",
+        elapsed.as_secs_f64(),
+        metrics.translations(),
+        metrics.instruction_translations,
+        metrics.load_translations,
+        metrics.store_translations,
+        metrics.translation_cache_hits,
+        metrics.translation_cache_misses,
+        metrics.translation_cache_flushes,
+        metrics.sv39_walks,
+        metrics.page_table_entries_read,
+        metrics.page_table_entries_written
+    )
 }
