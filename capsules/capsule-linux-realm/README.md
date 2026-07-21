@@ -413,6 +413,48 @@ interprets only its separate structured `args` tokens according to the grammar
 above; a single argument containing `"echo hello | cat"` exits with usage status
 64 instead of being reparsed as text.
 
+## Benchmarking
+
+The checked-in harness records raw JSON Lines samples plus median, mean, p95,
+minimum, maximum, and standard deviation summaries:
+
+```sh
+python3 scripts/benchmark-linux-realm.py \
+  --samples 30 --warmups 3 \
+  --output /tmp/aos-linux-realm-benchmark.jsonl
+```
+
+The native reference lane measures the AOS-owned RV64 machine in the same
+speed-optimized release profile used to establish interpreter throughput. It
+records three distinct boundaries:
+
+- `cold-to-init`: allocate 32 MiB, admit the preloaded image, and execute through
+  PID 1's `AOS LINUX /init` marker;
+- `cold-to-principal-bind`: continue through the first principal-home 9P request;
+- `checkpoint-to-bindable`: integrity-check and artifact-bind the preloaded
+  checkpoint, allocate and materialize its sparse 32 MiB machine, and stop at
+  that same unfulfilled principal-home request.
+
+When `qemu-system-riscv64` is installed, the harness boots the exact same Linux
+`Image` under single-threaded TCG and records process start through the same PID
+1 marker. QEMU cannot reach `AOS READY`: it does not implement the Astrid-owned
+home and workspace transports. The QEMU sample therefore compares the shared
+kernel-to-init boundary only, not complete Realm readiness.
+
+Docker measurements are opt-in with `--docker-image IMAGE`. The harness refuses
+implicit pulls and accepts only an existing local image. It labels ordinary
+container create/start/exit separately from unpausing an already resident
+container; neither is presented as a VM boot. An unavailable daemon or image is
+emitted as a machine-readable skip, not a zero or failed timing.
+
+Compilation, artifact file reads, and implicit network downloads stay outside
+timed regions. Committed baselines must identify the exact Git revision,
+artifact hashes, host architecture, engine versions, sample count, and boundary.
+The native reference lane is not the full outer-Wasm/MCP path. Governed
+request-to-result latency, QEMU snapshot restore, Docker/CRIU restore, RSS, and
+per-principal scaling remain separate required lanes before cross-system product
+claims are made.
+
 ## Current boundary
 
 The private `aos_realm_v0` ABI supplies bounded argument, environment, and CWD

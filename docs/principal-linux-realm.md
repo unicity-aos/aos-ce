@@ -2193,6 +2193,39 @@ shell boot from a prewarmed snapshot is evidence for snapshot design, not eviden
 that `rustc`, Cargo dependency traversal, linking, or large workspace I/O is
 usable.
 
+### 18.1 Benchmark protocol
+
+`scripts/benchmark-linux-realm.py` and the host-only `benchmark_linux` machine
+example make the first comparison reproducible. They emit versioned JSON Lines
+with raw samples and summaries rather than copying one favorable stopwatch value
+into this document. The initial matrix uses preloaded immutable artifacts and
+separates these boundaries:
+
+| Scenario | Starts at | Ends at | What it proves |
+| --- | --- | --- | --- |
+| `cold-to-init` | Native reference allocation | PID 1 `AOS LINUX /init` marker | AOS machine cold kernel/userland boot |
+| `cold-to-principal-bind` | Native reference allocation | First unfulfilled principal-home 9P request | Cold computation needed before authority attachment |
+| `checkpoint-to-bindable` | Encoded checkpoint in memory | Integrity-checked sparse machine at the same request | Principal-free restore cost before fresh authority is supplied |
+| `qemu-tcg-cold-to-init` | Fresh QEMU process | Same PID 1 marker from the exact AOS Image | Shared kernel-to-init comparison only |
+| `docker-run-to-exit` | Docker CLI request | Existing-image `/bin/true` exits and container is removed | Container creation/start path, not Linux boot |
+| `docker-unpause` | Paused resident container | Docker CLI unpause returns | Resident process unfreeze, not restore or boot |
+
+The AOS marker is observed at the next 100,000-step cooperative slice boundary,
+so its reported init time has that explicit upward resolution bound. The QEMU
+lane pins one RV64 vCPU and single-threaded TCG. It includes QEMU process and
+OpenSBI startup, but it cannot reach `AOS READY` because QEMU does not own
+Astrid's home/workspace providers. Docker is opt-in, never pulls implicitly, and
+records missing engines as skips.
+
+Every committed baseline must use at least 30 measured samples after at least
+three discarded warmups and record exact Git, image, checkpoint, host, and engine
+identity. Median and p95 are the primary latency statistics. The next matrix must
+add the signed outer-Wasm capsule through the real MCP front door, first useful
+shell completion, QEMU snapshot restore, Docker/CRIU restore where supported,
+peak and retained RSS, concurrent-principal scaling, and—after the development
+generation exists—compiler workloads. Native reference results must never be
+presented as end-to-end Astrid latency.
+
 ## 19. AOS Realm distribution and image policy
 
 The project should own the image recipe, package selection, signatures, and update
