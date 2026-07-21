@@ -17,6 +17,7 @@ pub mod status;
 pub use migration::{LegacyDistro, MigrationOutcome};
 
 const UNICITY_CE_MANIFEST: &str = include_str!("../../../distros/community/unicity-ce/Distro.toml");
+const RUNTIME_COMPATIBILITY: &str = include_str!("../../../release/runtime-compatibility.toml");
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(windows)]
@@ -106,6 +107,12 @@ impl AosHome {
     #[must_use]
     pub fn runtime_home(&self) -> PathBuf {
         self.root.join("runtime")
+    }
+
+    /// Durable identity installed last by a successful product cutover.
+    #[must_use]
+    pub fn active_generation_path(&self) -> PathBuf {
+        self.root.join("update/active-generation.toml")
     }
 
     /// The receipt written only after a successful standalone-runtime import.
@@ -314,6 +321,14 @@ impl AosHome {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        let args: Vec<OsString> = args
+            .into_iter()
+            .map(|argument| argument.as_ref().to_owned())
+            .collect();
+        let interrupted_upgrade_stop =
+            args.len() == 1 && args.first().is_some_and(|argument| argument == "stop");
+        let runtime_generation = embedded_runtime_generation()?;
+        self.validate_active_generation(&runtime_generation, interrupted_upgrade_stop)?;
         let runtime_binary = self.runtime_binary();
         let runtime_bin = runtime_binary.parent().ok_or_else(|| {
             io::Error::new(
@@ -326,12 +341,65 @@ impl AosHome {
             .env("ASTRID_HOME", self.runtime_home())
             .env("ASTRID_WORKSPACE_STATE_DIR", AOS_WORKSPACE_STATE_DIR)
             .env("ASTRID_ENFORCED_DISTRO", self.unicity_ce_manifest_path())
+            .env("ASTRID_DAEMON_GENERATION", &runtime_generation)
+            .env("ASTRID_REQUIRE_DAEMON_GENERATION", "1")
             .env(
                 "PATH",
                 Self::runtime_child_path(runtime_bin, std::env::var_os("PATH"))?,
             );
-        command.args(args);
+        command.args(&args);
         Ok(command)
+    }
+
+    fn validate_active_generation(
+        &self,
+        expected_runtime: &str,
+        allow_interrupted_upgrade_stop: bool,
+    ) -> io::Result<()> {
+        for interrupted in [
+            self.root.join("update/upgrade-in-progress.toml"),
+            self.root.join("update/transaction"),
+        ] {
+            match fs::symlink_metadata(&interrupted) {
+                Ok(_) if !allow_interrupted_upgrade_stop => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "an AOS upgrade was interrupted; rerun the installer before starting the runtime",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let path = self.active_generation_path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "active runtime generation marker must be a regular file",
+            ));
+        }
+        let marker = fs::read_to_string(&path)?
+            .parse::<toml::Value>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let product = marker.get("product-version").and_then(toml::Value::as_str);
+        let runtime = marker
+            .get("runtime-generation")
+            .and_then(toml::Value::as_str);
+        if product != Some(PRODUCT_VERSION) || runtime != Some(expected_runtime) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "installed AOS generation does not match this launcher (expected product {PRODUCT_VERSION}, runtime {expected_runtime}); rerun the installer"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn runtime_child_path(runtime_bin: &Path, host_path: Option<OsString>) -> io::Result<OsString> {
@@ -419,6 +487,33 @@ impl AosHome {
         }
         self.ensure_unicity_ce_manifest().map(drop)
     }
+}
+
+fn embedded_runtime_generation() -> io::Result<String> {
+    let compatibility = RUNTIME_COMPATIBILITY
+        .parse::<toml::Value>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let runtime = compatibility
+        .get("runtime")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing runtime metadata"))?;
+    let version = runtime
+        .get("version")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing runtime version"))?;
+    let source = runtime
+        .get("source-commit")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing runtime source commit")
+        })?;
+    if source.len() != 40 || !source.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime source commit must be a 40-character hexadecimal identity",
+        ));
+    }
+    Ok(format!("astrid:{version}:{source}"))
 }
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
@@ -747,12 +842,66 @@ mod tests {
 
         assert_eq!(env_value("ASTRID_HOME"), "/tmp/unicity-aos-test/runtime");
         assert_eq!(env_value("ASTRID_WORKSPACE_STATE_DIR"), ".aos");
+        assert_eq!(
+            env_value("ASTRID_DAEMON_GENERATION"),
+            "astrid:0.10.4:b6bf5d1d579915eb5d3c944857d84e62a4fcc878"
+        );
+        assert_eq!(env_value("ASTRID_REQUIRE_DAEMON_GENERATION"), "1");
         let path_entries: Vec<_> = std::env::split_paths(env_value("PATH")).collect();
         assert_eq!(
             path_entries.first(),
             Some(&PathBuf::from("/tmp/unicity-aos-test/runtime/bin"))
         );
         assert_eq!(std::env::var_os("PATH"), caller_path);
+    }
+
+    #[test]
+    fn runtime_command_rejects_a_partially_cut_over_launcher() {
+        let root = std::env::temp_dir().join(format!(
+            "unicity-aos-generation-test-{}",
+            std::process::id()
+        ));
+        let home = AosHome::from_root(&root);
+        fs::create_dir_all(root.join("update")).expect("create update directory");
+        fs::write(
+            home.active_generation_path(),
+            r#"schema-version = 1
+product-version = "2026.1.2"
+runtime-generation = "astrid:0.10.3:old"
+"#,
+        )
+        .expect("write stale generation marker");
+
+        let error = home
+            .runtime_command()
+            .expect_err("mixed product generation must fail closed");
+        assert!(error.to_string().contains("rerun the installer"));
+
+        fs::remove_dir_all(root).expect("remove generation fixture");
+    }
+
+    #[test]
+    fn runtime_command_rejects_an_interrupted_upgrade_without_an_active_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "unicity-aos-interrupted-generation-test-{}",
+            std::process::id()
+        ));
+        let home = AosHome::from_root(&root);
+        fs::create_dir_all(root.join("update/transaction")).expect("create transaction marker");
+
+        let error = home
+            .runtime_command()
+            .expect_err("interrupted cutover must fail closed");
+        assert!(error.to_string().contains("rerun the installer"));
+
+        home.runtime_command_with_args(["stop"])
+            .expect("the installer must still be able to drain the old runtime");
+        let status_error = home
+            .runtime_command_with_args(["status"])
+            .expect_err("only stop may cross an interrupted-upgrade marker");
+        assert!(status_error.to_string().contains("rerun the installer"));
+
+        fs::remove_dir_all(root).expect("remove interrupted fixture");
     }
 
     #[test]

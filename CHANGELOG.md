@@ -82,3 +82,12 @@
   `aos stop` only after every coordination marker is gone and the singleton
   lock is available; all other inherited runtime failures retain their output
   and exit status.
+
+### Fixed
+
+- Make bundled-runtime upgrades a fail-closed transaction: stop and verify the
+  old runtime before replacement, durably roll back interrupted cutovers, and
+  publish the signed product/runtime generation only after every executable,
+  release asset, and channel receipt is committed. AOS-launched runtime clients
+  now require that exact generation, preventing mixed-version reconnects.
+  Refs #50.

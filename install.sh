@@ -16,9 +16,10 @@ SKIP_MIGRATION_PROMPT=0
 channel_explicit=0
 version_explicit=0
 installation_started=0
-release_committed=0
 release_backup=
 rollback=
+transaction=
+upgrade_marker=
 channel_root=
 channel_current_path=
 channel_generation_dir=
@@ -118,6 +119,10 @@ esac
 case "$AOS_BIN_DIR" in
   /*) ;;
   *) echo "AOS_BIN_DIR must be an absolute path" >&2; exit 1 ;;
+esac
+case "$AOS_HOME$AOS_BIN_DIR" in
+  *'
+'*) echo "AOS_HOME and AOS_BIN_DIR must not contain newlines" >&2; exit 1 ;;
 esac
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "required command not found: $1" >&2; exit 1; }; }
@@ -628,8 +633,6 @@ cleanup() {
   trap - EXIT HUP INT TERM
   if [ "$installation_started" -eq 1 ]; then
     restore || status=1
-  elif [ "$release_committed" -eq 1 ] && [ -n "$release_backup" ]; then
-    rm -rf "$release_backup" || status=1
   fi
   release_install_lock || status=1
   rm -rf "$work"
@@ -777,7 +780,7 @@ bundle_name=$(tar -tzf "$work/$asset" | awk 'NR == 1 { sub(/\/.*/, "", $0); prin
 bundle="$work/unpack/$bundle_name"
 [ -d "$bundle" ] || { echo "release archive has no Unicity AOS bundle" >&2; exit 1; }
 
-for file in bin/aos libexec/install.sh runtime/bin/astrid runtime/bin/astrid-daemon runtime/bin/astrid-build runtime/bin/astrid-emit release-manifest.json Distro.toml capsule-assets.txt; do
+for file in bin/aos libexec/install.sh runtime/bin/astrid runtime/bin/astrid-daemon runtime/bin/astrid-build runtime/bin/astrid-emit release-manifest.json runtime-compatibility.toml Distro.toml capsule-assets.txt; do
   [ -f "$bundle/$file" ] || { echo "release archive is missing $file" >&2; exit 1; }
 done
 [ -d "$bundle/capsules" ] || { echo "release archive has no capsule directory" >&2; exit 1; }
@@ -800,6 +803,41 @@ while IFS= read -r capsule; do
   }
 done < "$bundle/capsule-assets.txt"
 
+bundle_product_version=$(toml_value "$bundle/runtime-compatibility.toml" "[product]" version)
+bundle_runtime_version=$(toml_value "$bundle/runtime-compatibility.toml" "[runtime]" version)
+bundle_runtime_source_commit=$(toml_value "$bundle/runtime-compatibility.toml" "[runtime]" source-commit)
+metadata_product_source_commit=$(toml_value "$work/$release_metadata_asset" "" source-commit)
+metadata_runtime_version=$(toml_value "$work/$release_metadata_asset" "[runtime]" version)
+metadata_runtime_source_commit=$(toml_value "$work/$release_metadata_asset" "[runtime]" source-commit)
+[ "$bundle_product_version" = "$AOS_VERSION" ] || {
+  echo "bundle compatibility metadata names a different product version" >&2
+  exit 1
+}
+[ "$bundle_runtime_version" = "$metadata_runtime_version" ] || {
+  echo "bundle runtime version does not match signed release metadata" >&2
+  exit 1
+}
+[ "$bundle_runtime_source_commit" = "$metadata_runtime_source_commit" ] || {
+  echo "bundle runtime source does not match signed release metadata" >&2
+  exit 1
+}
+printf '%s\n' "$bundle_runtime_source_commit" | grep -Eq '^[0-9a-f]{40}$' || {
+  echo "bundle runtime source identity is malformed" >&2
+  exit 1
+}
+runtime_generation="astrid:${bundle_runtime_version}:${bundle_runtime_source_commit}"
+active_generation_candidate="$work/active-generation.toml"
+cat > "$active_generation_candidate" <<EOF
+schema-version = 1
+product-version = "$AOS_VERSION"
+product-source-commit = "$metadata_product_source_commit"
+runtime-version = "$bundle_runtime_version"
+runtime-source-commit = "$bundle_runtime_source_commit"
+runtime-generation = "$runtime_generation"
+bundle-blake3 = "$asset_blake3"
+EOF
+chmod 600 "$active_generation_candidate"
+
 staged_version=$("$bundle/bin/aos" --version | awk '{print $NF}')
 if ! is_aos_release_version "$staged_version"; then
   echo "staged AOS binary reported an invalid product version" >&2
@@ -815,17 +853,16 @@ if [ "$bundle_name" != "unicity-aos-${staged_version}-${target}" ]; then
 fi
 
 release_dir="$AOS_HOME/releases/$staged_version"
-release_stage="$AOS_HOME/releases/.${staged_version}.new.$$"
-release_backup="$AOS_HOME/releases/.${staged_version}.rollback.$$"
-for managed in "$AOS_HOME" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases" "$release_dir" "$release_dir/capsules" "$AOS_HOME/update" "$AOS_HOME/update/channels"; do
+transaction="$AOS_HOME/update/transaction"
+upgrade_marker="$AOS_HOME/update/upgrade-in-progress.toml"
+rollback="$transaction/rollback"
+release_stage="$transaction/release.new"
+release_backup="$transaction/release.old"
+for managed in "$AOS_HOME" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases" "$release_dir" "$release_dir/capsules" "$AOS_HOME/update" "$AOS_HOME/update/channels" "$AOS_HOME/update/active-generation.toml" "$upgrade_marker" "$transaction"; do
   [ ! -L "$managed" ] || { echo "refusing symlinked managed path: $managed" >&2; exit 1; }
 done
 if [ -e "$release_dir" ] && [ ! -d "$release_dir" ]; then
   echo "refusing non-directory release destination: $release_dir" >&2
-  exit 1
-fi
-if [ -e "$release_stage" ] || [ -e "$release_backup" ]; then
-  echo "refusing stale release transaction state for $staged_version" >&2
   exit 1
 fi
 if [ -L "$AOS_BIN_DIR" ]; then
@@ -835,6 +872,22 @@ fi
 if [ -L "$AOS_BIN_DIR/aos" ] || { [ -e "$AOS_BIN_DIR/aos" ] && [ ! -f "$AOS_BIN_DIR/aos" ]; }; then
   echo "refusing non-regular install destination: $AOS_BIN_DIR/aos" >&2
   exit 1
+fi
+previous_runtime_generation=absent
+if [ -e "$AOS_HOME/update/active-generation.toml" ]; then
+  [ -f "$AOS_HOME/update/active-generation.toml" ] || {
+    echo "active runtime generation marker must be a regular file" >&2
+    exit 1
+  }
+  previous_runtime_generation=$(toml_value "$AOS_HOME/update/active-generation.toml" "" runtime-generation)
+  [ -n "$previous_runtime_generation" ] || {
+    echo "active runtime generation marker is missing runtime-generation" >&2
+    exit 1
+  }
+  printf '%s\n' "$previous_runtime_generation" | grep -Eq '^astrid:[0-9A-Za-z.+-]+:[0-9a-f]{40}$' || {
+    echo "active runtime generation marker contains an invalid runtime-generation" >&2
+    exit 1
+  }
 fi
 
 if [ -x "$AOS_BIN_DIR/aos" ] && [ "$ASSUME_YES" -ne 1 ]; then
@@ -846,13 +899,6 @@ if [ -x "$AOS_BIN_DIR/aos" ] && [ "$ASSUME_YES" -ne 1 ]; then
   case "$answer" in y|Y|yes|YES) ;; *) echo "Installation cancelled."; exit 0 ;; esac
 fi
 
-acquire_install_lock
-validate_accepted_channel
-
-if [ -x "$AOS_BIN_DIR/aos" ]; then
-  "$AOS_BIN_DIR/aos" stop >/dev/null 2>&1 || true
-fi
-
 mkdir -p "$AOS_BIN_DIR" "$AOS_HOME/libexec" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases"
 chmod 700 "$AOS_HOME" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases"
 if [ -n "$channel_root" ]; then
@@ -862,9 +908,6 @@ fi
 if [ "$AOS_BIN_DIR" = "$AOS_HOME/bin" ]; then
   chmod 700 "$AOS_BIN_DIR"
 fi
-rollback="$work/rollback"
-mkdir "$rollback"
-
 install_one() {
   source=$1
   destination=$2
@@ -936,11 +979,12 @@ restore() {
   elif [ -f "$rollback/release.touched" ]; then
     rm -rf "$release_dir" || result=1
   fi
-  for name in aos installer astrid astrid-daemon astrid-build astrid-emit channel-current; do
+  for name in aos installer astrid astrid-daemon astrid-build astrid-emit channel-current active-generation; do
     case "$name" in
       aos) destination="$AOS_BIN_DIR/aos" ;;
       installer) destination="$AOS_HOME/libexec/install.sh" ;;
       channel-current) destination=$channel_current_path ;;
+      active-generation) destination="$AOS_HOME/update/active-generation.toml" ;;
       *) destination="$AOS_HOME/runtime/bin/$name" ;;
     esac
     [ -n "$destination" ] || continue
@@ -956,10 +1000,139 @@ restore() {
       rm -f "$destination" || result=1
     fi
   done
+  if [ "$result" -eq 0 ]; then
+    rm -rf "$transaction" || result=1
+    rm -f "$upgrade_marker" || result=1
+  else
+    echo "AOS upgrade rollback is incomplete; durable recovery state was preserved" >&2
+  fi
   return "$result"
 }
 
+recover_interrupted_upgrade() {
+  if [ ! -e "$transaction" ] && [ ! -e "$upgrade_marker" ]; then
+    return 0
+  fi
+  if [ -d "$transaction" ] && [ ! -L "$transaction" ] \
+    && [ ! -e "$upgrade_marker" ] && [ ! -L "$upgrade_marker" ]
+  then
+    cutover_started=0
+    for state in \
+      "$release_stage" "$release_backup" \
+      "$rollback/aos.touched" "$rollback/installer.touched" \
+      "$rollback/astrid.touched" "$rollback/astrid-daemon.touched" \
+      "$rollback/astrid-build.touched" "$rollback/astrid-emit.touched" \
+      "$rollback/channel-current.touched" "$rollback/active-generation.touched"
+    do
+      if [ -e "$state" ] || [ -L "$state" ]; then
+        cutover_started=1
+        break
+      fi
+    done
+    if [ "$cutover_started" -eq 0 ]; then
+      # `begin_upgrade_transaction` publishes the external marker last and
+      # returns before drain. A transaction without that marker or any touched
+      # destination is therefore a recoverable pre-drain crash.
+      rm -rf "$transaction"
+      return 0
+    fi
+  fi
+  [ -d "$transaction" ] && [ ! -L "$transaction" ] || {
+    if [ ! -e "$transaction" ] && [ -f "$upgrade_marker" ] && [ ! -L "$upgrade_marker" ]; then
+      rm -f "$upgrade_marker"
+      return 0
+    fi
+    echo "AOS upgrade transaction state is unsafe or incomplete" >&2
+    return 1
+  }
+  if [ -f "$transaction/committed" ] && [ ! -L "$transaction/committed" ]; then
+    rm -rf "$transaction"
+    rm -f "$upgrade_marker"
+    return 0
+  fi
+  for state_file in release-version bin-dir channel-current-path; do
+    [ -f "$transaction/$state_file" ] && [ ! -L "$transaction/$state_file" ] || {
+      echo "AOS upgrade transaction is missing $state_file" >&2
+      return 1
+    }
+  done
+  IFS= read -r recovery_version < "$transaction/release-version"
+  IFS= read -r recovery_bin_dir < "$transaction/bin-dir"
+  IFS= read -r recovery_channel_path < "$transaction/channel-current-path" || recovery_channel_path=
+  is_aos_release_version "$recovery_version" || {
+    echo "AOS upgrade transaction has an invalid release version" >&2
+    return 1
+  }
+  [ "$recovery_bin_dir" = "$AOS_BIN_DIR" ] || {
+    echo "interrupted upgrade used AOS_BIN_DIR=$recovery_bin_dir; rerun with the same AOS_BIN_DIR" >&2
+    return 1
+  }
+  if [ -n "$recovery_channel_path" ]; then
+    case "$recovery_channel_path" in
+      "$AOS_HOME"/update/channels/*/current) ;;
+      *) echo "AOS upgrade transaction has an unsafe channel path" >&2; return 1 ;;
+    esac
+  fi
+  next_release_dir=$release_dir
+  next_channel_current_path=$channel_current_path
+  release_dir="$AOS_HOME/releases/$recovery_version"
+  channel_current_path=$recovery_channel_path
+  echo "Recovering an interrupted AOS upgrade before installing $staged_version..."
+  restore || return 1
+  release_dir=$next_release_dir
+  channel_current_path=$next_channel_current_path
+}
+
+stop_installed_runtime() {
+  if [ -x "$AOS_BIN_DIR/aos" ]; then
+    if ! "$AOS_BIN_DIR/aos" stop >"$work/runtime-stop.log" 2>&1; then
+      echo "could not stop the installed AOS runtime; no files were replaced" >&2
+      cat "$work/runtime-stop.log" >&2
+      return 1
+    fi
+  fi
+  for marker in system.sock system.pid system.ready system.token system.generation; do
+    if [ -e "$AOS_HOME/runtime/run/$marker" ] || [ -L "$AOS_HOME/runtime/run/$marker" ]; then
+      echo "runtime coordination marker $marker remains; no files were replaced" >&2
+      return 1
+    fi
+  done
+}
+
+begin_upgrade_transaction() {
+  [ ! -e "$transaction" ] && [ ! -L "$transaction" ] || {
+    echo "an AOS upgrade transaction is already present" >&2
+    return 1
+  }
+  mkdir "$transaction"
+  chmod 700 "$transaction"
+  mkdir "$rollback"
+  chmod 700 "$rollback"
+  printf '%s\n' "$staged_version" > "$transaction/release-version"
+  printf '%s\n' "$AOS_BIN_DIR" > "$transaction/bin-dir"
+  printf '%s\n' "$channel_current_path" > "$transaction/channel-current-path"
+  chmod 600 "$transaction/release-version" "$transaction/bin-dir" "$transaction/channel-current-path"
+  marker_stage="$transaction/upgrade-in-progress.new"
+  cat > "$marker_stage" <<EOF
+schema-version = 1
+candidate-version = "$staged_version"
+candidate-runtime-generation = "$runtime_generation"
+candidate-bundle-blake3 = "$asset_blake3"
+previous-runtime-generation = "$previous_runtime_generation"
+installer-pid = $$
+EOF
+  chmod 600 "$marker_stage"
+  mv "$marker_stage" "$upgrade_marker"
+  sync
+}
+
+acquire_install_lock
+recover_interrupted_upgrade
+validate_accepted_channel
 installation_started=1
+begin_upgrade_transaction
+stop_installed_runtime
+
 if ! install_one "$bundle/bin/aos" "$AOS_BIN_DIR/aos" aos 755; then exit 1; fi
 if ! install_one "$bundle/libexec/install.sh" "$AOS_HOME/libexec/install.sh" installer 600; then exit 1; fi
 for name in astrid astrid-daemon astrid-build astrid-emit; do
@@ -970,6 +1143,7 @@ chmod 700 "$release_stage"
 mkdir "$release_stage/capsules"
 chmod 700 "$release_stage/capsules"
 install -m 0600 "$bundle/release-manifest.json" "$release_stage/release-manifest.json"
+install -m 0600 "$bundle/runtime-compatibility.toml" "$release_stage/runtime-compatibility.toml"
 install -m 0600 "$bundle/Distro.toml" "$release_stage/Distro.toml"
 install -m 0600 "$bundle/capsule-assets.txt" "$release_stage/capsule-assets.txt"
 while IFS= read -r capsule; do
@@ -982,10 +1156,16 @@ fi
 if ! mv "$release_stage" "$release_dir"; then
   exit 1
 fi
-release_committed=1
 stage_channel_receipt
+sync
+if ! install_one "$active_generation_candidate" "$AOS_HOME/update/active-generation.toml" active-generation 600; then exit 1; fi
+sync
+: > "$transaction/committed"
+chmod 600 "$transaction/committed"
+sync
 installation_started=0
-rm -rf "$release_backup"
+rm -rf "$transaction"
+rm -f "$upgrade_marker"
 release_install_lock
 
 echo "Installed Unicity AOS $staged_version."

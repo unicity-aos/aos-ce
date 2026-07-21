@@ -102,7 +102,13 @@ pub async fn read(home: &AosHome) -> Result<AosStatus, String> {
 /// every transient marker is gone and the runtime lock can be acquired.
 pub fn confirm_stopped(home: &AosHome) -> Result<AosStatus, String> {
     let run_dir = home.runtime_home().join("run");
-    for marker in ["system.sock", "system.pid", "system.ready", "system.token"] {
+    for marker in [
+        "system.sock",
+        "system.pid",
+        "system.ready",
+        "system.token",
+        "system.generation",
+    ] {
         match fs::symlink_metadata(run_dir.join(marker)) {
             Ok(_) => {
                 return Err(format!(
@@ -239,5 +245,22 @@ mod tests {
 
         fs2::FileExt::unlock(&lock).expect("release runtime lock");
         fs::remove_dir_all(root).expect("remove running status fixture");
+    }
+
+    #[test]
+    fn refuses_to_report_stopped_while_a_generation_marker_remains() {
+        let root = temporary_status_home("generation-marker");
+        let home = AosHome::from_root(&root);
+        fs::create_dir_all(home.runtime_home().join("run")).expect("create runtime run dir");
+        fs::write(
+            home.runtime_home().join("run/system.generation"),
+            "astrid:0.10.5:source",
+        )
+        .expect("create runtime generation marker");
+
+        let error = confirm_stopped(&home).expect_err("generation marker must fence cutover");
+        assert!(error.contains("system.generation"));
+
+        fs::remove_dir_all(root).expect("remove generation marker fixture");
     }
 }

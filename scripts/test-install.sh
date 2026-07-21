@@ -249,6 +249,7 @@ test -x "$work/home/.aos/bin/aos"
 test -x "$work/home/.aos/runtime/bin/astrid-daemon"
 release_dir="$work/home/.aos/releases/2026.1.3"
 test -f "$release_dir/release-manifest.json"
+test -f "$release_dir/runtime-compatibility.toml"
 test -f "$release_dir/Distro.toml"
 test -f "$release_dir/capsule-assets.txt"
 test "$(find "$release_dir/capsules" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 19
@@ -264,6 +265,71 @@ test ! -e "$fixture/path-cosign-called"
 test "$(stat -c '%a' "$work/home/.aos" 2>/dev/null || stat -f '%Lp' "$work/home/.aos")" = 700
 test "$(stat -c '%a' "$release_dir/release-manifest.json" 2>/dev/null || stat -f '%Lp' "$release_dir/release-manifest.json")" = 600
 test "$(stat -c '%a' "$release_dir/capsules" 2>/dev/null || stat -f '%Lp' "$release_dir/capsules")" = 700
+active_generation="$work/home/.aos/update/active-generation.toml"
+python3 - "$active_generation" "$runtime_version" "$runtime_source_commit" "$asset_blake3" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+path, runtime_version, runtime_source, bundle_blake3 = sys.argv[1:]
+with pathlib.Path(path).open("rb") as file:
+    marker = tomllib.load(file)
+expected = f"astrid:{runtime_version}:{runtime_source}"
+if marker != {
+    "schema-version": 1,
+    "product-version": "2026.1.3",
+    "product-source-commit": "a" * 40,
+    "runtime-version": runtime_version,
+    "runtime-source-commit": runtime_source,
+    "runtime-generation": expected,
+    "bundle-blake3": bundle_blake3,
+}:
+    raise SystemExit(f"unexpected active generation marker: {marker!r}")
+PY
+test ! -e "$work/home/.aos/update/transaction"
+test ! -e "$work/home/.aos/update/upgrade-in-progress.toml"
+
+stop_failure_home="$work/stop-failure-home"
+mkdir -p "$stop_failure_home/.aos/bin" "$stop_failure_home/.aos/runtime/bin"
+cat > "$stop_failure_home/.aos/bin/aos" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = stop ]; then
+  test -f "$HOME/.aos/update/upgrade-in-progress.toml" || {
+    echo 'cutover marker was not durable before drain' >&2
+    exit 23
+  }
+  grep -F 'candidate-bundle-blake3 = ' "$HOME/.aos/update/upgrade-in-progress.toml" >/dev/null || {
+    echo 'cutover marker did not identify the signed bundle' >&2
+    exit 24
+  }
+  echo 'runtime refused to stop' >&2
+  exit 19
+fi
+echo old-launcher
+EOF
+chmod 755 "$stop_failure_home/.aos/bin/aos"
+printf 'old-runtime\n' > "$stop_failure_home/.aos/runtime/bin/astrid"
+cp "$stop_failure_home/.aos/bin/aos" "$work/stop-failure-aos-before"
+if PATH="$fake_bin:$PATH" HOME="$stop_failure_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >"$work/stop-failure.log" 2>&1; then
+  echo "installer replaced files after the installed runtime refused to stop" >&2
+  exit 1
+fi
+cmp "$work/stop-failure-aos-before" "$stop_failure_home/.aos/bin/aos"
+test "$(cat "$stop_failure_home/.aos/runtime/bin/astrid")" = old-runtime
+test ! -e "$stop_failure_home/.aos/update/transaction"
+grep -F 'no files were replaced' "$work/stop-failure.log" >/dev/null
+
+pre_marker_home="$work/pre-marker-home"
+mkdir -p "$pre_marker_home/.aos/update/transaction/rollback"
+printf '%s\n' 2026.1.3 > "$pre_marker_home/.aos/update/transaction/release-version"
+if ! PATH="$fake_bin:$PATH" HOME="$pre_marker_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null; then
+  echo "installer did not recover a crash before the cutover marker was published" >&2
+  exit 1
+fi
+test ! -e "$pre_marker_home/.aos/update/transaction"
+test -x "$pre_marker_home/.aos/bin/aos"
 
 python=${PYTHON3:-python3}
 "$python" "$repo_root/scripts/release_metadata.py" render-channel \
@@ -573,6 +639,7 @@ for binary in aos astrid astrid-daemon astrid-build astrid-emit; do
   chmod 755 "$destination"
 done
 printf 'old-release-manifest\n' > "$release_dir/release-manifest.json"
+cp "$active_generation" "$work/active-generation-before-failure"
 
 fail_bin="$work/fail-bin"
 mkdir "$fail_bin"
@@ -608,11 +675,38 @@ for binary in aos astrid astrid-daemon astrid-build astrid-emit; do
   test "$("$destination")" = "old-$binary"
 done
 test "$(cat "$release_dir/release-manifest.json")" = old-release-manifest
+cmp "$work/active-generation-before-failure" "$active_generation"
+test ! -e "$work/home/.aos/update/transaction"
+test ! -e "$work/home/.aos/update/upgrade-in-progress.toml"
 test "$(find "$release_dir/capsules" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 19
 while IFS= read -r capsule; do
   cmp "$work/capsules/$capsule" "$release_dir/capsules/$capsule"
 done < "$release_dir/capsule-assets.txt"
 test "$(cat "$work/home/.astrid/sentinel")" = standalone-runtime-state
+
+transaction="$work/home/.aos/update/transaction"
+mkdir -p "$transaction/rollback"
+printf '%s\n' 2026.1.3 > "$transaction/release-version"
+printf '%s\n' "$work/home/.aos/bin" > "$transaction/bin-dir"
+printf '\n' > "$transaction/channel-current-path"
+cat > "$transaction/rollback/aos" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod 755 "$transaction/rollback/aos"
+: > "$transaction/rollback/aos.touched"
+cat > "$work/home/.aos/bin/aos" <<'EOF'
+#!/bin/sh
+exit 91
+EOF
+chmod 755 "$work/home/.aos/bin/aos"
+printf 'schema-version = 1\n' > "$work/home/.aos/update/upgrade-in-progress.toml"
+PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >"$work/recovery.log"
+grep -F 'Recovering an interrupted AOS upgrade' "$work/recovery.log" >/dev/null
+test "$($work/home/.aos/bin/aos --version)" = 'Unicity AOS 2026.1.3'
+test ! -e "$transaction"
+test ! -e "$work/home/.aos/update/upgrade-in-progress.toml"
 
 cat > "$work/aos-mismatch" <<'EOF'
 #!/bin/sh
