@@ -2,10 +2,11 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct Fixture {
@@ -155,6 +156,71 @@ fn unowned_root_passes_through_with_argv_home_and_exit_code() {
         std::env::split_paths(OsStr::new(child_path.trim())).next(),
         fixture.runtime.parent().map(Path::to_path_buf)
     );
+}
+
+#[test]
+fn product_mcp_bridge_adds_local_form_support_and_rebrands_the_server() {
+    let fixture = Fixture::new("product-mcp");
+    fixture.install_runtime(
+        r#"#!/bin/sh
+printf '<%s>\n' "$@" > "$AOS_TEST_ARGS"
+IFS= read -r initialize
+printf '%s\n' "$initialize" > "$AOS_TEST_BOOTSTRAP_ARGS"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"astrid","version":"0.10.4"}}}'
+while IFS= read -r _line; do :; done
+"#,
+    );
+
+    let mut child = fixture
+        .command()
+        .args(["--principal", "grok-code", "mcp", "serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start product MCP bridge");
+    let mut stdin = child.stdin.take().expect("bridge stdin");
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "grok", "version": "1" }
+            }
+        })
+    )
+    .expect("write initialize");
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for MCP bridge");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.args).expect("read runtime args"),
+        "<--principal>\n<grok-code>\n<mcp>\n<serve>\n"
+    );
+    let forwarded: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(&fixture.bootstrap_args)
+            .expect("read forwarded initialize")
+            .trim(),
+    )
+    .expect("forwarded initialize JSON");
+    assert!(
+        forwarded
+            .pointer("/params/capabilities/elicitation/form")
+            .is_some()
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("product initialize response");
+    assert_eq!(response["result"]["serverInfo"]["name"], "unicity-aos");
+    assert_eq!(response["result"]["serverInfo"]["title"], "Unicity AOS");
 }
 
 #[test]
@@ -440,7 +506,7 @@ fn offline_init_keeps_the_runtime_offline_flag_and_uses_only_local_capsules() {
         .parse()
         .expect("parse materialized manifest");
     let capsules = manifest["capsule"].as_array().expect("capsule entries");
-    assert_eq!(capsules.len(), 20);
+    assert_eq!(capsules.len(), 21);
     let expected_root = fixture
         .home
         .join("releases")
