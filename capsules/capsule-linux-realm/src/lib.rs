@@ -251,6 +251,7 @@ struct StatusResponse {
     linux_state: &'static str,
     linux_residency: &'static str,
     linux_vcpus: u32,
+    linux_ram_bytes: Option<usize>,
     linux_ram_persistent: bool,
     linux_ram_durability: &'static str,
     linux_storage_persistent: bool,
@@ -273,6 +274,7 @@ struct StatusResponse {
 struct ResourceStatus {
     configured: RealmResources,
     active: Option<RealmResources>,
+    effective: Option<RealmResources>,
     reconfigure_on_next_exec: bool,
     configuration_scope: &'static str,
     outer_enforcement: &'static str,
@@ -298,6 +300,7 @@ struct LinuxSnapshot {
     last_outcome: Option<&'static str>,
     last_exit_status: Option<i32>,
     commands_completed: u64,
+    ram_bytes: Option<usize>,
 }
 
 impl LinuxSnapshot {
@@ -310,6 +313,7 @@ impl LinuxSnapshot {
             last_outcome: None,
             last_exit_status: None,
             commands_completed: 0,
+            ram_bytes: None,
         }
     }
 }
@@ -963,7 +967,7 @@ fn execute_linux_resident_cooperatively(
 
     if booted {
         *workspace_9p = None;
-        let restored_prewarm = limits.memory_bytes == LINUX_PREWARM_RAM_BYTES;
+        let requested_prewarm = limits.memory_bytes == LINUX_PREWARM_RAM_BYTES;
         let resident = LinuxMachine::new(
             Rv64MachineConfig {
                 ram_bytes: limits.memory_bytes,
@@ -971,9 +975,10 @@ fn execute_linux_resident_cooperatively(
                 // invocation-wide output ceiling is enforced below.
                 max_console_bytes: HARD_MAX_OUTPUT_BYTES,
             },
-            restored_prewarm,
+            requested_prewarm,
         )
         .map_err(SysError::ApiError)?;
+        let restored_prewarm = resident.ram_bytes() == LINUX_PREWARM_RAM_BYTES;
         *machine = Some(resident);
 
         if restored_prewarm {
@@ -1705,6 +1710,12 @@ fn status_response(
     configured_resources: RealmResources,
 ) -> StatusResponse {
     let active_resources = actor.resources;
+    let effective_resources = active_resources.map(|resources| {
+        actor
+            .linux
+            .ram_bytes
+            .map_or(resources, |bytes| resources.with_linux_memory_bytes(bytes))
+    });
     StatusResponse {
         realm: REALM_NAME,
         owner_principal: principal,
@@ -1806,6 +1817,7 @@ fn status_response(
         linux_state: actor.linux.state,
         linux_residency: "principal-affine-store",
         linux_vcpus: 1,
+        linux_ram_bytes: actor.linux.ram_bytes,
         linux_ram_persistent: actor.linux.state == "running",
         linux_ram_durability: "evictable-cache",
         linux_storage_persistent: true,
@@ -1824,11 +1836,12 @@ fn status_response(
         resources: ResourceStatus {
             configured: configured_resources,
             active: active_resources,
+            effective: effective_resources,
             reconfigure_on_next_exec: active_resources
                 .is_some_and(|active| active != configured_resources),
             configuration_scope: "principal-capsule-config",
             outer_enforcement: "astrid-principal-profile+wasmtime-store-limiter",
-            allocation_behavior: "explicit-bounded-no-host-max-autobind",
+            allocation_behavior: "host-and-principal-admitted-auto-or-explicit",
         },
     }
 }
@@ -2744,6 +2757,7 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
                     last_outcome: Some("exited"),
                     last_exit_status: Some(0),
                     commands_completed: 3,
+                    ram_bytes: None,
                 },
                 resources: Some(RealmResources::default()),
             },
@@ -2824,6 +2838,46 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
     }
 
     #[test]
+    fn status_distinguishes_auto_configuration_from_effective_guest_ram() {
+        let configured = RealmResources::default();
+        let response = status_response(
+            "alice".to_string(),
+            "ready",
+            FsStatus {
+                format: aos_realm_vfs::FORMAT_VERSION,
+                generation: 0,
+                files: 0,
+                manifest: None,
+            },
+            ActorSnapshot {
+                state: "running",
+                boot_sequence: 1,
+                commands_completed: 0,
+                machine: RealmMachine::default().status(),
+                linux: LinuxSnapshot {
+                    state: "running",
+                    ram_bytes: Some(1024 * 1024 * 1024),
+                    ..LinuxSnapshot::cold()
+                },
+                resources: Some(configured),
+            },
+            configured,
+        );
+
+        assert_eq!(response.linux_ram_bytes, Some(1024 * 1024 * 1024));
+        assert_eq!(response.resources.active, Some(configured));
+        assert_eq!(
+            response
+                .resources
+                .effective
+                .expect("running Realm has an effective envelope")
+                .linux_memory_bytes,
+            1024 * 1024 * 1024
+        );
+        assert!(!response.resources.reconfigure_on_next_exec);
+    }
+
+    #[test]
     fn actual_capsule_manifest_has_scoped_fs_and_no_host_process_authority() {
         let manifest: toml::Value = include_str!("../Capsule.toml")
             .parse()
@@ -2845,7 +2899,7 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
         );
         assert_eq!(
             manifest["env"]["linux_memory_bytes"]["default"].as_str(),
-            Some("33554432")
+            Some("0")
         );
         assert_eq!(
             manifest["env"]["linux_max_steps"]["default"].as_str(),

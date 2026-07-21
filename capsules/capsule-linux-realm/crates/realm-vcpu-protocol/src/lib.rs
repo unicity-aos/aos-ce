@@ -20,11 +20,11 @@ pub const HEADER_BYTES: usize = 128;
 /// Maximum descriptor admitted by the Astrid compute copy boundary.
 pub const CONTROL_BYTES: usize = 1024 * 1024;
 /// Dynamic heap headroom beyond the admitted guest RAM.
-pub const WORKER_HEAP_OVERHEAD_BYTES: usize = 32 * 1024 * 1024;
+pub const WORKER_HEAP_OVERHEAD_BYTES: usize = 64 * 1024 * 1024;
 /// Smallest shared memory accepted by the worker import.
 pub const WORKER_MIN_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// Largest shared memory accepted by the worker import.
-pub const WORKER_MAX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
+pub const WORKER_MAX_MEMORY_BYTES: usize = 3584 * 1024 * 1024;
 /// WebAssembly linear-memory page size.
 pub const WASM_PAGE_BYTES: usize = 65_536;
 

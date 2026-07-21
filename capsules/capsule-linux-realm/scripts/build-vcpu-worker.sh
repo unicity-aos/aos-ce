@@ -7,7 +7,7 @@ manifest="$realm_root/crates/realm-vcpu-worker/Cargo.toml"
 artifact="$repo_root/target/wasm32-unknown-unknown/release/aos_realm_vcpu_worker.wasm"
 installed="$realm_root/assets/linux-vcpu.wasm"
 expected_rustc=2972b5e59f1c5529b6ba770437812fd83ab4ebd4
-expected_blake3=d935bf594b0282f29fe2cb90ab5c4cd10fed0446feab1df70fe7d0edd9f4a9fb
+expected_blake3=66d03f9d73ba8c1a98ba3de0af3281e8f909182605320408585c2685942016c8
 toolchain=nightly-2026-04-04
 toolchain_root=$(rustc "+$toolchain" --print sysroot)
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
@@ -18,7 +18,7 @@ rustflags="--remap-path-prefix=$toolchain_root=/rust/toolchain \
 -C link-arg=--import-memory=astrid_compute,memory -C link-arg=--shared-memory \
 -C link-arg=--no-stack-first -C link-arg=--global-base=65536 \
 -C link-arg=--initial-memory=67108864 \
--C link-arg=--max-memory=536870912"
+-C link-arg=--max-memory=3758096384"
 
 actual_rustc=$(rustc "+$toolchain" -vV | awk '/^commit-hash:/ { print $2 }')
 if [[ "$actual_rustc" != "$expected_rustc" ]]; then

@@ -26,6 +26,11 @@ use astrid_sdk::compute::{ComputeGroup, GroupRequest, WorkDescriptor};
 pub(crate) const DEFAULT_LINUX_BACKEND_ID: &str = "aos-rv64-interpreter";
 /// Exact prewarm artifact size recorded in `linux/PREWARM.lock`.
 pub(crate) const LINUX_PREWARM_CHECKPOINT_BYTES: usize = 8_495_869;
+#[cfg(any(target_arch = "wasm32", test))]
+const AUTO_GUEST_RESERVE_BYTES: usize = 128 * 1024 * 1024;
+const AUTO_REFERENCE_RAM_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(any(target_arch = "wasm32", test))]
+const MAX_GUEST_RAM_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 #[cfg(not(target_arch = "wasm32"))]
 const LINUX_IMAGE: &[u8] = include_bytes!("../linux/Image");
@@ -74,6 +79,7 @@ pub(crate) enum LinuxMachine {
 pub(crate) struct ReferenceMachine {
     machine: Machine,
     pending_request: Option<HostRequestId>,
+    ram_bytes: usize,
 }
 
 impl LinuxMachine {
@@ -81,6 +87,14 @@ impl LinuxMachine {
     pub(crate) fn new(config: MachineConfig, restore_prewarm: bool) -> Result<Self, String> {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let mut config = config;
+            if config.ram_bytes == 0 {
+                // Native execution is the conformance/reference lane and has
+                // no Astrid compute admission query. Production wasm resolves
+                // auto sizing from its admitted group.
+                config.ram_bytes = AUTO_REFERENCE_RAM_BYTES;
+            }
+            let restore_prewarm = restore_prewarm || config.ram_bytes == AUTO_REFERENCE_RAM_BYTES;
             let machine = if restore_prewarm {
                 let binding = CheckpointBinding::new(
                     CheckpointDigest::hash(LINUX_IMAGE),
@@ -111,6 +125,7 @@ impl LinuxMachine {
             Ok(Self::Reference(ReferenceMachine {
                 machine,
                 pending_request: None,
+                ram_bytes: config.ram_bytes,
             }))
         }
 
@@ -125,6 +140,7 @@ impl LinuxMachine {
                 Self::Reference(ReferenceMachine {
                     machine,
                     pending_request: None,
+                    ram_bytes: config.ram_bytes,
                 })
             })
             .map_err(|error| error.to_string())
@@ -132,6 +148,15 @@ impl LinuxMachine {
 
     pub(crate) const fn backend_id(&self) -> &'static str {
         DEFAULT_LINUX_BACKEND_ID
+    }
+
+    pub(crate) const fn ram_bytes(&self) -> usize {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Reference(reference) => reference.ram_bytes,
+            #[cfg(target_arch = "wasm32")]
+            Self::Compute(compute) => compute.ram_bytes,
+        }
     }
 
     pub(crate) fn push_console_input(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -243,6 +268,7 @@ impl ReferenceMachine {
 pub(crate) struct ComputeMachine {
     group: ComputeGroup,
     control_offset: u64,
+    ram_bytes: usize,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -254,19 +280,36 @@ struct ComputeResponse {
 
 #[cfg(target_arch = "wasm32")]
 impl ComputeMachine {
-    fn new(config: MachineConfig, restore_prewarm: bool) -> Result<Self, String> {
-        let (initial_pages, maximum_pages, control_offset) =
+    fn new(mut config: MachineConfig, restore_prewarm: bool) -> Result<Self, String> {
+        let (initial_pages, maximum_pages, mut control_offset) =
             shared_memory_layout(config.ram_bytes)?;
-        let group = ComputeGroup::open(
-            &GroupRequest::new(protocol::WORKER_ID, initial_pages, maximum_pages).deterministic(),
-        )
-        .map_err(|error| format!("admit Linux vCPU compute worker: {error}"))?;
+        let group = if maximum_pages == 0 {
+            // The held compute contract exposes admission through group info,
+            // not a separate capacity query. Open a short-lived probe, derive
+            // a non-monopolizing guest size, release its all-remaining
+            // reservation, then retain only the exact explicit envelope.
+            let probe = open_compute_group(initial_pages, 0)?;
+            config.ram_bytes = auto_guest_ram_bytes(
+                probe
+                    .info()
+                    .map_err(|error| format!("inspect admitted Linux vCPU group: {error}"))?
+                    .maximum_memory_pages,
+            )?;
+            drop(probe);
+            let (initial_pages, maximum_pages, admitted_control_offset) =
+                shared_memory_layout(config.ram_bytes)?;
+            control_offset = admitted_control_offset;
+            open_compute_group(initial_pages, maximum_pages)?
+        } else {
+            open_compute_group(initial_pages, maximum_pages)?
+        };
         let machine = Self {
             group,
             control_offset,
+            ram_bytes: config.ram_bytes,
         };
         machine.invoke(
-            if restore_prewarm {
+            if restore_prewarm || config.ram_bytes == AUTO_REFERENCE_RAM_BYTES {
                 Operation::InitPrewarm
             } else {
                 Operation::InitCold
@@ -440,6 +483,25 @@ impl ComputeMachine {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn open_compute_group(
+    initial_memory_pages: u32,
+    maximum_memory_pages: u32,
+) -> Result<ComputeGroup, String> {
+    let request = GroupRequest::new(
+        protocol::WORKER_ID,
+        initial_memory_pages,
+        maximum_memory_pages,
+    );
+    let request = if maximum_memory_pages == 0 {
+        request.auto_memory()
+    } else {
+        request
+    };
+    ComputeGroup::open(&request.deterministic())
+        .map_err(|error| format!("admit Linux vCPU compute worker: {error}"))
+}
+
 #[cfg(any(target_arch = "wasm32", test))]
 fn shared_memory_layout(ram_bytes: usize) -> Result<(u32, u32, u64), String> {
     // Rust's wasm allocator acquires heap segments with `memory.grow`; it does
@@ -452,10 +514,16 @@ fn shared_memory_layout(ram_bytes: usize) -> Result<(u32, u32, u64), String> {
         .and_then(|value| value.checked_add(protocol::WORKER_HEAP_OVERHEAD_BYTES))
         .ok_or_else(|| "Linux vCPU shared-memory size overflow".to_string())?
         .max(protocol::WORKER_MIN_MEMORY_BYTES);
-    let maximum_pages = maximum_required
-        .checked_add(protocol::WASM_PAGE_BYTES - 1)
-        .ok_or_else(|| "Linux vCPU shared-memory rounding overflow".to_string())?
-        / protocol::WASM_PAGE_BYTES;
+    let maximum_pages = if ram_bytes == 0 {
+        // Zero is the held compute-contract sentinel for host admission. The
+        // effective value is read back from `group.info()` before VM init.
+        0
+    } else {
+        maximum_required
+            .checked_add(protocol::WASM_PAGE_BYTES - 1)
+            .ok_or_else(|| "Linux vCPU shared-memory rounding overflow".to_string())?
+            / protocol::WASM_PAGE_BYTES
+    };
     let maximum_bytes = maximum_pages
         .checked_mul(protocol::WASM_PAGE_BYTES)
         .ok_or_else(|| "Linux vCPU shared-memory size overflow".to_string())?;
@@ -473,6 +541,33 @@ fn shared_memory_layout(ram_bytes: usize) -> Result<(u32, u32, u64), String> {
             .map_err(|_| "Linux vCPU maximum page count is too large".to_string())?,
         control_offset as u64,
     ))
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn auto_guest_ram_bytes(maximum_memory_pages: u32) -> Result<usize, String> {
+    const GUEST_PAGE_BYTES: usize = 4096;
+    let admitted = usize::try_from(maximum_memory_pages)
+        .ok()
+        .and_then(|pages| pages.checked_mul(protocol::WASM_PAGE_BYTES))
+        .ok_or_else(|| "admitted Linux vCPU memory exceeds this platform".to_string())?;
+    let available = admitted
+        .checked_sub(protocol::WORKER_MIN_MEMORY_BYTES)
+        .and_then(|bytes| bytes.checked_sub(AUTO_GUEST_RESERVE_BYTES))
+        .ok_or_else(|| "admitted Linux vCPU memory leaves no guest RAM".to_string())?;
+    // Auto is a useful default, not an instruction to let the first Realm bind
+    // the whole host pool. Retain half of the currently usable capacity for
+    // another principal/capsule; an operator can still request up to 3 GiB
+    // explicitly for a dedicated build principal.
+    let selected = (available / 2)
+        .max(AUTO_REFERENCE_RAM_BYTES)
+        .min(MAX_GUEST_RAM_BYTES);
+    let aligned = selected - (selected % GUEST_PAGE_BYTES);
+    if aligned < AUTO_REFERENCE_RAM_BYTES {
+        return Err(format!(
+            "admitted Linux vCPU memory leaves {aligned} guest bytes; at least {AUTO_REFERENCE_RAM_BYTES} are required"
+        ));
+    }
+    Ok(aligned)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -514,13 +609,31 @@ mod tests {
         let (initial_pages, maximum_pages, control_offset) =
             shared_memory_layout(32 * 1024 * 1024).expect("default layout");
         assert_eq!(initial_pages, 1024);
-        assert_eq!(maximum_pages, 2048);
+        assert_eq!(maximum_pages, 2560);
         assert_eq!(control_offset, (63 * 1024 * 1024) as u64);
 
         let (initial_pages, maximum_pages, control_offset) =
-            shared_memory_layout(256 * 1024 * 1024).expect("largest Realm layout");
+            shared_memory_layout(3 * 1024 * 1024 * 1024).expect("largest Realm layout");
         assert_eq!(initial_pages, 1024);
-        assert_eq!(maximum_pages, 5632);
+        assert_eq!(maximum_pages, 51_200);
         assert_eq!(control_offset, (63 * 1024 * 1024) as u64);
+    }
+
+    #[test]
+    fn auto_memory_scales_without_monopolizing_the_admitted_group() {
+        let (initial_pages, maximum_pages, _) =
+            shared_memory_layout(0).expect("auto layout request");
+        assert_eq!(initial_pages, 1024);
+        assert_eq!(maximum_pages, 0);
+
+        assert_eq!(
+            auto_guest_ram_bytes(16_384).expect("one GiB group"),
+            416 * 1024 * 1024
+        );
+        assert_eq!(
+            auto_guest_ram_bytes(57_344).expect("signed worker maximum"),
+            1696 * 1024 * 1024
+        );
+        assert!(auto_guest_ram_bytes(2048).is_err());
     }
 }

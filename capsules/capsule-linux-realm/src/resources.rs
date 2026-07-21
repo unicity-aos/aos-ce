@@ -3,8 +3,9 @@
 use astrid_sdk::prelude::*;
 use serde::Serialize;
 
-pub(crate) const DEFAULT_LINUX_MEMORY_BYTES: usize = 32 * 1024 * 1024;
-pub(crate) const MAX_LINUX_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+/// Zero delegates guest-RAM sizing to Astrid's admitted compute envelope.
+pub(crate) const DEFAULT_LINUX_MEMORY_BYTES: usize = 0;
+pub(crate) const MAX_LINUX_MEMORY_BYTES: usize = 3 * 1024 * 1024 * 1024;
 pub(crate) const MIN_LINUX_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 /// No additional inner instruction ceiling; Astrid's principal CPU and timeout
 /// policy remains the outer enforcement boundary.
@@ -55,6 +56,11 @@ impl Default for RealmResources {
 }
 
 impl RealmResources {
+    pub(crate) const fn with_linux_memory_bytes(mut self, bytes: usize) -> Self {
+        self.linux_memory_bytes = bytes;
+        self
+    }
+
     pub(crate) const fn effective_max_steps(self) -> u64 {
         if self.linux_max_steps == 0 {
             u64::MAX
@@ -74,10 +80,18 @@ impl RealmResources {
             LINUX_MEMORY_BYTES_KEY,
             read(LINUX_MEMORY_BYTES_KEY)?,
             DEFAULT_LINUX_MEMORY_BYTES,
-            MIN_LINUX_MEMORY_BYTES,
+            0,
             MAX_LINUX_MEMORY_BYTES,
         )?;
-        if !linux_memory_bytes.is_multiple_of(GUEST_PAGE_BYTES) {
+        if linux_memory_bytes != 0 && linux_memory_bytes < MIN_LINUX_MEMORY_BYTES {
+            return Err(invalid_integer(
+                LINUX_MEMORY_BYTES_KEY,
+                &linux_memory_bytes.to_string(),
+                u64::try_from(MIN_LINUX_MEMORY_BYTES).expect("Realm minimum fits u64"),
+                u64::try_from(MAX_LINUX_MEMORY_BYTES).expect("Realm maximum fits u64"),
+            ));
+        }
+        if linux_memory_bytes != 0 && !linux_memory_bytes.is_multiple_of(GUEST_PAGE_BYTES) {
             return Err(SysError::ApiError(format!(
                 "Realm config `{LINUX_MEMORY_BYTES_KEY}` must be aligned to a {GUEST_PAGE_BYTES}-byte guest page"
             )));
@@ -177,8 +191,17 @@ mod tests {
         let defaults = resources(&[]).expect("defaults");
         assert_eq!(defaults, RealmResources::default());
         assert_eq!(defaults.linux_max_steps, 0);
+        assert_eq!(defaults.linux_memory_bytes, 0);
         assert_eq!(defaults.effective_max_steps(), u64::MAX);
         assert_eq!(defaults.linux_max_file_bytes, 0);
+
+        let installed_defaults = resources(&[
+            (LINUX_MEMORY_BYTES_KEY, "0"),
+            (LINUX_MAX_STEPS_KEY, "0"),
+            (LINUX_MAX_FILE_BYTES_KEY, "0"),
+        ])
+        .expect("serialized installation defaults");
+        assert_eq!(installed_defaults, defaults);
     }
 
     #[test]
@@ -203,7 +226,7 @@ mod tests {
         for values in [
             vec![(LINUX_MEMORY_BYTES_KEY, "unbounded")],
             vec![(LINUX_MEMORY_BYTES_KEY, "33554433")],
-            vec![(LINUX_MEMORY_BYTES_KEY, "536870912")],
+            vec![(LINUX_MEMORY_BYTES_KEY, "4294967296")],
             vec![(LINUX_MAX_STEPS_KEY, "1000000000001")],
             vec![(LINUX_MAX_OUTPUT_BYTES_KEY, "0")],
             vec![(LINUX_MAX_FILE_BYTES_KEY, "1099511627777")],
