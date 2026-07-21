@@ -301,6 +301,7 @@ impl MachineCheckpoint {
                 max_response_bytes,
             },
             response_address,
+            hart_id: 0,
         });
 
         let populated_pages = decoder.u32_usize()?;
