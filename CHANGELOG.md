@@ -19,7 +19,7 @@
 - Runtime import holds the standalone daemon's existing singleton lock without
   changing the source, and interrupted unreceipted cutovers always roll back
   before recopying the current locked source.
-- A signed release path for the 19 installable `aos-*` artifacts
+- A signed release path for the 20 installable `aos-*` artifacts
   built from this source tree and selected locally by Community Edition, with
   exact source/manifest identity checks, product-archive inclusion, offline
   provisioning, archive safety validation, BLAKE3 checksums, SHA-256
@@ -31,13 +31,18 @@
   tools, capsules, traces, and evaluations as an improvable world. Agents reach
   for Forge proactively when real work reveals a useful new capability, while
   optional workers remain a use-case choice rather than a prerequisite.
+- An authenticated `aos hook` ingress and Community Edition Meta Harness
+  capsule that normalize Codex, Claude, and Grok host events onto the generic
+  hook bus, collect private same-turn prompt context, and route it back only to
+  the exact originating session. Adaptive, propose, automatic, and off modes
+  preserve the agent's judgment while respecting its existing authority.
 - Homebrew formula updates initiated by the tap's authenticated stable-release
   poll, eliminating the cross-repository dispatch credential.
 - Strict, signed stable/dev/nightly channel and immutable release metadata
   contracts with exact workflow identities, expiry, replay-resistant generation
   state, and fail-closed direct installer resolution.
 - A native release gate that initializes a clean AOS home, verifies the exact
-  19-capsule CE lock, grants, and ready set, repeats initialization without
+  20-capsule CE lock, grants, and ready set, repeats initialization without
   changing runtime state, and proves clean daemon shutdown before publication.
 - Native `aos status` output for authenticated running state and verified
   stopped state without invoking the runtime CLI.

@@ -14,6 +14,8 @@ use std::time::Duration;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use unicity_aos_bootstrap::{AOS_WORKSPACE_STATE_DIR, AosHome};
 
+mod hook;
+
 // Product-owned commands are parsed here. Unknown roots bypass this parser and
 // are delegated byte-for-byte to the bundled runtime by `main`.
 #[derive(Parser)]
@@ -52,6 +54,8 @@ enum ProductCommand {
     Update(UpdateArgs),
     /// Distribution state is fixed to Unicity CE in this AOS release.
     Distro(DistroArgs),
+    /// Deliver a host hook through the authenticated AOS event bus.
+    Hook(hook::HookArgs),
     /// Serve the loopback-only product health endpoint.
     ServeHealth,
 }
@@ -276,11 +280,11 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
     if cli.principal.is_some()
         && !matches!(
             &cli.command,
-            Some(ProductCommand::Init(_) | ProductCommand::Distro(_))
+            Some(ProductCommand::Init(_) | ProductCommand::Distro(_) | ProductCommand::Hook(_))
         )
     {
         eprintln!(
-            "aos: '--principal' is supported for `aos init`; this AOS-owned command does not accept an operator principal"
+            "aos: '--principal' is supported for `aos init` and `aos hook`; this AOS-owned command does not accept an operator principal"
         );
         return Some(ExitCode::from(2));
     }
@@ -293,6 +297,7 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
         }) => Some(handle_migrate_runtime(&from)),
         Some(ProductCommand::Update(args)) => Some(handle_self_update(&args)),
         Some(ProductCommand::Distro(args)) => Some(refuse_distro_command(&args.arguments)),
+        Some(ProductCommand::Hook(args)) => Some(handle_hook(cli.principal, args)),
         Some(ProductCommand::ServeHealth) => Some(handle_health_service()),
         None => Some(print_product_help()),
     }
@@ -509,6 +514,7 @@ fn is_owned_root(value: &str) -> bool {
             | "self-update"
             | "self_update"
             | "distro"
+            | "hook"
             | "serve-health"
     )
 }
@@ -712,6 +718,31 @@ fn handle_health_service() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("aos: health service failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn handle_hook(principal: Option<String>, args: hook::HookArgs) -> ExitCode {
+    let home = match resolve_home() {
+        Ok(home) => home,
+        Err(code) => return code,
+    };
+    set_runtime_environment(&home);
+    let principal = principal.unwrap_or_else(|| "default".to_owned());
+    match hook::handle(principal, args) {
+        Ok(Some(context)) => {
+            print!("{context}");
+            if let Err(error) = io::stdout().flush() {
+                eprintln!("aos: failed to write hook response: {error}");
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Ok(None) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("aos: hook delivery failed: {error}");
             ExitCode::FAILURE
         }
     }

@@ -13,6 +13,7 @@ capsule-router
 capsule-prompt-builder
 capsule-context-engine
 capsule-hook-bridge
+capsule-meta-harness
 capsule-shell
 capsule-http
 capsule-fs

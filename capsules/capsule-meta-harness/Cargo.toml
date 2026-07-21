@@ -1,0 +1,14 @@
+[package]
+name = "aos-meta-harness"
+version = "0.1.0"
+edition = "2024"
+description = "Proactive user-space capability reflection for Unicity AOS agents"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+astrid-sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
