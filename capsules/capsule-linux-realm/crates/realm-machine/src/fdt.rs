@@ -20,6 +20,7 @@ pub(crate) const TIMEBASE_FREQUENCY: u32 = 10_000_000;
 pub(crate) struct LinuxFdtConfig<'a> {
     pub dram_base: u64,
     pub ram_bytes: u64,
+    pub hart_count: usize,
     pub uart_base: u64,
     pub uart_bytes: u64,
     pub bootargs: &'a str,
@@ -52,25 +53,29 @@ pub(crate) fn build_linux_fdt(config: &LinuxFdtConfig<'_>) -> Vec<u8> {
     tree.property_u32("#address-cells", 1);
     tree.property_u32("#size-cells", 0);
     tree.property_u32("timebase-frequency", TIMEBASE_FREQUENCY);
-    tree.begin_node("cpu@0");
-    tree.property_string("device_type", "cpu");
-    tree.property_u32("reg", 0);
-    tree.property_string("status", "okay");
-    tree.property_string("compatible", "riscv");
-    tree.property_string("riscv,isa", "rv64ima_zicsr_zifencei");
-    tree.property_string("riscv,isa-base", "rv64i");
-    tree.property_string_list(
-        "riscv,isa-extensions",
-        &["i", "m", "a", "zicsr", "zifencei"],
-    );
-    tree.property_string("mmu-type", "riscv,sv39");
-    tree.begin_node("interrupt-controller");
-    tree.property_u32("#interrupt-cells", 1);
-    tree.property_empty("interrupt-controller");
-    tree.property_string("compatible", "riscv,cpu-intc");
-    tree.property_u32("phandle", 1);
-    tree.end_node();
-    tree.end_node();
+    debug_assert!(config.hart_count > 0);
+    for hart_index in 0..config.hart_count {
+        let hart_id = u32::try_from(hart_index).expect("admitted hart ID fits u32");
+        tree.begin_node(&format!("cpu@{hart_id:x}"));
+        tree.property_string("device_type", "cpu");
+        tree.property_u32("reg", hart_id);
+        tree.property_string("status", "okay");
+        tree.property_string("compatible", "riscv");
+        tree.property_string("riscv,isa", "rv64ima_zicsr_zifencei");
+        tree.property_string("riscv,isa-base", "rv64i");
+        tree.property_string_list(
+            "riscv,isa-extensions",
+            &["i", "m", "a", "zicsr", "zifencei"],
+        );
+        tree.property_string("mmu-type", "riscv,sv39");
+        tree.begin_node("interrupt-controller");
+        tree.property_u32("#interrupt-cells", 1);
+        tree.property_empty("interrupt-controller");
+        tree.property_string("compatible", "riscv,cpu-intc");
+        tree.property_u32("phandle", cpu_interrupt_phandle(hart_id));
+        tree.end_node();
+        tree.end_node();
+    }
     tree.end_node();
 
     tree.begin_node(&format!("memory@{:x}", config.dram_base));
@@ -94,6 +99,12 @@ pub(crate) fn build_linux_fdt(config: &LinuxFdtConfig<'_>) -> Vec<u8> {
     tree.end_node();
     tree.end_node();
     tree.finish()
+}
+
+const fn cpu_interrupt_phandle(hart_id: u32) -> u32 {
+    hart_id
+        .checked_add(1)
+        .expect("admitted hart ID leaves room for a nonzero phandle")
 }
 
 #[derive(Default)]
@@ -219,6 +230,7 @@ mod tests {
         let tree = build_linux_fdt(&LinuxFdtConfig {
             dram_base: 0x8000_0000,
             ram_bytes: 64 * 1024 * 1024,
+            hart_count: 1,
             uart_base: 0x1000_0000,
             uart_bytes: 0x100,
             bootargs: "console=ttyS0 init=/init",
@@ -249,6 +261,34 @@ mod tests {
                 tree.windows(expected.len())
                     .any(|window| window == expected)
             );
+        }
+    }
+
+    #[test]
+    fn generated_tree_has_one_exact_node_and_unique_phandle_per_hart() {
+        let hart_count = 4;
+        let tree = build_linux_fdt(&LinuxFdtConfig {
+            dram_base: 0x8000_0000,
+            ram_bytes: 64 * 1024 * 1024,
+            hart_count,
+            uart_base: 0x1000_0000,
+            uart_bytes: 0x100,
+            bootargs: "console=ttyS0 init=/init",
+            initrd_start: None,
+            initrd_end: None,
+        });
+
+        for hart_id in 0..u32::try_from(hart_count).expect("test hart count") {
+            let mut encoded_node = FDT_BEGIN_NODE.to_be_bytes().to_vec();
+            encoded_node.extend_from_slice(format!("cpu@{hart_id:x}\0").as_bytes());
+            assert_eq!(
+                tree.windows(encoded_node.len())
+                    .filter(|window| *window == encoded_node)
+                    .count(),
+                1,
+                "hart {hart_id} must have exactly one CPU node"
+            );
+            assert_eq!(cpu_interrupt_phandle(hart_id), hart_id + 1);
         }
     }
 }

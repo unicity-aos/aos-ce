@@ -36,6 +36,9 @@ pub const LINUX_KERNEL_BASE: u64 = DRAM_BASE + 0x20_0000;
 /// Physical address of the generated Linux flattened device tree.
 pub const LINUX_FDT_BASE: u64 = DRAM_BASE + 0x1000;
 
+/// Hard guest-topology limit for the first deterministic scheduler.
+pub const MAX_HARTS: usize = 64;
+
 const UART_SIZE: u64 = 0x100;
 const TEST_FINISHER_SIZE: u64 = 0x1000;
 const CLINT_SIZE: u64 = 0x1_0000;
@@ -184,6 +187,8 @@ pub enum MachineError {
     InvalidRamBytes(usize),
     /// The retained serial-output limit exceeds the hard machine cap.
     InvalidConsoleBytes(usize),
+    /// The guest hart count is zero or exceeds the machine-profile maximum.
+    InvalidHartCount(usize),
     /// A program image is empty or does not fit in admitted guest RAM.
     InvalidProgramBytes { image: usize, ram: usize },
     /// The admitted RAM cannot contain the kernel, initramfs, and generated FDT
@@ -207,6 +212,10 @@ impl fmt::Display for MachineError {
             Self::InvalidConsoleBytes(bytes) => write!(
                 f,
                 "console limit must not exceed {MAX_CONSOLE_BYTES} bytes, got {bytes}"
+            ),
+            Self::InvalidHartCount(count) => write!(
+                f,
+                "guest hart count must be between 1 and {MAX_HARTS}, got {count}"
             ),
             Self::InvalidProgramBytes { image, ram } => {
                 write!(
@@ -243,6 +252,8 @@ pub enum CheckpointError {
     PendingConsoleInput { bytes: usize },
     /// Console bytes must be drained into the checkpoint build receipt first.
     UndrainedConsoleOutput { bytes: usize },
+    /// Checkpoint format 1 represents exactly one hart.
+    MultipleHarts { count: usize },
 }
 
 impl fmt::Display for CheckpointError {
@@ -259,6 +270,10 @@ impl fmt::Display for CheckpointError {
             Self::UndrainedConsoleOutput { bytes } => write!(
                 f,
                 "prewarm checkpoint contains {bytes} bytes of undrained console output"
+            ),
+            Self::MultipleHarts { count } => write!(
+                f,
+                "checkpoint format 1 supports one hart, machine has {count}"
             ),
         }
     }
@@ -1169,6 +1184,7 @@ impl Devices {
 #[derive(Clone, Debug)]
 pub struct Machine {
     config: MachineConfig,
+    hart_count: usize,
     cpu: Cpu,
     csrs: CsrFile,
     devices: Devices,
@@ -1233,6 +1249,14 @@ impl MachineCheckpoint {
 impl Machine {
     /// Admit resources and construct a reset RV64 machine.
     pub fn new(config: MachineConfig) -> Result<Self, MachineError> {
+        Self::new_with_harts(config, 1)
+    }
+
+    /// Admit resources and construct a reset RV64 machine with an exact guest
+    /// topology. Secondary-hart execution is enabled only as its architectural
+    /// state and SBI lifecycle are admitted; this constructor does not equate
+    /// guest harts with native host workers.
+    pub fn new_with_harts(config: MachineConfig, hart_count: usize) -> Result<Self, MachineError> {
         if !(MIN_RAM_BYTES..=MAX_RAM_BYTES).contains(&config.ram_bytes)
             || !config.ram_bytes.is_multiple_of(MIN_RAM_BYTES)
         {
@@ -1241,8 +1265,12 @@ impl Machine {
         if config.max_console_bytes > MAX_CONSOLE_BYTES {
             return Err(MachineError::InvalidConsoleBytes(config.max_console_bytes));
         }
+        if !(1..=MAX_HARTS).contains(&hart_count) {
+            return Err(MachineError::InvalidHartCount(hart_count));
+        }
         Ok(Self {
             config,
+            hart_count,
             cpu: Cpu::new(),
             csrs: CsrFile::default(),
             devices: Devices::new(config),
@@ -1258,6 +1286,12 @@ impl Machine {
             metrics: MachineMetrics::default(),
             translation_cache: TranslationCache::default(),
         })
+    }
+
+    /// Exact guest hart topology admitted for this machine.
+    #[must_use]
+    pub const fn hart_count(&self) -> usize {
+        self.hart_count
     }
 
     /// Reset the machine and copy a raw RV64 image to [`DRAM_BASE`].
@@ -1329,6 +1363,7 @@ impl Machine {
         let fdt = build_linux_fdt(&LinuxFdtConfig {
             dram_base: DRAM_BASE,
             ram_bytes: self.config.ram_bytes as u64,
+            hart_count: self.hart_count,
             uart_base: UART_BASE,
             uart_bytes: UART_SIZE,
             bootargs,
@@ -1489,6 +1524,11 @@ impl Machine {
     /// suspension. The pending request is retained and must be completed by a
     /// fresh principal-scoped provider after every restore.
     pub fn checkpoint_host_suspension(&self) -> Result<MachineCheckpoint, CheckpointError> {
+        if self.hart_count != 1 {
+            return Err(CheckpointError::MultipleHarts {
+                count: self.hart_count,
+            });
+        }
         if !matches!(self.state, RunState::Runnable) {
             return Err(CheckpointError::NotRunnable);
         }
@@ -3236,6 +3276,23 @@ mod tests {
             .expect_err("unaligned RAM must fail"),
             MachineError::InvalidRamBytes(4095)
         );
+        let config = MachineConfig {
+            ram_bytes: 4096,
+            max_console_bytes: 1,
+        };
+        assert_eq!(
+            Machine::new_with_harts(config, 0).expect_err("zero harts must fail"),
+            MachineError::InvalidHartCount(0)
+        );
+        assert_eq!(
+            Machine::new_with_harts(config, MAX_HARTS + 1)
+                .expect_err("unrepresentable hart count must fail"),
+            MachineError::InvalidHartCount(MAX_HARTS + 1)
+        );
+        let admitted =
+            Machine::new_with_harts(config, MAX_HARTS).expect("maximum hart topology is admitted");
+        assert_eq!(admitted.hart_count(), MAX_HARTS);
+        assert_eq!(machine(1).hart_count(), 1);
         let mut machine = machine(8);
         assert_eq!(
             machine.load_program(&[]),
@@ -3997,6 +4054,19 @@ mod tests {
 
     #[test]
     fn prewarm_checkpoint_rejects_unstable_or_principal_bearing_state() {
+        let multi_hart = Machine::new_with_harts(
+            MachineConfig {
+                ram_bytes: 4096,
+                max_console_bytes: 64,
+            },
+            2,
+        )
+        .expect("admit two-hart topology");
+        assert!(matches!(
+            multi_hart.checkpoint_host_suspension(),
+            Err(CheckpointError::MultipleHarts { count: 2 })
+        ));
+
         let mut machine = machine(64);
         machine
             .load_program(&RV64_SMOKE_PROGRAM)
