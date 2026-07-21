@@ -1417,6 +1417,90 @@ Current upstream references:
 - [Wasmtime proposal support and resource-limiter caveats](https://docs.wasmtime.dev/stability-wasm-proposals.html)
 - [WebAssembly Component Model roadmap](https://github.com/WebAssembly/component-model)
 
+### 7.3 Deterministic virtual SMP contract — active implementation increment
+
+Linux SMP is a guest-machine property, not a synonym for Astrid worker count.
+The first correct increment therefore runs multiple guest harts under one
+deterministic Realm scheduler. It may be slower than one hart and must be
+labelled `time-sliced`; its purpose is to settle Linux-visible topology, SBI,
+interrupt, memory-ordering, lifecycle, and metering semantics before native
+parallel execution introduces host races.
+
+The versioned machine contract is:
+
+1. `linux_vcpus` is resolved for every principal invocation. Zero asks Astrid
+   for an automatic value; a positive value requests that exact guest topology,
+   subject to the principal worker allowance, the host pool, and the signed
+   machine hard maximum. A changed active value requires a cold boot until CPU
+   hotplug is implemented.
+2. The FDT contains one `/cpus/cpu@N` node and one unique CPU interrupt-controller
+   phandle per admitted hart. Only hart 0 enters Linux at initial boot. This
+   follows Linux's ordered RISC-V boot contract; Linux starts secondaries through
+   SBI HSM.
+3. Every hart owns registers, privilege/CSR state, LR/SC reservation,
+   translation cache, timer comparator, software-interrupt state, retired
+   instructions, and cycle count. RAM, UART, monotonic guest time, finisher,
+   firmware, and host-effect queues are machine-wide.
+4. SBI HSM implements `hart_start`, non-returning `hart_stop`, and status with
+   explicit stopped/started transitions. SBI IPI targets admitted hart masks.
+   RFENCE synchronously invalidates the selected harts' translation caches in
+   the deterministic scheduler. SBI TIME programs the calling hart's timer.
+5. One fixed round-robin quantum selects runnable harts. Each decoded machine
+   step is charged exactly once to the same principal ledger, including traps,
+   firmware calls, idle polling, and failed operations. No hart may make progress
+   after the foreground deadline or cancellation becomes observable.
+6. An outstanding 9P effect records its requesting hart. The whole deterministic
+   machine suspends until completion, then writes the SBI result only to that
+   hart. A later parallel implementation may serialize effects through an
+   arbiter but may not change this observable contract.
+7. A store invalidates every overlapping hart reservation. Guest atomicity is
+   defined at instruction boundaries in the time-sliced engine. The later
+   shared-memory engine must preserve the same RISC-V result set with atomics or
+   bounded locks rather than relying on a Wasm data race.
+8. Existing single-hart checkpoints remain format 1. Multi-hart machines cold
+   boot until format 2 binds every hart, HSM state, scheduler cursor, interrupt,
+   reservation, and translation state to the machine/image identity.
+
+The two execution modes share that machine protocol but make distinct claims:
+
+| Mode | Guest sees | Host execution | Claim allowed |
+| --- | --- | --- | --- |
+| deterministic SMP | N Linux CPUs | one worker, fixed interleaving | topology and SMP correctness |
+| parallel SMP | N Linux CPUs | admitted compute workers over one shared region | concurrent execution and measured speedup |
+
+Parallel SMP is admitted only after the deterministic trace is stable. Its
+worker protocol assigns one hart to an exact worker index, leaves policy and
+device effects with the supervisor, and aggregates fuel, deadline,
+cancellation, and peak memory over the entire group. No WIT change is needed:
+the already-held generic compute-group draft is sufficient, and remains
+unmerged before Astrid 1.0.
+
+Implementation and proof order:
+
+- [x] admit a bounded hart count, emit exact FDT CPU nodes and interrupt-controller
+  phandles, preserve the existing one-hart constructor, and reject multi-hart
+  state from checkpoint format 1;
+- [ ] split per-hart architectural state from machine-wide devices, expose exact
+  `mhartid`, and add the deterministic round-robin scheduler;
+- [ ] implement and negatively test SBI HSM, IPI, RFENCE, and per-hart TIME;
+- [ ] enable SMP in the pinned Linux build and prove two CPUs reach userspace,
+  schedule work, receive interrupts, and remain within aggregate metering;
+- [ ] resolve `linux_vcpus` from principal and operator authority, with automatic
+  local defaults and finite managed ceilings;
+- [ ] add checkpoint format 2 or prove multi-hart cold-boot behavior at every
+  lifecycle boundary;
+- [ ] move harts onto the generic compute group, then benchmark one hart,
+  time-sliced SMP, and parallel SMP without conflating boot latency, warm command
+  latency, and throughput.
+
+Normative references for this increment are the
+[Linux RISC-V boot requirements](https://docs.kernel.org/next/arch/riscv/boot.html),
+the ratified [SBI HSM](https://docs.riscv.org/reference/sbi/v3.0/ext-hsm.html),
+[SBI IPI](https://docs.riscv.org/reference/sbi/_attachments/riscv-sbi.pdf), and
+[SBI RFENCE](https://docs.riscv.org/reference/sbi/v3.0/ext-rfence.html)
+contracts, plus the
+[Devicetree CPU-node rules](https://devicetree-specification.readthedocs.io/en/stable/devicenodes.html).
+
 ## 8. Executable compatibility lanes
 
 There are two compatible long-term execution lanes behind the same realm API.
@@ -2715,8 +2799,10 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   separate warm machines and durable homes, survive a daemon restart, and fix
   the late-epoch Store-construction deadline wrap exposed by the second
   principal;
-- [ ] add deterministic virtual SMP within one principal-owned Realm after that
-  lifecycle and metering boundary is executable;
+- [ ] execute the deterministic virtual SMP contract in section 7.3: exact FDT
+  topology, per-hart architectural state, HSM/IPI/RFENCE/TIME, aggregate
+  metering, an SMP-enabled Linux proof, and explicit multi-hart checkpoint
+  behavior;
 - [x] specify the generic principal-owned compute-group RFC and WIT draft while
   keeping the canonical WIT branch deliberately unmerged until 1.0; lifecycle,
   budgets, cancellation, shared-region ownership, and accounting remain generic
