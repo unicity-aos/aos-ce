@@ -60,6 +60,7 @@ const LINUX_FDT_MAX_BYTES: usize = 64 * 1024;
 const GUEST_PAGE_SHIFT: u32 = 12;
 const GUEST_PAGE_MASK: u64 = (1 << GUEST_PAGE_SHIFT) - 1;
 const TRANSLATION_CACHE_ENTRIES: usize = 1024;
+const HART_SCHEDULER_QUANTUM: u64 = 1024;
 
 const MSTATUS_SIE: u64 = 1 << 1;
 const MSTATUS_MIE: u64 = 1 << 3;
@@ -141,6 +142,9 @@ const MIDELEG_SUPPORTED: u64 = MIP_SSIP | MIP_STIP | MIP_SEIP;
 
 const SBI_EXT_BASE: u64 = 0x10;
 const SBI_EXT_TIME: u64 = 0x5449_4d45;
+const SBI_EXT_IPI: u64 = 0x0073_5049;
+const SBI_EXT_RFENCE: u64 = 0x5246_4e43;
+const SBI_EXT_HSM: u64 = 0x0048_534d;
 const SBI_EXT_DBCN: u64 = 0x4442_434e;
 const SBI_EXT_SRST: u64 = 0x5352_5354;
 /// Private AOS 9P transport in the SBI experimental extension range.
@@ -160,6 +164,8 @@ const SBI_ERR_INVALID_PARAM: u64 = (-3_i64) as u64;
 const SBI_ERR_DENIED: u64 = (-4_i64) as u64;
 const SBI_ERR_INVALID_ADDRESS: u64 = (-5_i64) as u64;
 const SBI_ERR_ALREADY_AVAILABLE: u64 = (-6_i64) as u64;
+const SBI_HART_STATE_STARTED: u64 = 0;
+const SBI_HART_STATE_STOPPED: u64 = 1;
 
 /// Explicit resource admission for one virtual machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -564,6 +570,8 @@ pub enum HostCompletionError {
     },
     /// The previously admitted response range is no longer writable guest RAM.
     ResponseAddressUnavailable,
+    /// The hart that issued the request is absent from the admitted topology.
+    RequestHartUnavailable { hart_id: usize },
 }
 
 impl fmt::Display for HostCompletionError {
@@ -585,6 +593,9 @@ impl fmt::Display for HostCompletionError {
             ),
             Self::ResponseAddressUnavailable => {
                 write!(f, "pending 9P response buffer is no longer admitted RAM")
+            }
+            Self::RequestHartUnavailable { hart_id } => {
+                write!(f, "pending 9P request hart {hart_id} is unavailable")
             }
         }
     }
@@ -841,10 +852,48 @@ enum RunState {
     Trapped(MachineTrap),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HartLifecycle {
+    Started,
+    Stopped,
+}
+
+#[derive(Clone, Debug)]
+struct ParkedHart {
+    id: usize,
+    lifecycle: HartLifecycle,
+    cpu: Cpu,
+    csrs: CsrFile,
+    cycle: u64,
+    instret: u64,
+    reservation: Option<(u64, u8)>,
+    mtimecmp: u64,
+    msip: bool,
+    translation_cache: TranslationCache,
+}
+
+impl ParkedHart {
+    fn stopped(id: usize) -> Self {
+        Self {
+            id,
+            lifecycle: HartLifecycle::Stopped,
+            cpu: Cpu::new(),
+            csrs: CsrFile::default(),
+            cycle: 0,
+            instret: 0,
+            reservation: None,
+            mtimecmp: u64::MAX,
+            msip: false,
+            translation_cache: TranslationCache::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PendingPlan9Request {
     request: Plan9Request,
     response_address: u64,
+    hart_id: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1185,6 +1234,10 @@ impl Devices {
 pub struct Machine {
     config: MachineConfig,
     hart_count: usize,
+    active_hart_id: usize,
+    active_hart_lifecycle: HartLifecycle,
+    parked_harts: Vec<Option<ParkedHart>>,
+    scheduler_quantum_remaining: u64,
     cpu: Cpu,
     csrs: CsrFile,
     devices: Devices,
@@ -1271,6 +1324,12 @@ impl Machine {
         Ok(Self {
             config,
             hart_count,
+            active_hart_id: 0,
+            active_hart_lifecycle: HartLifecycle::Started,
+            parked_harts: (0..hart_count)
+                .map(|hart_id| (hart_id != 0).then(|| ParkedHart::stopped(hart_id)))
+                .collect(),
+            scheduler_quantum_remaining: HART_SCHEDULER_QUANTUM,
             cpu: Cpu::new(),
             csrs: CsrFile::default(),
             devices: Devices::new(config),
@@ -1294,6 +1353,96 @@ impl Machine {
         self.hart_count
     }
 
+    /// Hart whose architectural state is currently selected by the deterministic
+    /// scheduler. This is guest topology, not a native worker index.
+    #[must_use]
+    pub const fn active_hart_id(&self) -> usize {
+        self.active_hart_id
+    }
+
+    fn reset_harts(&mut self) {
+        self.active_hart_id = 0;
+        self.active_hart_lifecycle = HartLifecycle::Started;
+        self.parked_harts = (0..self.hart_count)
+            .map(|hart_id| (hart_id != 0).then(|| ParkedHart::stopped(hart_id)))
+            .collect();
+        self.scheduler_quantum_remaining = HART_SCHEDULER_QUANTUM;
+        self.cpu.reset();
+        self.csrs.reset();
+        self.cycle = 0;
+        self.instret = 0;
+        self.reservation = None;
+        self.devices.mtimecmp = u64::MAX;
+        self.devices.msip = false;
+        self.translation_cache.clear();
+    }
+
+    fn hart_lifecycle(&self, hart_id: usize) -> Option<HartLifecycle> {
+        if hart_id == self.active_hart_id {
+            return Some(self.active_hart_lifecycle);
+        }
+        self.parked_harts
+            .get(hart_id)?
+            .as_ref()
+            .map(|hart| hart.lifecycle)
+    }
+
+    fn switch_active_hart(&mut self, hart_id: usize) -> bool {
+        if hart_id == self.active_hart_id {
+            return true;
+        }
+        let Some(incoming) = self.parked_harts.get_mut(hart_id).and_then(Option::take) else {
+            return false;
+        };
+        let ParkedHart {
+            id: incoming_id,
+            lifecycle,
+            cpu,
+            csrs,
+            cycle,
+            instret,
+            reservation,
+            mtimecmp,
+            msip,
+            translation_cache,
+        } = incoming;
+        debug_assert_eq!(incoming_id, hart_id);
+        let outgoing = ParkedHart {
+            id: std::mem::replace(&mut self.active_hart_id, incoming_id),
+            lifecycle: std::mem::replace(&mut self.active_hart_lifecycle, lifecycle),
+            cpu: std::mem::replace(&mut self.cpu, cpu),
+            csrs: std::mem::replace(&mut self.csrs, csrs),
+            cycle: std::mem::replace(&mut self.cycle, cycle),
+            instret: std::mem::replace(&mut self.instret, instret),
+            reservation: std::mem::replace(&mut self.reservation, reservation),
+            mtimecmp: std::mem::replace(&mut self.devices.mtimecmp, mtimecmp),
+            msip: std::mem::replace(&mut self.devices.msip, msip),
+            translation_cache: std::mem::replace(&mut self.translation_cache, translation_cache),
+        };
+        let outgoing_id = outgoing.id;
+        debug_assert!(self.parked_harts[outgoing_id].is_none());
+        self.parked_harts[outgoing_id] = Some(outgoing);
+        true
+    }
+
+    fn select_runnable_hart(&mut self) -> bool {
+        if self.active_hart_lifecycle == HartLifecycle::Started
+            && self.scheduler_quantum_remaining > 0
+        {
+            return true;
+        }
+        for offset in 1..=self.hart_count {
+            let candidate = (self.active_hart_id + offset) % self.hart_count;
+            if self.hart_lifecycle(candidate) == Some(HartLifecycle::Started) {
+                let switched = self.switch_active_hart(candidate);
+                debug_assert!(switched);
+                self.scheduler_quantum_remaining = HART_SCHEDULER_QUANTUM;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Reset the machine and copy a raw RV64 image to [`DRAM_BASE`].
     pub fn load_program(&mut self, program: &[u8]) -> Result<(), MachineError> {
         if program.is_empty() || program.len() > self.config.ram_bytes {
@@ -1302,20 +1451,15 @@ impl Machine {
                 ram: self.config.ram_bytes,
             });
         }
-        self.cpu.reset();
-        self.csrs.reset();
         self.devices.reset();
+        self.reset_harts();
         self.devices.load_program(program);
         self.state = RunState::Runnable;
         self.steps_executed = 0;
         self.instructions_retired = 0;
-        self.cycle = 0;
-        self.instret = 0;
-        self.reservation = None;
         self.firmware = SbiFirmware::default();
         self.pending_9p_request = None;
         self.metrics = MachineMetrics::default();
-        self.translation_cache.clear();
         Ok(())
     }
 
@@ -1327,10 +1471,11 @@ impl Machine {
         initramfs: &[u8],
         bootargs: &str,
     ) -> Result<LinuxBootLayout, MachineError> {
+        let ram_bytes = self.config.ram_bytes;
         let invalid_images = || MachineError::InvalidLinuxImages {
             kernel: kernel.len(),
             initramfs: initramfs.len(),
-            ram: self.config.ram_bytes,
+            ram: ram_bytes,
         };
         if kernel.is_empty() || self.config.ram_bytes < MIN_LINUX_RAM_BYTES {
             return Err(invalid_images());
@@ -1377,9 +1522,8 @@ impl Machine {
             return Err(invalid_images());
         }
 
-        self.cpu.reset();
-        self.csrs.reset();
         self.devices.reset();
+        self.reset_harts();
         if !self.devices.write_ram_slice(LINUX_KERNEL_BASE, kernel)
             || !self.devices.write_ram_slice(LINUX_FDT_BASE, &fdt)
             || initrd_start.is_some_and(|start| !self.devices.write_ram_slice(start, initramfs))
@@ -1396,13 +1540,9 @@ impl Machine {
         self.state = RunState::Runnable;
         self.steps_executed = 0;
         self.instructions_retired = 0;
-        self.cycle = 0;
-        self.instret = 0;
-        self.reservation = None;
         self.firmware.enabled = true;
         self.pending_9p_request = None;
         self.metrics = MachineMetrics::default();
-        self.translation_cache.clear();
 
         Ok(LinuxBootLayout {
             kernel_start: LINUX_KERNEL_BASE,
@@ -1454,6 +1594,12 @@ impl Machine {
             });
         }
         let response_address = pending.response_address;
+        let request_hart = pending.hart_id;
+        if !self.switch_active_hart(request_hart) {
+            return Err(HostCompletionError::RequestHartUnavailable {
+                hart_id: request_hart,
+            });
+        }
         if !self.devices.write_ram_slice(response_address, response) {
             return Err(HostCompletionError::ResponseAddressUnavailable);
         }
@@ -1476,6 +1622,12 @@ impl Machine {
             return Err(HostCompletionError::RequestIdMismatch {
                 expected: pending.request.id,
                 actual: id,
+            });
+        }
+        let request_hart = pending.hart_id;
+        if !self.switch_active_hart(request_hart) {
+            return Err(HostCompletionError::RequestHartUnavailable {
+                hart_id: request_hart,
             });
         }
         self.cpu.write(
@@ -1559,12 +1711,17 @@ impl Machine {
             && matches!(self.state, RunState::Runnable)
             && self.pending_9p_request.is_none()
         {
+            if !self.select_runnable_hart() {
+                break;
+            }
             match self.step() {
                 Ok(effect) => {
                     steps = steps.saturating_add(1);
                     self.steps_executed = self.steps_executed.saturating_add(1);
                     self.cycle = self.cycle.wrapping_add(1);
                     self.devices.tick();
+                    self.scheduler_quantum_remaining =
+                        self.scheduler_quantum_remaining.saturating_sub(1);
                     if effect.retired {
                         retired = retired.saturating_add(1);
                         self.instructions_retired = self.instructions_retired.saturating_add(1);
@@ -1580,6 +1737,8 @@ impl Machine {
                         self.steps_executed = self.steps_executed.saturating_add(1);
                         self.cycle = self.cycle.wrapping_add(1);
                         self.devices.tick();
+                        self.scheduler_quantum_remaining =
+                            self.scheduler_quantum_remaining.saturating_sub(1);
                         self.take_exception(cause, value, self.cpu.pc);
                         self.cpu.registers[0] = 0;
                     } else {
@@ -1988,11 +2147,19 @@ impl Machine {
     }
 
     fn invalidate_reservation(&mut self, address: u64, bytes: u8) {
-        if let Some((reserved, reserved_bytes)) = self.reservation {
-            let end = address.saturating_add(u64::from(bytes));
-            let reserved_end = reserved.saturating_add(u64::from(reserved_bytes));
-            if address < reserved_end && reserved < end {
-                self.reservation = None;
+        let overlaps = |reservation: Option<(u64, u8)>| {
+            reservation.is_some_and(|(reserved, reserved_bytes)| {
+                let end = address.saturating_add(u64::from(bytes));
+                let reserved_end = reserved.saturating_add(u64::from(reserved_bytes));
+                address < reserved_end && reserved < end
+            })
+        };
+        if overlaps(self.reservation) {
+            self.reservation = None;
+        }
+        for hart in self.parked_harts.iter_mut().flatten() {
+            if overlaps(hart.reservation) {
+                hart.reservation = None;
             }
         }
     }
@@ -2047,6 +2214,7 @@ impl Machine {
             Csr::Cycle | Csr::Mcycle => self.cycle,
             Csr::Time => self.devices.mtime,
             Csr::Instret | Csr::Minstret => self.instret,
+            Csr::Mhartid => self.active_hart_id as u64,
             _ => self.csrs.read(csr),
         }
     }
@@ -2081,6 +2249,120 @@ impl Machine {
         self.csrs.mip = (self.csrs.mip & !hardware_mask) | hardware;
     }
 
+    fn sbi_hart_start(&mut self, arguments: [u64; 6]) -> (u64, u64) {
+        let Ok(hart_id) = usize::try_from(arguments[0]) else {
+            return (SBI_ERR_INVALID_PARAM, 0);
+        };
+        if hart_id >= self.hart_count {
+            return (SBI_ERR_INVALID_PARAM, 0);
+        }
+        if self.hart_lifecycle(hart_id) != Some(HartLifecycle::Stopped) {
+            return (SBI_ERR_ALREADY_AVAILABLE, 0);
+        }
+        let start_address = arguments[1];
+        if start_address & 3 != 0 || self.devices.ram_range(start_address, 4).is_none() {
+            return (SBI_ERR_INVALID_ADDRESS, 0);
+        }
+        let Some(hart) = self.parked_harts[hart_id].as_mut() else {
+            return (SBI_ERR_INVALID_PARAM, 0);
+        };
+        hart.lifecycle = HartLifecycle::Started;
+        hart.cpu.reset();
+        hart.cpu.pc = start_address;
+        hart.cpu.privilege = Privilege::Supervisor;
+        hart.cpu.write(10, hart_id as u64);
+        hart.cpu.write(11, arguments[2]);
+        hart.csrs.reset();
+        hart.csrs.medeleg = MEDELEG_SUPPORTED;
+        hart.csrs.mideleg = MIDELEG_SUPPORTED;
+        hart.csrs.mcounteren = 0b111;
+        hart.cycle = 0;
+        hart.instret = 0;
+        hart.reservation = None;
+        hart.mtimecmp = u64::MAX;
+        hart.msip = false;
+        hart.translation_cache.clear();
+        (SBI_SUCCESS, 0)
+    }
+
+    fn sbi_hart_status(&self, hart_id: u64) -> (u64, u64) {
+        let Ok(hart_id) = usize::try_from(hart_id) else {
+            return (SBI_ERR_INVALID_PARAM, 0);
+        };
+        match self.hart_lifecycle(hart_id) {
+            Some(HartLifecycle::Started) => (SBI_SUCCESS, SBI_HART_STATE_STARTED),
+            Some(HartLifecycle::Stopped) => (SBI_SUCCESS, SBI_HART_STATE_STOPPED),
+            None => (SBI_ERR_INVALID_PARAM, 0),
+        }
+    }
+
+    fn selected_started_harts(
+        &self,
+        hart_mask: u64,
+        hart_mask_base: u64,
+    ) -> Result<Vec<usize>, u64> {
+        if hart_mask_base == u64::MAX {
+            return Ok((0..self.hart_count)
+                .filter(|hart_id| self.hart_lifecycle(*hart_id) == Some(HartLifecycle::Started))
+                .collect());
+        }
+        let Ok(base) = usize::try_from(hart_mask_base) else {
+            return Err(SBI_ERR_INVALID_PARAM);
+        };
+        let mut selected = Vec::new();
+        for bit in 0..u64::BITS {
+            if hart_mask & (1_u64 << bit) == 0 {
+                continue;
+            }
+            let Some(hart_id) = base.checked_add(bit as usize) else {
+                return Err(SBI_ERR_INVALID_PARAM);
+            };
+            if self.hart_lifecycle(hart_id) != Some(HartLifecycle::Started) {
+                return Err(SBI_ERR_INVALID_PARAM);
+            }
+            selected.push(hart_id);
+        }
+        Ok(selected)
+    }
+
+    fn sbi_send_ipi(&mut self, arguments: [u64; 6]) -> (u64, u64) {
+        let selected = match self.selected_started_harts(arguments[0], arguments[1]) {
+            Ok(selected) => selected,
+            Err(error) => return (error, 0),
+        };
+        for hart_id in selected {
+            if hart_id == self.active_hart_id {
+                self.csrs.mip |= MIP_SSIP;
+            } else if let Some(hart) = self.parked_harts[hart_id].as_mut() {
+                hart.csrs.mip |= MIP_SSIP;
+            }
+        }
+        (SBI_SUCCESS, 0)
+    }
+
+    fn sbi_remote_fence(&mut self, function: u64, arguments: [u64; 6]) -> (u64, u64) {
+        if !matches!(function, 0..=2) {
+            return (SBI_ERR_NOT_SUPPORTED, 0);
+        }
+        let selected = match self.selected_started_harts(arguments[0], arguments[1]) {
+            Ok(selected) => selected,
+            Err(error) => return (error, 0),
+        };
+        if function == 0 {
+            return (SBI_SUCCESS, 0);
+        }
+        for hart_id in selected {
+            if hart_id == self.active_hart_id {
+                self.translation_cache.clear();
+            } else if let Some(hart) = self.parked_harts[hart_id].as_mut() {
+                hart.translation_cache.clear();
+            }
+            self.metrics.translation_cache_flushes =
+                self.metrics.translation_cache_flushes.saturating_add(1);
+        }
+        (SBI_SUCCESS, 0)
+    }
+
     fn handle_sbi_call(&mut self) -> Result<Option<HaltStatus>, MachineTrap> {
         let extension = self.cpu.read(17);
         let function = self.cpu.read(16);
@@ -2101,7 +2383,14 @@ impl Machine {
                 SBI_SUCCESS,
                 u64::from(matches!(
                     arguments[0],
-                    SBI_EXT_BASE | SBI_EXT_TIME | SBI_EXT_DBCN | SBI_EXT_SRST | SBI_EXT_AOS_9P
+                    SBI_EXT_BASE
+                        | SBI_EXT_TIME
+                        | SBI_EXT_IPI
+                        | SBI_EXT_RFENCE
+                        | SBI_EXT_HSM
+                        | SBI_EXT_DBCN
+                        | SBI_EXT_SRST
+                        | SBI_EXT_AOS_9P
                 )),
             )),
             (SBI_EXT_BASE, 4..=6) => Some((SBI_SUCCESS, 0)),
@@ -2110,6 +2399,14 @@ impl Machine {
                 self.csrs.mip &= !MIP_STIP;
                 Some((SBI_SUCCESS, 0))
             }
+            (SBI_EXT_IPI, 0) => Some(self.sbi_send_ipi(arguments)),
+            (SBI_EXT_RFENCE, function) => Some(self.sbi_remote_fence(function, arguments)),
+            (SBI_EXT_HSM, 0) => Some(self.sbi_hart_start(arguments)),
+            (SBI_EXT_HSM, 1) => {
+                self.active_hart_lifecycle = HartLifecycle::Stopped;
+                None
+            }
+            (SBI_EXT_HSM, 2) => Some(self.sbi_hart_status(arguments[0])),
             (SBI_EXT_DBCN, 0) => Some(self.sbi_debug_console_write(arguments)?),
             (SBI_EXT_DBCN, 1) => Some(self.sbi_debug_console_read(arguments)),
             (SBI_EXT_DBCN, 2) => {
@@ -2177,6 +2474,7 @@ impl Machine {
                 max_response_bytes: response_bytes,
             },
             response_address: arguments[2],
+            hart_id: self.active_hart_id,
         });
         None
     }
@@ -3304,6 +3602,89 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_scheduler_preserves_exact_per_hart_architectural_state() {
+        let mut machine = Machine::new_with_harts(
+            MachineConfig {
+                ram_bytes: 4096,
+                max_console_bytes: 8,
+            },
+            2,
+        )
+        .expect("admit two harts");
+        machine
+            .load_program(&words(&[
+                encode_csrr(5, Csr::Mhartid),
+                encode_addi(6, 5, 10),
+            ]))
+            .expect("load shared hart probe");
+        machine.parked_harts[1]
+            .as_mut()
+            .expect("parked hart 1")
+            .lifecycle = HartLifecycle::Started;
+
+        machine.scheduler_quantum_remaining = 1;
+        assert_eq!(machine.run_slice(1).instructions_retired, 1);
+        assert_eq!(machine.active_hart_id(), 0);
+        assert_eq!(machine.register(5), Some(0));
+
+        assert_eq!(machine.run_slice(1).instructions_retired, 1);
+        assert_eq!(machine.active_hart_id(), 1);
+        assert_eq!(machine.csr(Csr::Mhartid), 1);
+        assert_eq!(machine.register(5), Some(1));
+        assert_eq!(machine.instret, 1);
+        let hart_zero = machine.parked_harts[0].as_ref().expect("parked hart 0");
+        assert_eq!(hart_zero.cpu.registers[5], 0);
+        assert_eq!(hart_zero.instret, 1);
+
+        machine.devices.mtimecmp = 11;
+        machine.devices.msip = true;
+        machine.csrs.sscratch = 0x1111;
+        assert_eq!(machine.run_slice(1).instructions_retired, 1);
+        assert_eq!(machine.register(6), Some(11));
+        machine.scheduler_quantum_remaining = 0;
+        assert_eq!(machine.run_slice(1).instructions_retired, 1);
+        assert_eq!(machine.active_hart_id(), 0);
+        assert_eq!(machine.register(6), Some(10));
+        assert_eq!(machine.devices.mtimecmp, u64::MAX);
+        assert!(!machine.devices.msip);
+        assert_eq!(machine.csrs.sscratch, 0);
+        let hart_one = machine.parked_harts[1].as_ref().expect("parked hart 1");
+        assert_eq!(hart_one.cpu.registers[6], 11);
+        assert_eq!(hart_one.mtimecmp, 11);
+        assert!(hart_one.msip);
+        assert_eq!(hart_one.csrs.sscratch, 0x1111);
+        assert_eq!(machine.instructions_retired, 4);
+    }
+
+    #[test]
+    fn a_store_invalidates_every_harts_overlapping_reservation() {
+        let mut machine = Machine::new_with_harts(
+            MachineConfig {
+                ram_bytes: 4096,
+                max_console_bytes: 8,
+            },
+            2,
+        )
+        .expect("admit two harts");
+        machine.reservation = Some((DRAM_BASE + 8, 8));
+        machine.parked_harts[1]
+            .as_mut()
+            .expect("parked hart 1")
+            .reservation = Some((DRAM_BASE + 12, 4));
+
+        machine.invalidate_reservation(DRAM_BASE + 10, 4);
+
+        assert_eq!(machine.reservation, None);
+        assert_eq!(
+            machine.parked_harts[1]
+                .as_ref()
+                .expect("parked hart 1")
+                .reservation,
+            None
+        );
+    }
+
+    #[test]
     fn console_input_is_read_through_uart_registers() {
         let mut machine = machine(8);
         let program = words(&[
@@ -3908,6 +4289,163 @@ mod tests {
     }
 
     #[test]
+    fn sbi_hsm_ipi_rfence_and_time_drive_exact_secondary_hart_state() {
+        fn call_sbi(
+            machine: &mut Machine,
+            extension: u64,
+            function: u64,
+            arguments: [u64; 6],
+        ) -> Option<HaltStatus> {
+            machine.cpu.registers[10..16].copy_from_slice(&arguments);
+            machine.cpu.write(16, function);
+            machine.cpu.write(17, extension);
+            machine.handle_sbi_call().expect("bounded SBI call")
+        }
+
+        let mut machine = Machine::new_with_harts(
+            MachineConfig {
+                ram_bytes: 4096,
+                max_console_bytes: 64,
+            },
+            2,
+        )
+        .expect("admit two harts");
+        machine
+            .load_program(&words(&[
+                encode_csrr(5, Csr::Mhartid),
+                encode_addi(5, 10, 0),
+                0x0000_0073,
+            ]))
+            .expect("load shared HSM probe");
+        machine.firmware.enabled = true;
+        let secondary_start = DRAM_BASE + 4;
+        let opaque = 0xfeed_beef;
+
+        assert_eq!(
+            call_sbi(
+                &mut machine,
+                SBI_EXT_HSM,
+                0,
+                [1, secondary_start, opaque, 0, 0, 0],
+            ),
+            None
+        );
+        assert_eq!(machine.register(10), Some(SBI_SUCCESS));
+        let secondary = machine.parked_harts[1]
+            .as_ref()
+            .expect("started secondary hart");
+        assert_eq!(secondary.lifecycle, HartLifecycle::Started);
+        assert_eq!(secondary.cpu.pc, secondary_start);
+        assert_eq!(secondary.cpu.privilege, Privilege::Supervisor);
+        assert_eq!(secondary.cpu.registers[10], 1);
+        assert_eq!(secondary.cpu.registers[11], opaque);
+        assert_eq!(secondary.csrs.satp, 0);
+        assert_eq!(secondary.csrs.mstatus & MSTATUS_SIE, 0);
+
+        call_sbi(
+            &mut machine,
+            SBI_EXT_HSM,
+            0,
+            [1, secondary_start, opaque, 0, 0, 0],
+        );
+        assert_eq!(machine.register(10), Some(SBI_ERR_ALREADY_AVAILABLE));
+        call_sbi(&mut machine, SBI_EXT_HSM, 2, [1, 0, 0, 0, 0, 0]);
+        assert_eq!(machine.register(10), Some(SBI_SUCCESS));
+        assert_eq!(machine.register(11), Some(SBI_HART_STATE_STARTED));
+
+        call_sbi(&mut machine, SBI_EXT_IPI, 0, [1 << 1, 0, 0, 0, 0, 0]);
+        assert_eq!(machine.register(10), Some(SBI_SUCCESS));
+        assert_ne!(
+            machine.parked_harts[1]
+                .as_ref()
+                .expect("secondary hart")
+                .csrs
+                .mip
+                & MIP_SSIP,
+            0
+        );
+        call_sbi(&mut machine, SBI_EXT_IPI, 0, [1 << 2, 0, 0, 0, 0, 0]);
+        assert_eq!(machine.register(10), Some(SBI_ERR_INVALID_PARAM));
+
+        let context = TranslationContext {
+            satp: 0,
+            permission_context: 0,
+            privilege: Privilege::Supervisor,
+            access: AccessType::Instruction,
+        };
+        machine.parked_harts[1]
+            .as_mut()
+            .expect("secondary hart")
+            .translation_cache
+            .insert(DRAM_BASE, DRAM_BASE, context);
+        call_sbi(
+            &mut machine,
+            SBI_EXT_RFENCE,
+            1,
+            [1 << 1, 0, DRAM_BASE, 4096, 0, 0],
+        );
+        assert_eq!(machine.register(10), Some(SBI_SUCCESS));
+        assert_eq!(
+            machine.parked_harts[1]
+                .as_ref()
+                .expect("secondary hart")
+                .translation_cache
+                .lookup(DRAM_BASE, context),
+            None
+        );
+        call_sbi(&mut machine, SBI_EXT_RFENCE, 3, [1 << 1, 0, 0, 0, 0, 0]);
+        assert_eq!(machine.register(10), Some(SBI_ERR_NOT_SUPPORTED));
+
+        machine.scheduler_quantum_remaining = 0;
+        assert_eq!(machine.run_slice(1).instructions_retired, 1);
+        assert_eq!(machine.active_hart_id(), 1);
+        assert_eq!(machine.register(5), Some(1));
+        call_sbi(&mut machine, SBI_EXT_TIME, 0, [77, 0, 0, 0, 0, 0]);
+        assert_eq!(machine.devices.mtimecmp, 77);
+        machine.cpu.write(16, 1);
+        machine.cpu.write(17, SBI_EXT_HSM);
+        assert_eq!(machine.run_slice(1).instructions_retired, 0);
+        assert_eq!(machine.active_hart_lifecycle, HartLifecycle::Stopped);
+
+        assert_eq!(machine.run_slice(1).instructions_retired, 1);
+        assert_eq!(machine.active_hart_id(), 0);
+        call_sbi(&mut machine, SBI_EXT_HSM, 2, [1, 0, 0, 0, 0, 0]);
+        assert_eq!(machine.register(10), Some(SBI_SUCCESS));
+        assert_eq!(machine.register(11), Some(SBI_HART_STATE_STOPPED));
+        assert_eq!(
+            machine.parked_harts[1]
+                .as_ref()
+                .expect("stopped secondary")
+                .mtimecmp,
+            77
+        );
+
+        call_sbi(&mut machine, SBI_EXT_HSM, 0, [1, DRAM_BASE + 2, 0, 0, 0, 0]);
+        assert_eq!(machine.register(10), Some(SBI_ERR_INVALID_ADDRESS));
+        call_sbi(
+            &mut machine,
+            SBI_EXT_HSM,
+            0,
+            [2, secondary_start, 0, 0, 0, 0],
+        );
+        assert_eq!(machine.register(10), Some(SBI_ERR_INVALID_PARAM));
+        call_sbi(
+            &mut machine,
+            SBI_EXT_HSM,
+            0,
+            [1, secondary_start, 0xcafe, 0, 0, 0],
+        );
+        assert_eq!(machine.register(10), Some(SBI_SUCCESS));
+        let restarted = machine.parked_harts[1]
+            .as_ref()
+            .expect("restarted secondary");
+        assert_eq!(restarted.lifecycle, HartLifecycle::Started);
+        assert_eq!(restarted.cpu.registers[11], 0xcafe);
+        assert_eq!(restarted.mtimecmp, u64::MAX);
+        assert_eq!(restarted.csrs.mip & MIP_SSIP, 0);
+    }
+
+    #[test]
     fn sbi_9p_exchange_pauses_until_the_exact_bounded_response_arrives() {
         let mut machine = Machine::new(MachineConfig {
             ram_bytes: MIN_LINUX_RAM_BYTES,
@@ -4082,6 +4620,63 @@ mod tests {
             machine.checkpoint_host_suspension(),
             Err(CheckpointError::NotRunnable)
         ));
+    }
+
+    #[test]
+    fn multi_hart_9p_completion_returns_only_to_the_requesting_hart() {
+        let mut machine = Machine::new_with_harts(
+            MachineConfig {
+                ram_bytes: 4096,
+                max_console_bytes: 64,
+            },
+            2,
+        )
+        .expect("admit two harts");
+        machine.parked_harts[1]
+            .as_mut()
+            .expect("parked hart 1")
+            .lifecycle = HartLifecycle::Started;
+        assert!(machine.switch_active_hart(1));
+        let request_address = DRAM_BASE + 0x100;
+        let response_address = DRAM_BASE + 0x200;
+        let request = [7, 0, 0, 0, 100, 1, 0];
+        let response = [7, 0, 0, 0, 101, 1, 0];
+        assert!(machine.devices.write_ram_slice(request_address, &request));
+        machine.cpu.registers[10..16].copy_from_slice(&[
+            request_address,
+            request.len() as u64,
+            response_address,
+            32,
+            1,
+            0,
+        ]);
+        machine.cpu.write(16, 0);
+        machine.cpu.write(17, SBI_EXT_AOS_9P);
+        assert_eq!(machine.handle_sbi_call().expect("9P SBI call"), None);
+        let request_id = machine
+            .pending_9p_request
+            .as_ref()
+            .expect("pending request")
+            .request
+            .id;
+        assert!(machine.switch_active_hart(0));
+        machine.cpu.write(10, 0xdead);
+
+        machine
+            .complete_9p_request(request_id, &response)
+            .expect("complete requesting hart");
+
+        assert_eq!(machine.active_hart_id(), 1);
+        assert_eq!(machine.register(10), Some(SBI_SUCCESS));
+        assert_eq!(machine.register(11), Some(response.len() as u64));
+        assert_eq!(
+            machine.parked_harts[0]
+                .as_ref()
+                .expect("parked hart 0")
+                .cpu
+                .registers[10],
+            0xdead
+        );
     }
 
     #[test]

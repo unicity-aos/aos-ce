@@ -1480,9 +1480,13 @@ Implementation and proof order:
 - [x] admit a bounded hart count, emit exact FDT CPU nodes and interrupt-controller
   phandles, preserve the existing one-hart constructor, and reject multi-hart
   state from checkpoint format 1;
-- [ ] split per-hart architectural state from machine-wide devices, expose exact
-  `mhartid`, and add the deterministic round-robin scheduler;
-- [ ] implement and negatively test SBI HSM, IPI, RFENCE, and per-hart TIME;
+- [x] split per-hart architectural state from machine-wide devices, expose exact
+  `mhartid`, add the deterministic round-robin scheduler and aggregate step
+  accounting, invalidate overlapping LR/SC reservations across every hart, and
+  return suspended 9P completions only to their requesting hart;
+- [x] implement and negatively test SBI HSM, IPI, RFENCE, and per-hart TIME,
+  including ordered S-mode secondary entry, non-returning stop, invalid targets,
+  unsupported fences, restart reset state, and hart-local interrupts;
 - [ ] enable SMP in the pinned Linux build and prove two CPUs reach userspace,
   schedule work, receive interrupts, and remain within aggregate metering;
 - [ ] resolve `linux_vcpus` from principal and operator authority, with automatic
