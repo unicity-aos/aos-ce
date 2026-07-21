@@ -24,7 +24,7 @@ else
     output_image=$script_dir/Image
 fi
 expected_rootfs=10d26184e85add731208050fb3da9fed5e1dda7475b6e66e0d9814a221ecf3f4
-expected_image=fd394b7e5b09638d52483fe2f417985ae1af6a730eea5bc3e415b97262f863de
+expected_image=7cb62638de9f41c2fe2a237a1c46642189b6d97e373c8592cc931f74f88419ff
 record_image=${AOS_RECORD_IMAGE:-0}
 
 if [ "$record_image" != 0 ] && [ "$record_image" != 1 ]; then
@@ -91,7 +91,8 @@ make -C "$kernel_source" O="$build_dir/kernel" \
     --enable MMU \
     --enable RISCV_SBI \
     --enable NONPORTABLE \
-    --disable SMP \
+    --enable SMP \
+    --set-val NR_CPUS 64 \
     --disable RISCV_ISA_C \
     --disable FPU \
     --disable RISCV_ISA_V \

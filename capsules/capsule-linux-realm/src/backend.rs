@@ -25,7 +25,7 @@ use astrid_sdk::compute::{ComputeGroup, GroupRequest, WorkDescriptor};
 /// exposed to tools, traces, checkpoints, or differential tests.
 pub(crate) const DEFAULT_LINUX_BACKEND_ID: &str = "aos-rv64-interpreter";
 /// Exact prewarm artifact size recorded in `linux/PREWARM.lock`.
-pub(crate) const LINUX_PREWARM_CHECKPOINT_BYTES: usize = 8_495_869;
+pub(crate) const LINUX_PREWARM_CHECKPOINT_BYTES: usize = 9_172_369;
 #[cfg(any(target_arch = "wasm32", test))]
 const AUTO_GUEST_RESERVE_BYTES: usize = 128 * 1024 * 1024;
 const AUTO_REFERENCE_RAM_BYTES: usize = 32 * 1024 * 1024;
