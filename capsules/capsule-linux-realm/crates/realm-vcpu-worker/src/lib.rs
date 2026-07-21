@@ -108,7 +108,18 @@ fn initialize(bytes: &mut [u8], prewarm: bool) -> WorkerResult {
     let max_console_bytes =
         usize::try_from(protocol::read_u64(bytes, field::MAX_CONSOLE_BYTES).unwrap_or_default())
             .map_err(|_| invalid("console size is not addressable"))?;
+    let hart_count =
+        usize::try_from(protocol::read_u32(bytes, field::HART_COUNT).unwrap_or_default())
+            .map_err(|_| invalid("hart count is not addressable"))?;
+    if !(1..=aos_realm_machine::MAX_HARTS).contains(&hart_count) {
+        return Err(invalid("hart count must be between 1 and 64"));
+    }
     let machine = if prewarm {
+        if hart_count != 1 {
+            return Err(machine_error(
+                "format-1 prewarm checkpoints require exactly one hart",
+            ));
+        }
         let binding = CheckpointBinding::new(
             CheckpointDigest::hash(LINUX_IMAGE),
             CheckpointDigest::hash(LINUX_SOURCES),
@@ -124,10 +135,13 @@ fn initialize(bytes: &mut [u8], prewarm: bool) -> WorkerResult {
         }
         checkpoint.into_machine()
     } else {
-        let mut machine = Machine::new(MachineConfig {
-            ram_bytes,
-            max_console_bytes,
-        })
+        let mut machine = Machine::new_with_harts(
+            MachineConfig {
+                ram_bytes,
+                max_console_bytes,
+            },
+            hart_count,
+        )
         .map_err(|error| machine_error(error.to_string()))?;
         machine
             .boot_linux(
@@ -392,7 +406,7 @@ mod tests {
 
     const SIGNED_WORKER: &[u8] = include_bytes!("../../../assets/linux-vcpu.wasm");
     const SIGNED_WORKER_HASH: &str =
-        "blake3:66d03f9d73ba8c1a98ba3de0af3281e8f909182605320408585c2685942016c8";
+        "blake3:613e1d61c5f1611e0f50cb5300bcb79d80bf5ca1d793a3e7000501a90e737b02";
 
     #[test]
     fn protocol_fields_round_trip() {
@@ -465,6 +479,7 @@ mod tests {
         );
         protocol::write_u64(&mut request, field::RAM_BYTES, 32 * 1024 * 1024);
         protocol::write_u64(&mut request, field::MAX_CONSOLE_BYTES, 64 * 1024);
+        protocol::write_u32(&mut request, field::HART_COUNT, 1);
         group.write(control_offset, &request).expect("write init");
         let result = group
             .submit(descriptor)
@@ -508,5 +523,101 @@ mod tests {
                 .is_some_and(|steps| steps >= 15_899_016)
         );
         assert!(protocol::read_u32(&header, field::MESSAGE_LEN).is_some_and(|length| length > 0));
+    }
+
+    #[test]
+    fn signed_worker_cold_boots_two_linux_cpus_inside_the_real_compute_runtime() {
+        use astrid_compute::{
+            ComputeLedger, ComputeLimits, ComputeRuntime, ExecutionMode, GroupRequest, Parallelism,
+            WorkDescriptor, WorkerArtifact,
+        };
+        use astrid_core::principal::PrincipalId;
+
+        let artifact =
+            WorkerArtifact::from_bytes(protocol::WORKER_ID, SIGNED_WORKER, SIGNED_WORKER_HASH)
+                .expect("signed worker hash");
+        let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
+            .expect("compute runtime");
+        let group = runtime
+            .open_group(
+                &PrincipalId::new("linux-smp-worker-conformance").expect("principal"),
+                &artifact,
+                GroupRequest {
+                    mode: ExecutionMode::Deterministic,
+                    parallelism: Parallelism::Exact(1),
+                    initial_memory_pages: 1024,
+                    maximum_memory_pages: 2048,
+                },
+            )
+            .expect("worker admission");
+        let control_offset = (63 * 1024 * 1024) as u64;
+        let descriptor = WorkDescriptor {
+            offset: control_offset,
+            length: protocol::CONTROL_BYTES as u64,
+            tag: Operation::InitCold as u64,
+            worker_index: Some(0),
+            fuel: None,
+        };
+        let mut request = vec![0_u8; protocol::HEADER_BYTES];
+        protocol::write_u32(&mut request, field::MAGIC, protocol::MAGIC);
+        protocol::write_u32(&mut request, field::VERSION, protocol::VERSION);
+        protocol::write_u32(&mut request, field::OPERATION, Operation::InitCold as u32);
+        protocol::write_u64(&mut request, field::RAM_BYTES, 32 * 1024 * 1024);
+        protocol::write_u64(&mut request, field::MAX_CONSOLE_BYTES, 64 * 1024);
+        protocol::write_u32(&mut request, field::HART_COUNT, 2);
+        group.write(control_offset, &request).expect("write init");
+        group
+            .submit(descriptor)
+            .expect("submit init")
+            .join()
+            .expect("initialize two-hart Linux");
+
+        let mut console = Vec::new();
+        let total_steps = loop {
+            protocol::write_u32(&mut request, field::OPERATION, Operation::RunSlice as u32);
+            protocol::write_u64(&mut request, field::SLICE_BUDGET, 1_000_000);
+            group.write(control_offset, &request).expect("write slice");
+            group
+                .submit(WorkDescriptor {
+                    tag: Operation::RunSlice as u64,
+                    ..descriptor
+                })
+                .expect("submit slice")
+                .join()
+                .expect("run two-hart Linux");
+            let header = group
+                .read(control_offset, protocol::HEADER_BYTES as u32)
+                .expect("read slice response");
+            assert_eq!(
+                protocol::read_u32(&header, field::STATUS),
+                Some(Status::Ok as u32)
+            );
+            let console_len =
+                protocol::read_u32(&header, field::CONSOLE_LEN).expect("console length") as u32;
+            if console_len != 0 {
+                console.extend(
+                    group
+                        .read(control_offset + protocol::HEADER_BYTES as u64, console_len)
+                        .expect("read Linux console"),
+                );
+            }
+            let total_steps =
+                protocol::read_u64(&header, field::TOTAL_STEPS_EXECUTED).expect("total steps");
+            if protocol::read_u32(&header, field::OUTCOME) == Some(Outcome::HostRequest as u32) {
+                break total_steps;
+            }
+            assert!(
+                total_steps < 50_000_000,
+                "Linux did not reach its first host request"
+            );
+        };
+
+        let console = String::from_utf8_lossy(&console);
+        assert!(console.contains("Linux version 6.18.39"), "{console}");
+        assert!(
+            console.contains("smp: Brought up 1 node, 2 CPUs"),
+            "{console}"
+        );
+        assert!((30_000_000..50_000_000).contains(&total_steps));
     }
 }

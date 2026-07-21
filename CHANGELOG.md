@@ -82,6 +82,15 @@
   an exact reservation. RAM may still be fixed per principal through 3 GiB.
   Worker fuel joins the ordinary cross-capsule principal CPU account and rate
   limit.
+- Deterministic virtual SMP for Linux Realm: exact 1–64-hart FDT topology,
+  per-hart architectural, timer, interrupt, reservation, and translation state,
+  round-robin aggregate metering, SBI HSM/IPI/RFENCE/TIME services, an
+  SMP-enabled reproducible Linux image, and a signed-worker proof that brings
+  two Linux CPUs online through Astrid's real generic-compute runtime.
+  `linux_vcpus=0` derives a useful topology from current principal/host compute
+  admission; explicit per-principal values select 1–64 logical CPUs without
+  reserving unused native workers. Multi-hart machines cold-boot while the
+  existing format-1 prewarm artifact remains exactly one hart.
 - A reproducibly pinned Buildroot 2026.05.1, static musl, and BusyBox `ash`
   workbench for the resident Linux guest, with an unprivileged `agent` shell,
   token-bound command framing, bounded process resources, descendant cleanup,

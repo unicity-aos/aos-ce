@@ -17,12 +17,18 @@ pub(crate) const MAX_LINUX_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// the outer enforcement boundary.
 pub(crate) const DEFAULT_LINUX_MAX_FILE_BYTES: u64 = 0;
 pub(crate) const MAX_LINUX_MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+/// Zero derives the guest's logical CPU topology from Astrid's admitted
+/// compute parallelism. The interpreter remains one deterministic worker;
+/// logical harts are time-sliced inside that worker.
+pub(crate) const DEFAULT_LINUX_VCPUS: u32 = 0;
+pub(crate) const MAX_LINUX_VCPUS: u32 = aos_realm_machine::MAX_HARTS as u32;
 const GUEST_PAGE_BYTES: usize = 4096;
 
 const LINUX_MEMORY_BYTES_KEY: &str = "linux_memory_bytes";
 const LINUX_MAX_STEPS_KEY: &str = "linux_max_steps";
 const LINUX_MAX_OUTPUT_BYTES_KEY: &str = "linux_max_output_bytes";
 const LINUX_MAX_FILE_BYTES_KEY: &str = "linux_max_file_bytes";
+const LINUX_VCPUS_KEY: &str = "linux_vcpus";
 
 /// Inner resources admitted to one principal-affine Realm machine.
 ///
@@ -50,7 +56,7 @@ impl Default for RealmResources {
             linux_max_steps: DEFAULT_LINUX_MAX_STEPS,
             linux_max_output_bytes: DEFAULT_LINUX_MAX_OUTPUT_BYTES,
             linux_max_file_bytes: DEFAULT_LINUX_MAX_FILE_BYTES,
-            linux_vcpus: 1,
+            linux_vcpus: DEFAULT_LINUX_VCPUS,
         }
     }
 }
@@ -58,6 +64,11 @@ impl Default for RealmResources {
 impl RealmResources {
     pub(crate) const fn with_linux_memory_bytes(mut self, bytes: usize) -> Self {
         self.linux_memory_bytes = bytes;
+        self
+    }
+
+    pub(crate) const fn with_linux_vcpus(mut self, count: u32) -> Self {
+        self.linux_vcpus = count;
         self
     }
 
@@ -120,9 +131,36 @@ impl RealmResources {
                 0,
                 MAX_LINUX_MAX_FILE_BYTES,
             )?,
-            linux_vcpus: 1,
+            linux_vcpus: parse_u32(
+                LINUX_VCPUS_KEY,
+                read(LINUX_VCPUS_KEY)?,
+                DEFAULT_LINUX_VCPUS,
+                0,
+                MAX_LINUX_VCPUS,
+            )?,
         })
     }
+}
+
+fn parse_u32(
+    key: &str,
+    raw: Option<String>,
+    default: u32,
+    minimum: u32,
+    maximum: u32,
+) -> Result<u32, SysError> {
+    let value = parse_u64(
+        key,
+        raw,
+        u64::from(default),
+        u64::from(minimum),
+        u64::from(maximum),
+    )?;
+    u32::try_from(value).map_err(|_| {
+        SysError::ApiError(format!(
+            "Realm config `{key}` exceeds the supported CPU topology"
+        ))
+    })
 }
 
 fn parse_u64(
@@ -194,6 +232,7 @@ mod tests {
         assert_eq!(defaults.linux_memory_bytes, 0);
         assert_eq!(defaults.effective_max_steps(), u64::MAX);
         assert_eq!(defaults.linux_max_file_bytes, 0);
+        assert_eq!(defaults.linux_vcpus, 0);
 
         let installed_defaults = resources(&[
             (LINUX_MEMORY_BYTES_KEY, "0"),
@@ -211,6 +250,7 @@ mod tests {
             (LINUX_MAX_STEPS_KEY, "25000000"),
             (LINUX_MAX_OUTPUT_BYTES_KEY, "32768"),
             (LINUX_MAX_FILE_BYTES_KEY, "268435456"),
+            (LINUX_VCPUS_KEY, "8"),
         ])
         .expect("bounded envelope");
 
@@ -218,7 +258,7 @@ mod tests {
         assert_eq!(selected.linux_max_steps, 25_000_000);
         assert_eq!(selected.linux_max_output_bytes, 32 * 1024);
         assert_eq!(selected.linux_max_file_bytes, 256 * 1024 * 1024);
-        assert_eq!(selected.linux_vcpus, 1);
+        assert_eq!(selected.linux_vcpus, 8);
     }
 
     #[test]
@@ -230,6 +270,8 @@ mod tests {
             vec![(LINUX_MAX_STEPS_KEY, "1000000000001")],
             vec![(LINUX_MAX_OUTPUT_BYTES_KEY, "0")],
             vec![(LINUX_MAX_FILE_BYTES_KEY, "1099511627777")],
+            vec![(LINUX_VCPUS_KEY, "65")],
+            vec![(LINUX_VCPUS_KEY, "many")],
         ] {
             assert!(resources(&values).is_err(), "accepted {values:?}");
         }

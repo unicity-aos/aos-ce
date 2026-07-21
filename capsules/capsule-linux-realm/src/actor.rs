@@ -89,6 +89,7 @@ struct LinuxActivity {
     last_outcome: Option<&'static str>,
     last_exit_status: Option<i32>,
     active_memory_bytes: Option<usize>,
+    active_vcpus: Option<u32>,
 }
 
 impl LinuxActivity {
@@ -97,6 +98,7 @@ impl LinuxActivity {
         self.home_9p = None;
         self.workspace_9p = None;
         self.active_memory_bytes = None;
+        self.active_vcpus = None;
         if was_running {
             self.last_outcome = Some("resource-policy-changed");
             self.last_exit_status = None;
@@ -141,14 +143,18 @@ impl LinuxActivity {
             LinuxInvocationLimits {
                 run: limits,
                 max_file_bytes: resources.linux_max_file_bytes,
+                vcpus: resources.linux_vcpus,
             },
         );
         self.active_memory_bytes = self.machine.as_ref().map(LinuxMachine::ram_bytes);
+        self.active_vcpus = self.machine.as_ref().map(LinuxMachine::hart_count);
         let report = report?;
         let effective_memory_bytes = self
             .active_memory_bytes
             .unwrap_or(resources.linux_memory_bytes);
-        let effective_resources = resources.with_linux_memory_bytes(effective_memory_bytes);
+        let effective_resources = resources
+            .with_linux_memory_bytes(effective_memory_bytes)
+            .with_linux_vcpus(self.active_vcpus.unwrap_or(resources.linux_vcpus));
 
         if report.booted {
             self.boot_executions = self.boot_executions.saturating_add(1);
@@ -216,6 +222,7 @@ impl LinuxActivity {
             last_exit_status: self.last_exit_status,
             commands_completed: self.commands_completed,
             ram_bytes: self.active_memory_bytes,
+            vcpus: self.active_vcpus,
         }
     }
 }

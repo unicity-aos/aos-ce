@@ -235,7 +235,7 @@ timer, fuel, trap, and host-suspension path.
 The host-side release measurement on 2026-07-21 used the checked-in Linux image
 and `cargo run --release -p aos-realm-machine --example boot_linux --
 capsules/capsule-linux-realm/linux/Image 250000000`. Both runs reached the first
-unwired 9P request after exactly 15,899,016 charged steps at the same PC:
+unwired 9P request after exactly 21,767,183 charged steps at the same PC:
 
 | Machine state | Steps/s | Sv39 walks | PTE reads | Meaning |
 |---|---:|---:|---:|---|
@@ -250,8 +250,8 @@ these counters so native and Astrid-hosted builds can be compared explicitly.
 The next route is also implemented for the default 32 MiB Realm. The AOS machine
 boots the exact checked-in image to its first unanswered home-9P request, drains
 the boot console into the build receipt, verifies that no console input exists,
-and emits a sparse durable checkpoint. The current artifact is 8,495,869 bytes
-and represents 15,899,016 precomputed guest steps. It is bound to BLAKE3 digests
+and emits a sparse durable checkpoint. The current artifact is 9,172,369 bytes
+and represents 21,767,183 precomputed guest steps. It is bound to BLAKE3 digests
 of both `Image` and `SOURCES.lock`; its codec checksum, machine model, CPU state,
 CSR masks, RAM envelope, sparse-page order, pending request identity, response
 buffer, and trailing bytes all fail closed. The signed capsule containing the
@@ -261,7 +261,7 @@ Restoration does not restore authority. The checkpoint stops before Linux's
 first storage response, so each new principal still creates a fresh Astrid home
 9P session and a fresh invocation workspace session. Only then can Linux finish
 mounting and print `AOS READY`. Under the normal large boot budget that resume
-uses 277,798 charged steps and seven cooperative host/slice suspensions, about
+uses 320,291 charged steps and seven cooperative host/slice suspensions, about
 57 times fewer guest steps than replaying the cold kernel boot. A 200,000-step
 request also reaches the already-emitted ready marker at its final slice
 boundary; this is covered separately so fuel-boundary behavior remains explicit.
@@ -1182,8 +1182,8 @@ machine and every CPU, memory, storage, network, and device charge rolls up to
 that owner.
 
 The current Linux adapter is lazy and principal-resident. The affined Store owns
-one optional single-hart machine with a host-admitted automatic RAM default and
-an explicit 32 MiB–3 GiB per-principal override. `linux-boot`, `linux-console`, or
+one optional 1–64-hart machine with host-admitted automatic RAM and vCPU defaults,
+plus explicit 32 MiB–3 GiB RAM and 1–64-vCPU per-principal overrides. `linux-boot`, `linux-console`, or
 `linux-sh` creates it when cold, advances Linux in bounded 100,000-step slices
 until the controlled `/init` reports ready, and retains its CPU and RAM for later
 invocations. A `counter` probe reaches 1 and then 2 across separate calls, and a
@@ -1214,15 +1214,14 @@ astrid quota set --agent NAME --memory SIZE --compute-workers N --cpu-fuel-per-s
 
 Principal memory is a virtual ceiling rather than an eager reservation; zero
 compute workers delegates to the host, and zero CPU fuel per second means
-unlimited. The current Linux adapter requests one deterministic compute worker
-because it implements one RV64 hart. The worker quota is therefore real
-schedulable capacity for all capsules, but it must not be presented as a Linux
-vCPU knob until Realm implements harts, interrupt routing, SBI/IPI behavior, and
-the corresponding device-tree description.
+unlimited. The current Linux adapter retains one deterministic compute worker
+and time-slices every admitted RV64 hart within it. Compute-worker count is real
+native schedulable capacity for all capsules; Linux vCPU count is a separate
+guest topology and currently carries no native-parallel speedup claim.
 
 The outer principal profile remains authoritative for Wasmtime memory, CPU rate,
 storage, processes, and timeout. The inner configuration currently selects guest
-RAM, interpreted steps, captured output, and an optional per-file ceiling. Zero
+RAM, logical vCPUs, interpreted steps, captured output, and an optional per-file ceiling. Zero
 step or file ceilings delegate only those dimensions to the outer CPU/timeout or
 storage policy. The envelope is read for every invocation and never cached across principals. A
 changed envelope destroys only that
@@ -1233,12 +1232,15 @@ read-only and reports configured versus active values plus a pending-change bit.
 The held compute contract now supplies the missing audited feedback loop without
 changing its WIT record shape. A maximum-memory request of zero asks the kernel
 to resolve the largest currently admissible shared region from the signed worker,
-principal quota, host pool, and live reservations. `group.info()` returns that
-concrete maximum before machine initialization. Realm subtracts its worker base
-and reserve, takes half of the usable remainder so one automatic Realm does not
-monopolize the pool, page-aligns it, and caps guest-visible RAM at 3 GiB. It then
-releases the capacity probe and opens an exact reservation for the chosen guest.
-Explicit nonzero requests retain their exact old meaning. The canonical WIT PR
+principal quota, host pool, and live reservations. An automatic-parallelism
+probe also reports the currently useful principal/host worker intersection.
+`group.info()` returns both concrete values before machine initialization. Realm
+subtracts its worker base and reserve, takes half of the usable remainder so one
+automatic Realm does not monopolize the pool, page-aligns it, caps guest-visible
+RAM at 3 GiB, and clamps the topology hint to 1–64 harts. It then releases the
+capacity probe and opens an exact one-worker reservation for the chosen guest.
+An explicit `linux_vcpus` value changes only logical topology and does not
+reserve otherwise-idle native workers. The canonical WIT PR
 remains held until Astrid 1.0.
 
 Every non-boot command uses a fresh 128-bit host-CSPRNG token. PID 1 disables
@@ -1319,10 +1321,9 @@ Principal-affine residency, idle Store eviction, the persistent Linux supervisor
 token-bound console transport, bounded BusyBox shell, durable principal home,
 invocation workspace, and clean shutdown are now implemented. The next storage
 order is an immutable base plus durable root overlay; explicit
-disabled-vs-evicted lifecycle policy and deterministic virtual SMP remain
-separate increments.
-Initial SMP can interleave
-harts in one host thread with a fixed scheduling quantum. True host-parallel harts
+disabled-vs-evicted lifecycle policy remains a separate increment.
+Deterministic SMP now interleaves harts in one host thread with a fixed
+scheduling quantum. True host-parallel harts
 remain optional because they add races to snapshots, metering, devices, and
 reproducibility without improving cross-principal isolation.
 
@@ -1432,10 +1433,11 @@ parallel execution introduces host races.
 The versioned machine contract is:
 
 1. `linux_vcpus` is resolved for every principal invocation. Zero asks Astrid
-   for an automatic value; a positive value requests that exact guest topology,
-   subject to the principal worker allowance, the host pool, and the signed
-   machine hard maximum. A changed active value requires a cold boot until CPU
-   hotplug is implemented.
+   for a useful value derived from the current principal/host generic-compute
+   admission; a positive value requests that exact guest topology from the
+   principal-scoped capsule configuration, subject to the signed machine hard
+   maximum. It does not claim or reserve the same number of native workers. A
+   changed active value requires a cold boot until CPU hotplug is implemented.
 2. The FDT contains one `/cpus/cpu@N` node and one unique CPU interrupt-controller
    phandle per admitted hart. Only hart 0 enters Linux at initial boot. This
    follows Linux's ordered RISC-V boot contract; Linux starts secondaries through
@@ -1492,10 +1494,13 @@ Implementation and proof order:
   unsupported fences, restart reset state, and hart-local interrupts;
 - [x] enable SMP in the pinned Linux build and prove two CPUs reach userspace,
   schedule work, receive interrupts, and remain within aggregate metering;
-- [ ] resolve `linux_vcpus` from principal and operator authority, with automatic
-  local defaults and finite managed ceilings;
-- [ ] add checkpoint format 2 or prove multi-hart cold-boot behavior at every
-  lifecycle boundary;
+- [x] resolve `linux_vcpus` from principal-scoped capsule configuration, derive
+  zero from generic compute admission, expose configured versus effective values,
+  and cold-restart only that principal when topology changes;
+- [x] retain checkpoint format 1 as exactly one hart, reject multi-hart restores,
+  and prove an admitted multi-hart topology cold-boots even when the 32 MiB
+  prewarm path is requested; shutdown, failure, eviction, and topology changes
+  continue to discard machine state;
 - [ ] move harts onto the generic compute group, then benchmark one hart,
   time-sliced SMP, and parallel SMP without conflating boot latency, warm command
   latency, and throughput.
@@ -2196,7 +2201,7 @@ CE set rather than test-installed companions.
   commit is `1a06329b5a0d6bb4d66ac942ae3bdcc3b66abf47`; RFC commit `b0c77e4` and WIT
   draft commit `0a90e89` remain feature-branch artifacts. No WIT PR is opened or
   merged before the planned 1.0 contract decision;
-- the Linux vCPU worker is a 13,341,895-byte core-Wasm module built by exact
+- the then-current Linux vCPU worker was a 13,341,895-byte core-Wasm module built by exact
   `nightly-2026-04-04` rustc commit
   `2972b5e59f1c5529b6ba770437812fd83ab4ebd4` and
   admitted as
@@ -2262,7 +2267,18 @@ CE set rather than test-installed companions.
   the SMP-capable image and updated source lock. Its SHA-256 is
   `3de27c49129483c34e5956d23f44fed87ea3d4876db3f30e2276a1662cc5800d`;
   multi-hart machines cold boot until checkpoint format 2 binds every hart and
-  scheduler field.
+  scheduler field;
+- private controller/worker protocol 2 carries the admitted hart count in its
+  fixed header. The reproducible signed worker is 14,431,704 bytes with BLAKE3
+  `613e1d61c5f1611e0f50cb5300bcb79d80bf5ca1d793a3e7000501a90e737b02`.
+  A real generic-compute-runtime regression cold-boots that signed module with
+  two harts and requires Linux's `smp: Brought up 1 node, 2 CPUs` before the
+  first 9P host request;
+- `linux_vcpus=0` now probes generic compute with automatic parallelism and
+  records the clamped 1–64 result as the effective topology; an explicit 1–64
+  value bypasses that heuristic. Status distinguishes configured zero from the
+  running effective count, and a changed principal configuration discards only
+  that principal's warm machine.
 
 ## 16. Ordered implementation milestones
 
@@ -2352,7 +2368,7 @@ CE set rather than test-installed companions.
 - add a PLIC when an admitted interrupting device requires it;
 - [x] boot pinned Linux longterm 6.18.39 to an AOS-controlled `/init`, retain its
   exact serial evidence, and run it through the capsule command adapter;
-- [x] expose the current lazy Linux lifecycle, single-vCPU topology, evictable
+- [x] expose the current lazy Linux lifecycle, admitted virtual-SMP topology, evictable
   resident RAM, and per-principal Store-residency guest-step totals;
 - [x] add a principal-affine resident service Store to Astrid with permanent
   owner binding, per-call charging, exact resident-memory accounting, live quota
@@ -2832,7 +2848,7 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   separate warm machines and durable homes, survive a daemon restart, and fix
   the late-epoch Store-construction deadline wrap exposed by the second
   principal;
-- [ ] execute the deterministic virtual SMP contract in section 7.3: exact FDT
+- [x] execute the deterministic virtual SMP contract in section 7.3: exact FDT
   topology, per-hart architectural state, HSM/IPI/RFENCE/TIME, aggregate
   metering, an SMP-enabled Linux proof, and explicit multi-hart checkpoint
   behavior;
@@ -2841,8 +2857,9 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   budgets, cancellation, shared-region ownership, and accounting remain generic
   while Linux is an SDK consumer;
 - [x] implement aggregate-metered signed worker groups and prove deterministic
-  and parallel modes against the same protocol; Linux remains one vCPU until its
-  guest-visible SMP, device, and snapshot semantics are separately implemented;
+  and parallel modes against the same protocol; Linux now consumes the
+  deterministic one-worker mode for guest-visible time-sliced SMP, while native
+  parallel harts and multi-hart snapshot format 2 remain separate work;
 - [x] expose bounded pipe creation, signed child creation, direct-child wait, and
   direct-child signal through the private guest ABI without allowing jobs to
   escape foreground actor accounting;

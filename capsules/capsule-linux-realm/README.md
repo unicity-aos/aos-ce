@@ -61,8 +61,9 @@ RV64 instruction images, and the first resident Linux boot image:
 `linux_realm_status` reports the guest-visible mount and command surface without
 exposing physical host paths. It also reports the caller's actor boot sequence,
 completed-command count, next process identifier, and live process/pipe resource
-accounting. Linux-specific fields state whether the one-vCPU guest is cold or
-running, whether RAM is currently resident, the number of boots, completed
+accounting. Linux-specific fields state whether the admitted virtual-CPU topology
+is cold or running, the configured and effective vCPU counts, whether RAM is
+currently resident, the number of boots, completed
 commands, clean shutdowns, and exact guest-step totals for the current
 principal-affine Store. Outer Wasm metering is charged to the verified invoking
 principal. The response's versioned path contract reports the semantic mount,
@@ -252,13 +253,14 @@ exception delivery/delegation, `mret`/`sret`, Sv39 translation, and `sfence.vma`
 under the ratified RISC-V Machine and Supervisor ISA 1.13. The page walker is
 bounded and checks canonicality, PTE/superpage form, U/S and R/W/X permissions,
 SUM/MXR, MPRV, and A/D updates against admitted RAM. It also owns independent
-architectural counters, the deterministic single-hart CLINT, interrupt selection
-and vector entry, and bounded `wfi`. The Linux boot contract loads a raw RV64
+architectural counters, per-hart CLINT timer/software interrupts, deterministic
+round-robin hart scheduling, interrupt selection and vector entry, and bounded
+`wfi`. The Linux boot contract loads a raw RV64
 `Image` at the standard 2 MiB boundary, page-aligns an admitted initramfs after
 it, generates the versioned `aos-rv64-virt-v0` FDT without a host tool, and
 enters the kernel in S-mode with `a0=hartid` and `a1=FDT`. Its private firmware
-implements the SBI 3.0 Base, TIME, DBCN, and SRST subsets needed by this
-single-hart profile. The private implementation ID is deliberately unregistered;
+implements the SBI 3.0 Base, TIME, IPI, RFENCE, HSM, DBCN, and SRST subsets
+needed by the SMP profile. The private implementation ID is deliberately unregistered;
 it is not presented as an assigned RISC-V SBI implementation ID. The machine has
 no browser, JavaScript, JIT, host process, host filesystem, or network dependency
 and compiles for the capsule's `wasm32-unknown-unknown` target.
@@ -330,6 +332,7 @@ per-capsule configuration on every operation:
 | `linux_max_steps` | 0 | 0–1000000000000 | Guest steps admitted per invocation; zero delegates to Astrid's outer principal CPU and timeout policy |
 | `linux_max_output_bytes` | 65536 | 1–65536 | Captured Linux output per invocation |
 | `linux_max_file_bytes` | 0 | 0–1099511627776 | Guest `RLIMIT_FSIZE`; zero applies no extra inner cap and leaves Astrid's principal storage quota in force |
+| `linux_vcpus` | 0 | 0–64 | Logical Linux CPUs; zero derives a useful topology from current principal/host compute admission, while 1–64 selects an exact time-sliced topology |
 
 Operators control the enclosing pool independently from each principal. With
 both host keys omitted, Astrid derives the worker count from useful CPU
@@ -352,9 +355,10 @@ astrid quota set --agent alice --memory 8GiB --compute-workers 4 --cpu-fuel-per-
 `--compute-workers 0` delegates worker parallelism to the host; and
 `--cpu-fuel-per-sec 0` removes the CPU rate cap. Managed installations can use
 finite values for all three. Compute workers are the generic schedulable CPU
-boundary. The current Linux machine still contains one actual RV64 hart, so a
-higher worker quota creates headroom for parallel capsules and future SMP but
-does not falsely report extra Linux CPUs today.
+boundary. Linux vCPUs are a separate guest topology: today one deterministic
+worker time-slices every admitted hart and charges their aggregate steps to the
+principal. This provides correct Linux SMP semantics but makes no parallel
+speedup claim.
 
 The effective boundary is the intersection of the Astrid principal profile, the
 daemon's host-wide compute pool, current aggregate reservations, the signed
@@ -362,15 +366,17 @@ worker maximum, the capsule hard maximum, this configured envelope, and any
 lower per-command request.
 For the optional step and file-size limits, zero omits only that inner boundary;
 Astrid's outer CPU, timeout, and storage limits still apply. The guest cannot
-raise any boundary. With `linux_memory_bytes = 0`, Astrid first opens a
-short-lived admission probe and the capsule reads the effective group size
-before creating Linux. It keeps the worker's fixed 64 MiB base and a 128 MiB
+raise any boundary. When guest RAM or vCPUs are automatic, Astrid first opens a
+short-lived generic-compute admission probe. The capsule reads effective memory
+and worker parallelism, releases the probe, and retains one exact deterministic
+worker. For RAM it keeps the worker's fixed 64 MiB base and a 128 MiB
 allocator/scheduling reserve outside guest RAM, selects half of the remaining
-usable capacity, aligns down to a guest page, and never exceeds 3 GiB. The probe
-is then released and replaced by an exact reservation for the selected machine.
-This prevents the first Realm from binding the whole process-wide pool. An
-explicit nonzero value remains useful for repeatable tests and managed tiers;
-insufficient outer admission fails closed.
+usable capacity, aligns down to a guest page, and never exceeds 3 GiB. This
+prevents the first Realm from binding the whole process-wide pool. For vCPUs it
+clamps the parallelism hint to the machine's 1–64-hart range. An explicit
+`linux_vcpus` value is a logical topology override and does not reserve idle
+native workers. Explicit limits remain useful for repeatable tests and managed
+tiers; insufficient outer admission fails closed.
 
 Changing the inner envelope never retargets a Store to another principal. On the
 next mutating execution the capsule discards that principal's warm Linux RAM and

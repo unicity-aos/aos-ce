@@ -1,6 +1,6 @@
 format=astrid-compute-core-wasm-1
 worker_id=linux-vcpu
-protocol=aos-linux-vcpu-1
+protocol=aos-linux-vcpu-2
 target=wasm32-unknown-unknown
 rust_toolchain=nightly-2026-04-04
 rustc_commit=2972b5e59f1c5529b6ba770437812fd83ab4ebd4
@@ -13,5 +13,5 @@ link_stack_after_static_data=true
 static_data_base=65536
 initial_memory_bytes=67108864
 maximum_memory_bytes=3758096384
-worker_bytes=13341895
-worker_blake3=66d03f9d73ba8c1a98ba3de0af3281e8f909182605320408585c2685942016c8
+worker_bytes=14431704
+worker_blake3=613e1d61c5f1611e0f50cb5300bcb79d80bf5ca1d793a3e7000501a90e737b02

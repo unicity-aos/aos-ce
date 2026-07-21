@@ -301,6 +301,7 @@ struct LinuxSnapshot {
     last_exit_status: Option<i32>,
     commands_completed: u64,
     ram_bytes: Option<usize>,
+    vcpus: Option<u32>,
 }
 
 impl LinuxSnapshot {
@@ -314,6 +315,7 @@ impl LinuxSnapshot {
             last_exit_status: None,
             commands_completed: 0,
             ram_bytes: None,
+            vcpus: None,
         }
     }
 }
@@ -882,6 +884,7 @@ fn execute_linux_resident(
 struct LinuxInvocationLimits {
     run: RunLimits,
     max_file_bytes: u64,
+    vcpus: u32,
 }
 
 impl From<RunLimits> for LinuxInvocationLimits {
@@ -889,6 +892,9 @@ impl From<RunLimits> for LinuxInvocationLimits {
         Self {
             run,
             max_file_bytes: resources::DEFAULT_LINUX_MAX_FILE_BYTES,
+            // Direct reference tests use the format-1 prewarm checkpoint.
+            // Principal-configured execution passes its explicit/auto value.
+            vcpus: 1,
         }
     }
 }
@@ -930,6 +936,7 @@ fn execute_linux_resident_cooperatively(
     let LinuxInvocationLimits {
         run: limits,
         max_file_bytes,
+        vcpus,
     } = limits.into();
     let LinuxResidentState {
         machine,
@@ -975,6 +982,7 @@ fn execute_linux_resident_cooperatively(
                 // invocation-wide output ceiling is enforced below.
                 max_console_bytes: HARD_MAX_OUTPUT_BYTES,
             },
+            vcpus,
             requested_prewarm,
         )
         .map_err(SysError::ApiError)?;
@@ -1711,10 +1719,14 @@ fn status_response(
 ) -> StatusResponse {
     let active_resources = actor.resources;
     let effective_resources = active_resources.map(|resources| {
-        actor
+        let resources = actor
             .linux
             .ram_bytes
-            .map_or(resources, |bytes| resources.with_linux_memory_bytes(bytes))
+            .map_or(resources, |bytes| resources.with_linux_memory_bytes(bytes));
+        actor
+            .linux
+            .vcpus
+            .map_or(resources, |count| resources.with_linux_vcpus(count))
     });
     StatusResponse {
         realm: REALM_NAME,
@@ -1816,7 +1828,10 @@ fn status_response(
         linux_prewarm_authority: "signed-capsule-artifact+fresh-principal-providers",
         linux_state: actor.linux.state,
         linux_residency: "principal-affine-store",
-        linux_vcpus: 1,
+        linux_vcpus: actor
+            .linux
+            .vcpus
+            .unwrap_or(configured_resources.linux_vcpus),
         linux_ram_bytes: actor.linux.ram_bytes,
         linux_ram_persistent: actor.linux.state == "running",
         linux_ram_durability: "evictable-cache",
@@ -2152,7 +2167,7 @@ mod tests {
         let stdout = String::from_utf8_lossy(&boot.stdout);
         assert!(stdout.contains("AOS PREWARM RESTORED"));
         assert!(contains_bytes(&boot.stdout, LINUX_READY_MARKER));
-        assert_eq!(boot.fuel_consumed, 277_798);
+        assert_eq!(boot.fuel_consumed, 320_291);
         assert_eq!(boot.suspensions, 7);
 
         let first = execute_linux_resident_cooperatively(
@@ -2224,6 +2239,7 @@ mod tests {
             LinuxInvocationLimits {
                 run: limits,
                 max_file_bytes: 4,
+                vcpus: 1,
             },
             || Ok(()),
         )
@@ -2384,7 +2400,7 @@ mod tests {
             LINUX_DEFAULT_CWD,
             None,
             RunLimits {
-                fuel: LINUX_SLICE_STEPS * 2,
+                fuel: LINUX_SLICE_STEPS * 4,
                 memory_bytes: DEFAULT_LINUX_MEMORY_BYTES,
                 output_bytes: HARD_MAX_OUTPUT_BYTES,
             },
@@ -2396,7 +2412,7 @@ mod tests {
         .expect("bounded Linux execution yields cooperatively");
 
         assert_eq!(report.outcome, "ready");
-        assert_eq!(report.fuel_consumed, LINUX_SLICE_STEPS * 2);
+        assert_eq!(report.fuel_consumed, 320_291);
         assert_eq!(report.suspensions, 7);
         assert_eq!(cooperative_yields, report.suspensions);
         assert!(machine.is_some(), "ready prewarm RAM remains resident");
@@ -2758,6 +2774,7 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
                     last_exit_status: Some(0),
                     commands_completed: 3,
                     ram_bytes: None,
+                    vcpus: None,
                 },
                 resources: Some(RealmResources::default()),
             },
@@ -2775,7 +2792,7 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
         assert!(json.contains("\"linux_backend\":\"aos-rv64-interpreter\""));
         assert!(json.contains("\"linux_cold_start\":\"bound-prewarm-32m-or-full-boot\""));
         assert!(json.contains("\"linux_prewarm_ram_bytes\":33554432"));
-        assert!(json.contains("\"linux_prewarm_checkpoint_bytes\":8495869"));
+        assert!(json.contains("\"linux_prewarm_checkpoint_bytes\":9172369"));
         assert!(json.contains("\"linux-sh\""));
         assert!(json.contains("\"linux_state\":\"cold\""));
         assert!(json.contains("\"linux_boot_executions_this_actor_boot\":2"));
@@ -2857,6 +2874,7 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
                 linux: LinuxSnapshot {
                     state: "running",
                     ram_bytes: Some(1024 * 1024 * 1024),
+                    vcpus: Some(12),
                     ..LinuxSnapshot::cold()
                 },
                 resources: Some(configured),
@@ -2865,6 +2883,7 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
         );
 
         assert_eq!(response.linux_ram_bytes, Some(1024 * 1024 * 1024));
+        assert_eq!(response.linux_vcpus, 12);
         assert_eq!(response.resources.active, Some(configured));
         assert_eq!(
             response
@@ -2873,6 +2892,14 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
                 .expect("running Realm has an effective envelope")
                 .linux_memory_bytes,
             1024 * 1024 * 1024
+        );
+        assert_eq!(
+            response
+                .resources
+                .effective
+                .expect("running Realm has an effective envelope")
+                .linux_vcpus,
+            12
         );
         assert!(!response.resources.reconfigure_on_next_exec);
     }

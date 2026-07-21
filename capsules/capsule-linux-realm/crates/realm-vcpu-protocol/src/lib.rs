@@ -14,7 +14,7 @@ pub const WORKER_ID: &str = "linux-vcpu";
 /// `LVC1`, encoded little-endian at the beginning of every descriptor.
 pub const MAGIC: u32 = 0x4c56_4331;
 /// Current controller/worker protocol version.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// Fixed header before any input or response payload.
 pub const HEADER_BYTES: usize = 128;
 /// Maximum descriptor admitted by the Astrid compute copy boundary.
@@ -76,6 +76,8 @@ pub mod field {
     pub const MESSAGE_LEN: usize = 116;
     /// UTF-8 error response bytes, `u32`.
     pub const ERROR_LEN: usize = 120;
+    /// Admitted logical Linux hart count, `u32`.
+    pub const HART_COUNT: usize = 124;
 }
 
 /// Stateful operation requested by the Realm controller.
@@ -234,7 +236,9 @@ mod tests {
         let mut bytes = [0_u8; HEADER_BYTES];
         assert!(write_u32(&mut bytes, field::MAGIC, MAGIC));
         assert!(write_u64(&mut bytes, field::RAM_BYTES, 32 * 1024 * 1024));
+        assert!(write_u32(&mut bytes, field::HART_COUNT, 8));
         assert_eq!(read_u32(&bytes, field::MAGIC), Some(MAGIC));
         assert_eq!(read_u64(&bytes, field::RAM_BYTES), Some(32 * 1024 * 1024));
+        assert_eq!(read_u32(&bytes, field::HART_COUNT), Some(8));
     }
 }
