@@ -73,6 +73,15 @@
   to the mandatory outer CPU/timeout or storage controls, respectively. Status
   distinguishes configured and active limits, while a changed envelope
   cold-reconfigures only that principal's warm Linux machine.
+- Dynamic Linux Realm compute admission. Omitted daemon worker and memory
+  ceilings derive from host CPU parallelism and physical RAM with a safety
+  reserve, then intersect a process-wide pool, the invoking principal's memory
+  and compute-worker quotas, existing reservations, and the signed worker
+  maximum. Realm probes the admitted envelope, defaults guest RAM to half of
+  its usable capacity so one Realm does not monopolize the pool, then reopens
+  an exact reservation. RAM may still be fixed per principal through 3 GiB.
+  Worker fuel joins the ordinary cross-capsule principal CPU account and rate
+  limit.
 - A reproducibly pinned Buildroot 2026.05.1, static musl, and BusyBox `ash`
   workbench for the resident Linux guest, with an unprivileged `agent` shell,
   token-bound command framing, bounded process resources, descendant cleanup,

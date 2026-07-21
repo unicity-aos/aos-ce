@@ -165,7 +165,7 @@ dependencies = [
  "aos-realm-runtime",
  "aos-realm-vcpu-protocol",
  "aos-realm-vfs",
- "astrid-sdk 0.7.1 (git+https://github.com/astrid-runtime/sdk-rust.git?rev=1c7382c545c152eb242fb782a2c13559b8f6c09a)",
+ "astrid-sdk 0.7.1 (git+https://github.com/astrid-runtime/sdk-rust.git?rev=1a06329b5a0d6bb4d66ac942ae3bdcc3b66abf47)",
  "serde",
  "serde_json",
  "toml 0.8.23",
@@ -266,7 +266,7 @@ dependencies = [
  "aos-realm-machine",
  "aos-realm-vcpu-protocol",
  "astrid-compute",
- "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=43c1282b23c13b3c50cfebd94eafe6ca88d4c7e0)",
+ "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=15c264813d5c224cd3ca6c1f38d29290b8343622)",
 ]
 
 [[package]]
@@ -363,11 +363,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "astrid-capsule-types"
+version = "0.10.4"
+source = "git+https://github.com/astrid-runtime/astrid.git?rev=15c264813d5c224cd3ca6c1f38d29290b8343622#15c264813d5c224cd3ca6c1f38d29290b8343622"
+dependencies = [
+ "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=15c264813d5c224cd3ca6c1f38d29290b8343622)",
+ "dashmap",
+ "nix",
+ "parking_lot",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "toml 0.9.12+spec-1.1.0",
+ "web-time",
+]
+
+[[package]]
 name = "astrid-compute"
 version = "0.10.4"
-source = "git+https://github.com/astrid-runtime/astrid.git?rev=43c1282b23c13b3c50cfebd94eafe6ca88d4c7e0#43c1282b23c13b3c50cfebd94eafe6ca88d4c7e0"
+source = "git+https://github.com/astrid-runtime/astrid.git?rev=15c264813d5c224cd3ca6c1f38d29290b8343622#15c264813d5c224cd3ca6c1f38d29290b8343622"
 dependencies = [
- "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=43c1282b23c13b3c50cfebd94eafe6ca88d4c7e0)",
+ "astrid-capsule-types",
+ "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=15c264813d5c224cd3ca6c1f38d29290b8343622)",
  "blake3",
  "thiserror 2.0.19",
  "wasmtime",
@@ -398,7 +416,7 @@ dependencies = [
 [[package]]
 name = "astrid-core"
 version = "0.10.4"
-source = "git+https://github.com/astrid-runtime/astrid.git?rev=43c1282b23c13b3c50cfebd94eafe6ca88d4c7e0#43c1282b23c13b3c50cfebd94eafe6ca88d4c7e0"
+source = "git+https://github.com/astrid-runtime/astrid.git?rev=15c264813d5c224cd3ca6c1f38d29290b8343622#15c264813d5c224cd3ca6c1f38d29290b8343622"
 dependencies = [
  "async-trait",
  "base64",
@@ -453,10 +471,10 @@ dependencies = [
 [[package]]
 name = "astrid-sdk"
 version = "0.7.1"
-source = "git+https://github.com/astrid-runtime/sdk-rust.git?rev=1c7382c545c152eb242fb782a2c13559b8f6c09a#1c7382c545c152eb242fb782a2c13559b8f6c09a"
+source = "git+https://github.com/astrid-runtime/sdk-rust.git?rev=1a06329b5a0d6bb4d66ac942ae3bdcc3b66abf47#1a06329b5a0d6bb4d66ac942ae3bdcc3b66abf47"
 dependencies = [
- "astrid-sdk-macros 0.7.1 (git+https://github.com/astrid-runtime/sdk-rust.git?rev=1c7382c545c152eb242fb782a2c13559b8f6c09a)",
- "astrid-sys 0.7.1 (git+https://github.com/astrid-runtime/sdk-rust.git?rev=1c7382c545c152eb242fb782a2c13559b8f6c09a)",
+ "astrid-sdk-macros 0.7.1 (git+https://github.com/astrid-runtime/sdk-rust.git?rev=1a06329b5a0d6bb4d66ac942ae3bdcc3b66abf47)",
+ "astrid-sys 0.7.1 (git+https://github.com/astrid-runtime/sdk-rust.git?rev=1a06329b5a0d6bb4d66ac942ae3bdcc3b66abf47)",
  "astrid-types 0.7.0",
  "borsh",
  "schemars",
@@ -481,7 +499,7 @@ dependencies = [
 [[package]]
 name = "astrid-sdk-macros"
 version = "0.7.1"
-source = "git+https://github.com/astrid-runtime/sdk-rust.git?rev=1c7382c545c152eb242fb782a2c13559b8f6c09a#1c7382c545c152eb242fb782a2c13559b8f6c09a"
+source = "git+https://github.com/astrid-runtime/sdk-rust.git?rev=1a06329b5a0d6bb4d66ac942ae3bdcc3b66abf47#1a06329b5a0d6bb4d66ac942ae3bdcc3b66abf47"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -503,7 +521,7 @@ dependencies = [
 [[package]]
 name = "astrid-sys"
 version = "0.7.1"
-source = "git+https://github.com/astrid-runtime/sdk-rust.git?rev=1c7382c545c152eb242fb782a2c13559b8f6c09a#1c7382c545c152eb242fb782a2c13559b8f6c09a"
+source = "git+https://github.com/astrid-runtime/sdk-rust.git?rev=1a06329b5a0d6bb4d66ac942ae3bdcc3b66abf47#1a06329b5a0d6bb4d66ac942ae3bdcc3b66abf47"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
@@ -1089,6 +1107,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "debugid"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1395,6 +1427,12 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+
+[[package]]
+name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
@@ -1652,6 +1690,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "lock_api"
+version = "0.4.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
 name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1702,6 +1749,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1733,6 +1792,29 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "parking_lot"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
+dependencies = [
+ "lock_api",
+ "parking_lot_core",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "redox_syscall",
+ "smallvec",
+ "windows-link",
+]
 
 [[package]]
 name = "percent-encoding"
@@ -1878,6 +1960,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_syscall"
+version = "0.5.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
 name = "redox_users"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1972,6 +2063,12 @@ dependencies = [
  "serde_derive_internals",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "scopeguard"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "semver"
@@ -3013,6 +3110,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4bfc5ce906144200c972ec617470aa35bd847472e170b26dde3e80541c674055"
 dependencies = [
  "wast",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]

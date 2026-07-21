@@ -1179,8 +1179,8 @@ machine and every CPU, memory, storage, network, and device charge rolls up to
 that owner.
 
 The current Linux adapter is lazy and principal-resident. The affined Store owns
-one optional single-hart machine with a proven 32 MiB default and an explicitly
-configured 32–256 MiB guest-RAM envelope. `linux-boot`, `linux-console`, or
+one optional single-hart machine with a host-admitted automatic RAM default and
+an explicit 32 MiB–3 GiB per-principal override. `linux-boot`, `linux-console`, or
 `linux-sh` creates it when cold, advances Linux in bounded 100,000-step slices
 until the controlled `/init` reports ready, and retains its CPU and RAM for later
 invocations. A `counter` probe reaches 1 and then 2 across separate calls, and a
@@ -1188,14 +1188,34 @@ file written by UID 1000 under `/home/agent` is readable by a later shell call.
 No CPU runs while the Store is idle: every guest step occurs inside an admitted
 outer tool invocation and is charged to the verified principal.
 
-Resource admission is a strict intersection rather than an ambient host query:
+Resource admission is a strict intersection:
 
 ```text
 Astrid administrator's principal profile
+∩ daemon host-wide CPU/RAM compute pool
+∩ live reservations across all principals
+∩ signed worker declaration
 ∩ capsule hard maximum
 ∩ invoking principal's per-capsule Realm configuration
 ∩ optional lower per-command request
 ```
+
+The host pool is dynamic when
+`capsule.compute_host_max_workers` and
+`capsule.compute_host_max_shared_memory_bytes` are omitted. A system
+administrator can set either key globally, then narrow a named principal:
+
+```console
+astrid quota set --agent NAME --memory SIZE --compute-workers N --cpu-fuel-per-sec FUEL
+```
+
+Principal memory is a virtual ceiling rather than an eager reservation; zero
+compute workers delegates to the host, and zero CPU fuel per second means
+unlimited. The current Linux adapter requests one deterministic compute worker
+because it implements one RV64 hart. The worker quota is therefore real
+schedulable capacity for all capsules, but it must not be presented as a Linux
+vCPU knob until Realm implements harts, interrupt routing, SBI/IPI behavior, and
+the corresponding device-tree description.
 
 The outer principal profile remains authoritative for Wasmtime memory, CPU rate,
 storage, processes, and timeout. The inner configuration currently selects guest
@@ -1207,12 +1227,16 @@ principal's warm RAM before the next execution; durable home and workspace
 authority are reattached, and another principal's Store is untouched. Status is
 read-only and reports configured versus active values plus a pending-change bit.
 
-The capsule cannot yet read the exact enclosing Store ceiling through the frozen
-host ABI, so it does not pretend to derive RAM automatically from the physical
-machine or consume the maximum. A future versioned host resource-admission query
-may turn `auto` into a concrete audited allocation. Until then, the administrator
-sets the outer principal quota and the Realm's guest-RAM request separately; an
-undersized outer quota fails closed at the existing Wasmtime limiter.
+The held compute contract now supplies the missing audited feedback loop without
+changing its WIT record shape. A maximum-memory request of zero asks the kernel
+to resolve the largest currently admissible shared region from the signed worker,
+principal quota, host pool, and live reservations. `group.info()` returns that
+concrete maximum before machine initialization. Realm subtracts its worker base
+and reserve, takes half of the usable remainder so one automatic Realm does not
+monopolize the pool, page-aligns it, and caps guest-visible RAM at 3 GiB. It then
+releases the capacity probe and opens an exact reservation for the chosen guest.
+Explicit nonzero requests retain their exact old meaning. The canonical WIT PR
+remains held until Astrid 1.0.
 
 Every non-boot command uses a fresh 128-bit host-CSPRNG token. PID 1 disables
 console echo and emits token-bound begin/end frames; the host accepts the final
@@ -2069,35 +2093,45 @@ CE set rather than test-installed companions.
 
 ### Generic-compute Linux evidence recorded on 2026-07-21
 
-- Astrid core commit `43c1282b23c13b3c50cfebd94eafe6ca88d4c7e0`
+- Astrid core commit `15c264813d5c224cd3ca6c1f38d29290b8343622`
   admits hash-pinned `compute-worker` assets, retains principal-bound groups
   between calls, reserves worker memory before execution, and implements the
   already-frozen Astrid file-handle resource. It also gives the frozen
   filesystem contract real `stat` versus `lstat` semantics: following metadata
   cannot traverse an escaping final link, while non-following metadata can
-  inspect the confined link entry itself. The paired SDK commit is
-  `1c7382c545c152eb242fb782a2c13559b8f6c09a`; RFC commit `b0c77e4` and WIT
+  inspect the confined link entry itself. It now also derives one host-wide
+  worker/RAM pool, intersects it with independent per-principal quotas, and
+  charges worker fuel to the ordinary principal CPU account. The paired SDK
+  commit is `1a06329b5a0d6bb4d66ac942ae3bdcc3b66abf47`; RFC commit `b0c77e4` and WIT
   draft commit `0a90e89` remain feature-branch artifacts. No WIT PR is opened or
   merged before the planned 1.0 contract decision;
-- the Linux vCPU worker is a 13,341,894-byte core-Wasm module built by exact
+- the Linux vCPU worker is a 13,341,895-byte core-Wasm module built by exact
   `nightly-2026-04-04` rustc commit
   `2972b5e59f1c5529b6ba770437812fd83ab4ebd4` and
   admitted as
-  `blake3:d935bf594b0282f29fe2cb90ab5c4cd10fed0446feab1df70fe7d0edd9f4a9fb`.
+  `blake3:66d03f9d73ba8c1a98ba3de0af3281e8f909182605320408585c2685942016c8`.
   Its build remaps toolchain, Cargo registry, and repository source paths, so
   the signed module does not encode a builder's home directory or depend on a
   moving `nightly` alias.
   Its controller retains Astrid host authority; the worker imports only the
   shared compute memory and operates the RV64 machine protocol;
-- core validation passed all 580 `astrid-capsule` tests, all 34 `astrid-vfs`
-  tests, and warning-denied clippy. The Realm passed 58 controller/machine tests
-  and three worker tests, including restoration inside the real generic compute
-  runtime rather than a mock;
-- current Astrid 0.10.4 `astrid-build` produced a 4.4 MiB archive with SHA-256
-  `5135109a68f561cc55cf1250f31a08364add1ad40359e08807f416f83047cdec`.
+- core validation passed all 581 `astrid-capsule` tests, all 18
+  `astrid-compute` tests, and warning-denied clippy. The Realm passed 60
+  controller/machine tests and three worker tests, including restoration inside
+  the real generic compute runtime rather than a mock;
+- current Astrid 0.10.4 `astrid-build` produced a 4,652,749-byte archive with
+  SHA-256
+  `c6cd036df144e53ff2bbfe85a319a9f8ca36528d0aa33c924c3c1bb7021af917`.
   Its archive contains `aos_linux_realm.wasm`, the manifest, and both the signed
-  worker bytes and lock metadata. The isolated daemon loaded component hash
-  `605a8cdef2b3a6bd6ee85b50927bc259e52c85161fb158e36f795f0020b7d6ee`;
+  worker bytes and lock metadata. The packaged controller component has BLAKE3
+  hash `839ee34bab97c0d67b284421b6b1ee6fe9fd08ff7f30bf5ce85349db4659891a`;
+- live automatic admission on the normal host selected 1,778,384,896 bytes
+  (1,696 MiB) of guest RAM from the signed worker ceiling and reached `AOS READY`.
+  Restarting the isolated daemon with a two-worker, 512 MiB process-wide pool
+  selected an exact 167,772,160-byte (160 MiB) guest reservation and reached the
+  same ready state. This exercises the host operator knobs rather than relying
+  only on unit arithmetic. The installed string-valued `"0"` default also
+  round-tripped through capsule configuration and retained automatic sizing;
 - a live guest restored the prewarm checkpoint as Realm boot 10, executed Linux
   6.18.39 on `riscv64` as UID/GID 1000, and returned a version-3 path receipt.
   The receipt identifies `/workspace` as the real `cwd://` resource with

@@ -326,27 +326,62 @@ per-capsule configuration on every operation:
 
 | Config key | Default | Admitted range | Meaning |
 | --- | ---: | ---: | --- |
-| `linux_memory_bytes` | 33554432 | 33554432–268435456, 4 KiB aligned | Guest-visible RV64 RAM |
+| `linux_memory_bytes` | 0 | 0, or 33554432–3221225472 aligned to 4 KiB | Guest-visible RV64 RAM; zero asks Astrid to size it from current host and principal admission |
 | `linux_max_steps` | 0 | 0–1000000000000 | Guest steps admitted per invocation; zero delegates to Astrid's outer principal CPU and timeout policy |
 | `linux_max_output_bytes` | 65536 | 1–65536 | Captured Linux output per invocation |
 | `linux_max_file_bytes` | 0 | 0–1099511627776 | Guest `RLIMIT_FSIZE`; zero applies no extra inner cap and leaves Astrid's principal storage quota in force |
 
+Operators control the enclosing pool independently from each principal. With
+both host keys omitted, Astrid derives the worker count from useful CPU
+parallelism and the shared-memory pool from physical RAM after a safety reserve:
+
+```toml
+[capsule]
+compute_host_max_workers = 16
+compute_host_max_shared_memory_bytes = 34359738368
+```
+
+Those values are optional ceilings, not recommended fixed defaults. A managed
+host can then narrow one principal without changing the machine-wide pool:
+
+```console
+astrid quota set --agent alice --memory 8GiB --compute-workers 4 --cpu-fuel-per-sec 0
+```
+
+`--memory` is a virtual admission ceiling, not eager allocation;
+`--compute-workers 0` delegates worker parallelism to the host; and
+`--cpu-fuel-per-sec 0` removes the CPU rate cap. Managed installations can use
+finite values for all three. Compute workers are the generic schedulable CPU
+boundary. The current Linux machine still contains one actual RV64 hart, so a
+higher worker quota creates headroom for parallel capsules and future SMP but
+does not falsely report extra Linux CPUs today.
+
 The effective boundary is the intersection of the Astrid principal profile, the
-capsule hard maximum, this configured envelope, and any lower per-command request.
+daemon's host-wide compute pool, current aggregate reservations, the signed
+worker maximum, the capsule hard maximum, this configured envelope, and any
+lower per-command request.
 For the optional step and file-size limits, zero omits only that inner boundary;
 Astrid's outer CPU, timeout, and storage limits still apply. The guest cannot
-raise any boundary. RAM
-above the proven 32 MiB default requires
-the administrator to raise that principal's outer Wasmtime memory quota enough
-to contain both guest RAM and the capsule itself.
+raise any boundary. With `linux_memory_bytes = 0`, Astrid first opens a
+short-lived admission probe and the capsule reads the effective group size
+before creating Linux. It keeps the worker's fixed 64 MiB base and a 128 MiB
+allocator/scheduling reserve outside guest RAM, selects half of the remaining
+usable capacity, aligns down to a guest page, and never exceeds 3 GiB. The probe
+is then released and replaced by an exact reservation for the selected machine.
+This prevents the first Realm from binding the whole process-wide pool. An
+explicit nonzero value remains useful for repeatable tests and managed tiers;
+insufficient outer admission fails closed.
 
 Changing the inner envelope never retargets a Store to another principal. On the
 next mutating execution the capsule discards that principal's warm Linux RAM and
 9P sessions, retains the actor boot identity, and remounts the same durable home
 and invocation workspace under the new limits. Read-only status reports both the
 configured and active envelopes plus whether that cold reconfiguration is
-pending. The current contract deliberately does not bind guest RAM to all
-available host memory; allocation is explicit, bounded, and auditable.
+pending. Auto does not bind to all physical RAM. The daemon reserves at least
+one eighth of host memory (with a 1 GiB floor), the compute ledger admits all
+principals against the remainder, and the signed worker still imposes its own
+finite maximum. Status exposes configured, active, and effective envelopes plus
+the currently resident `linux_ram_bytes`.
 
 Astrid Runtime now has the experimental primitive required to make this boundary
 honest: an opt-in Store permanently keyed by `(capsule, component, verified

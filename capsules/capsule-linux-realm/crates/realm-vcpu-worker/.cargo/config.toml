@@ -12,5 +12,5 @@ rustflags = [
     "-C", "link-arg=--import-memory=astrid_compute,memory",
     "-C", "link-arg=--shared-memory",
     "-C", "link-arg=--initial-memory=67108864",
-    "-C", "link-arg=--max-memory=536870912",
+    "-C", "link-arg=--max-memory=3758096384",
 ]

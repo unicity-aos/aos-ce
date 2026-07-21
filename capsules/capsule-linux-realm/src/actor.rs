@@ -88,6 +88,7 @@ struct LinuxActivity {
     guest_steps: u64,
     last_outcome: Option<&'static str>,
     last_exit_status: Option<i32>,
+    active_memory_bytes: Option<usize>,
 }
 
 impl LinuxActivity {
@@ -95,6 +96,7 @@ impl LinuxActivity {
         let was_running = self.machine.take().is_some();
         self.home_9p = None;
         self.workspace_9p = None;
+        self.active_memory_bytes = None;
         if was_running {
             self.last_outcome = Some("resource-policy-changed");
             self.last_exit_status = None;
@@ -140,7 +142,13 @@ impl LinuxActivity {
                 run: limits,
                 max_file_bytes: resources.linux_max_file_bytes,
             },
-        )?;
+        );
+        self.active_memory_bytes = self.machine.as_ref().map(LinuxMachine::ram_bytes);
+        let report = report?;
+        let effective_memory_bytes = self
+            .active_memory_bytes
+            .unwrap_or(resources.linux_memory_bytes);
+        let effective_resources = resources.with_linux_memory_bytes(effective_memory_bytes);
 
         if report.booted {
             self.boot_executions = self.boot_executions.saturating_add(1);
@@ -184,13 +192,13 @@ impl LinuxActivity {
             stdout: String::from_utf8_lossy(&report.stdout).into_owned(),
             stderr: String::new(),
             fuel_consumed: report.fuel_consumed,
-            memory_limit_bytes: limits.memory_bytes,
+            memory_limit_bytes: effective_memory_bytes,
             suspensions: report.suspensions,
             processes: 0,
             realm_boot_sequence: boot_sequence,
             process_ids: Vec::new(),
             next_process_id,
-            resources,
+            resources: effective_resources,
         })
     }
 
@@ -207,6 +215,7 @@ impl LinuxActivity {
             last_outcome: self.last_outcome,
             last_exit_status: self.last_exit_status,
             commands_completed: self.commands_completed,
+            ram_bytes: self.active_memory_bytes,
         }
     }
 }
@@ -266,7 +275,8 @@ impl ResidentRealm {
     ) -> Result<ExecResponse, SysError> {
         let realm = self.realm_with_boot(principal, resources, load_boot)?;
         let selected = select_program(&args)?;
-        let mut response = if matches!(selected.execution, SelectedExecution::Linux(_)) {
+        let linux_execution = matches!(selected.execution, SelectedExecution::Linux(_));
+        let mut response = if linux_execution {
             realm.linux.execute(
                 args,
                 principal,
@@ -285,7 +295,9 @@ impl ResidentRealm {
                 home_generation,
             )?
         };
-        response.resources = realm.resources;
+        if !linux_execution {
+            response.resources = realm.resources;
+        }
         realm.commands_completed = realm.commands_completed.saturating_add(1);
         Ok(response)
     }

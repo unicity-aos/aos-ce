@@ -392,7 +392,7 @@ mod tests {
 
     const SIGNED_WORKER: &[u8] = include_bytes!("../../../assets/linux-vcpu.wasm");
     const SIGNED_WORKER_HASH: &str =
-        "blake3:d935bf594b0282f29fe2cb90ab5c4cd10fed0446feab1df70fe7d0edd9f4a9fb";
+        "blake3:66d03f9d73ba8c1a98ba3de0af3281e8f909182605320408585c2685942016c8";
 
     #[test]
     fn protocol_fields_round_trip() {
