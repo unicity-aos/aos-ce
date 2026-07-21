@@ -14,5 +14,9 @@ publish = false
 [dependencies]
 blake3 = { workspace = true }
 
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
 [lib]
 path = "src/lib.rs"
