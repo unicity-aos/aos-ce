@@ -5,7 +5,7 @@
 //! signed Astrid compute worker, leaving 9P and every other host effect in the
 //! principal-affine controller component.
 
-use aos_realm_machine::{HostRequestFailure, MachineConfig};
+use aos_realm_machine::{HostRequestFailure, MAX_HARTS, MachineConfig};
 #[cfg(any(target_arch = "wasm32", test))]
 use aos_realm_vcpu_protocol as protocol;
 
@@ -17,7 +17,7 @@ use aos_realm_machine::{
     CheckpointBinding, CheckpointDigest, HostRequestId, Machine, MachineCheckpoint, SliceOutcome,
 };
 #[cfg(target_arch = "wasm32")]
-use astrid_sdk::compute::{ComputeGroup, GroupRequest, WorkDescriptor};
+use astrid_sdk::compute::{ComputeGroup, GroupRequest, Parallelism, WorkDescriptor};
 
 /// Stable identity of the selected Linux machine implementation.
 ///
@@ -80,21 +80,28 @@ pub(crate) struct ReferenceMachine {
     machine: Machine,
     pending_request: Option<HostRequestId>,
     ram_bytes: usize,
+    hart_count: u32,
 }
 
 impl LinuxMachine {
     /// Admit and initialize the production backend for this build target.
-    pub(crate) fn new(config: MachineConfig, restore_prewarm: bool) -> Result<Self, String> {
+    pub(crate) fn new(
+        config: MachineConfig,
+        configured_hart_count: u32,
+        restore_prewarm: bool,
+    ) -> Result<Self, String> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut config = config;
+            let hart_count = reference_hart_count(configured_hart_count)?;
             if config.ram_bytes == 0 {
                 // Native execution is the conformance/reference lane and has
                 // no Astrid compute admission query. Production wasm resolves
                 // auto sizing from its admitted group.
                 config.ram_bytes = AUTO_REFERENCE_RAM_BYTES;
             }
-            let restore_prewarm = restore_prewarm || config.ram_bytes == AUTO_REFERENCE_RAM_BYTES;
+            let restore_prewarm = hart_count == 1
+                && (restore_prewarm || config.ram_bytes == AUTO_REFERENCE_RAM_BYTES);
             let machine = if restore_prewarm {
                 let binding = CheckpointBinding::new(
                     CheckpointDigest::hash(LINUX_IMAGE),
@@ -112,7 +119,8 @@ impl LinuxMachine {
                 }
                 checkpoint.into_machine()
             } else {
-                let mut machine = Machine::new(config).map_err(|error| error.to_string())?;
+                let mut machine = Machine::new_with_harts(config, hart_count as usize)
+                    .map_err(|error| error.to_string())?;
                 machine
                     .boot_linux(
                         LINUX_IMAGE,
@@ -126,11 +134,12 @@ impl LinuxMachine {
                 machine,
                 pending_request: None,
                 ram_bytes: config.ram_bytes,
+                hart_count,
             }))
         }
 
         #[cfg(target_arch = "wasm32")]
-        ComputeMachine::new(config, restore_prewarm).map(Self::Compute)
+        ComputeMachine::new(config, configured_hart_count, restore_prewarm).map(Self::Compute)
     }
 
     #[cfg(test)]
@@ -141,6 +150,7 @@ impl LinuxMachine {
                     machine,
                     pending_request: None,
                     ram_bytes: config.ram_bytes,
+                    hart_count: 1,
                 })
             })
             .map_err(|error| error.to_string())
@@ -156,6 +166,15 @@ impl LinuxMachine {
             Self::Reference(reference) => reference.ram_bytes,
             #[cfg(target_arch = "wasm32")]
             Self::Compute(compute) => compute.ram_bytes,
+        }
+    }
+
+    pub(crate) const fn hart_count(&self) -> u32 {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Reference(reference) => reference.hart_count,
+            #[cfg(target_arch = "wasm32")]
+            Self::Compute(compute) => compute.hart_count,
         }
     }
 
@@ -269,6 +288,7 @@ pub(crate) struct ComputeMachine {
     group: ComputeGroup,
     control_offset: u64,
     ram_bytes: usize,
+    hart_count: u32,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -280,36 +300,50 @@ struct ComputeResponse {
 
 #[cfg(target_arch = "wasm32")]
 impl ComputeMachine {
-    fn new(mut config: MachineConfig, restore_prewarm: bool) -> Result<Self, String> {
-        let (initial_pages, maximum_pages, mut control_offset) =
+    fn new(
+        mut config: MachineConfig,
+        configured_hart_count: u32,
+        restore_prewarm: bool,
+    ) -> Result<Self, String> {
+        let mut hart_count = explicit_hart_count(configured_hart_count)?;
+        let auto_memory = config.ram_bytes == 0;
+        let (initial_pages, mut maximum_pages, mut control_offset) =
             shared_memory_layout(config.ram_bytes)?;
-        let group = if maximum_pages == 0 {
-            // The held compute contract exposes admission through group info,
-            // not a separate capacity query. Open a short-lived probe, derive
-            // a non-monopolizing guest size, release its all-remaining
-            // reservation, then retain only the exact explicit envelope.
-            let probe = open_compute_group(initial_pages, 0)?;
-            config.ram_bytes = auto_guest_ram_bytes(
-                probe
-                    .info()
-                    .map_err(|error| format!("inspect admitted Linux vCPU group: {error}"))?
-                    .maximum_memory_pages,
-            )?;
+        if auto_memory || hart_count.is_none() {
+            // A short-lived generic-compute probe exposes the current
+            // principal/host intersection without adding a Linux-specific
+            // host call. The retained interpreter group remains deterministic
+            // and single-worker; its guest harts are logical, time-sliced CPUs.
+            let probe_maximum_pages = if auto_memory { 0 } else { initial_pages };
+            let probe = open_compute_probe(initial_pages, probe_maximum_pages)?;
+            let info = probe
+                .info()
+                .map_err(|error| format!("inspect admitted Linux vCPU group: {error}"))?;
+            if auto_memory {
+                config.ram_bytes = auto_guest_ram_bytes(info.maximum_memory_pages)?;
+            }
+            if hart_count.is_none() {
+                hart_count = Some(auto_guest_hart_count(info.parallelism));
+            }
             drop(probe);
-            let (initial_pages, maximum_pages, admitted_control_offset) =
+            let (_, admitted_maximum_pages, admitted_control_offset) =
                 shared_memory_layout(config.ram_bytes)?;
+            maximum_pages = admitted_maximum_pages;
             control_offset = admitted_control_offset;
-            open_compute_group(initial_pages, maximum_pages)?
-        } else {
-            open_compute_group(initial_pages, maximum_pages)?
-        };
+        }
+        let hart_count = hart_count.ok_or_else(|| {
+            "Linux vCPU auto admission did not produce a logical CPU count".to_string()
+        })?;
+        let group = open_compute_group(initial_pages, maximum_pages)?;
         let machine = Self {
             group,
             control_offset,
             ram_bytes: config.ram_bytes,
+            hart_count,
         };
         machine.invoke(
-            if restore_prewarm || config.ram_bytes == AUTO_REFERENCE_RAM_BYTES {
+            if hart_count == 1 && (restore_prewarm || config.ram_bytes == AUTO_REFERENCE_RAM_BYTES)
+            {
                 Operation::InitPrewarm
             } else {
                 Operation::InitCold
@@ -322,6 +356,7 @@ impl ComputeMachine {
                     field::MAX_CONSOLE_BYTES,
                     config.max_console_bytes as u64,
                 );
+                protocol::write_u32(header, field::HART_COUNT, hart_count);
             },
         )?;
         Ok(machine)
@@ -502,6 +537,54 @@ fn open_compute_group(
         .map_err(|error| format!("admit Linux vCPU compute worker: {error}"))
 }
 
+#[cfg(target_arch = "wasm32")]
+fn open_compute_probe(
+    initial_memory_pages: u32,
+    maximum_memory_pages: u32,
+) -> Result<ComputeGroup, String> {
+    let request = GroupRequest::new(
+        protocol::WORKER_ID,
+        initial_memory_pages,
+        maximum_memory_pages,
+    )
+    .parallel(Parallelism::Auto);
+    let request = if maximum_memory_pages == 0 {
+        request.auto_memory()
+    } else {
+        request
+    };
+    ComputeGroup::open(&request)
+        .map_err(|error| format!("probe admitted Linux vCPU capacity: {error}"))
+}
+
+fn explicit_hart_count(configured: u32) -> Result<Option<u32>, String> {
+    if configured == 0 {
+        return Ok(None);
+    }
+    if configured > MAX_HARTS as u32 {
+        return Err(format!(
+            "Linux hart count must be between 1 and {MAX_HARTS}, got {configured}"
+        ));
+    }
+    Ok(Some(configured))
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn auto_guest_hart_count(admitted_parallelism: u32) -> u32 {
+    admitted_parallelism.clamp(1, MAX_HARTS as u32)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn reference_hart_count(configured: u32) -> Result<u32, String> {
+    if let Some(count) = explicit_hart_count(configured)? {
+        return Ok(count);
+    }
+    let available = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, MAX_HARTS);
+    u32::try_from(available).map_err(|_| "host CPU count is not addressable".to_string())
+}
+
 #[cfg(any(target_arch = "wasm32", test))]
 fn shared_memory_layout(ram_bytes: usize) -> Result<(u32, u32, u64), String> {
     // Rust's wasm allocator acquires heap segments with `memory.grow`; it does
@@ -602,6 +685,7 @@ mod tests {
         .expect("reference backend admission");
 
         assert_eq!(machine.backend_id(), DEFAULT_LINUX_BACKEND_ID);
+        assert_eq!(machine.hart_count(), 1);
     }
 
     #[test]
@@ -635,5 +719,35 @@ mod tests {
             1696 * 1024 * 1024
         );
         assert!(auto_guest_ram_bytes(2048).is_err());
+    }
+
+    #[test]
+    fn explicit_and_native_auto_hart_topologies_are_bounded() {
+        assert_eq!(explicit_hart_count(0).expect("auto"), None);
+        assert_eq!(explicit_hart_count(8).expect("eight harts"), Some(8));
+        assert!(explicit_hart_count((MAX_HARTS + 1) as u32).is_err());
+        assert!(
+            (1..=MAX_HARTS as u32)
+                .contains(&reference_hart_count(0).expect("native auto topology"))
+        );
+        assert_eq!(auto_guest_hart_count(0), 1);
+        assert_eq!(auto_guest_hart_count(8), 8);
+        assert_eq!(auto_guest_hart_count(128), MAX_HARTS as u32);
+    }
+
+    #[test]
+    fn multi_hart_machine_cold_boots_even_when_prewarm_is_requested() {
+        let machine = LinuxMachine::new(
+            MachineConfig {
+                ram_bytes: AUTO_REFERENCE_RAM_BYTES,
+                max_console_bytes: 64 * 1024,
+            },
+            2,
+            true,
+        )
+        .expect("two-hart cold machine");
+
+        assert_eq!(machine.hart_count(), 2);
+        assert_eq!(machine.ram_bytes(), AUTO_REFERENCE_RAM_BYTES);
     }
 }

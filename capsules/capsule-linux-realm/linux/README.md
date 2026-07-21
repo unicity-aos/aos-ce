@@ -2,8 +2,10 @@
 
 This directory contains the Linux-bearing artifact for `aos-rv64-virt-v0`.
 Linux 6.18.39 boots the checked-in Buildroot 2026.05.1 `newc` root filesystem,
-runs an AOS-owned static `/init` as PID 1, and keeps one single-hart guest
-resident per admitted principal Store.
+runs an AOS-owned static `/init` as PID 1, and keeps one admitted 1–64-hart
+guest resident per principal Store. Automatic topology follows Astrid's current
+principal/host compute admission; every hart is deterministically time-sliced
+inside one generic compute worker in the current implementation.
 
 The current userland is intentionally small but real:
 
