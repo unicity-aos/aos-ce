@@ -18,8 +18,8 @@ pub(crate) const MAX_LINUX_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 pub(crate) const DEFAULT_LINUX_MAX_FILE_BYTES: u64 = 0;
 pub(crate) const MAX_LINUX_MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 /// Zero derives the guest's logical CPU topology from Astrid's admitted
-/// compute parallelism. The interpreter remains one deterministic worker;
-/// logical harts are time-sliced inside that worker.
+/// compute parallelism. The current single-worker interpreter caps auto mode
+/// at two harts; explicit 1–64-hart topologies remain available for testing.
 pub(crate) const DEFAULT_LINUX_VCPUS: u32 = 0;
 pub(crate) const MAX_LINUX_VCPUS: u32 = aos_realm_machine::MAX_HARTS as u32;
 const GUEST_PAGE_BYTES: usize = 4096;

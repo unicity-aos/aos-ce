@@ -26,10 +26,14 @@ pub(crate) const DEFAULT_LINUX_BACKEND_ID: &str = "aos-rv64-interpreter";
 const AUTO_GUEST_RESERVE_BYTES: usize = 128 * 1024 * 1024;
 const AUTO_REFERENCE_RAM_BYTES: usize = 512 * 1024 * 1024;
 #[cfg(any(target_arch = "wasm32", test))]
+const AUTO_INTERPRETER_RAM_BYTES: usize = 1024 * 1024 * 1024;
+#[cfg(any(target_arch = "wasm32", test))]
+const AUTO_INTERPRETER_HARTS: u32 = 2;
+#[cfg(any(target_arch = "wasm32", test))]
 const MAX_GUEST_RAM_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 #[cfg(not(target_arch = "wasm32"))]
-const LINUX_IMAGE: &[u8] = include_bytes!("../linux/Image");
+const LINUX_IMAGE: &[u8] = include_bytes!("../assets/linux-kernel.img");
 
 fn wall_time_seconds() -> Result<u64, String> {
     #[cfg(target_arch = "wasm32")]
@@ -42,6 +46,7 @@ fn wall_time_seconds() -> Result<u64, String> {
         .map_err(|_| "wall clock is before the Unix epoch".to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn linux_bootargs(wall_time_seconds: u64) -> String {
     format!("earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time={wall_time_seconds}")
 }
@@ -118,7 +123,7 @@ impl LinuxMachine {
         }
 
         #[cfg(target_arch = "wasm32")]
-        ComputeMachine::new(config, configured_hart_count).map(Self::Compute)
+        ComputeMachine::new(config, configured_hart_count, wall_time_seconds).map(Self::Compute)
     }
 
     #[cfg(test)]
@@ -300,7 +305,11 @@ struct ComputeResponse {
 
 #[cfg(target_arch = "wasm32")]
 impl ComputeMachine {
-    fn new(mut config: MachineConfig, configured_hart_count: u32) -> Result<Self, String> {
+    fn new(
+        mut config: MachineConfig,
+        configured_hart_count: u32,
+        wall_time_seconds: u64,
+    ) -> Result<Self, String> {
         let mut hart_count = explicit_hart_count(configured_hart_count)?;
         let auto_memory = config.ram_bytes == 0;
         let (initial_pages, mut maximum_pages, mut control_offset) =
@@ -562,7 +571,11 @@ fn explicit_hart_count(configured: u32) -> Result<Option<u32>, String> {
 
 #[cfg(any(target_arch = "wasm32", test))]
 fn auto_guest_hart_count(admitted_parallelism: u32) -> u32 {
-    admitted_parallelism.clamp(1, MAX_HARTS as u32)
+    // This backend has one deterministic worker today. More logical harts add
+    // Linux bring-up and scheduler work without running concurrently, so auto
+    // mode proves SMP with two harts instead of mirroring host CPU count.
+    // Explicit configuration remains available for topology testing.
+    admitted_parallelism.clamp(1, AUTO_INTERPRETER_HARTS)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -629,11 +642,16 @@ fn auto_guest_ram_bytes(maximum_memory_pages: u32) -> Result<usize, String> {
         .and_then(|bytes| bytes.checked_sub(AUTO_GUEST_RESERVE_BYTES))
         .ok_or_else(|| "admitted Linux vCPU memory leaves no guest RAM".to_string())?;
     // The admitted group is already the intersection of host capacity,
-    // operator policy, and the invoking principal's profile. Do not apply a
-    // second arbitrary fraction here: reserve the worker base, allocator
-    // headroom, and a host safety margin, then make the remainder useful to
-    // the guest up to the signed Realm ceiling.
-    let selected = available.clamp(AUTO_REFERENCE_RAM_BYTES, MAX_GUEST_RAM_BYTES);
+    // operator policy, and the invoking principal's profile. The pure RV64
+    // interpreter also has a measured cold-boot cost proportional to guest
+    // memory: 3 GiB exceeds the ordinary five-minute principal timeout on the
+    // M2 Ultra reference host. Auto mode therefore remains host-aware below
+    // 1 GiB but does not silently select a machine that cannot become ready in
+    // the default budget. Explicit configuration retains the signed 3-GiB
+    // ceiling for longer-lived principals and future accelerated backends.
+    let selected = available
+        .clamp(AUTO_REFERENCE_RAM_BYTES, MAX_GUEST_RAM_BYTES)
+        .min(AUTO_INTERPRETER_RAM_BYTES);
     let aligned = selected - (selected % GUEST_PAGE_BYTES);
     if aligned < AUTO_REFERENCE_RAM_BYTES {
         return Err(format!(
@@ -706,7 +724,7 @@ mod tests {
         );
         assert_eq!(
             auto_guest_ram_bytes(57_344).expect("signed worker maximum"),
-            3 * 1024 * 1024 * 1024
+            AUTO_INTERPRETER_RAM_BYTES
         );
         assert!(auto_guest_ram_bytes(2048).is_err());
     }
@@ -721,8 +739,8 @@ mod tests {
                 .contains(&reference_hart_count(0).expect("native auto topology"))
         );
         assert_eq!(auto_guest_hart_count(0), 1);
-        assert_eq!(auto_guest_hart_count(8), 8);
-        assert_eq!(auto_guest_hart_count(128), MAX_HARTS as u32);
+        assert_eq!(auto_guest_hart_count(8), AUTO_INTERPRETER_HARTS);
+        assert_eq!(auto_guest_hart_count(128), AUTO_INTERPRETER_HARTS);
     }
 
     #[test]

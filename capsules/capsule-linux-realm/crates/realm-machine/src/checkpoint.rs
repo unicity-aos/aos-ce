@@ -165,25 +165,17 @@ impl MachineCheckpoint {
         push_u64(&mut bytes, pending.request.max_response_bytes as u64);
         push_u64(&mut bytes, pending.response_address);
 
-        let populated_pages = machine
-            .devices
-            .ram
-            .chunks_exact(PAGE_BYTES)
-            .filter(|page| page.iter().any(|byte| *byte != 0))
-            .count();
+        let populated_pages = machine.devices.ram.nonzero_pages(PAGE_BYTES);
         push_u32(
             &mut bytes,
-            u32::try_from(populated_pages).expect("admitted RAM has at most 65,536 pages"),
+            u32::try_from(populated_pages.len()).expect("admitted RAM has at most 65,536 pages"),
         );
-        for (index, page) in machine.devices.ram.chunks_exact(PAGE_BYTES).enumerate() {
-            if page.iter().all(|byte| *byte == 0) {
-                continue;
-            }
+        for (index, page) in populated_pages {
             push_u32(
                 &mut bytes,
                 u32::try_from(index).expect("admitted RAM page index fits u32"),
             );
-            bytes.extend_from_slice(page);
+            bytes.extend_from_slice(&page);
         }
 
         let digest = blake3::hash(&bytes);
@@ -322,8 +314,9 @@ impl MachineCheckpoint {
                 return Err(CheckpointDecodeError::InvalidField("RAM page order"));
             }
             let page_bytes = decoder.take(PAGE_BYTES)?;
-            let start = page * PAGE_BYTES;
-            machine.devices.ram[start..start + PAGE_BYTES].copy_from_slice(page_bytes);
+            if !machine.devices.ram.write_page(page, PAGE_BYTES, page_bytes) {
+                return Err(CheckpointDecodeError::InvalidField("RAM page range"));
+            }
             previous_page = Some(page);
         }
         if !decoder.is_empty() {

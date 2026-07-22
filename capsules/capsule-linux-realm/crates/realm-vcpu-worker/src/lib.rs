@@ -1,9 +1,9 @@
 //! Stateful RV64 machine worker behind the Astrid generic-compute ABI.
 //!
-//! This core-Wasm module deliberately imports only
-//! `astrid_compute.memory`. The controller owns every host effect and exchanges
-//! bounded commands, slice reports, console bytes, and 9P messages through the
-//! descriptor region in that shared memory.
+//! This core-Wasm module deliberately imports only shared memory and immutable
+//! asset reads from `astrid_compute`. The controller owns every host effect and
+//! exchanges bounded commands, slice reports, console bytes, and 9P messages
+//! through the descriptor region in that shared memory.
 
 #![deny(clippy::all)]
 #![deny(unreachable_pub)]
@@ -21,8 +21,25 @@ use aos_realm_vcpu_protocol::{
 use std::sync::Mutex;
 
 const ABI_VERSION: i32 = 1;
+#[cfg(target_arch = "wasm32")]
+const LINUX_KERNEL_ASSET_INDEX: i32 = 0;
+#[cfg(target_arch = "wasm32")]
+const MAX_LINUX_KERNEL_BYTES: usize = 256 * 1024 * 1024;
+#[cfg(target_arch = "wasm32")]
+const MAX_ASSET_READ_BYTES: usize = 64 * 1024;
+#[cfg(target_arch = "wasm32")]
+const ASSET_OK: i32 = 0;
 
-const LINUX_IMAGE: &[u8] = include_bytes!("../../../linux/Image");
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "astrid_compute")]
+unsafe extern "C" {
+    #[link_name = "asset_count"]
+    fn host_asset_count() -> i32;
+    #[link_name = "asset_size"]
+    fn host_asset_size(index: i32) -> i64;
+    #[link_name = "asset_read"]
+    fn host_asset_read(index: i32, offset: i64, destination: i64, length: i64) -> i32;
+}
 
 struct WorkerState {
     machine: Machine,
@@ -149,16 +166,65 @@ fn initialize(bytes: &mut [u8]) -> WorkerResult {
         hart_count,
     )
     .map_err(|error| machine_error(error.to_string()))?;
+    let linux_image = load_linux_image()?;
     let bootargs =
         format!("earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time={wall_time_seconds}");
     machine
-        .boot_linux(LINUX_IMAGE, &[], &bootargs)
+        .boot_linux(&linux_image, &[], &bootargs)
         .map_err(|error| machine_error(error.to_string()))?;
     *STATE.lock().expect("worker state lock") = Some(WorkerState {
         machine,
         pending_request: None,
     });
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_linux_image() -> Result<Vec<u8>, (Status, String)> {
+    // SAFETY: these exact imports are validated and linked by Astrid before the
+    // worker can start. They expose no path and read only the hash-bound asset
+    // list attached to this signed compute worker.
+    let asset_count = unsafe { host_asset_count() };
+    if asset_count <= LINUX_KERNEL_ASSET_INDEX {
+        return Err(machine_error("Linux kernel asset is not attached"));
+    }
+    // SAFETY: the index was admitted above; a negative status still fails
+    // closed before allocation.
+    let asset_size = unsafe { host_asset_size(LINUX_KERNEL_ASSET_INDEX) };
+    let size = usize::try_from(asset_size)
+        .ok()
+        .filter(|size| (1..=MAX_LINUX_KERNEL_BYTES).contains(size))
+        .ok_or_else(|| machine_error("Linux kernel asset size is outside the admitted range"))?;
+    let mut image = Vec::new();
+    image
+        .try_reserve_exact(size)
+        .map_err(|_| machine_error("Linux kernel asset allocation was denied"))?;
+    image.resize(size, 0);
+    for offset in (0..size).step_by(MAX_ASSET_READ_BYTES) {
+        let length = (size - offset).min(MAX_ASSET_READ_BYTES);
+        let destination = i64::try_from(image[offset..].as_mut_ptr() as usize)
+            .map_err(|_| machine_error("Linux kernel destination is not addressable"))?;
+        let offset = i64::try_from(offset)
+            .map_err(|_| machine_error("Linux kernel offset is not addressable"))?;
+        let length = i64::try_from(length)
+            .map_err(|_| machine_error("Linux kernel chunk is not addressable"))?;
+        // SAFETY: `destination..destination+length` is the live mutable chunk
+        // in `image`; Astrid bounds the source and destination and returns only
+        // after the atomic copy has completed.
+        let status =
+            unsafe { host_asset_read(LINUX_KERNEL_ASSET_INDEX, offset, destination, length) };
+        if status != ASSET_OK {
+            return Err(machine_error(format!(
+                "Linux kernel asset read failed with status {status}"
+            )));
+        }
+    }
+    Ok(image)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_linux_image() -> Result<Vec<u8>, (Status, String)> {
+    Ok(include_bytes!("../../../assets/linux-kernel.img").to_vec())
 }
 
 fn run_slice(bytes: &mut [u8]) -> WorkerResult {
@@ -415,9 +481,10 @@ fn machine_error(message: impl Into<String>) -> (Status, String) {
 mod tests {
     use super::*;
 
-    const SIGNED_WORKER: &[u8] = include_bytes!("../../../assets/linux-vcpu.wasm");
     const SIGNED_WORKER_HASH: &str =
-        "blake3:2e571fa14f7369f4a4e790f11c35a5334e449e400707cf9cc0d236520b702cb1";
+        "blake3:989fbacab512da6c6ef34b1f6ed3b32f9d9c0a4a5a180c2c82662c15f6546609";
+    const SIGNED_KERNEL_HASH: &str =
+        "blake3:fd3bff3a266b66fc1596c16414a5cd7ef7d2c68eb76684627ab8d4d6e74647e8";
 
     fn request(operation: u32, input: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0_u8; protocol::HEADER_BYTES + input.len()];
@@ -565,13 +632,27 @@ mod tests {
     fn signed_worker_cold_boots_two_linux_cpus_inside_the_real_compute_runtime() {
         use astrid_compute::{
             ComputeLedger, ComputeLimits, ComputeRuntime, ExecutionMode, GroupRequest, Parallelism,
-            WorkDescriptor, WorkerArtifact,
+            WorkDescriptor, WorkerArtifact, WorkerAssetSpec,
         };
         use astrid_core::principal::PrincipalId;
+        use std::path::{Path, PathBuf};
 
-        let artifact =
-            WorkerArtifact::from_bytes(protocol::WORKER_ID, SIGNED_WORKER, SIGNED_WORKER_HASH)
-                .expect("signed worker hash");
+        let capsule_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("capsule root");
+        let artifact = WorkerArtifact::from_capsule_path_with_assets(
+            protocol::WORKER_ID,
+            capsule_root,
+            Path::new("assets/linux-vcpu.wasm"),
+            SIGNED_WORKER_HASH,
+            &[WorkerAssetSpec {
+                id: "linux-kernel".to_owned(),
+                relative_path: PathBuf::from("assets/linux-kernel.img"),
+                expected_hash: SIGNED_KERNEL_HASH.to_owned(),
+            }],
+        )
+        .expect("signed worker and kernel asset");
         let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
             .expect("compute runtime");
         let group = runtime
