@@ -135,6 +135,24 @@ pub struct ExecArgs {
     pub max_output_bytes: Option<usize>,
 }
 
+/// Agent-facing shell request that can execute only inside the Linux Realm.
+///
+/// This deliberately does not expose a host executable or host-process option.
+/// The command is delivered to Bash in the principal-affine RV64 Linux guest;
+/// the host only drives the metered virtual machine and its confined mounts.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RealmShellArgs {
+    /// Exact script to execute inside the Linux Realm.
+    pub command: String,
+    /// Guest-visible CWD beneath `/home/agent` or `/workspace`.
+    pub cwd: Option<String>,
+    /// Optional lower guest-step ceiling. It cannot raise the principal limit.
+    pub max_steps: Option<u64>,
+    /// Optional lower output ceiling. It cannot raise the principal limit.
+    pub max_output_bytes: Option<usize>,
+}
+
 #[derive(Debug, Serialize)]
 struct ExecResponse {
     realm: &'static str,
@@ -410,6 +428,22 @@ impl LinuxRealm {
         actor::execute_resident(&principal, args, RealmResources::load()?)
     }
 
+    /// Run a foreground shell command inside the caller's Linux Realm.
+    ///
+    /// This is the normal shell surface for agents. It never invokes a host
+    /// shell and the capsule declares no `host_process` capability. Files built
+    /// in `/workspace` therefore remain data on the host and execute only in the
+    /// guest unless a separate, explicitly privileged boundary promotes them.
+    #[astrid::tool("realm_shell", mutable)]
+    pub fn shell(&self, args: RealmShellArgs) -> Result<String, SysError> {
+        let principal = caller_principal()?;
+        actor::execute_resident(
+            &principal,
+            realm_shell_exec_args(args),
+            RealmResources::load()?,
+        )
+    }
+
     /// Discover the per-consumer CWD and mount projections without exposing
     /// physical host paths. Call this before selecting a path for a Realm job.
     #[astrid::tool("linux_realm_status")]
@@ -539,6 +573,17 @@ fn cli_exec(command: &str, args: Vec<String>, cwd: Option<String>) -> ExecArgs {
         cwd,
         fuel: None,
         max_output_bytes: None,
+    }
+}
+
+fn realm_shell_exec_args(args: RealmShellArgs) -> ExecArgs {
+    ExecArgs {
+        program: Some(RealmProgram::LinuxSh),
+        command: None,
+        args: vec![args.command],
+        cwd: args.cwd,
+        fuel: args.max_steps,
+        max_output_bytes: args.max_output_bytes,
     }
 }
 
@@ -1947,6 +1992,23 @@ mod tests {
     }
 
     #[test]
+    fn agent_realm_shell_can_only_select_the_linux_guest_shell() {
+        let args = realm_shell_exec_args(RealmShellArgs {
+            command: "cc hello.c -o hello && ./hello".to_string(),
+            cwd: Some("/workspace/project".to_string()),
+            max_steps: Some(50_000_000),
+            max_output_bytes: Some(16_384),
+        });
+
+        assert!(matches!(args.program, Some(RealmProgram::LinuxSh)));
+        assert!(args.command.is_none(), "no executable selector is accepted");
+        assert_eq!(args.args, ["cc hello.c -o hello && ./hello"]);
+        assert_eq!(args.cwd.as_deref(), Some("/workspace/project"));
+        assert_eq!(args.fuel, Some(50_000_000));
+        assert_eq!(args.max_output_bytes, Some(16_384));
+    }
+
+    #[test]
     fn cli_actions_reject_ambiguous_or_incomplete_shell_input() {
         let error = parse_cli_action(&["sh".to_string(), "echo".to_string(), "split".to_string()])
             .expect_err("a shell script must remain one CLI argument");
@@ -3014,6 +3076,10 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
         );
         assert!(capabilities.contains_key("fs_read"));
         assert!(capabilities.contains_key("fs_write"));
+        assert_eq!(
+            manifest["subscribe"]["tool.v1.execute.realm_shell"]["handler"].as_str(),
+            Some("tool_execute_realm_shell")
+        );
     }
 
     #[test]
