@@ -107,17 +107,23 @@ The diagnostic `linux-console` surface admits only `ping`, `counter`, and
 
 `SOURCES.lock` records the verified kernel.org and Buildroot archives, the
 Buildroot signing-key fingerprint, exact source/toolchain versions, the pinned
-OCI builder, and all retained artifact digests. `build-userland.sh` requires an
+OCI builder, and the retained bootstrap outputs used by the historical prewarm
+proof. `DEVELOPMENT.lock` separately binds the development stage, guest-tool
+inputs, shipped guest binaries, final rootfs, and kernel image. Keeping the two
+identities separate prevents a compiler-image refresh from silently rewriting
+the bootstrap checkpoint's source identity. `build-userland.sh` requires an
 exact Buildroot 2026.05.1 tree, verifies the generated RV64GC/LP64D shared-glibc
 configuration and Rust distribution hashes before compiling, uses Buildroot's
-forced package-hash checks, and rejects a rootfs digest mismatch.
+forced package-hash checks, and rejects a development-stage digest mismatch.
 `prepare-guest-tools.sh` verifies and extracts the official Linux/AArch64 Rust
 host archive, its RISC-V standard library, the published `astrid-build` crate,
 and rustup source. `build-guest-tools.sh` cross-builds the two guest-native
 binaries with Buildroot's admitted RISC-V linker and rejects host path leakage.
-`assemble-userland.sh` installs them and asks Buildroot to reproducibly rebuild
-the final CPIO. `build-image.sh` similarly requires Linux
-6.18.39, Clang/LLD 18.1.3, the recorded rootfs, and a clean output directory.
+`assemble-userland.sh` verifies and installs them, asks Buildroot to
+reproducibly rebuild the final CPIO, then verifies both stripped guest binaries
+and the final archive against `DEVELOPMENT.lock`. `build-image.sh` similarly
+requires Linux 6.18.39, Clang/LLD 18.1.3, the recorded development rootfs, and a
+clean output directory before accepting the recorded image.
 
 The earlier 32 MiB seed proved that an AOS-owned RV64 checkpoint can stop at a
 principal-free 9P suspension and attach fresh providers after restore. It is not

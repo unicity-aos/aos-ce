@@ -14,5 +14,6 @@ The generated target and host source trees are about 454 MiB and are not checked
 into this repository. Before distributing the capsule, release packaging must
 regenerate `make legal-info`, add the exact Buildroot 2026.05.1 source tree, add
 the exact Linux 6.18.39 source tree, review Buildroot's warnings, and publish the
-corresponding source bundle alongside the binary artifact. `SOURCES.lock`
-provides the upstream archive identities needed for that release gate.
+corresponding source bundle alongside the binary artifact. `SOURCES.lock` and
+`DEVELOPMENT.lock` provide the upstream and output identities needed for that
+release gate.

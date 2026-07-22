@@ -23,8 +23,18 @@ if [ "$#" -eq 4 ]; then
 else
     output_image=$script_dir/../assets/linux-kernel.img
 fi
-expected_rootfs=10d26184e85add731208050fb3da9fed5e1dda7475b6e66e0d9814a221ecf3f4
-expected_image=7cb62638de9f41c2fe2a237a1c46642189b6d97e373c8592cc931f74f88419ff
+development_lock=$script_dir/DEVELOPMENT.lock
+if [ ! -f "$development_lock" ] || \
+    ! grep -qxF 'format=aos-realm-development-image-1' "$development_lock"; then
+    echo "missing or invalid development generation lock: $development_lock" >&2
+    exit 66
+fi
+expected_rootfs=$(sed -n 's/^rootfs_cpio_sha256=//p' "$development_lock")
+expected_image=$(sed -n 's/^image_sha256=//p' "$development_lock")
+if [ -z "$expected_rootfs" ] || [ -z "$expected_image" ]; then
+    echo "development generation lock is missing rootfs or image identity" >&2
+    exit 66
+fi
 record_image=${AOS_RECORD_IMAGE:-0}
 build_jobs=${AOS_BUILD_JOBS:-8}
 
