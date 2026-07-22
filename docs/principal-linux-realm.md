@@ -816,7 +816,8 @@ The ambiguity rules are:
 | An invocation-scoped reference is reused later | Reject it unless the runtime rebinds the same attachment explicitly |
 | A durable-home generation changed | Treat the captured generation as admission evidence, not an assertion about the latest head |
 | A path escapes every admitted root, uses an unmounted root, or has a physical host prefix | Reject before any storage operation |
-| A symlink would escape a mount | Resolve beneath the mount in the transport and reject the escape |
+| A symlink appears anywhere in the workspace projection | Reject it; the current 9P server neither creates nor traverses symlinks, while Astrid's host VFS independently resolves beneath its capability root |
+| A pre-existing hard link aliases an inode outside the attachment | Reject multi-link regular files at attachment admission or materialize a private copy; pathname confinement alone cannot prove the location of every inode alias |
 | Principal B replays principal A's reference | Reject at the stamped-principal and mount-ownership boundary |
 | Linux requests a workspace descendant that does not exist after mount | Let guest `chdir` fail; do not redirect it to home or create it implicitly |
 
@@ -1687,6 +1688,9 @@ outer principal identity.
 The capsule uses existing tool-bus conventions without creating a public WIT
 package. The live seed exports:
 
+- `realm_shell`: the normal agent-facing foreground shell; it always executes
+  Bash inside the caller's principal-affine Linux Realm and has no host-process
+  mode or host executable selector;
 - `linux_realm_exec`: run one exact signed program with structured arguments, CWD,
   and caller-reducible fuel/output limits; the temporary `rv64-smoke` diagnostic
   selects the bounded RV64 backend explicitly rather than a signed core-WASM guest;
@@ -1729,15 +1733,50 @@ linked into every capsule.
   through Bash and `curl` would add authority and failure modes without benefit.
 - Build-oriented capsules such as Forge may eventually delegate compilation to a
   disposable realm clone and receive only a verified artifact plus build receipt.
-- The current `aos-shell` capsule remains the explicitly privileged host-process
-  compatibility path until the realm has real shell/process/toolchain parity. It
-  can then leave the default CE set without deleting the emergency compatibility
-  option.
+- The current `aos-shell` capsule is an explicitly privileged operator
+  compatibility path, not an agent fallback. The Realm's default agent-facing
+  tool is `realm_shell`; an unavailable Realm fails closed instead of silently
+  executing the same request on the host. Once interactive and background-process
+  parity is measured, `aos-shell` leaves the default CE set without deleting the
+  separately installable emergency option.
 
 There is normally one durable realm per principal and profile, with many bounded
 process jobs. There is not one Linux image per calling capsule. Jobs that execute
 untrusted package hooks or builds can run in disposable clones derived from the
 principal's selected snapshot.
+
+### 13.2 Execution and artifact promotion are different authorities
+
+`realm_shell` executes workspace bytes only as files or Linux executables inside
+the guest. Writing an ELF, script, dynamic library, compiler output, or
+`.capsule` archive to `/workspace` does not make it executable by the host and
+does not install it into Astrid. There is no automatic fallback from a failed
+Realm command to a native process.
+
+The transitions are deliberately separate:
+
+| Transition | Required boundary |
+| --- | --- |
+| Realm writes or executes a workspace program | Realm filesystem and process policy; no host execution |
+| Realm exports a build result | Immutable digest plus producer, target, inputs, and resource receipt |
+| Astrid installs a built capsule | Independent archive and manifest verification plus install authority |
+| Installed capsule receives capabilities | Declared capabilities intersect the installer's delegable ceiling; installation alone cannot mint `host_process` or broader filesystem/network authority |
+| Operator runs a native compatibility command | Separately installed host-process capsule, explicit operator authority and approval; never reachable as a `realm_shell` fallback |
+
+The immutable digest matters because approving a pathname and executing it later
+permits a writer to swap the bytes between those operations. Promotion snapshots
+the candidate into content-addressed storage, verifies that snapshot, and passes
+the digest—not a mutable workspace path—to the installer. Interpreters are part
+of the same rule: `bash file`, `python file`, dynamic loaders, package hooks, and
+`cargo run` execute workspace-controlled bytes even when the selected host
+binary itself is trusted.
+
+The current kernel already gates daemon-wide installation with
+`capsule:install`, rejects archive traversal and link entries, and runs installed
+Wasm inside Astrid's capability boundary. The remaining non-amplification work is
+to make the installer's delegable capability ceiling explicit before introducing
+self-service Realm-to-capsule promotion. Until that exists, Realm builds produce
+inert candidates; they are not self-installed.
 
 Delegation must not union authority. The effective authority of a submitted job is
 the intersection of:
@@ -2515,6 +2554,10 @@ The design must be tested against at least these scenarios:
 | Both use the same base/tool binary | Immutable bytes may be deduplicated |
 | A supplies B's principal id in JSON | Ignored/rejected; host-stamped A is used |
 | Guest root reads host path | No mount and no corresponding host import |
+| Guest creates a 9P symlink | `EOPNOTSUPP`; no link is created |
+| Workspace contains a symlink to an outside sentinel | Walk, stat, read, write, rename, and remove cannot reach the target |
+| Workspace symlink target is swapped during repeated opens | Astrid's capability-root operation still cannot leave the attachment |
+| Workspace contains a hard link with another alias outside the attachment | Attachment is rejected or materialized before Realm exposure |
 | Guest root rewrites network config | Outer egress policy remains unchanged |
 | Guest forks without support | Explicit `ENOSYS`, never partial cloning |
 | Guest loops forever | Fuel/deadline terminates or suspends it |
@@ -2523,6 +2566,9 @@ The design must be tested against at least these scenarios:
 | Base image is upgraded | Existing realm remains bound or migrates explicitly |
 | Snapshot uses another engine version | Rejected unless compatibility is established |
 | Agent builds malicious capsule | Candidate leaves only through verifier/install policy |
+| Agent builds and runs a native program through `realm_shell` | Program executes only in the RV64 Linux guest; host bytes remain inert |
+| Agent passes a Realm-built path to a host interpreter | No default route exists; native compatibility requires separate operator authority and content-bound approval |
+| Agent requests install of a capsule declaring authority above its delegable ceiling | Denied before install mutation or load |
 | Process requests more authority than realm | Denied; children cannot widen outer grants |
 | Package script accesses a secret | No secret unless exact lease was granted |
 | Shared cache is corrupted | Digest mismatch rejects entry without cross-principal mutation |
@@ -2749,7 +2795,8 @@ This work preserves the current system:
 
 - current capsules remain Component Model artifacts;
 - current manifest, topic, principal, capability, and install semantics remain;
-- `aos-shell` remains a host-process compatibility tool during migration;
+- `aos-shell` remains a separately privileged host-process compatibility tool
+  during migration and is never an implicit fallback for `realm_shell`;
 - the realm becomes the default agent shell/build service only after measured
   parity, while ordinary capsules keep their narrow interfaces;
 - the Linux realm does not replace the kernel's capability enforcement;
@@ -2895,6 +2942,9 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
 - [x] return exact result, trap, and accounting records through the existing tool
   topic convention;
 - [x] produce an installable artifact with no `host_process` capability;
+- [x] expose `realm_shell` directly from the Realm capsule, map it only to the
+  resident Linux Bash action, and provide no native-host fallback or executable
+  selector;
 - [x] test malformed modules, undeclared imports, invalid pointers, unknown
   descriptors, fuel exhaustion, output exhaustion, memory admission, and forged
   principal input;
@@ -2906,6 +2956,14 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   audience-specific renderings, and projection state without physical host paths;
 - [ ] carry an opaque workspace attachment ID and epoch from runtime admission to
   Realm receipts and the already-live Linux file transport;
+- [ ] add the live denied-path matrix: unsupported guest symlink creation,
+  pre-seeded symlink traversal, concurrent link-swap opens, special nodes, and a
+  conservative hard-link admission rule or private attachment materialization;
+- [ ] make Realm build export immutable candidates by digest and receipt rather
+  than approving mutable workspace paths;
+- [ ] enforce an installer delegable-capability ceiling before any Realm-built
+  capsule can self-install, with `host_process`, host filesystem, and network
+  authority denied unless independently delegated by an operator;
 - [x] implement the bounded 9P2000.L server, Astrid `cwd://` adapter, private
   SBI host-request boundary, GPL Linux transport, per-call remount, and exact
   Linux read/write/rename/remount regression without adding virtio, PLIC, sockets,
@@ -3067,8 +3125,10 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
 - [ ] complete the seven-step in-guest Rust build/run/artifact receipt proof;
 - [ ] define the attenuating capsule-to-realm job contract and migrate Forge as the
   first non-interactive consumer after artifact verification exists;
-- [ ] replace `aos-shell` in the default distro only after interactive and
-  background-process parity is measured; retain an explicit compatibility path;
+- [ ] make `realm_shell` the default distro shell route now that it executes the
+  real Linux workbench; keep incomplete interactive and background operations
+  visibly unsupported, and retain `aos-shell` only as an explicitly installed
+  operator compatibility path;
 - [ ] fix or consume an `astrid-build` release that normalizes archive metadata,
   then add a same-input/same-capsule-digest reproducibility test;
 - [ ] keep the seed out of the signed Unicity CE default capsule set until it is a

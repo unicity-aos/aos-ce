@@ -54,6 +54,7 @@ linux_vcpus = { type = "integer", default = "0", request = "Logical Linux CPUs (
 
 [subscribe]
 "tool.v1.execute.linux_realm_exec" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_linux_realm_exec" }
+"tool.v1.execute.realm_shell" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_realm_shell" }
 "tool.v1.execute.linux_realm_status" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_linux_realm_status" }
 "tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }
 "cli.v1.command.run.aos-linux-realm" = { wit = "opaque", handler = "cli_run_linux_realm" }

@@ -26,8 +26,14 @@ agent -> realm tool -> signed nested WASM command -> private realm ABI
 
 ## What works
 
-`linux_realm_exec` currently admits signed core-WASM workloads, two diagnostic
-RV64 instruction images, and the first resident Linux boot image:
+`realm_shell` is the normal agent-facing shell tool. Its `command` is executed
+by Bash as UID/GID 1000 inside the caller's resident Linux Realm, with an
+optional guest `cwd`, lower guest-step ceiling, and lower output ceiling. It has
+no host execution mode and never falls back to `aos-shell`.
+
+`linux_realm_exec` is the lower-level structured and diagnostic surface. It
+currently admits signed core-WASM workloads, two diagnostic RV64 instruction
+images, and the first resident Linux boot image:
 
 - `pwd`
 - `echo`
