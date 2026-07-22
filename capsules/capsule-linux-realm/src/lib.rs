@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 const HARD_MAX_FUEL: u64 = 100_000;
 const HARD_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const HARD_MEMORY_BYTES: usize = 64 * 1024;
-const LINUX_SLICE_STEPS: u64 = 100_000;
+const LINUX_SLICE_STEPS: u64 = aos_realm_vcpu_protocol::MAX_SLICE_STEPS;
 // `/dev/console` has the normal TTY output transformation enabled, so the
 // init protocol's line feeds emerge as CRLF on the SBI debug console.
 const LINUX_READY_MARKER: &[u8] = b"AOS READY\r\n";

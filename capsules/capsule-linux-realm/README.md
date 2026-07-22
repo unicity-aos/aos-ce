@@ -5,11 +5,12 @@ agent workbench whose guest interface is Linux-shaped and whose outer authority
 is an ordinary Astrid capsule.
 
 It keeps Linux resident for each active principal. The capsule runs signed,
-embedded core WebAssembly command modules under Wasmi and a pinned Linux
-6.18.39 image inside the bounded `aos-rv64-virt-v1` machine. Linux reaches an
+embedded core WebAssembly command modules under Wasmi and a signed core-Wasm
+RV64 worker whose pinned Linux 6.18.39 image is a separate hash-bound,
+read-only capsule asset. Linux reaches an
 AOS-controlled PID 1, accepts token-bound command frames, and remains alive
-until explicit shutdown or runtime eviction. The checked-in capsule still
-embeds the small BusyBox bootstrap image. A separately built development image
+until explicit shutdown or runtime eviction. The checked-in kernel asset still
+contains the small BusyBox bootstrap initramfs. A separately built development image
 has also completed the full interpreter test with Bash, Git, Python,
 Clang/C++, Make, CMake, and Ninja; immutable distribution packaging remains the
 step between that proof artifact and the installable capsule.
@@ -42,9 +43,11 @@ RV64 instruction images, and the first resident Linux boot image:
   mode with `mret`, delegates a Supervisor `ecall` through `stvec`, returns with
   `sret`, writes `STR\n`, and halts from Supervisor mode. It charges 31 bounded
   steps while retiring 30 instructions because `ecall` does not retire
-- `linux-boot`, which lazily boots the embedded Linux 6.18.39 `Image` in the
+- `linux-boot`, which lazily boots the hash-bound Linux 6.18.39 image in the
   principal's admitted 512 MiB–3 GiB envelope and returns when `/init` reports
-  `AOS READY`; calling it again while warm is a zero-step readiness check
+  `AOS READY`; interpreter auto mode selects at most 1 GiB and two logical
+  harts, while explicit principal configuration retains the full ceiling;
+  calling it again while warm is a zero-step readiness check
 - `linux-console`, which lazily boots if needed, sends one validated line to the
   resident `/init`, and returns one framed result while preserving Linux RAM;
   the proof commands are `ping`, `counter`, and `echo ...`
@@ -311,7 +314,7 @@ and inspect state before retrying.
 
 The principal-affine component Store owns one optional `Rv64Machine`. The first
 `linux-boot`, `linux-console`, or `linux-sh` allocates admitted RAM and advances
-the guest in bounded 100,000-step slices until `/init` is ready. Later calls
+the guest in bounded 1,000,000-step slices until `/init` is ready. Later calls
 resume the same kernel and userspace memory, so the `counter` proof advances
 across separate tool invocations. There is no background CPU: Linux advances
 only inside an admitted, metered invocation. A clean `linux-shutdown`, execution failure, output-limit
@@ -331,11 +334,11 @@ per-capsule configuration on every operation:
 
 | Config key | Default | Admitted range | Meaning |
 | --- | ---: | ---: | --- |
-| `linux_memory_bytes` | 0 | 0, or 536870912–3221225472 aligned to 4 KiB | Guest-visible RV64 RAM; zero uses the current host/principal compute admission after reserving worker and safety headroom |
+| `linux_memory_bytes` | 0 | 0, or 536870912–3221225472 aligned to 4 KiB | Guest-visible RV64 RAM; zero uses current host/principal admission but caps the interpreter at its measured 1 GiB cold-boot default |
 | `linux_max_steps` | 0 | 0–1000000000000 | Guest steps admitted per invocation; zero delegates to Astrid's outer principal CPU and timeout policy |
 | `linux_max_output_bytes` | 65536 | 1–65536 | Captured Linux output per invocation |
 | `linux_max_file_bytes` | 0 | 0–1099511627776 | Guest `RLIMIT_FSIZE`; zero applies no extra inner cap and leaves Astrid's principal storage quota in force |
-| `linux_vcpus` | 0 | 0–64 | Logical Linux CPUs; zero derives a useful topology from current principal/host compute admission, while 1–64 selects an exact time-sliced topology |
+| `linux_vcpus` | 0 | 0–64 | Logical Linux CPUs; zero selects up to two SMP harts for the current single-worker interpreter, while 1–64 selects an exact time-sliced topology |
 
 Operators control the enclosing pool independently from each principal. With
 both host keys omitted, Astrid derives the worker count from useful CPU
@@ -375,9 +378,12 @@ and worker parallelism, releases the probe, and retains one exact deterministic
 worker. For RAM it keeps the worker's fixed 64 MiB base, allocator headroom, and
 a 128 MiB safety reserve outside guest RAM, uses the remaining
 principal-admitted capacity, aligns down to a guest page, and never exceeds 3
-GiB. The daemon and principal profile have already bounded the process-wide pool
-before this calculation. For vCPUs it clamps the parallelism hint to the
-machine's 1–64-hart range. An explicit
+GiB when explicitly configured. Auto mode stops at the measured 1 GiB
+interpreter default so it can become ready inside the ordinary principal
+timeout. The daemon and principal profile have already bounded the process-wide
+pool before this calculation. For vCPUs auto mode clamps the parallelism hint
+to two logical harts because one deterministic worker cannot run them in
+parallel. An explicit
 `linux_vcpus` value is a logical topology override and does not reserve idle
 native workers. Explicit limits remain useful for repeatable tests and managed
 tiers; insufficient outer admission fails closed.
@@ -519,7 +525,7 @@ nested descriptor closes, so a trapped command does not leave a partial guest
 file. Durable-home closes select a content-addressed generation with a KV CAS;
 workspace and temporary files retain their outer mount semantics.
 
-The embedded kernel executes general RV64 Linux syscalls, including PID 1's
+The packaged, hash-bound kernel asset executes general RV64 Linux syscalls, including PID 1's
 console, mount, credential, process, and reboot paths; the earlier nested
 core-WASM process lane still uses the private Realm ABI. Static musl, BusyBox
 `execve`, and `ash` are live. This slice does not yet provide shared or inherited

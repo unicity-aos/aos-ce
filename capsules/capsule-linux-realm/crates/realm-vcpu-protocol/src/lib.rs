@@ -93,7 +93,7 @@ pub mod field {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Operation {
-    /// Create a machine and boot the embedded Linux image.
+    /// Create a machine and boot its immutable, hash-bound Linux kernel asset.
     InitCold = 1,
     /// Execute one bounded RV64 scheduling slice.
     RunSlice = 2,

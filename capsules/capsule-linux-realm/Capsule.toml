@@ -16,13 +16,19 @@ id = "linux-realm"
 file = "aos_linux_realm.wasm"
 type = "executable"
 
-# Hash-pinned core-Wasm machine object. It imports only shared memory; the
-# executable controller retains every Astrid host capability and 9P provider.
+# Hash-pinned core-Wasm machine object. It imports shared memory and bounded
+# reads of the immutable kernel asset below; the executable controller retains
+# every Astrid host capability and 9P provider.
 [[component]]
 id = "linux-vcpu"
 file = "assets/linux-vcpu.wasm"
 type = "compute-worker"
-hash = "blake3:2e571fa14f7369f4a4e790f11c35a5334e449e400707cf9cc0d236520b702cb1"
+hash = "blake3:989fbacab512da6c6ef34b1f6ed3b32f9d9c0a4a5a180c2c82662c15f6546609"
+
+[[component.asset]]
+id = "linux-kernel"
+file = "assets/linux-kernel.img"
+hash = "blake3:fd3bff3a266b66fc1596c16414a5cd7ef7d2c68eb76684627ab8d4d6e74647e8"
 
 # The realm sees only the invocation CWD, its private subtree of the caller's
 # principal home, and its principal-scoped tmp subtree. It has no host_process.
@@ -35,11 +41,11 @@ fs_write = ["cwd://", "home://.local/share/aos-realm/", "home://.local/tmp/aos-r
 # profile remains the outer CPU, memory, storage, and timeout authority; these
 # values cannot enlarge the enclosing Wasmtime Store or bypass its meter.
 [env]
-linux_memory_bytes = { type = "integer", default = "0", request = "AOS Realm guest RAM in bytes (0 = auto from host and principal admission; explicit range 512 MiB to 3 GiB)" }
+linux_memory_bytes = { type = "integer", default = "0", request = "AOS Realm guest RAM in bytes (0 = host/principal-aware auto up to the measured 1 GiB interpreter default; explicit range 512 MiB to 3 GiB)" }
 linux_max_steps = { type = "integer", default = "0", request = "Maximum interpreted Linux guest steps per invocation (0 uses Astrid's outer principal CPU and timeout policy; otherwise 1 to 1000000000000)" }
 linux_max_output_bytes = { type = "integer", default = "65536", request = "Maximum Linux command output bytes per invocation (1 to 65536)" }
 linux_max_file_bytes = { type = "integer", default = "0", request = "Maximum bytes per Linux-created file (0 uses only Astrid's outer principal storage quota; otherwise 1 to 1099511627776)" }
-linux_vcpus = { type = "integer", default = "0", request = "Logical Linux CPUs (0 = auto from host and principal compute admission; explicit range 1 to 64)" }
+linux_vcpus = { type = "integer", default = "0", request = "Logical Linux CPUs (0 = auto up to 2 for the current single-worker interpreter; explicit range 1 to 64)" }
 
 [publish]
 "tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }

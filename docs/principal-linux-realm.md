@@ -234,7 +234,7 @@ timer, fuel, trap, and host-suspension path.
 
 The host-side release measurement on 2026-07-21 used the checked-in Linux image
 and `cargo run --release -p aos-realm-machine --example boot_linux --
-capsules/capsule-linux-realm/linux/Image 250000000`. Both runs reached the first
+capsules/capsule-linux-realm/assets/linux-kernel.img 250000000`. Both runs reached the first
 unwired 9P request after exactly 21,767,183 charged steps at the same PC:
 
 | Machine state | Steps/s | Sv39 walks | PTE reads | Meaning |
@@ -1183,8 +1183,8 @@ that owner.
 
 The current Linux adapter is lazy and principal-resident. The affined Store owns
 one optional 1–64-hart machine with host-admitted automatic RAM and vCPU defaults,
-plus explicit 32 MiB–3 GiB RAM and 1–64-vCPU per-principal overrides. `linux-boot`, `linux-console`, or
-`linux-sh` creates it when cold, advances Linux in bounded 100,000-step slices
+plus explicit 512 MiB–3 GiB RAM and 1–64-vCPU per-principal overrides. `linux-boot`, `linux-console`, or
+`linux-sh` creates it when cold, advances Linux in bounded 1,000,000-step slices
 until the controlled `/init` reports ready, and retains its CPU and RAM for later
 invocations. A `counter` probe reaches 1 and then 2 across separate calls, and a
 file written by UID 1000 under `/home/agent` is readable by a later shell call.
@@ -1237,7 +1237,10 @@ probe also reports the currently useful principal/host worker intersection.
 `group.info()` returns both concrete values before machine initialization. Realm
 subtracts its worker base, allocator headroom, and safety reserve from the
 already principal-admitted region, page-aligns the remainder, caps guest-visible
-RAM at 3 GiB, and clamps the topology hint to 1–64 harts. It then releases the
+RAM at a measured 1 GiB for interpreter auto mode, and clamps the topology hint
+to two SMP harts because the current deterministic worker executes them on one
+native thread. Explicit configuration retains the 3 GiB and 64-hart signed
+ceilings. It then releases the
 capacity probe and opens an exact one-worker reservation for the chosen guest.
 An explicit `linux_vcpus` value changes only logical topology and does not
 reserve otherwise-idle native workers. The canonical WIT PR
@@ -1246,8 +1249,10 @@ remains held until Astrid 1.0.
 The development bootstrap's measured explicit minimum is 512 MiB. That floor
 boots with roughly 398 MiB left for userspace, but it is not the recommended
 large-project allocation. On an unconstrained normal host, automatic sizing uses
-the admitted remainder up to 3 GiB; managed installations can set any page-aligned
-value from 512 MiB through 3 GiB per principal.
+the admitted remainder up to the interpreter's measured 1 GiB cold-boot cap;
+managed installations and long-lived owner principals can explicitly set any
+page-aligned value from 512 MiB through 3 GiB. Larger automatic envelopes return
+only when an accelerated backend makes their cold-start cost honest.
 
 Every non-boot command uses a fresh 128-bit host-CSPRNG token. PID 1 disables
 console echo and emits token-bound begin/end frames; the host accepts the final
@@ -2287,6 +2292,61 @@ CE set rather than test-installed companions.
   running effective count, and a changed principal configuration discards only
   that principal's warm machine.
 
+### Immutable worker-asset and clean default-boot evidence recorded on 2026-07-22
+
+- Astrid core commit `0bbd8e389ef96d8b3447ce4f97b67c48523952b4`
+  adds the private, pre-1.0 immutable compute-asset boundary without changing
+  public WIT or the public capsule manifest Rust type. The builder and runtime
+  independently reject traversal, symlinks, duplicate IDs, non-files, size
+  violations, and BLAKE3 drift; the worker sees only bounded metered reads by
+  index during an admitted job, never a host path or ambient filesystem;
+- the Linux kernel moved out of the worker to the read-only
+  `linux-kernel` asset. It is 5,127,496 bytes with BLAKE3
+  `fd3bff3a266b66fc1596c16414a5cd7ef7d2c68eb76684627ab8d4d6e74647e8`.
+  The reproducible worker shrank from 5,306,109 bytes to 183,330 bytes and is
+  pinned as
+  `blake3:989fbacab512da6c6ef34b1f6ed3b32f9d9c0a4a5a180c2c82662c15f6546609`.
+  Its imports are exactly the shared compute memory plus `asset_count`,
+  `asset_size`, and `asset_read`; its only exports remain the private worker
+  ABI and run entry;
+- the wasm32 machine now represents guest RAM as 2 MiB demand-zero chunks.
+  A regression admits the complete 3 GiB ceiling without allocating its bytes,
+  proves untouched reads return zero, materializes exactly two chunks for a
+  cross-boundary write, and drops every chunk on reset. Checkpoint encoding
+  visits only materialized chunks rather than allocating a temporary page for
+  every zero page in the admitted address space. Explicit 3 GiB remains real
+  authority rather than a `Vec` capacity trap;
+- hostile live measurements showed why representable capacity and an honest
+  automatic default are different. Eager 3 GiB zeroing generated about 50,000
+  audited suspensions before readiness, and interpreter auto-topology had
+  mirrored host parallelism even though all logical harts run on one worker.
+  Auto mode now selects at most 1 GiB and two SMP harts; explicit configuration
+  still admits 512 MiB–3 GiB and 1–64 harts. Cooperative slices use the private
+  protocol's existing 1,000,000-step maximum instead of 100,000, preserving
+  metering while reducing host crossings and audit pressure;
+- current Astrid `astrid-build` produced installable capsule SHA-256
+  `4f2ec2cdb6069dadc0bd2b2057152d9ab427c8455dc9ab39a5d23028440437fe`.
+  Its 1,719,135-byte controller has BLAKE3
+  `d5cfa045c27f9486fa6539cb8d1cc9b1b3a8757390d8cd72f6db19a10ae781f0`;
+  the archive separately contains the controller, kernel asset, worker, worker
+  lock, manifest, and WIT mirrors;
+- a fresh isolated Astrid home, default principal profile, and untouched Realm
+  configuration loaded that exact capsule. Automatic admission selected 1 GiB
+  and two harts. Linux 6.18.39 reported `smp: Brought up 1 node, 2 CPUs` and
+  `AOS READY` after 58,564,683 charged steps and 64 cooperative suspensions in
+  under 30 seconds. A warm governed shell then returned `riscv64` and
+  `CWD=/home/agent` with exit status 0 after 4,931,538
+  more steps and 11 suspensions. Status reported the machine resident with
+  effective 1 GiB/two-hart resources, and `realm shutdown` reached SBI poweroff
+  cleanly after 282,886 steps with no suspension;
+- the capsule-command CLI wait no longer needs the former hidden 70-second
+  ceiling. Its default is 310 seconds and
+  `ASTRID_CAPSULE_COMMAND_TIMEOUT_SECS` admits 1–86,700 seconds. Expiry now
+  states that cancellation is not yet propagated. A principal epoch interrupt
+  at the configured 300-second budget was separately observed as a real Wasm
+  trap; turning that trap into a correlated terminal command result remains an
+  explicit lifecycle task.
+
 ## 16. Ordered implementation milestones
 
 ### Milestone A: nested process proof
@@ -2969,10 +3029,14 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
 - [x] define a principal-free host-suspension checkpoint, add the sparse bound
   codec and reproducible builder, embed the 32 MiB artifact, and prove each
   restore attaches fresh home/workspace providers before ready;
-- [ ] build and boot the first AOS Realm development bootstrap with pinned Bash,
+- [x] move the Linux kernel out of the worker into a separately hash-bound,
+  read-only compute asset; make wasm32 guest RAM demand-zero; package, install,
+  boot, execute a warm shell, report effective resources, and shut down through
+  a fresh default Astrid home;
+- [x] build and boot the first AOS Realm development bootstrap with pinned Bash,
   Git, Python, Clang/binutils, Make, CMake, Ninja, target headers, CA roots, and
   explicit `/etc/os-release` identity;
-- [ ] execute Bash and Python probes, local Git operations, C and C++
+- [x] execute Bash and Python probes, local Git operations, C and C++
   compile/run loops, and Make/CMake/Ninja builds entirely inside the Realm;
 - [ ] measure the bootstrap image size, minimum useful RAM, cold-boot steps,
   retained pages, and prewarm trade-off before replacing the 32 MiB seed;
@@ -2985,6 +3049,13 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
 - [ ] replace the fixed 64 KiB captured-result ceiling with principal-configured
   bounded streaming or durable job logs; a compiler must not lose its diagnostic
   tail merely because a foreground result envelope is intentionally small;
+- [ ] propagate foreground disconnect, CLI expiry, and principal epoch traps to
+  one correlated terminal command result; a timed-out caller must not leave an
+  unobserved invocation running, and an interrupted capsule must not leave the
+  CLI waiting for a result it can no longer publish;
+- [ ] aggregate or batch per-slice compute audit persistence without weakening
+  exact principal accounting; benchmark the current one-million-step slice and
+  fail closed on audit-pipeline saturation instead of producing warning storms;
 - [ ] build an immutable AOS Realm development generation with the current
   supported stable Rust/Cargo/linker/libc identities and enough measured memory
   for compiler workloads;

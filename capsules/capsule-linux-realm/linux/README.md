@@ -7,7 +7,8 @@ guest resident per principal Store. Automatic topology follows Astrid's current
 principal/host compute admission; every hart is deterministically time-sliced
 inside one generic compute worker in the current implementation.
 
-The current userland is an intentionally bounded agent development workbench:
+`build-userland.sh` produces the current, intentionally bounded agent
+development-workbench candidate:
 
 - musl 1.2.6 and BusyBox 1.38.0 as the base system;
 - Bash 5.2.37 as the command shell;
@@ -41,9 +42,12 @@ copies the bounded response back, and resumes Linux. There is no PLIC, virtio,
 socket, network device, shared-memory ring, or host filesystem handle in this
 path.
 
-This is AOS Realm, not Debian. It deliberately has no Rust/Cargo, Node/npm,
-package manager, network device, block device, PTY, or durable Linux root disk
-yet. Git therefore operates on local trees only. `/home/agent` is the separate
+This is AOS Realm, not Debian. The installable capsule currently retains the
+smaller BusyBox bootstrap initramfs while the development candidate completes
+its independent reproducibility gate. The candidate deliberately has no
+Rust/Cargo, Node/npm, package manager, network device, block device, PTY, or
+durable Linux root disk yet. Git therefore operates on local trees only.
+`/home/agent` is the separate
 crash-consistent Realm filesystem: each successful mutation selects an immutable
 principal generation, so its bytes survive warm calls, guest shutdown, component
 eviction, and daemon restart. `/workspace` is the invocation's Astrid COW

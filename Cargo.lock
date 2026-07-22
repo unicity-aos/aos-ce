@@ -269,7 +269,7 @@ dependencies = [
  "aos-realm-machine",
  "aos-realm-vcpu-protocol",
  "astrid-compute",
- "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=15c264813d5c224cd3ca6c1f38d29290b8343622)",
+ "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=0bbd8e389ef96d8b3447ce4f97b67c48523952b4)",
 ]
 
 [[package]]
@@ -368,9 +368,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 [[package]]
 name = "astrid-capsule-types"
 version = "0.10.4"
-source = "git+https://github.com/astrid-runtime/astrid.git?rev=15c264813d5c224cd3ca6c1f38d29290b8343622#15c264813d5c224cd3ca6c1f38d29290b8343622"
+source = "git+https://github.com/astrid-runtime/astrid.git?rev=0bbd8e389ef96d8b3447ce4f97b67c48523952b4#0bbd8e389ef96d8b3447ce4f97b67c48523952b4"
 dependencies = [
- "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=15c264813d5c224cd3ca6c1f38d29290b8343622)",
+ "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=0bbd8e389ef96d8b3447ce4f97b67c48523952b4)",
  "dashmap",
  "nix",
  "parking_lot",
@@ -385,11 +385,12 @@ dependencies = [
 [[package]]
 name = "astrid-compute"
 version = "0.10.4"
-source = "git+https://github.com/astrid-runtime/astrid.git?rev=15c264813d5c224cd3ca6c1f38d29290b8343622#15c264813d5c224cd3ca6c1f38d29290b8343622"
+source = "git+https://github.com/astrid-runtime/astrid.git?rev=0bbd8e389ef96d8b3447ce4f97b67c48523952b4#0bbd8e389ef96d8b3447ce4f97b67c48523952b4"
 dependencies = [
  "astrid-capsule-types",
- "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=15c264813d5c224cd3ca6c1f38d29290b8343622)",
+ "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=0bbd8e389ef96d8b3447ce4f97b67c48523952b4)",
  "blake3",
+ "memmap2",
  "thiserror 2.0.19",
  "wasmtime",
 ]
@@ -419,7 +420,7 @@ dependencies = [
 [[package]]
 name = "astrid-core"
 version = "0.10.4"
-source = "git+https://github.com/astrid-runtime/astrid.git?rev=15c264813d5c224cd3ca6c1f38d29290b8343622#15c264813d5c224cd3ca6c1f38d29290b8343622"
+source = "git+https://github.com/astrid-runtime/astrid.git?rev=0bbd8e389ef96d8b3447ce4f97b67c48523952b4#0bbd8e389ef96d8b3447ce4f97b67c48523952b4"
 dependencies = [
  "async-trait",
  "base64",
@@ -1741,6 +1742,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad38eb12aea514a0466ea40a80fd8cc83637065948eb4a426e4aa46261175227"
 dependencies = [
  "rustix",
+]
+
+[[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

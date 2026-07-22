@@ -21,7 +21,7 @@ if [ "$#" -eq 4 ]; then
         *) output_image=$caller_dir/$4 ;;
     esac
 else
-    output_image=$script_dir/Image
+    output_image=$script_dir/../assets/linux-kernel.img
 fi
 expected_rootfs=10d26184e85add731208050fb3da9fed5e1dda7475b6e66e0d9814a221ecf3f4
 expected_image=7cb62638de9f41c2fe2a237a1c46642189b6d97e373c8592cc931f74f88419ff

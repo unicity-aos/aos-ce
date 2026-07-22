@@ -232,6 +232,8 @@ impl Default for MachineConfig {
 pub enum MachineError {
     /// RAM is too small, too large, or not aligned to a 4 KiB guest page.
     InvalidRamBytes(usize),
+    /// The admitted guest RAM could not be allocated without aborting the worker.
+    RamAllocationDenied(usize),
     /// The retained serial-output limit exceeds the hard machine cap.
     InvalidConsoleBytes(usize),
     /// The guest hart count is zero or exceeds the machine-profile maximum.
@@ -256,6 +258,9 @@ impl fmt::Display for MachineError {
                 f,
                 "guest RAM must be 4 KiB aligned and between {MIN_RAM_BYTES} and {MAX_RAM_BYTES} bytes, got {bytes}"
             ),
+            Self::RamAllocationDenied(bytes) => {
+                write!(f, "guest RAM allocation of {bytes} bytes was denied")
+            }
             Self::InvalidConsoleBytes(bytes) => write!(
                 f,
                 "console limit must not exceed {MAX_CONSOLE_BYTES} bytes, got {bytes}"
@@ -1016,8 +1021,245 @@ struct SbiFirmware {
 }
 
 #[derive(Clone, Debug)]
+struct GuestRam {
+    #[cfg(not(any(target_arch = "wasm32", test)))]
+    bytes: Vec<u8>,
+    #[cfg(any(target_arch = "wasm32", test))]
+    chunks: Vec<Option<Box<[u8]>>>,
+    len: usize,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+const RAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
+impl GuestRam {
+    fn zeroed(len: usize) -> Result<Self, MachineError> {
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(len)
+                .map_err(|_| MachineError::RamAllocationDenied(len))?;
+            bytes.resize(len, 0);
+            Ok(Self { bytes, len })
+        }
+        #[cfg(any(target_arch = "wasm32", test))]
+        {
+            let chunk_count = len.div_ceil(RAM_CHUNK_BYTES);
+            let mut chunks = Vec::new();
+            chunks
+                .try_reserve_exact(chunk_count)
+                .map_err(|_| MachineError::RamAllocationDenied(len))?;
+            chunks.resize_with(chunk_count, || None);
+            Ok(Self { chunks, len })
+        }
+    }
+
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    fn fill_zero(&mut self) {
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        self.bytes.fill(0);
+        #[cfg(any(target_arch = "wasm32", test))]
+        for chunk in &mut self.chunks {
+            *chunk = None;
+        }
+    }
+
+    fn byte(&self, index: usize) -> Option<u8> {
+        if index >= self.len {
+            return None;
+        }
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        return self.bytes.get(index).copied();
+        #[cfg(any(target_arch = "wasm32", test))]
+        self.chunks.get(index / RAM_CHUNK_BYTES).map(|chunk| {
+            chunk
+                .as_deref()
+                .map_or(0, |bytes| bytes[index % RAM_CHUNK_BYTES])
+        })
+    }
+
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn ensure_chunk(&mut self, index: usize) -> bool {
+        let Some(slot) = self.chunks.get_mut(index) else {
+            return false;
+        };
+        if slot.is_some() {
+            return true;
+        }
+        let start = index * RAM_CHUNK_BYTES;
+        let chunk_len = (self.len - start).min(RAM_CHUNK_BYTES);
+        let mut chunk = Vec::new();
+        if chunk.try_reserve_exact(chunk_len).is_err() {
+            return false;
+        }
+        chunk.resize(chunk_len, 0);
+        *slot = Some(chunk.into_boxed_slice());
+        true
+    }
+
+    fn set_byte(&mut self, index: usize, value: u8) -> bool {
+        if index >= self.len {
+            return false;
+        }
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        let slot = self.bytes.get_mut(index);
+        #[cfg(any(target_arch = "wasm32", test))]
+        if value != 0 && !self.ensure_chunk(index / RAM_CHUNK_BYTES) {
+            return false;
+        }
+        #[cfg(any(target_arch = "wasm32", test))]
+        if value == 0 && self.chunks[index / RAM_CHUNK_BYTES].is_none() {
+            return true;
+        }
+        #[cfg(any(target_arch = "wasm32", test))]
+        let slot = self
+            .chunks
+            .get_mut(index / RAM_CHUNK_BYTES)
+            .and_then(Option::as_deref_mut)
+            .and_then(|chunk| chunk.get_mut(index % RAM_CHUNK_BYTES));
+        if let Some(slot) = slot {
+            *slot = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn copy_from_slice(&mut self, start: usize, source: &[u8]) -> bool {
+        let Some(end) = start
+            .checked_add(source.len())
+            .filter(|end| *end <= self.len)
+        else {
+            return false;
+        };
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        {
+            self.bytes[start..end].copy_from_slice(source);
+        }
+        #[cfg(any(target_arch = "wasm32", test))]
+        {
+            let mut destination = start;
+            let mut source_offset = 0;
+            while destination < end {
+                let chunk_index = destination / RAM_CHUNK_BYTES;
+                let chunk_offset = destination % RAM_CHUNK_BYTES;
+                let copy_len = (end - destination).min(RAM_CHUNK_BYTES - chunk_offset);
+                let source_slice = &source[source_offset..source_offset + copy_len];
+                if source_slice.iter().any(|byte| *byte != 0) {
+                    if !self.ensure_chunk(chunk_index) {
+                        return false;
+                    }
+                    self.chunks[chunk_index]
+                        .as_deref_mut()
+                        .expect("chunk admitted")[chunk_offset..chunk_offset + copy_len]
+                        .copy_from_slice(source_slice);
+                } else if let Some(chunk) = self.chunks[chunk_index].as_deref_mut() {
+                    chunk[chunk_offset..chunk_offset + copy_len].fill(0);
+                }
+                destination += copy_len;
+                source_offset += copy_len;
+            }
+        }
+        true
+    }
+
+    fn copy_to_vec(&self, range: std::ops::Range<usize>) -> Option<Vec<u8>> {
+        if range.start > range.end || range.end > self.len {
+            return None;
+        }
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        return Some(self.bytes[range].to_vec());
+        #[cfg(any(target_arch = "wasm32", test))]
+        {
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(range.len()).ok()?;
+            bytes.resize(range.len(), 0);
+            let mut source = range.start;
+            let mut destination = 0;
+            while source < range.end {
+                let chunk_index = source / RAM_CHUNK_BYTES;
+                let chunk_offset = source % RAM_CHUNK_BYTES;
+                let copy_len = (range.end - source).min(RAM_CHUNK_BYTES - chunk_offset);
+                if let Some(chunk) = self.chunks[chunk_index].as_deref() {
+                    bytes[destination..destination + copy_len]
+                        .copy_from_slice(&chunk[chunk_offset..chunk_offset + copy_len]);
+                }
+                source += copy_len;
+                destination += copy_len;
+            }
+            Some(bytes)
+        }
+    }
+
+    fn slice(&self, range: std::ops::Range<usize>) -> Option<&[u8]> {
+        if range.start > range.end || range.end > self.len {
+            return None;
+        }
+        if range.is_empty() {
+            return Some(&[]);
+        }
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        return self.bytes.get(range);
+        #[cfg(any(target_arch = "wasm32", test))]
+        {
+            let chunk_index = range.start / RAM_CHUNK_BYTES;
+            let chunk_offset = range.start % RAM_CHUNK_BYTES;
+            let length = range.len();
+            self.chunks
+                .get(chunk_index)
+                .and_then(Option::as_deref)
+                .and_then(|chunk| chunk.get(chunk_offset..chunk_offset.checked_add(length)?))
+        }
+    }
+
+    fn write_page(&mut self, index: usize, page_bytes: usize, bytes: &[u8]) -> bool {
+        if bytes.len() != page_bytes {
+            return false;
+        }
+        index
+            .checked_mul(page_bytes)
+            .is_some_and(|start| self.copy_from_slice(start, bytes))
+    }
+
+    fn nonzero_pages(&self, page_bytes: usize) -> Vec<(usize, Vec<u8>)> {
+        debug_assert!(page_bytes > 0);
+        debug_assert_eq!(self.len % page_bytes, 0);
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        return self
+            .bytes
+            .chunks_exact(page_bytes)
+            .enumerate()
+            .filter(|(_, page)| page.iter().any(|byte| *byte != 0))
+            .map(|(index, page)| (index, page.to_vec()))
+            .collect();
+        #[cfg(any(target_arch = "wasm32", test))]
+        {
+            let mut pages = Vec::new();
+            for (chunk_index, chunk) in self.chunks.iter().enumerate() {
+                let Some(chunk) = chunk.as_deref() else {
+                    continue;
+                };
+                let first_page = chunk_index * RAM_CHUNK_BYTES / page_bytes;
+                pages.extend(
+                    chunk
+                        .chunks_exact(page_bytes)
+                        .enumerate()
+                        .filter(|(_, page)| page.iter().any(|byte| *byte != 0))
+                        .map(|(page_index, page)| (first_page + page_index, page.to_vec())),
+                );
+            }
+            pages
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct Devices {
-    ram: Vec<u8>,
+    ram: GuestRam,
     mtime: u64,
     mtimecmp: u64,
     msip: bool,
@@ -1138,20 +1380,20 @@ impl StepEffect {
 }
 
 impl Devices {
-    fn new(config: MachineConfig) -> Self {
-        Self {
-            ram: vec![0; config.ram_bytes],
+    fn new(config: MachineConfig) -> Result<Self, MachineError> {
+        Ok(Self {
+            ram: GuestRam::zeroed(config.ram_bytes)?,
             mtime: 0,
             mtimecmp: u64::MAX,
             msip: false,
             console_input: VecDeque::new(),
             console_output: Vec::new(),
             max_console_bytes: config.max_console_bytes,
-        }
+        })
     }
 
     fn reset(&mut self) {
-        self.ram.fill(0);
+        self.ram.fill_zero();
         self.mtime = 0;
         self.mtimecmp = u64::MAX;
         self.msip = false;
@@ -1159,8 +1401,8 @@ impl Devices {
         self.console_output.clear();
     }
 
-    fn load_program(&mut self, program: &[u8]) {
-        self.ram[..program.len()].copy_from_slice(program);
+    fn load_program(&mut self, program: &[u8]) -> bool {
+        self.ram.copy_from_slice(0, program)
     }
 
     fn take_new_console(&mut self) -> Vec<u8> {
@@ -1205,8 +1447,8 @@ impl Devices {
             .ram_range(address, bytes)
             .ok_or(MachineTrap::LoadAccessFault { address, bytes })?;
         let mut value = 0_u64;
-        for (shift, byte) in self.ram[range].iter().enumerate() {
-            value |= u64::from(*byte) << (shift * 8);
+        for (shift, index) in range.enumerate() {
+            value |= u64::from(self.ram.byte(index).expect("range validated")) << (shift * 8);
         }
         Ok(value)
     }
@@ -1271,8 +1513,10 @@ impl Devices {
         let range = self
             .ram_range(address, bytes)
             .ok_or(MachineTrap::StoreAccessFault { address, bytes })?;
-        for (shift, byte) in self.ram[range].iter_mut().enumerate() {
-            *byte = (value >> (shift * 8)) as u8;
+        for (shift, index) in range.enumerate() {
+            if !self.ram.set_byte(index, (value >> (shift * 8)) as u8) {
+                return Err(MachineTrap::StoreAccessFault { address, bytes });
+            }
         }
         Ok(None)
     }
@@ -1286,8 +1530,8 @@ impl Devices {
 
     fn read_ram(&self, address: u64, bytes: u8) -> Option<u64> {
         let mut value = 0_u64;
-        for (shift, byte) in self.ram[self.ram_range(address, bytes)?].iter().enumerate() {
-            value |= u64::from(*byte) << (shift * 8);
+        for (shift, index) in self.ram_range(address, bytes)?.enumerate() {
+            value |= u64::from(self.ram.byte(index).expect("range validated")) << (shift * 8);
         }
         Some(value)
     }
@@ -1296,8 +1540,10 @@ impl Devices {
         let Some(range) = self.ram_range(address, bytes) else {
             return false;
         };
-        for (shift, byte) in self.ram[range].iter_mut().enumerate() {
-            *byte = (value >> (shift * 8)) as u8;
+        for (shift, index) in range.enumerate() {
+            if !self.ram.set_byte(index, (value >> (shift * 8)) as u8) {
+                return false;
+            }
         }
         true
     }
@@ -1313,8 +1559,7 @@ impl Devices {
         let Some(range) = self.ram_range_len(address, bytes.len()) else {
             return false;
         };
-        self.ram[range].copy_from_slice(bytes);
-        true
+        self.ram.copy_from_slice(range.start, bytes)
     }
 
     fn push_console_output(&mut self, byte: u8) -> Result<(), MachineTrap> {
@@ -1446,7 +1691,7 @@ impl Machine {
             scheduler_quantum_remaining: HART_SCHEDULER_QUANTUM,
             cpu: Cpu::new(),
             csrs: CsrFile::default(),
-            devices: Devices::new(config),
+            devices: Devices::new(config)?,
             state: RunState::Runnable,
             steps_executed: 0,
             instructions_retired: 0,
@@ -1567,7 +1812,9 @@ impl Machine {
         }
         self.devices.reset();
         self.reset_harts();
-        self.devices.load_program(program);
+        if !self.devices.load_program(program) {
+            return Err(MachineError::RamAllocationDenied(self.config.ram_bytes));
+        }
         self.state = RunState::Runnable;
         self.steps_executed = 0;
         self.instructions_retired = 0;
@@ -1642,7 +1889,7 @@ impl Machine {
             || !self.devices.write_ram_slice(LINUX_FDT_BASE, &fdt)
             || initrd_start.is_some_and(|start| !self.devices.write_ram_slice(start, initramfs))
         {
-            return Err(invalid_images());
+            return Err(MachineError::RamAllocationDenied(self.config.ram_bytes));
         }
         self.cpu.pc = LINUX_KERNEL_BASE;
         self.cpu.privilege = Privilege::Supervisor;
@@ -1679,7 +1926,7 @@ impl Machine {
     pub fn physical_ram(&self, address: u64, bytes: usize) -> Option<&[u8]> {
         self.devices
             .ram_range_len(address, bytes)
-            .map(|range| &self.devices.ram[range])
+            .and_then(|range| self.devices.ram.slice(range))
     }
 
     /// Copy a successful 9P response into the buffer admitted by the pending
@@ -2902,7 +3149,11 @@ impl Machine {
             request: Plan9Request {
                 id,
                 channel,
-                message: self.devices.ram[request_range].to_vec(),
+                message: self
+                    .devices
+                    .ram
+                    .copy_to_vec(request_range)
+                    .expect("request range validated"),
                 max_response_bytes: response_bytes,
             },
             response_address: arguments[2],
@@ -2926,7 +3177,11 @@ impl Machine {
             .max_console_bytes
             .saturating_sub(self.devices.console_output.len());
         let written = bytes.min(remaining);
-        let output = self.devices.ram[range.start..range.start + written].to_vec();
+        let output = self
+            .devices
+            .ram
+            .copy_to_vec(range.start..range.start + written)
+            .expect("console range validated");
         for byte in output {
             self.devices.push_console_output(byte)?;
         }
@@ -2945,11 +3200,14 @@ impl Machine {
         };
         let read = bytes.min(self.devices.console_input.len());
         for offset in 0..read {
-            self.devices.ram[range.start + offset] = self
+            let byte = self
                 .devices
                 .console_input
                 .pop_front()
                 .expect("length checked console input");
+            if !self.devices.ram.set_byte(range.start + offset, byte) {
+                return (SBI_ERR_FAILED, offset as u64);
+            }
         }
         (SBI_SUCCESS, read as u64)
     }
@@ -3689,6 +3947,36 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn admitted_max_ram_is_demand_zero_and_exact_across_chunks() {
+        let mut ram = GuestRam::zeroed(MAX_RAM_BYTES).expect("admit maximum guest RAM");
+        assert_eq!(ram.len(), MAX_RAM_BYTES);
+        assert_eq!(ram.chunks.len(), MAX_RAM_BYTES / RAM_CHUNK_BYTES);
+        assert!(ram.chunks.iter().all(Option::is_none));
+        assert_eq!(ram.byte(0), Some(0));
+        assert_eq!(ram.byte(MAX_RAM_BYTES - 1), Some(0));
+        assert!(ram.nonzero_pages(4096).is_empty());
+
+        let start = RAM_CHUNK_BYTES - 2;
+        assert!(ram.copy_from_slice(start, &[1, 2, 3, 4]));
+        assert_eq!(ram.chunks.iter().filter(|chunk| chunk.is_some()).count(), 2);
+        assert_eq!(ram.copy_to_vec(start..start + 4), Some(vec![1, 2, 3, 4]));
+        let populated = ram.nonzero_pages(4096);
+        assert_eq!(
+            populated
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![511, 512]
+        );
+
+        ram.fill_zero();
+        assert!(ram.chunks.iter().all(Option::is_none));
+        assert_eq!(ram.copy_to_vec(start..start + 4), Some(vec![0; 4]));
+        assert!(!ram.copy_from_slice(MAX_RAM_BYTES - 1, &[1, 2]));
+        assert_eq!(ram.byte(MAX_RAM_BYTES), None);
+    }
+
     fn paged_machine() -> Machine {
         let mut machine = Machine::new(MachineConfig {
             ram_bytes: 64 * 1024,
@@ -3902,7 +4190,12 @@ mod tests {
         assert_eq!(supervisor.privilege(), Privilege::Supervisor);
         let forbidden = encode_csrw(Csr::Mstatus, 0);
         let offset = usize::try_from(supervisor.pc() - DRAM_BASE).expect("RAM offset");
-        supervisor.devices.ram[offset..offset + 4].copy_from_slice(&forbidden.to_le_bytes());
+        assert!(
+            supervisor
+                .devices
+                .ram
+                .copy_from_slice(offset, &forbidden.to_le_bytes())
+        );
         let report = supervisor.run_slice(1);
         assert_eq!(report.outcome, SliceOutcome::Yielded);
         assert_eq!(report.instructions_retired, 0);
@@ -3957,7 +4250,12 @@ mod tests {
         assert_eq!(supervisor.run_slice(12).outcome, SliceOutcome::Yielded);
         let mret = 0x3020_0073_u32;
         let offset = usize::try_from(supervisor.pc() - DRAM_BASE).expect("RAM offset");
-        supervisor.devices.ram[offset..offset + 4].copy_from_slice(&mret.to_le_bytes());
+        assert!(
+            supervisor
+                .devices
+                .ram
+                .copy_from_slice(offset, &mret.to_le_bytes())
+        );
         assert_eq!(supervisor.run_slice(1).outcome, SliceOutcome::Yielded);
         assert_eq!(supervisor.privilege(), Privilege::Machine);
         assert_eq!(supervisor.csr(Csr::Mcause), 2);
@@ -5080,14 +5378,14 @@ mod tests {
             machine
                 .devices
                 .ram_range_len(LINUX_FDT_BASE, 4)
-                .map(|range| machine.devices.ram[range].to_vec()),
+                .and_then(|range| machine.devices.ram.copy_to_vec(range)),
             Some(vec![0xd0, 0x0d, 0xfe, 0xed])
         );
         assert_eq!(
             machine
                 .devices
                 .ram_range_len(layout.initrd_start.expect("initrd start"), initramfs.len())
-                .map(|range| machine.devices.ram[range].to_vec()),
+                .and_then(|range| machine.devices.ram.copy_to_vec(range)),
             Some(initramfs.to_vec())
         );
     }
