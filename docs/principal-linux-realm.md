@@ -1235,13 +1235,19 @@ to resolve the largest currently admissible shared region from the signed worker
 principal quota, host pool, and live reservations. An automatic-parallelism
 probe also reports the currently useful principal/host worker intersection.
 `group.info()` returns both concrete values before machine initialization. Realm
-subtracts its worker base and reserve, takes half of the usable remainder so one
-automatic Realm does not monopolize the pool, page-aligns it, caps guest-visible
+subtracts its worker base, allocator headroom, and safety reserve from the
+already principal-admitted region, page-aligns the remainder, caps guest-visible
 RAM at 3 GiB, and clamps the topology hint to 1–64 harts. It then releases the
 capacity probe and opens an exact one-worker reservation for the chosen guest.
 An explicit `linux_vcpus` value changes only logical topology and does not
 reserve otherwise-idle native workers. The canonical WIT PR
 remains held until Astrid 1.0.
+
+The development bootstrap's measured explicit minimum is 512 MiB. That floor
+boots with roughly 398 MiB left for userspace, but it is not the recommended
+large-project allocation. On an unconstrained normal host, automatic sizing uses
+the admitted remainder up to 3 GiB; managed installations can set any page-aligned
+value from 512 MiB through 3 GiB per principal.
 
 Every non-boot command uses a fresh 128-bit host-CSPRNG token. PID 1 disables
 console echo and emits token-bound begin/end frames; the host accepts the final
@@ -2268,9 +2274,10 @@ CE set rather than test-installed companions.
   `3de27c49129483c34e5956d23f44fed87ea3d4876db3f30e2276a1662cc5800d`;
   multi-hart machines cold boot until checkpoint format 2 binds every hart and
   scheduler field;
-- private controller/worker protocol 2 carries the admitted hart count in its
-  fixed header. The reproducible signed worker is 14,431,704 bytes with BLAKE3
-  `613e1d61c5f1611e0f50cb5300bcb79d80bf5ca1d793a3e7000501a90e737b02`.
+- private controller/worker protocol 1 carries the admitted hart count and cold
+  boot clock in its fixed descriptor. The reproducible signed worker is
+  5,306,109 bytes with BLAKE3
+  `2e571fa14f7369f4a4e790f11c35a5334e449e400707cf9cc0d236520b702cb1`.
   A real generic-compute-runtime regression cold-boots that signed module with
   two harts and requires Linux's `smp: Brought up 1 node, 2 CPUs` before the
   first 9P host request;
@@ -2614,6 +2621,60 @@ must name the newest supported version and the blocking delta; it must not repor
 the host's Rust version. Distribution updates create a new signed generation and
 never mutate a running principal's toolchain in place.
 
+The first executable development *bootstrap* is deliberately a smaller claim.
+It targets the versions supported by the pinned Buildroot 2026.05.1 release:
+Bash 5.2.37, Git 2.54.0, Python 3.14.6, Clang/LLVM 22.1.7, binutils 2.45.1,
+Make 4.4.1, CMake 4.3.2, Ninja 1.13.2, and musl 1.2.6. It includes target
+headers and startup objects so `cc` and `c++` are real in-guest compilers. Git
+2.54.0 and LLVM 22.1.7 are one upstream update behind Git 2.55.0 and LLVM
+22.1.8 respectively; this is an explicit stable-Buildroot delta, not a claim
+that older packages are current. This bootstrap does not claim Rust, Cargo,
+Node, npm, a package manager, or outbound networking. Those become a subsequent
+signed generation after their execution and dependency-fetch boundaries work on
+the selected guest ISA.
+
+The pinned OCI image is a bootstrap build environment, not part of the Realm
+architecture. Buildroot and several GNU package probes require Linux filesystem
+semantics, so the current reproducible build runs in a disposable Linux
+container and emits only an RV64 root filesystem plus provenance material. The
+container, Docker daemon, Docker socket, host mount names, and build credentials
+are absent from the capsule and from the running guest. Once a released Realm
+generation can build its own distribution inputs within admitted resources, the
+same build should run as a Realm/CI job; until then, claiming a self-hosted build
+would be circular.
+
+### Rust and JavaScript compatibility generation
+
+The July 22, 2026 upstream check names Rust 1.97.1, Node 26.5.0 Current, and
+Node 24.18.0 LTS. The Rust `riscv64gc-unknown-linux-musl` target distributes a
+standard library but is not a host-tools platform; the official native compiler
+lane is `riscv64gc-unknown-linux-gnu`. Node classifies RISC-V Linux as
+experimental, requires kernel 5.19 or newer plus glibc 2.36 or newer, and does
+not publish official RISC-V release binaries. The community RISC-V artifacts are
+explicitly unofficial and glibc-based. Those are ABI and supply-chain facts, not
+package-selection preferences.
+
+The compatibility generation therefore has four prerequisites:
+
+1. implement the RISC-V C, F, and D extensions in the AOS-owned machine,
+   including two-byte instruction alignment, floating-point registers, `fcsr`,
+   precise traps, context state, and checkpoint-format evolution;
+2. advertise `rv64imafdc_zicsr_zifencei`, enable the kernel FPU/C paths, and
+   prove Linux context switching plus one- and multi-hart execution against
+   architectural vectors;
+3. rebuild the agent workbench on glibc 2.43 with the LP64D ABI while retaining
+   the same principal, filesystem, no-network, and no-privilege boundaries;
+4. install the exact official Rust 1.97.1 GNU host artifact, and build Node LTS
+   from the signed upstream source under AOS provenance because no official
+   RISC-V binary exists. `cargo`, `rustc`, `node`, and `npm` enter the image only
+   after native hello-world and dependency-free package tests pass inside the
+   Realm.
+
+This does not turn the mutable root into a package-managed general-purpose OS.
+Toolchains remain an immutable signed base; project dependencies and caches live
+in the principal home or attached workspace. Network fetches remain a separate,
+audited capability rather than an ambient property of Linux.
+
 Every image is immutable and identified by its manifest and block hashes. Package
 installation mutates only a realm overlay. Reproducible jobs name an exact base and
 overlay snapshot rather than relying on the current contents of `default`.
@@ -2908,9 +2969,30 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
 - [x] define a principal-free host-suspension checkpoint, add the sparse bound
   codec and reproducible builder, embed the 32 MiB artifact, and prove each
   restore attaches fresh home/workspace providers before ready;
+- [ ] build and boot the first AOS Realm development bootstrap with pinned Bash,
+  Git, Python, Clang/binutils, Make, CMake, Ninja, target headers, CA roots, and
+  explicit `/etc/os-release` identity;
+- [ ] execute Bash and Python probes, local Git operations, C and C++
+  compile/run loops, and Make/CMake/Ninja builds entirely inside the Realm;
+- [ ] measure the bootstrap image size, minimum useful RAM, cold-boot steps,
+  retained pages, and prewarm trade-off before replacing the 32 MiB seed;
+- [ ] use those measurements to decide whether the immutable toolchain base
+  graduates from an eager initramfs to a verified, demand-paged SquashFS or
+  content-block portal; do not spend every principal's RAM on cold compiler
+  bytes merely because initramfs was sufficient for the seed proof;
+- [ ] replace fixed guest `RLIMIT_NOFILE` and `RLIMIT_NPROC` values with bounded
+  per-principal resource fields before claiming large-project support;
+- [ ] replace the fixed 64 KiB captured-result ceiling with principal-configured
+  bounded streaming or durable job logs; a compiler must not lose its diagnostic
+  tail merely because a foreground result envelope is intentionally small;
 - [ ] build an immutable AOS Realm development generation with the current
   supported stable Rust/Cargo/linker/libc identities and enough measured memory
   for compiler workloads;
+- [ ] implement and architecture-test RV64C plus RV64F/RV64D, evolve machine
+  checkpoints for the new register state, and enable Linux FPU context support;
+- [ ] switch the compatibility generation to glibc 2.43/LP64D, install official
+  Rust 1.97.1 host tools, and source-build Node 24.18.0 LTS with its RISC-V
+  experimental status visible in provenance;
 - [ ] complete the seven-step in-guest Rust build/run/artifact receipt proof;
 - [ ] define the attenuating capsule-to-realm job contract and migrate Forge as the
   first non-interactive consumer after artifact verification exists;

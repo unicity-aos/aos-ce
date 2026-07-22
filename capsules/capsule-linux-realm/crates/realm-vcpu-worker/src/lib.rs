@@ -13,8 +13,7 @@
 )]
 
 use aos_realm_machine::{
-    CheckpointBinding, CheckpointDigest, HaltStatus, HostRequestFailure, HostRequestId, Machine,
-    MachineCheckpoint, MachineConfig, SliceOutcome,
+    HaltStatus, HostRequestFailure, HostRequestId, Machine, MachineConfig, SliceOutcome,
 };
 use aos_realm_vcpu_protocol::{
     self as protocol, Operation, Outcome, RequestFailure, Status, field,
@@ -24,8 +23,6 @@ use std::sync::Mutex;
 const ABI_VERSION: i32 = 1;
 
 const LINUX_IMAGE: &[u8] = include_bytes!("../../../linux/Image");
-const LINUX_SOURCES: &[u8] = include_bytes!("../../../linux/SOURCES.lock");
-const LINUX_PREWARM_32M: &[u8] = include_bytes!("../../../linux/prewarm-32m.aos-machine");
 
 struct WorkerState {
     machine: Machine,
@@ -48,11 +45,14 @@ pub extern "C" fn astrid_compute_abi_version() -> i32 {
 /// the response header.
 #[unsafe(no_mangle)]
 pub extern "C" fn astrid_compute_run(
-    _worker_index: i32,
+    worker_index: i32,
     descriptor_offset: i64,
     descriptor_length: i64,
-    _descriptor_tag: i64,
+    descriptor_tag: i64,
 ) -> i32 {
+    if worker_index != 0 {
+        return -1;
+    }
     let Ok(offset) = usize::try_from(descriptor_offset) else {
         return -1;
     };
@@ -67,6 +67,10 @@ pub extern "C" fn astrid_compute_run(
     // memory before dispatch. wasm32 pointers are offsets into that same memory,
     // and this invocation is the sole owner of the descriptor region.
     let bytes = unsafe { std::slice::from_raw_parts_mut(offset as *mut u8, length) };
+    dispatch(bytes, descriptor_tag)
+}
+
+fn dispatch(bytes: &mut [u8], descriptor_tag: i64) -> i32 {
     if protocol::read_u32(bytes, field::MAGIC) != Some(protocol::MAGIC)
         || protocol::read_u32(bytes, field::VERSION) != Some(protocol::VERSION)
     {
@@ -80,17 +84,25 @@ pub extern "C" fn astrid_compute_run(
     clear_response(bytes);
     let operation = protocol::read_u32(bytes, field::OPERATION)
         .and_then(|value| Operation::try_from(value).ok());
+    if operation.is_some_and(|operation| descriptor_tag != i64::from(operation as u32)) {
+        write_failure(
+            bytes,
+            Status::Invalid,
+            "descriptor tag does not match Linux vCPU operation",
+        );
+        return 0;
+    }
     let result = match operation {
-        Some(Operation::InitCold) => initialize(bytes, false),
-        Some(Operation::InitPrewarm) => initialize(bytes, true),
+        Some(Operation::InitCold) => initialize(bytes),
         Some(Operation::RunSlice) => run_slice(bytes),
         Some(Operation::PushConsole) => push_console(bytes),
         Some(Operation::Complete9p) => complete_9p(bytes),
         Some(Operation::Fail9p) => fail_9p(bytes),
-        Some(Operation::Reset) => {
+        Some(Operation::Reset) if input(bytes).is_ok_and(<[u8]>::is_empty) => {
             *STATE.lock().expect("worker state lock") = None;
             Ok(())
         }
+        Some(Operation::Reset) => Err(invalid("reset does not accept an input payload")),
         None => Err((Status::Invalid, "unknown Linux vCPU operation".to_string())),
     };
     if let Err((status, error)) = result {
@@ -101,7 +113,22 @@ pub extern "C" fn astrid_compute_run(
 
 type WorkerResult = Result<(), (Status, String)>;
 
-fn initialize(bytes: &mut [u8], prewarm: bool) -> WorkerResult {
+fn initialize(bytes: &mut [u8]) -> WorkerResult {
+    if STATE.lock().expect("worker state lock").is_some() {
+        return Err(invalid("Linux vCPU is already initialized"));
+    }
+    let boot_input = input(bytes)?;
+    if boot_input.len() != protocol::COLD_BOOT_INPUT_BYTES {
+        return Err(invalid("cold boot input must contain wall-clock seconds"));
+    }
+    let wall_time_seconds = u64::from_le_bytes(
+        boot_input
+            .try_into()
+            .map_err(|_| invalid("cold boot wall clock is malformed"))?,
+    );
+    if wall_time_seconds == 0 || wall_time_seconds > i64::MAX as u64 {
+        return Err(invalid("cold boot wall clock is outside the Linux range"));
+    }
     let ram_bytes =
         usize::try_from(protocol::read_u64(bytes, field::RAM_BYTES).unwrap_or_default())
             .map_err(|_| invalid("RAM size is not addressable"))?;
@@ -114,44 +141,19 @@ fn initialize(bytes: &mut [u8], prewarm: bool) -> WorkerResult {
     if !(1..=aos_realm_machine::MAX_HARTS).contains(&hart_count) {
         return Err(invalid("hart count must be between 1 and 64"));
     }
-    let machine = if prewarm {
-        if hart_count != 1 {
-            return Err(machine_error(
-                "format-1 prewarm checkpoints require exactly one hart",
-            ));
-        }
-        let binding = CheckpointBinding::new(
-            CheckpointDigest::hash(LINUX_IMAGE),
-            CheckpointDigest::hash(LINUX_SOURCES),
-        );
-        let checkpoint = MachineCheckpoint::decode(LINUX_PREWARM_32M, binding)
-            .map_err(|error| machine_error(error.to_string()))?;
-        if checkpoint.ram_bytes() != ram_bytes
-            || checkpoint.max_console_bytes() != max_console_bytes
-        {
-            return Err(machine_error(
-                "prewarm checkpoint resources do not match admitted resources",
-            ));
-        }
-        checkpoint.into_machine()
-    } else {
-        let mut machine = Machine::new_with_harts(
-            MachineConfig {
-                ram_bytes,
-                max_console_bytes,
-            },
-            hart_count,
-        )
+    let mut machine = Machine::new_with_harts(
+        MachineConfig {
+            ram_bytes,
+            max_console_bytes,
+        },
+        hart_count,
+    )
+    .map_err(|error| machine_error(error.to_string()))?;
+    let bootargs =
+        format!("earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time={wall_time_seconds}");
+    machine
+        .boot_linux(LINUX_IMAGE, &[], &bootargs)
         .map_err(|error| machine_error(error.to_string()))?;
-        machine
-            .boot_linux(
-                LINUX_IMAGE,
-                &[],
-                "earlycon=sbi console=hvc0 init=/init panic=-1",
-            )
-            .map_err(|error| machine_error(error.to_string()))?;
-        machine
-    };
     *STATE.lock().expect("worker state lock") = Some(WorkerState {
         machine,
         pending_request: None,
@@ -160,9 +162,12 @@ fn initialize(bytes: &mut [u8], prewarm: bool) -> WorkerResult {
 }
 
 fn run_slice(bytes: &mut [u8]) -> WorkerResult {
+    if !input(bytes)?.is_empty() {
+        return Err(invalid("run slice does not accept an input payload"));
+    }
     let budget = protocol::read_u64(bytes, field::SLICE_BUDGET).unwrap_or_default();
-    if budget == 0 {
-        return Err(invalid("slice budget must be greater than zero"));
+    if !(1..=protocol::MAX_SLICE_STEPS).contains(&budget) {
+        return Err(invalid("slice budget is outside the admitted range"));
     }
     let mut state = STATE.lock().expect("worker state lock");
     let state = state.as_mut().ok_or_else(|| {
@@ -222,6 +227,9 @@ fn run_slice(bytes: &mut [u8]) -> WorkerResult {
 
 fn push_console(bytes: &mut [u8]) -> WorkerResult {
     let input = input(bytes)?.to_vec();
+    if input.len() > protocol::MAX_CONSOLE_INPUT_BYTES {
+        return Err(invalid("console input exceeds the per-descriptor limit"));
+    }
     let mut state = STATE.lock().expect("worker state lock");
     state
         .as_mut()
@@ -256,6 +264,9 @@ fn complete_9p(bytes: &mut [u8]) -> WorkerResult {
 }
 
 fn fail_9p(bytes: &mut [u8]) -> WorkerResult {
+    if !input(bytes)?.is_empty() {
+        return Err(invalid("9P failure does not accept an input payload"));
+    }
     let request_id = protocol::read_u64(bytes, field::REQUEST_ID).unwrap_or_default();
     let failure = match protocol::read_u32(bytes, field::REQUEST_FAILURE).unwrap_or_default() {
         value if value == RequestFailure::Denied as u32 => HostRequestFailure::Denied,
@@ -406,7 +417,30 @@ mod tests {
 
     const SIGNED_WORKER: &[u8] = include_bytes!("../../../assets/linux-vcpu.wasm");
     const SIGNED_WORKER_HASH: &str =
-        "blake3:613e1d61c5f1611e0f50cb5300bcb79d80bf5ca1d793a3e7000501a90e737b02";
+        "blake3:2e571fa14f7369f4a4e790f11c35a5334e449e400707cf9cc0d236520b702cb1";
+
+    fn request(operation: u32, input: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; protocol::HEADER_BYTES + input.len()];
+        protocol::write_u32(&mut bytes, field::MAGIC, protocol::MAGIC);
+        protocol::write_u32(&mut bytes, field::VERSION, protocol::VERSION);
+        protocol::write_u32(&mut bytes, field::OPERATION, operation);
+        protocol::write_u32(&mut bytes, field::INPUT_LEN, input.len() as u32);
+        bytes[protocol::HEADER_BYTES..].copy_from_slice(input);
+        bytes
+    }
+
+    fn assert_bounded_response(bytes: &[u8], expected_status: Status) {
+        assert_eq!(
+            protocol::read_u32(bytes, field::STATUS),
+            Some(expected_status as u32)
+        );
+        let response = protocol::read_u32(bytes, field::RESPONSE_LEN).expect("response length");
+        let console = protocol::read_u32(bytes, field::CONSOLE_LEN).expect("console length");
+        let message = protocol::read_u32(bytes, field::MESSAGE_LEN).expect("message length");
+        let error = protocol::read_u32(bytes, field::ERROR_LEN).expect("error length");
+        assert_eq!(response, console + message + error);
+        assert!(response as usize <= bytes.len() - protocol::HEADER_BYTES);
+    }
 
     #[test]
     fn protocol_fields_round_trip() {
@@ -437,92 +471,94 @@ mod tests {
     }
 
     #[test]
-    fn signed_worker_restores_linux_inside_the_real_compute_runtime() {
-        use astrid_compute::{
-            ComputeLedger, ComputeLimits, ComputeRuntime, ExecutionMode, GroupRequest, Parallelism,
-            WorkDescriptor, WorkerArtifact,
-        };
-        use astrid_core::principal::PrincipalId;
+    fn malformed_and_out_of_state_descriptors_fail_closed() {
+        *STATE.lock().expect("worker state lock") = None;
 
-        let artifact =
-            WorkerArtifact::from_bytes(protocol::WORKER_ID, SIGNED_WORKER, SIGNED_WORKER_HASH)
-                .expect("signed worker hash");
-        let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
-            .expect("compute runtime");
-        let group = runtime
-            .open_group(
-                &PrincipalId::new("linux-worker-conformance").expect("principal"),
-                &artifact,
-                GroupRequest {
-                    mode: ExecutionMode::Deterministic,
-                    parallelism: Parallelism::Exact(1),
-                    initial_memory_pages: 1024,
-                    maximum_memory_pages: 2048,
-                },
-            )
-            .expect("worker admission");
-        let control_offset = (63 * 1024 * 1024) as u64;
-        let descriptor = WorkDescriptor {
-            offset: control_offset,
-            length: protocol::CONTROL_BYTES as u64,
-            tag: Operation::InitPrewarm as u64,
-            worker_index: Some(0),
-            fuel: None,
-        };
-        let mut request = vec![0_u8; protocol::HEADER_BYTES];
-        protocol::write_u32(&mut request, field::MAGIC, protocol::MAGIC);
-        protocol::write_u32(&mut request, field::VERSION, protocol::VERSION);
+        let mut bytes = request(Operation::Reset as u32, &[]);
+        assert_eq!(dispatch(&mut bytes, Operation::RunSlice as i64), 0);
+        assert_bounded_response(&bytes, Status::Invalid);
+
+        let mut bytes = request(99, &[]);
+        assert_eq!(dispatch(&mut bytes, 99), 0);
+        assert_bounded_response(&bytes, Status::Invalid);
+
+        let mut bytes = request(Operation::RunSlice as u32, b"unexpected");
+        protocol::write_u64(&mut bytes, field::SLICE_BUDGET, 1);
+        assert_eq!(dispatch(&mut bytes, Operation::RunSlice as i64), 0);
+        assert_bounded_response(&bytes, Status::Invalid);
+
+        for budget in [0, protocol::MAX_SLICE_STEPS + 1] {
+            let mut bytes = request(Operation::RunSlice as u32, &[]);
+            protocol::write_u64(&mut bytes, field::SLICE_BUDGET, budget);
+            assert_eq!(dispatch(&mut bytes, Operation::RunSlice as i64), 0);
+            assert_bounded_response(&bytes, Status::Invalid);
+        }
+
+        let mut bytes = request(
+            Operation::PushConsole as u32,
+            &vec![0; protocol::MAX_CONSOLE_INPUT_BYTES + 1],
+        );
+        assert_eq!(dispatch(&mut bytes, Operation::PushConsole as i64), 0);
+        assert_bounded_response(&bytes, Status::Invalid);
+
+        let mut bytes = request(Operation::Complete9p as u32, &[]);
+        protocol::write_u64(&mut bytes, field::REQUEST_ID, 1);
+        assert_eq!(dispatch(&mut bytes, Operation::Complete9p as i64), 0);
+        assert_bounded_response(&bytes, Status::NotInitialized);
+
+        let mut bytes = request(Operation::Fail9p as u32, b"unexpected");
         protocol::write_u32(
-            &mut request,
-            field::OPERATION,
-            Operation::InitPrewarm as u32,
+            &mut bytes,
+            field::REQUEST_FAILURE,
+            RequestFailure::Denied as u32,
         );
-        protocol::write_u64(&mut request, field::RAM_BYTES, 32 * 1024 * 1024);
-        protocol::write_u64(&mut request, field::MAX_CONSOLE_BYTES, 64 * 1024);
-        protocol::write_u32(&mut request, field::HART_COUNT, 1);
-        group.write(control_offset, &request).expect("write init");
-        let result = group
-            .submit(descriptor)
-            .expect("submit init")
-            .join()
-            .expect("restore checkpoint");
-        assert_eq!(result.worker_status, 0);
-        let header = group
-            .read(control_offset, protocol::HEADER_BYTES as u32)
-            .expect("read init response");
-        assert_eq!(
-            protocol::read_u32(&header, field::STATUS),
-            Some(Status::Ok as u32)
-        );
+        assert_eq!(dispatch(&mut bytes, Operation::Fail9p as i64), 0);
+        assert_bounded_response(&bytes, Status::Invalid);
 
-        protocol::write_u32(&mut request, field::OPERATION, Operation::RunSlice as u32);
-        protocol::write_u64(&mut request, field::SLICE_BUDGET, 100_000);
-        group.write(control_offset, &request).expect("write slice");
-        group
-            .submit(WorkDescriptor {
-                tag: Operation::RunSlice as u64,
-                ..descriptor
-            })
-            .expect("submit slice")
-            .join()
-            .expect("run restored Linux");
-        let header = group
-            .read(control_offset, protocol::HEADER_BYTES as u32)
-            .expect("read slice response");
+        let mut bytes = request(Operation::Reset as u32, b"unexpected");
+        assert_eq!(dispatch(&mut bytes, Operation::Reset as i64), 0);
+        assert_bounded_response(&bytes, Status::Invalid);
+
+        let mut bytes = request(Operation::Reset as u32, &[]);
+        assert_eq!(dispatch(&mut bytes, Operation::Reset as i64), 0);
+        assert_bounded_response(&bytes, Status::Ok);
+    }
+
+    #[test]
+    fn arbitrary_invalid_envelopes_never_escape_the_descriptor() {
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+        for length in protocol::HEADER_BYTES..protocol::HEADER_BYTES + 257 {
+            let mut bytes = vec![0_u8; length];
+            for byte in &mut bytes {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            // Force at least one envelope field invalid so fuzzing cannot
+            // allocate a machine; all remaining bytes stay adversarial.
+            protocol::write_u32(&mut bytes, field::MAGIC, protocol::MAGIC ^ 1);
+            assert_eq!(dispatch(&mut bytes, i64::MAX), 0);
+            assert_bounded_response(&bytes, Status::Invalid);
+        }
+    }
+
+    #[test]
+    fn transport_rejects_invalid_worker_and_descriptor_geometry_before_dereference() {
+        assert_eq!(astrid_compute_run(1, 0, 0, 0), -1);
         assert_eq!(
-            protocol::read_u32(&header, field::STATUS),
-            Some(Status::Ok as u32)
+            astrid_compute_run(0, -1, protocol::HEADER_BYTES as i64, 0),
+            -1
+        );
+        assert_eq!(astrid_compute_run(0, 64, -1, 0), -1);
+        assert_eq!(
+            astrid_compute_run(0, 64, (protocol::HEADER_BYTES - 1) as i64, 0),
+            -1
         );
         assert_eq!(
-            protocol::read_u32(&header, field::OUTCOME),
-            Some(Outcome::HostRequest as u32)
+            astrid_compute_run(0, 64, (protocol::CONTROL_BYTES + 1) as i64, 0),
+            -1
         );
-        assert_eq!(protocol::read_u32(&header, field::REQUEST_CHANNEL), Some(1));
-        assert!(
-            protocol::read_u64(&header, field::TOTAL_STEPS_EXECUTED)
-                .is_some_and(|steps| steps >= 15_899_016)
-        );
-        assert!(protocol::read_u32(&header, field::MESSAGE_LEN).is_some_and(|length| length > 0));
     }
 
     #[test]
@@ -558,13 +594,19 @@ mod tests {
             worker_index: Some(0),
             fuel: None,
         };
-        let mut request = vec![0_u8; protocol::HEADER_BYTES];
+        let mut request = vec![0_u8; protocol::HEADER_BYTES + protocol::COLD_BOOT_INPUT_BYTES];
         protocol::write_u32(&mut request, field::MAGIC, protocol::MAGIC);
         protocol::write_u32(&mut request, field::VERSION, protocol::VERSION);
         protocol::write_u32(&mut request, field::OPERATION, Operation::InitCold as u32);
+        protocol::write_u32(
+            &mut request,
+            field::INPUT_LEN,
+            protocol::COLD_BOOT_INPUT_BYTES as u32,
+        );
         protocol::write_u64(&mut request, field::RAM_BYTES, 32 * 1024 * 1024);
         protocol::write_u64(&mut request, field::MAX_CONSOLE_BYTES, 64 * 1024);
         protocol::write_u32(&mut request, field::HART_COUNT, 2);
+        request[protocol::HEADER_BYTES..].copy_from_slice(&1_753_142_400_u64.to_le_bytes());
         group.write(control_offset, &request).expect("write init");
         group
             .submit(descriptor)
@@ -575,6 +617,7 @@ mod tests {
         let mut console = Vec::new();
         let total_steps = loop {
             protocol::write_u32(&mut request, field::OPERATION, Operation::RunSlice as u32);
+            protocol::write_u32(&mut request, field::INPUT_LEN, 0);
             protocol::write_u64(&mut request, field::SLICE_BUDGET, 1_000_000);
             group.write(control_offset, &request).expect("write slice");
             group

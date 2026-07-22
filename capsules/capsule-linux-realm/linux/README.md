@@ -1,16 +1,21 @@
 # AOS Linux image
 
-This directory contains the Linux-bearing artifact for `aos-rv64-virt-v0`.
+This directory contains Linux inputs for `aos-rv64-virt-v1`.
 Linux 6.18.39 boots the checked-in Buildroot 2026.05.1 `newc` root filesystem,
 runs an AOS-owned static `/init` as PID 1, and keeps one admitted 1–64-hart
 guest resident per principal Store. Automatic topology follows Astrid's current
 principal/host compute admission; every hart is deterministically time-sliced
 inside one generic compute worker in the current implementation.
 
-The current userland is intentionally small but real:
+The current userland is an intentionally bounded agent development workbench:
 
-- static musl 1.2.6;
-- BusyBox 1.38.0 and its `ash` shell;
+- musl 1.2.6 and BusyBox 1.38.0 as the base system;
+- Bash 5.2.37 as the command shell;
+- Git 2.54.0 and CA roots for source and certificate handling, although the
+  guest has no network authority or network device yet;
+- Python 3.14.6;
+- Clang/LLVM 22.1.7, binutils 2.45.1, target C/C++ headers and libraries, Make
+  4.4.1, CMake 4.3.2, Ninja 1.13.2, pkgconf, and patch;
 - an unprivileged `agent` account at UID/GID 1000 with `/home/agent`;
 - a locked root password and no login service;
 - `/proc`, `/sys`, static device nodes, and ordinary Linux process/syscall
@@ -36,16 +41,16 @@ copies the bounded response back, and resumes Linux. There is no PLIC, virtio,
 socket, network device, shared-memory ring, or host filesystem handle in this
 path.
 
-This is not Bash, Debian, or a development distribution yet. It has no Python,
-GCC inside the guest, package manager, network device, block device, PTY, or
-durable Linux root disk. `/home/agent` is the separate crash-consistent Realm
-filesystem: each successful mutation selects an immutable principal generation,
-so its bytes survive warm calls, guest shutdown, component eviction, and daemon
-restart. `/workspace` is the invocation's Astrid COW resource, not a Linux disk.
-PID 1 unmounts and remounts both views before every shell command; the home
-reattaches the current durable head, while workspace remounting ensures stale 9P
-FIDs cannot cross an invocation boundary. `/tmp` and the initramfs root remain
-boot-local RAM.
+This is AOS Realm, not Debian. It deliberately has no Rust/Cargo, Node/npm,
+package manager, network device, block device, PTY, or durable Linux root disk
+yet. Git therefore operates on local trees only. `/home/agent` is the separate
+crash-consistent Realm filesystem: each successful mutation selects an immutable
+principal generation, so its bytes survive warm calls, guest shutdown, component
+eviction, and daemon restart. `/workspace` is the invocation's Astrid COW
+resource, not a Linux disk. PID 1 unmounts and remounts both views before every
+shell command; the home reattaches the current durable head, while workspace
+remounting ensures stale 9P FIDs cannot cross an invocation boundary. `/tmp` and
+the initramfs root remain boot-local RAM.
 
 ## Command protocol
 
@@ -55,8 +60,8 @@ PID 1 disables terminal echo and accepts one canonical console line:
 AOS/1 <32-lowercase-hex-token> sh <max-file-bytes> <cwd-byte-length> <cwd> <script>\n
 ```
 
-Lifecycle and diagnostic commands retain their shorter fixed forms. The shell
-The per-file limit is a decimal byte count; zero means no additional inner
+Lifecycle and diagnostic commands retain their shorter fixed forms. The
+per-file limit is a decimal byte count; zero means no additional inner
 `RLIMIT_FSIZE`, while Astrid's outer principal storage quota remains mandatory.
 The frame's CWD length makes the absolute guest CWD unambiguous; only
 `/home/agent`, `/workspace`, and their normalized descendants are admitted.
@@ -89,20 +94,20 @@ The diagnostic `linux-console` surface admits only `ping`, `counter`, and
 `SOURCES.lock` records the verified kernel.org and Buildroot archives, the
 Buildroot signing-key fingerprint, exact source/toolchain versions, the pinned
 OCI builder, and all retained artifact digests. `build-userland.sh` requires an
-exact Buildroot 2026.05.1 tree, verifies the generated RV64IMA/static-musl
-configuration before compiling, uses Buildroot's forced package-hash checks,
-and rejects a rootfs digest mismatch. `build-image.sh` similarly requires Linux
+exact Buildroot 2026.05.1 tree, verifies the generated interim RV64IMA/LP64
+shared-musl configuration before compiling, uses Buildroot's forced
+package-hash checks, and rejects a rootfs digest mismatch. `build-image.sh`
+similarly requires Linux
 6.18.39, Clang/LLD 18.1.3, the recorded rootfs, and a clean output directory.
 
-`prewarm-32m.aos-machine` is not another operating system or an imported VM. It
-is a sparse checkpoint produced by the AOS-owned RV64 machine after the exact
-checked-in image reaches its first, still-unanswered home 9P request. No
-principal filesystem response or console input has entered the machine at that
-point. The codec binds the state to BLAKE3 digests of `Image` and `SOURCES.lock`,
-checks its own payload integrity, validates every decoded resource and CPU field,
-and restores only for the exact 32 MiB envelope. The signed capsule artifact is
-the authenticity boundary. `PREWARM.lock` records the reproducible checkpoint
-receipt and outer file digests without creating a circular input binding.
+The earlier 32 MiB seed proved that an AOS-owned RV64 checkpoint can stop at a
+principal-free 9P suspension and attach fresh providers after restore. It is not
+compatible with this development generation: the larger immutable toolchain
+uses a measured 512 MiB minimum, and an eager sparse checkpoint would retain
+hundreds of MiB of initramfs pages. The current image therefore performs one
+full boot and remains principal-resident until shutdown or eviction. A new
+prewarm artifact must not be shipped until its retained bytes and restore time
+beat that honest cold-boot contract.
 
 The active Buildroot output directory must be on a Linux filesystem. GNU
 package configure probes create path patterns that macOS file-sharing mounts do
@@ -113,35 +118,31 @@ the resulting capsule.
 Inside the builder recorded in `SOURCES.lock`:
 
 ```sh
-./build-userland.sh /work/buildroot-2026.05.1 /build/rootfs-out /work/rootfs.cpio
-./build-image.sh /work/linux-6.18.39 /work/rootfs.cpio /build/kernel-out /work/Image
+./build-userland.sh /work/buildroot-2026.05.1 /build/rootfs-out /work/rootfs.cpio.gz
+./build-image.sh /work/linux-6.18.39 /work/rootfs.cpio.gz /build/kernel-out /work/Image
 ```
 
 `build-userland.sh` uses `BR2_DL_DIR` when supplied; otherwise it creates a
 sibling cache next to the output directory. It never writes downloads into the
-source tree or the container root filesystem.
+source tree or the container root filesystem. `AOS_BUILD_JOBS` controls both
+Buildroot and nested package concurrency. The userland build defaults to one job
+because LLVM compilation can exceed an 8 GiB builder when several C++ compiler
+processes overlap; larger builders may raise it explicitly. The kernel image
+build defaults to eight jobs and accepts the same override.
 
 Both scripts default to fail-closed digest verification. `AOS_RECORD_USERLAND=1`
 and `AOS_RECORD_IMAGE=1` only print candidate digests for an intentional source
 refresh; recording them still requires review plus an independent clean rebuild.
 
-After reproducing `Image`, regenerate the prewarm artifact through the machine
-itself:
+The development image deliberately has no prewarm artifact. Each admitted
+principal receives an honest cold boot, after which the capsule retains that
+principal's machine in memory until shutdown or eviction. The old 32 MiB seed
+remains historical evidence only and is rejected by the current machine model.
+Any future prewarm format must remain principal-free, bind the complete machine
+identity and immutable system image, and demonstrate lower retained bytes and
+latency than this cold-boot contract.
 
-```sh
-cargo run --release -p aos-realm-machine --example build_prewarm -- \
-  capsules/capsule-linux-realm/linux/Image \
-  capsules/capsule-linux-realm/linux/SOURCES.lock \
-  capsules/capsule-linux-realm/linux/prewarm-32m.aos-machine
-```
-
-The builder rejects a halt, trap, unexpected channel, missing init marker,
-undrained output, or principal-bearing console input. Default cold Realm startup
-then restores this state, attaches fresh principal home and invocation workspace
-sessions, and reaches `AOS READY`. A different admitted RAM size takes the full
-cold-boot path rather than coercing the checkpoint.
-
-The checked-in `Image` contains the GPL-2.0-only Linux kernel and GPL-2.0-only
+The produced `Image` contains the GPL-2.0-only Linux kernel and GPL-2.0-only
 BusyBox; the in-kernel `trans_aos.c` transport is GPL-2.0-only because it is
 compiled into Linux. That boundary does not change the MIT/Apache licensing of
 the Rust RV64 machine, 9P server, capsule, or Astrid runtime: they communicate
@@ -152,12 +153,15 @@ notices and make the exact corresponding sources from `SOURCES.lock` available.
 configuration, target license texts, and kernel license; its README defines the
 larger corresponding-source release gate.
 
-To exercise the image through the AOS interpreter rather than QEMU, including a
-durable-home write/rename, clean shutdown, cold boot, and exact readback:
+To exercise the image through the AOS interpreter rather than QEMU, including
+Bash, Git, Python, Clang, C++, Make, CMake, Ninja, a real compilation, and a Git
+commit:
 
 ```sh
-cargo test --release -p aos-linux-realm \
-  linux_boot_and_console_preserve_userspace_across_invocations -- --nocapture
+AOS_REALM_TEST_LINUX_IMAGE=/absolute/path/to/Image \
+  cargo test --release -p aos-linux-realm \
+  external_developer_image_executes_the_complete_base_toolchain \
+  -- --ignored --nocapture
 ```
 
 QEMU remains useful only as an independent control experiment. It is not linked

@@ -13,6 +13,8 @@ publish = false
 
 [dependencies]
 blake3 = { workspace = true }
+ieee-apsqrt = { workspace = true }
+rustc_apfloat = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }

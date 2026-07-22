@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::host::{REALM_HOME, REALM_TMP, canonical_guest_path, resolve_guest_path};
 
-pub(crate) const PATH_CONTRACT_VERSION: u32 = 3;
+pub(crate) const PATH_CONTRACT_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]

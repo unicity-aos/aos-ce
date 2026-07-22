@@ -13,8 +13,11 @@
 pub const WORKER_ID: &str = "linux-vcpu";
 /// `LVC1`, encoded little-endian at the beginning of every descriptor.
 pub const MAGIC: u32 = 0x4c56_4331;
-/// Current controller/worker protocol version.
-pub const VERSION: u32 = 2;
+/// Controller/worker protocol version.
+///
+/// This private ABI has not shipped, so its first releasable shape starts at
+/// version 1 rather than preserving local development revisions.
+pub const VERSION: u32 = 1;
 /// Fixed header before any input or response payload.
 pub const HEADER_BYTES: usize = 128;
 /// Maximum descriptor admitted by the Astrid compute copy boundary.
@@ -27,6 +30,12 @@ pub const WORKER_MIN_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 pub const WORKER_MAX_MEMORY_BYTES: usize = 3584 * 1024 * 1024;
 /// WebAssembly linear-memory page size.
 pub const WASM_PAGE_BYTES: usize = 65_536;
+/// Exact `InitCold` payload: admitted wall-clock seconds since Unix epoch.
+pub const COLD_BOOT_INPUT_BYTES: usize = 8;
+/// Largest scheduling slice one descriptor may request.
+pub const MAX_SLICE_STEPS: u64 = 1_000_000;
+/// Largest serial input accepted by one descriptor.
+pub const MAX_CONSOLE_INPUT_BYTES: usize = 64 * 1024;
 
 /// Byte offsets for the fixed descriptor header.
 pub mod field {
@@ -86,18 +95,16 @@ pub mod field {
 pub enum Operation {
     /// Create a machine and boot the embedded Linux image.
     InitCold = 1,
-    /// Restore the signed 32-MiB prewarm checkpoint.
-    InitPrewarm = 2,
     /// Execute one bounded RV64 scheduling slice.
-    RunSlice = 3,
+    RunSlice = 2,
     /// Append bytes to the emulated console input.
-    PushConsole = 4,
+    PushConsole = 3,
     /// Complete the current 9P request.
-    Complete9p = 5,
+    Complete9p = 4,
     /// Fail the current 9P request.
-    Fail9p = 6,
+    Fail9p = 5,
     /// Drop all machine state held by this worker instance.
-    Reset = 7,
+    Reset = 6,
 }
 
 impl TryFrom<u32> for Operation {
@@ -106,12 +113,11 @@ impl TryFrom<u32> for Operation {
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::InitCold),
-            2 => Ok(Self::InitPrewarm),
-            3 => Ok(Self::RunSlice),
-            4 => Ok(Self::PushConsole),
-            5 => Ok(Self::Complete9p),
-            6 => Ok(Self::Fail9p),
-            7 => Ok(Self::Reset),
+            2 => Ok(Self::RunSlice),
+            3 => Ok(Self::PushConsole),
+            4 => Ok(Self::Complete9p),
+            5 => Ok(Self::Fail9p),
+            6 => Ok(Self::Reset),
             _ => Err(()),
         }
     }
@@ -240,5 +246,56 @@ mod tests {
         assert_eq!(read_u32(&bytes, field::MAGIC), Some(MAGIC));
         assert_eq!(read_u64(&bytes, field::RAM_BYTES), Some(32 * 1024 * 1024));
         assert_eq!(read_u32(&bytes, field::HART_COUNT), Some(8));
+    }
+
+    #[test]
+    fn complete_header_layout_is_non_overlapping_and_bounded() {
+        let mut fields = [
+            (field::MAGIC, 4),
+            (field::VERSION, 4),
+            (field::OPERATION, 4),
+            (field::STATUS, 4),
+            (field::RAM_BYTES, 8),
+            (field::MAX_CONSOLE_BYTES, 8),
+            (field::SLICE_BUDGET, 8),
+            (field::REQUEST_ID, 8),
+            (field::REQUEST_FAILURE, 4),
+            (field::INPUT_LEN, 4),
+            (field::RESPONSE_LEN, 4),
+            (field::OUTCOME, 4),
+            (field::STEPS_EXECUTED, 8),
+            (field::TOTAL_STEPS_EXECUTED, 8),
+            (field::INSTRUCTIONS_RETIRED, 8),
+            (field::TOTAL_INSTRUCTIONS_RETIRED, 8),
+            (field::HALT_CODE, 4),
+            (field::HALT_PASSED, 4),
+            (field::REQUEST_CHANNEL, 4),
+            (field::MAX_RESPONSE_BYTES, 4),
+            (field::CONSOLE_LEN, 4),
+            (field::MESSAGE_LEN, 4),
+            (field::ERROR_LEN, 4),
+            (field::HART_COUNT, 4),
+        ];
+        fields.sort_unstable_by_key(|(offset, _)| *offset);
+        for pair in fields.windows(2) {
+            assert!(pair[0].0 + pair[0].1 <= pair[1].0);
+        }
+        let (last_offset, last_width) = fields[fields.len() - 1];
+        assert!(last_offset + last_width <= HEADER_BYTES);
+    }
+
+    #[test]
+    fn operation_discriminants_are_dense_and_start_at_one() {
+        assert_eq!(Operation::InitCold as u32, 1);
+        assert_eq!(Operation::RunSlice as u32, 2);
+        assert_eq!(Operation::PushConsole as u32, 3);
+        assert_eq!(Operation::Complete9p as u32, 4);
+        assert_eq!(Operation::Fail9p as u32, 5);
+        assert_eq!(Operation::Reset as u32, 6);
+        for value in 1..=6 {
+            assert!(Operation::try_from(value).is_ok());
+        }
+        assert!(Operation::try_from(0).is_err());
+        assert!(Operation::try_from(7).is_err());
     }
 }

@@ -25,9 +25,7 @@ use aos_realm_runtime::{
 use aos_realm_vfs::FsStatus;
 use astrid_sdk::prelude::*;
 use astrid_sdk::schemars;
-use backend::{
-    DEFAULT_LINUX_BACKEND_ID, LINUX_PREWARM_CHECKPOINT_BYTES, LinuxMachine, LinuxSliceOutcome,
-};
+use backend::{DEFAULT_LINUX_BACKEND_ID, LinuxMachine, LinuxSliceOutcome};
 #[cfg(test)]
 use host::NativeTestWorkspace9p;
 #[cfg(not(test))]
@@ -60,7 +58,6 @@ const MAX_LINUX_CWD_BYTES: usize = 64;
 const LINUX_DEFAULT_CWD: &str = "/home/agent";
 #[cfg(target_arch = "wasm32")]
 const LINUX_COOPERATE_TOPIC: &str = "realm.v1.linux.cooperate";
-const LINUX_PREWARM_RAM_BYTES: usize = 32 * 1024 * 1024;
 
 #[cfg(not(test))]
 type WorkspacePlan9Session = Plan9Session<AstridWorkspace9p>;
@@ -245,9 +242,6 @@ struct StatusResponse {
     linux_lifecycle: &'static str,
     linux_backend: &'static str,
     linux_cold_start: &'static str,
-    linux_prewarm_ram_bytes: usize,
-    linux_prewarm_checkpoint_bytes: usize,
-    linux_prewarm_authority: &'static str,
     linux_state: &'static str,
     linux_residency: &'static str,
     linux_vcpus: u32,
@@ -892,8 +886,8 @@ impl From<RunLimits> for LinuxInvocationLimits {
         Self {
             run,
             max_file_bytes: resources::DEFAULT_LINUX_MAX_FILE_BYTES,
-            // Direct reference tests use the format-1 prewarm checkpoint.
-            // Principal-configured execution passes its explicit/auto value.
+            // Direct reference tests use one logical guest CPU. Principal-
+            // configured execution passes its explicit or admitted auto value.
             vcpus: 1,
         }
     }
@@ -974,7 +968,6 @@ fn execute_linux_resident_cooperatively(
 
     if booted {
         *workspace_9p = None;
-        let requested_prewarm = limits.memory_bytes == LINUX_PREWARM_RAM_BYTES;
         let resident = LinuxMachine::new(
             Rv64MachineConfig {
                 ram_bytes: limits.memory_bytes,
@@ -983,15 +976,9 @@ fn execute_linux_resident_cooperatively(
                 max_console_bytes: HARD_MAX_OUTPUT_BYTES,
             },
             vcpus,
-            requested_prewarm,
         )
         .map_err(SysError::ApiError)?;
-        let restored_prewarm = resident.ram_bytes() == LINUX_PREWARM_RAM_BYTES;
         *machine = Some(resident);
-
-        if restored_prewarm {
-            stdout.extend_from_slice(b"AOS PREWARM RESTORED\r\n");
-        }
 
         let report = match drive_linux_until(
             machine.as_mut().expect("machine inserted"),
@@ -1822,10 +1809,7 @@ fn status_response(
         next_process_id: actor.machine.next_process_id.map(|process| process.get()),
         linux_lifecycle: "lazy-principal-resident",
         linux_backend: DEFAULT_LINUX_BACKEND_ID,
-        linux_cold_start: "bound-prewarm-32m-or-full-boot",
-        linux_prewarm_ram_bytes: LINUX_PREWARM_RAM_BYTES,
-        linux_prewarm_checkpoint_bytes: LINUX_PREWARM_CHECKPOINT_BYTES,
-        linux_prewarm_authority: "signed-capsule-artifact+fresh-principal-providers",
+        linux_cold_start: "full-boot-then-principal-resident",
         linux_state: actor.linux.state,
         linux_residency: "principal-affine-store",
         linux_vcpus: actor
@@ -1914,6 +1898,20 @@ fn io_error_name(error: RealmIoError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EXTERNAL_DEVELOPER_TOOLCHAIN_PROBE: &str = concat!(
+        "set -eu; ",
+        "rm -rf /workspace/aos-dev-probe; mkdir /workspace/aos-dev-probe; cd /workspace/aos-dev-probe; ",
+        "bash --version; git --version; python3 --version; clang --version; clang++ --version; make --version; cmake --version; ninja --version; ",
+        "python3 -c 'print(\"PYTHON_OK\")'; ",
+        "printf '#include <stdio.h>\\nint main(void){puts(\"C_OK\");}\\n' > hello.c; cc hello.c -o hello-c; ./hello-c; ",
+        "printf '#include <iostream>\\nint main(){std::cout << \"CXX_OK\\\\n\";}\\n' > hello.cc; c++ hello.cc -o hello-cxx; ./hello-cxx; ",
+        "printf 'all:\\n\\t@echo MAKE_OK\\n' > Makefile; make; ",
+        "printf 'cmake_minimum_required(VERSION 3.15)\\nproject(probe C)\\nadd_executable(cmake-probe hello.c)\\n' > CMakeLists.txt; ",
+        "cmake -S . -B cmake-build -G Ninja; cmake --build cmake-build; ./cmake-build/cmake-probe; ",
+        "git init -q; git config user.name Agent; git config user.email agent@aos.invalid; git add .; git commit -qm probe; git rev-parse --verify HEAD; ",
+        "echo TOOLCHAIN_OK",
+    );
 
     #[test]
     fn cli_actions_are_structured_and_preserve_one_quoted_script() {
@@ -2165,10 +2163,10 @@ mod tests {
         );
         assert!(machine.is_some());
         let stdout = String::from_utf8_lossy(&boot.stdout);
-        assert!(stdout.contains("AOS PREWARM RESTORED"));
+        assert!(stdout.contains("AOS LINUX /init"));
         assert!(contains_bytes(&boot.stdout, LINUX_READY_MARKER));
-        assert_eq!(boot.fuel_consumed, 320_291);
-        assert_eq!(boot.suspensions, 7);
+        assert!(boot.fuel_consumed > LINUX_SLICE_STEPS);
+        assert!(boot.suspensions > 1);
 
         let first = execute_linux_resident_cooperatively(
             LinuxResidentState::new(&mut machine, &mut home_9p, &mut workspace_9p),
@@ -2388,7 +2386,87 @@ mod tests {
     }
 
     #[test]
-    fn prewarm_resume_cooperates_at_every_host_and_slice_boundary() {
+    #[ignore = "boots the external pinned developer image under the full RV64 interpreter"]
+    fn external_developer_image_executes_the_complete_base_toolchain() {
+        assert!(EXTERNAL_DEVELOPER_TOOLCHAIN_PROBE.len() <= MAX_LINUX_COMMAND_BYTES);
+        let image_path = std::env::var_os("AOS_REALM_TEST_LINUX_IMAGE")
+            .expect("set AOS_REALM_TEST_LINUX_IMAGE to the recorded Linux Image");
+        let image = std::fs::read(&image_path).expect("read external developer image");
+        let limits = RunLimits {
+            fuel: u64::MAX,
+            memory_bytes: 512 * 1024 * 1024,
+            output_bytes: HARD_MAX_OUTPUT_BYTES,
+        };
+        let mut machine = Some(
+            LinuxMachine::new_reference_with_image(
+                Rv64MachineConfig {
+                    ram_bytes: limits.memory_bytes,
+                    max_console_bytes: HARD_MAX_OUTPUT_BYTES,
+                },
+                1,
+                &image,
+            )
+            .expect("admit external developer image"),
+        );
+        let mut home_9p = None;
+        let mut workspace_9p = None;
+        let boot = drive_linux_until(
+            machine.as_mut().expect("machine inserted"),
+            LinuxPlan9State {
+                home: &mut home_9p,
+                workspace: &mut workspace_9p,
+            },
+            limits.fuel,
+            limits.output_bytes,
+            LinuxAction::Boot,
+            None,
+            &mut || Ok(()),
+        )
+        .expect("drive external image to readiness");
+        assert!(
+            matches!(boot.outcome, LinuxDriveOutcome::Ready),
+            "external image boot output:\n{}",
+            String::from_utf8_lossy(&boot.stdout)
+        );
+        eprintln!(
+            "external developer image ready after {} steps and {} host suspensions",
+            boot.fuel_consumed, boot.suspensions
+        );
+
+        let result = execute_linux_resident_cooperatively(
+            LinuxResidentState::new(&mut machine, &mut home_9p, &mut workspace_9p),
+            LinuxAction::Shell,
+            Some(EXTERNAL_DEVELOPER_TOOLCHAIN_PROBE),
+            "/workspace",
+            Some("decafbaddecafbaddecafbaddecafbad"),
+            limits,
+            || Ok(()),
+        )
+        .expect("execute complete developer toolchain probe");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        eprintln!("external developer toolchain output:\n{stdout}");
+        assert_eq!(result.outcome, "completed", "toolchain output:\n{stdout}");
+        assert_eq!(result.exit_status, Some(0), "toolchain output:\n{stdout}");
+        for marker in [
+            "GNU bash, version 5.2.37",
+            "git version 2.54.0",
+            "Python 3.14.6",
+            "clang version 22.1.7",
+            "GNU Make 4.4.1",
+            "cmake version 4.3.2",
+            "1.13.2",
+            "PYTHON_OK",
+            "C_OK",
+            "CXX_OK",
+            "MAKE_OK",
+            "TOOLCHAIN_OK",
+        ] {
+            assert!(stdout.contains(marker), "missing {marker:?} in:\n{stdout}");
+        }
+    }
+
+    #[test]
+    fn bounded_cold_boot_cooperates_at_every_slice_boundary() {
         let mut cooperative_yields = 0_u64;
         let mut machine = None;
         let mut home_9p = None;
@@ -2411,11 +2489,11 @@ mod tests {
         )
         .expect("bounded Linux execution yields cooperatively");
 
-        assert_eq!(report.outcome, "ready");
-        assert_eq!(report.fuel_consumed, 320_291);
-        assert_eq!(report.suspensions, 7);
+        assert_eq!(report.outcome, "fuel-exhausted");
+        assert_eq!(report.fuel_consumed, LINUX_SLICE_STEPS * 4);
+        assert_eq!(report.suspensions, 4);
         assert_eq!(cooperative_yields, report.suspensions);
-        assert!(machine.is_some(), "ready prewarm RAM remains resident");
+        assert!(machine.is_none(), "partial cold-boot RAM is discarded");
     }
 
     #[test]
@@ -2790,9 +2868,7 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
         assert!(json.contains("\"commands_completed\":4"));
         assert!(json.contains("\"linux_lifecycle\":\"lazy-principal-resident\""));
         assert!(json.contains("\"linux_backend\":\"aos-rv64-interpreter\""));
-        assert!(json.contains("\"linux_cold_start\":\"bound-prewarm-32m-or-full-boot\""));
-        assert!(json.contains("\"linux_prewarm_ram_bytes\":33554432"));
-        assert!(json.contains("\"linux_prewarm_checkpoint_bytes\":9172369"));
+        assert!(json.contains("\"linux_cold_start\":\"full-boot-then-principal-resident\""));
         assert!(json.contains("\"linux-sh\""));
         assert!(json.contains("\"linux_state\":\"cold\""));
         assert!(json.contains("\"linux_boot_executions_this_actor_boot\":2"));
@@ -2807,7 +2883,7 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
             )
         );
         assert!(json.contains("\"reconfigure_on_next_exec\":false"));
-        assert!(json.contains("\"path_contract_version\":3"));
+        assert!(json.contains("\"path_contract_version\":1"));
         assert!(json.contains("\"physical_host_paths_visible\":false"));
         assert!(json.contains(
             "\"cwd_defaults\":[{\"consumer\":\"nested-core-wasm\",\"cwd\":\"/workspace\"},{\"consumer\":\"linux-guest\",\"cwd\":\"/home/agent\"},{\"consumer\":\"bare-rv64\",\"cwd\":null}]"
@@ -2938,5 +3014,31 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
         );
         assert!(capabilities.contains_key("fs_read"));
         assert!(capabilities.contains_key("fs_write"));
+    }
+
+    #[test]
+    fn signed_worker_manifest_lock_and_bytes_are_one_identity() {
+        let manifest: toml::Value = include_str!("../Capsule.toml")
+            .parse()
+            .expect("Capsule.toml parses");
+        let component = manifest["component"]
+            .as_array()
+            .expect("components are an array")
+            .iter()
+            .find(|component| component["id"].as_str() == Some("linux-vcpu"))
+            .expect("Linux vCPU component");
+        let bytes = include_bytes!("../assets/linux-vcpu.wasm");
+        let actual_hash = format!("blake3:{}", blake3::hash(bytes).to_hex());
+        assert_eq!(component["hash"].as_str(), Some(actual_hash.as_str()));
+
+        let lock = include_str!("../assets/linux-vcpu.lock");
+        let field = |name: &str| {
+            lock.lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("worker lock is missing {name}"))
+        };
+        assert_eq!(field("protocol"), "aos-linux-vcpu-1");
+        assert_eq!(field("worker_bytes"), bytes.len().to_string());
+        assert_eq!(format!("blake3:{}", field("worker_blake3")), actual_hash);
     }
 }
