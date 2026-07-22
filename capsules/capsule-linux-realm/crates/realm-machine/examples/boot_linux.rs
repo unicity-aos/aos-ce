@@ -1,4 +1,4 @@
-use aos_realm_machine::{Machine, MachineConfig, SliceOutcome};
+use aos_realm_machine::{Csr, Machine, MachineConfig, SliceOutcome};
 use std::{
     env, fs,
     io::Write,
@@ -6,7 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const RAM_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_RAM_MIB: usize = 32;
+const MIB: usize = 1024 * 1024;
 const CONSOLE_BYTES: usize = 4 * 1024 * 1024;
 const SLICE_STEPS: u64 = 100_000;
 const DEFAULT_MAX_STEPS: u64 = 250_000_000;
@@ -24,9 +25,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let mut args = env::args_os().skip(1);
-    let image_path = args
-        .next()
-        .ok_or_else(|| "usage: boot_linux IMAGE [MAX_STEPS] [HARTS]".to_string())?;
+    let image_path = args.next().ok_or_else(usage)?;
     let max_steps = args
         .next()
         .map(|value| {
@@ -49,22 +48,40 @@ fn run() -> Result<(), String> {
         })
         .transpose()?
         .unwrap_or(1);
+    let ram_mib = args
+        .next()
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| "RAM_MIB must be UTF-8".to_string())?
+                .parse::<usize>()
+                .map_err(|error| format!("invalid RAM_MIB: {error}"))
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_RAM_MIB);
+    let ram_bytes = ram_bytes_from_mib(ram_mib)?;
     if args.next().is_some() {
-        return Err("usage: boot_linux IMAGE [MAX_STEPS] [HARTS]".to_string());
+        return Err(usage());
     }
 
     let image =
         fs::read(&image_path).map_err(|error| format!("could not read {image_path:?}: {error}"))?;
     let mut machine = Machine::new_with_harts(
         MachineConfig {
-            ram_bytes: RAM_BYTES,
+            ram_bytes,
             max_console_bytes: CONSOLE_BYTES,
         },
         hart_count,
     )
     .map_err(|error| format!("could not admit Linux machine: {error}"))?;
+    let wall_time_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "host wall clock is before the Unix epoch".to_string())?
+        .as_secs();
+    let bootargs =
+        format!("earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time={wall_time_seconds}");
     machine
-        .boot_linux(&image, &[], "earlycon=sbi console=hvc0 init=/init panic=-1")
+        .boot_linux(&image, &[], &bootargs)
         .map_err(|error| format!("could not admit Linux image: {error}"))?;
 
     let started = Instant::now();
@@ -72,12 +89,21 @@ fn run() -> Result<(), String> {
     let mut total_steps = 0;
     while total_steps < max_steps {
         let remaining = max_steps.saturating_sub(total_steps);
+        let slice_start_pc = machine.pc();
         let report = machine.run_slice(remaining.min(SLICE_STEPS));
         total_steps = report.total_steps_executed;
         std::io::stdout()
             .write_all(&report.console)
             .map_err(|error| format!("could not write serial output: {error}"))?;
         serial.extend_from_slice(&report.console);
+        if machine.pc() == 0 && slice_start_pc != 0 {
+            return Err(format!(
+                "Linux fell through its unset trap vector during the slice starting at {slice_start_pc:#x}: mcause={:#x}, mepc={:#x}, mtval={:#x}",
+                machine.csr(Csr::Mcause),
+                machine.csr(Csr::Mepc),
+                machine.csr(Csr::Mtval),
+            ));
+        }
         match report.outcome {
             SliceOutcome::Yielded => {}
             SliceOutcome::Halted(status) => {
@@ -120,7 +146,7 @@ fn run() -> Result<(), String> {
                     ));
                 }
                 eprintln!(
-                    "AOS Linux boot reached its first governed host request with {hart_count} hart(s): {} retired instructions; {}",
+                    "AOS Linux boot reached its first governed host request with {hart_count} hart(s) and {ram_mib} MiB RAM: {} retired instructions; {}",
                     report.total_instructions_retired,
                     performance_summary(&machine, report.total_steps_executed, started.elapsed())
                 );
@@ -142,6 +168,19 @@ fn run() -> Result<(), String> {
         machine.privilege(),
         performance_summary(&machine, total_steps, started.elapsed())
     ))
+}
+
+fn usage() -> String {
+    "usage: boot_linux IMAGE [MAX_STEPS] [HARTS] [RAM_MIB]".to_string()
+}
+
+fn ram_bytes_from_mib(ram_mib: usize) -> Result<usize, String> {
+    if ram_mib == 0 {
+        return Err("RAM_MIB must be greater than zero".to_string());
+    }
+    ram_mib
+        .checked_mul(MIB)
+        .ok_or_else(|| format!("RAM_MIB {ram_mib} overflows the host address space"))
 }
 
 fn linux_reported_cpu_count(serial: &[u8], hart_count: usize) -> bool {
@@ -173,4 +212,36 @@ fn performance_summary(machine: &Machine, steps: u64, elapsed: Duration) -> Stri
         metrics.page_table_entries_read,
         metrics.page_table_entries_written
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ram_mebibytes_are_checked_before_machine_admission() {
+        assert_eq!(ram_bytes_from_mib(32), Ok(32 * MIB));
+        assert_eq!(
+            ram_bytes_from_mib(0),
+            Err("RAM_MIB must be greater than zero".to_string())
+        );
+
+        let overflowing = usize::MAX / MIB + 1;
+        assert_eq!(
+            ram_bytes_from_mib(overflowing),
+            Err(format!(
+                "RAM_MIB {overflowing} overflows the host address space"
+            ))
+        );
+    }
+
+    #[test]
+    fn smp_boot_markers_accept_both_linux_formats() {
+        assert!(linux_reported_cpu_count(b"SMP: 8 CPUs online", 8));
+        assert!(linux_reported_cpu_count(
+            b"Brought up 4 nodes, 4 processors activated",
+            4
+        ));
+        assert!(!linux_reported_cpu_count(b"SMP: 2 CPUs online", 8));
+    }
 }

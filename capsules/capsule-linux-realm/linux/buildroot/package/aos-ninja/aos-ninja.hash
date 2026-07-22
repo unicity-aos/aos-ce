@@ -1,0 +1,3 @@
+# Locally generated from Buildroot's pinned host Ninja package.
+sha256  974d6b2f4eeefa25625d34da3cb36bdcebe7fbce40f4c16ac0835fd1c0cbae17  aos-ninja-1.13.2.tar.gz
+sha256  eb7e9ab9690124c5c9f42bdc81383d886a3dede26345b6ed15bbad7caf81f7ea  COPYING

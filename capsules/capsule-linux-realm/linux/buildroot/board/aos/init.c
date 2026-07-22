@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -14,10 +15,12 @@
 #include <sys/reboot.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/mount.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PROTOCOL_PREFIX "AOS/1 "
@@ -139,14 +142,25 @@ static int shell_status(const char *cwd, const char *script,
         return 70;
 
     if (child == 0) {
-        char *const argv[] = { "sh", "-c", (char *)script, NULL };
+        char *const argv[] = {
+            "bash", "--noprofile", "--norc", "-c", (char *)script, NULL
+        };
         static char *const environment[] = {
             "HOME=/home/agent",
-            "PATH=/bin:/usr/bin",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "USER=agent",
             "LOGNAME=agent",
-            "SHELL=/bin/sh",
+            "SHELL=/bin/bash",
             "TERM=dumb",
+            "LANG=C",
+            "LC_ALL=C",
+            "TMPDIR=/tmp",
+            "CC=cc",
+            "CXX=c++",
+            "AR=ar",
+            "AOS_REALM_NAME=AOS Realm",
+            "AOS_PRINCIPAL_HOME=/home/agent",
+            "AOS_WORKSPACE=/workspace",
             NULL,
         };
         int null_fd;
@@ -172,7 +186,7 @@ static int shell_status(const char *cwd, const char *script,
             set_limit(RLIMIT_FSIZE,
                       max_file_bytes == 0 ? RLIM_INFINITY : max_file_bytes) < 0)
             _exit(126);
-        execve("/bin/sh", argv, environment);
+        execve("/bin/bash", argv, environment);
         _exit(127);
     }
 
@@ -320,6 +334,60 @@ static void configure_console(void)
     }
 }
 
+static int configure_wall_clock(void)
+{
+    static const char marker[] = "aos.wall_time=";
+    char command_line[4096];
+    int fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 70;
+    ssize_t length;
+    do {
+        length = read(fd, command_line, sizeof(command_line) - 1);
+    } while (length < 0 && errno == EINTR);
+    close(fd);
+    if (length <= 0)
+        return 70;
+    command_line[length] = '\0';
+    char *encoded = strstr(command_line, marker);
+    if (encoded == NULL)
+        return 70;
+    encoded += sizeof(marker) - 1;
+    errno = 0;
+    char *end;
+    unsigned long long seconds = strtoull(encoded, &end, 10);
+    if (errno != 0 || end == encoded ||
+        (*end != '\0' && !isspace((unsigned char)*end)) ||
+        seconds == 0 || seconds > (unsigned long long)INT64_MAX)
+        return 70;
+    struct timespec wall_time = {
+        .tv_sec = (time_t)seconds,
+        .tv_nsec = 0,
+    };
+    if (clock_settime(CLOCK_REALTIME, &wall_time) < 0) {
+        int clock_error = errno;
+        struct timeval legacy_wall_time = {
+            .tv_sec = (time_t)seconds,
+            .tv_usec = 0,
+        };
+
+        if (settimeofday(&legacy_wall_time, NULL) < 0) {
+            char diagnostic[96];
+            int length = snprintf(diagnostic, sizeof(diagnostic),
+                                  "AOS CLOCK SET FAILED clock=%d time=%d\n",
+                                  clock_error, errno);
+
+            if (length > 0)
+                write_all(diagnostic, (size_t)length);
+            return 70;
+        }
+        write_text("AOS CLOCK HOST-ADMITTED settimeofday\n");
+        return 0;
+    }
+    write_text("AOS CLOCK HOST-ADMITTED\n");
+    return 0;
+}
+
 int main(void)
 {
     char line[MAX_COMMAND_BYTES + PROTOCOL_OVERHEAD_BYTES];
@@ -330,8 +398,12 @@ int main(void)
     (void)mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "");
     umask(0077);
     write_text("AOS LINUX /init\n");
-    write_text("AOS USERLAND buildroot-2026.05.1 busybox-1.38.0\n");
-    int mount_status = refresh_home();
+    write_text("AOS USERLAND dev-2026.07 buildroot-2026.05.1 bash-5.2.37\n");
+    int mount_status = configure_wall_clock();
+    if (mount_status != 0)
+        write_text("AOS CLOCK FAILED\n");
+    if (mount_status == 0)
+        mount_status = refresh_home();
     if (mount_status == 0)
         mount_status = refresh_workspace();
     if (mount_status != 0) {

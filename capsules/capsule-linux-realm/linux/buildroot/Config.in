@@ -1,1 +1,5 @@
-# AOS Realm currently selects only packages from the main Buildroot tree.
+menu "AOS Realm development tools"
+
+source "$BR2_EXTERNAL_AOS_PATH/package/aos-ninja/Config.in"
+
+endmenu

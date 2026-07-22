@@ -13,9 +13,7 @@ use aos_realm_vcpu_protocol as protocol;
 use aos_realm_vcpu_protocol::{Operation, Outcome, RequestFailure, Status, field};
 
 #[cfg(not(target_arch = "wasm32"))]
-use aos_realm_machine::{
-    CheckpointBinding, CheckpointDigest, HostRequestId, Machine, MachineCheckpoint, SliceOutcome,
-};
+use aos_realm_machine::{HostRequestId, Machine, SliceOutcome};
 #[cfg(target_arch = "wasm32")]
 use astrid_sdk::compute::{ComputeGroup, GroupRequest, Parallelism, WorkDescriptor};
 
@@ -24,20 +22,29 @@ use astrid_sdk::compute::{ComputeGroup, GroupRequest, Parallelism, WorkDescripto
 /// Compute changes where the interpreter executes, not the machine semantics
 /// exposed to tools, traces, checkpoints, or differential tests.
 pub(crate) const DEFAULT_LINUX_BACKEND_ID: &str = "aos-rv64-interpreter";
-/// Exact prewarm artifact size recorded in `linux/PREWARM.lock`.
-pub(crate) const LINUX_PREWARM_CHECKPOINT_BYTES: usize = 9_172_369;
 #[cfg(any(target_arch = "wasm32", test))]
 const AUTO_GUEST_RESERVE_BYTES: usize = 128 * 1024 * 1024;
-const AUTO_REFERENCE_RAM_BYTES: usize = 32 * 1024 * 1024;
+const AUTO_REFERENCE_RAM_BYTES: usize = 512 * 1024 * 1024;
 #[cfg(any(target_arch = "wasm32", test))]
 const MAX_GUEST_RAM_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 #[cfg(not(target_arch = "wasm32"))]
 const LINUX_IMAGE: &[u8] = include_bytes!("../linux/Image");
-#[cfg(not(target_arch = "wasm32"))]
-const LINUX_SOURCES: &[u8] = include_bytes!("../linux/SOURCES.lock");
-#[cfg(not(target_arch = "wasm32"))]
-const LINUX_PREWARM_32M: &[u8] = include_bytes!("../linux/prewarm-32m.aos-machine");
+
+fn wall_time_seconds() -> Result<u64, String> {
+    #[cfg(target_arch = "wasm32")]
+    let now =
+        astrid_sdk::time::now().map_err(|error| format!("read admitted wall clock: {error}"))?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let now = std::time::SystemTime::now();
+    now.duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| "wall clock is before the Unix epoch".to_string())
+}
+
+fn linux_bootargs(wall_time_seconds: u64) -> String {
+    format!("earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time={wall_time_seconds}")
+}
 
 /// Normalized host request produced by the machine backend.
 #[derive(Debug)]
@@ -85,11 +92,8 @@ pub(crate) struct ReferenceMachine {
 
 impl LinuxMachine {
     /// Admit and initialize the production backend for this build target.
-    pub(crate) fn new(
-        config: MachineConfig,
-        configured_hart_count: u32,
-        restore_prewarm: bool,
-    ) -> Result<Self, String> {
+    pub(crate) fn new(config: MachineConfig, configured_hart_count: u32) -> Result<Self, String> {
+        let wall_time_seconds = wall_time_seconds()?;
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut config = config;
@@ -100,36 +104,11 @@ impl LinuxMachine {
                 // auto sizing from its admitted group.
                 config.ram_bytes = AUTO_REFERENCE_RAM_BYTES;
             }
-            let restore_prewarm = hart_count == 1
-                && (restore_prewarm || config.ram_bytes == AUTO_REFERENCE_RAM_BYTES);
-            let machine = if restore_prewarm {
-                let binding = CheckpointBinding::new(
-                    CheckpointDigest::hash(LINUX_IMAGE),
-                    CheckpointDigest::hash(LINUX_SOURCES),
-                );
-                let checkpoint = MachineCheckpoint::decode(LINUX_PREWARM_32M, binding)
-                    .map_err(|error| error.to_string())?;
-                if checkpoint.ram_bytes() != config.ram_bytes
-                    || checkpoint.max_console_bytes() != config.max_console_bytes
-                {
-                    return Err(
-                        "Linux prewarm checkpoint resources do not match admitted resources"
-                            .to_string(),
-                    );
-                }
-                checkpoint.into_machine()
-            } else {
-                let mut machine = Machine::new_with_harts(config, hart_count as usize)
-                    .map_err(|error| error.to_string())?;
-                machine
-                    .boot_linux(
-                        LINUX_IMAGE,
-                        &[],
-                        "earlycon=sbi console=hvc0 init=/init panic=-1",
-                    )
-                    .map_err(|error| error.to_string())?;
-                machine
-            };
+            let mut machine = Machine::new_with_harts(config, hart_count as usize)
+                .map_err(|error| error.to_string())?;
+            machine
+                .boot_linux(LINUX_IMAGE, &[], &linux_bootargs(wall_time_seconds))
+                .map_err(|error| error.to_string())?;
             Ok(Self::Reference(ReferenceMachine {
                 machine,
                 pending_request: None,
@@ -139,7 +118,7 @@ impl LinuxMachine {
         }
 
         #[cfg(target_arch = "wasm32")]
-        ComputeMachine::new(config, configured_hart_count, restore_prewarm).map(Self::Compute)
+        ComputeMachine::new(config, configured_hart_count).map(Self::Compute)
     }
 
     #[cfg(test)]
@@ -154,6 +133,27 @@ impl LinuxMachine {
                 })
             })
             .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_reference_with_image(
+        config: MachineConfig,
+        hart_count: u32,
+        image: &[u8],
+    ) -> Result<Self, String> {
+        let hart_count = reference_hart_count(hart_count)?;
+        let wall_time_seconds = wall_time_seconds()?;
+        let mut machine = Machine::new_with_harts(config, hart_count as usize)
+            .map_err(|error| error.to_string())?;
+        machine
+            .boot_linux(image, &[], &linux_bootargs(wall_time_seconds))
+            .map_err(|error| error.to_string())?;
+        Ok(Self::Reference(ReferenceMachine {
+            machine,
+            pending_request: None,
+            ram_bytes: config.ram_bytes,
+            hart_count,
+        }))
     }
 
     pub(crate) const fn backend_id(&self) -> &'static str {
@@ -300,11 +300,7 @@ struct ComputeResponse {
 
 #[cfg(target_arch = "wasm32")]
 impl ComputeMachine {
-    fn new(
-        mut config: MachineConfig,
-        configured_hart_count: u32,
-        restore_prewarm: bool,
-    ) -> Result<Self, String> {
+    fn new(mut config: MachineConfig, configured_hart_count: u32) -> Result<Self, String> {
         let mut hart_count = explicit_hart_count(configured_hart_count)?;
         let auto_memory = config.ram_bytes == 0;
         let (initial_pages, mut maximum_pages, mut control_offset) =
@@ -342,13 +338,8 @@ impl ComputeMachine {
             hart_count,
         };
         machine.invoke(
-            if hart_count == 1 && (restore_prewarm || config.ram_bytes == AUTO_REFERENCE_RAM_BYTES)
-            {
-                Operation::InitPrewarm
-            } else {
-                Operation::InitCold
-            },
-            &[],
+            Operation::InitCold,
+            &wall_time_seconds.to_le_bytes(),
             |header| {
                 protocol::write_u64(header, field::RAM_BYTES, config.ram_bytes as u64);
                 protocol::write_u64(
@@ -637,13 +628,12 @@ fn auto_guest_ram_bytes(maximum_memory_pages: u32) -> Result<usize, String> {
         .checked_sub(protocol::WORKER_MIN_MEMORY_BYTES)
         .and_then(|bytes| bytes.checked_sub(AUTO_GUEST_RESERVE_BYTES))
         .ok_or_else(|| "admitted Linux vCPU memory leaves no guest RAM".to_string())?;
-    // Auto is a useful default, not an instruction to let the first Realm bind
-    // the whole host pool. Retain half of the currently usable capacity for
-    // another principal/capsule; an operator can still request up to 3 GiB
-    // explicitly for a dedicated build principal.
-    let selected = (available / 2)
-        .max(AUTO_REFERENCE_RAM_BYTES)
-        .min(MAX_GUEST_RAM_BYTES);
+    // The admitted group is already the intersection of host capacity,
+    // operator policy, and the invoking principal's profile. Do not apply a
+    // second arbitrary fraction here: reserve the worker base, allocator
+    // headroom, and a host safety margin, then make the remainder useful to
+    // the guest up to the signed Realm ceiling.
+    let selected = available.clamp(AUTO_REFERENCE_RAM_BYTES, MAX_GUEST_RAM_BYTES);
     let aligned = selected - (selected % GUEST_PAGE_BYTES);
     if aligned < AUTO_REFERENCE_RAM_BYTES {
         return Err(format!(
@@ -691,9 +681,9 @@ mod tests {
     #[test]
     fn shared_memory_keeps_machine_and_control_region_disjoint() {
         let (initial_pages, maximum_pages, control_offset) =
-            shared_memory_layout(32 * 1024 * 1024).expect("default layout");
+            shared_memory_layout(512 * 1024 * 1024).expect("default layout");
         assert_eq!(initial_pages, 1024);
-        assert_eq!(maximum_pages, 2560);
+        assert_eq!(maximum_pages, 10_240);
         assert_eq!(control_offset, (63 * 1024 * 1024) as u64);
 
         let (initial_pages, maximum_pages, control_offset) =
@@ -712,11 +702,11 @@ mod tests {
 
         assert_eq!(
             auto_guest_ram_bytes(16_384).expect("one GiB group"),
-            416 * 1024 * 1024
+            832 * 1024 * 1024
         );
         assert_eq!(
             auto_guest_ram_bytes(57_344).expect("signed worker maximum"),
-            1696 * 1024 * 1024
+            3 * 1024 * 1024 * 1024
         );
         assert!(auto_guest_ram_bytes(2048).is_err());
     }
@@ -736,18 +726,17 @@ mod tests {
     }
 
     #[test]
-    fn multi_hart_machine_cold_boots_even_when_prewarm_is_requested() {
+    fn multi_hart_machine_uses_the_explicit_topology() {
         let machine = LinuxMachine::new(
             MachineConfig {
-                ram_bytes: AUTO_REFERENCE_RAM_BYTES,
+                ram_bytes: 32 * 1024 * 1024,
                 max_console_bytes: 64 * 1024,
             },
             2,
-            true,
         )
         .expect("two-hart cold machine");
 
         assert_eq!(machine.hart_count(), 2);
-        assert_eq!(machine.ram_bytes(), AUTO_REFERENCE_RAM_BYTES);
+        assert_eq!(machine.ram_bytes(), 32 * 1024 * 1024);
     }
 }

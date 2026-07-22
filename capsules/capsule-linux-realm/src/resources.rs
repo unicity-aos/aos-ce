@@ -6,7 +6,7 @@ use serde::Serialize;
 /// Zero delegates guest-RAM sizing to Astrid's admitted compute envelope.
 pub(crate) const DEFAULT_LINUX_MEMORY_BYTES: usize = 0;
 pub(crate) const MAX_LINUX_MEMORY_BYTES: usize = 3 * 1024 * 1024 * 1024;
-pub(crate) const MIN_LINUX_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MIN_LINUX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 /// No additional inner instruction ceiling; Astrid's principal CPU and timeout
 /// policy remains the outer enforcement boundary.
 pub(crate) const DEFAULT_LINUX_MAX_STEPS: u64 = 0;
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn principal_config_selects_a_bounded_page_aligned_envelope() {
         let selected = resources(&[
-            (LINUX_MEMORY_BYTES_KEY, "67108864"),
+            (LINUX_MEMORY_BYTES_KEY, "536870912"),
             (LINUX_MAX_STEPS_KEY, "25000000"),
             (LINUX_MAX_OUTPUT_BYTES_KEY, "32768"),
             (LINUX_MAX_FILE_BYTES_KEY, "268435456"),
@@ -254,7 +254,7 @@ mod tests {
         ])
         .expect("bounded envelope");
 
-        assert_eq!(selected.linux_memory_bytes, 64 * 1024 * 1024);
+        assert_eq!(selected.linux_memory_bytes, 512 * 1024 * 1024);
         assert_eq!(selected.linux_max_steps, 25_000_000);
         assert_eq!(selected.linux_max_output_bytes, 32 * 1024);
         assert_eq!(selected.linux_max_file_bytes, 256 * 1024 * 1024);

@@ -1,1 +1,1 @@
-# AOS Realm currently defines no external Buildroot packages.
+include $(sort $(wildcard $(BR2_EXTERNAL_AOS_PATH)/package/*/*.mk))

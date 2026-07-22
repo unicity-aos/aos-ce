@@ -14,7 +14,7 @@ use std::{collections::VecDeque, time::UNIX_EPOCH};
 #[cfg(test)]
 use std::{
     fs as native_fs,
-    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
+    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -112,6 +112,12 @@ impl Plan9FileSystem for AstridHome9p {
     fn set_len(&mut self, path: &str, len: u64) -> Result<(), Plan9Errno> {
         RealmFs::new(AstridRealmStore)
             .set_len(path, len)
+            .map_err(map_vfs_9p_error)
+    }
+
+    fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), Plan9Errno> {
+        RealmFs::new(AstridRealmStore)
+            .set_mode(path, mode)
             .map_err(map_vfs_9p_error)
     }
 
@@ -264,6 +270,16 @@ impl Plan9FileSystem for AstridWorkspace9p {
             .map_err(map_sdk_9p_error)
     }
 
+    fn set_mode(&mut self, path: &str, _mode: u32) -> Result<(), Plan9Errno> {
+        // The frozen Astrid fs@1.0 host contract exposes mode through stat but
+        // has no chmod operation. Validate the node through the same governed
+        // workspace capability, then acknowledge Linux's compatibility-only
+        // mode update. Regular workspace files are projected owner-executable
+        // below, so the permission survives the command-boundary remount.
+        let _ = plan9_metadata(&workspace_path(path)?)?;
+        Ok(())
+    }
+
     fn remove_file(&mut self, path: &str) -> Result<(), Plan9Errno> {
         fs::remove_file(&workspace_path(path)?).map_err(map_sdk_9p_error)
     }
@@ -366,13 +382,21 @@ fn plan9_metadata(path: &str) -> Result<Plan9Metadata, Plan9Errno> {
 /// authority boundary; these bits govern only access by uid 1000 inside the
 /// already-confined Linux mount.
 const fn workspace_projection_mode(kind: Plan9NodeKind, advertised: u32) -> u32 {
-    if advertised & 0o7777 != 0 {
-        advertised
+    let permissions = if advertised & 0o7777 != 0 {
+        advertised & 0o7777
     } else {
         match kind {
             Plan9NodeKind::Directory => 0o755,
             Plan9NodeKind::File => 0o644,
         }
+    };
+    match kind {
+        Plan9NodeKind::Directory => permissions,
+        // POSIX modes inside this single-principal compatibility guest are not
+        // an authority boundary. `cwd://` remains capability checked on every
+        // operation; owner-execute lets locally linked tools survive remounts
+        // until the host contract grows an audited chmod operation.
+        Plan9NodeKind::File => permissions | 0o100,
     }
 }
 
@@ -527,7 +551,14 @@ impl Plan9FileSystem for NativeTestWorkspace9p {
         truncate: bool,
     ) -> Result<(), Plan9Errno> {
         let mut options = native_fs::OpenOptions::new();
-        options.read(true).write(true).mode(mode & 0o7777);
+        // Match the live Astrid workspace projection: the frozen fs@1.0 host
+        // contract creates files through an already-authorized writable
+        // handle but cannot atomically apply Linux's requested mode. Retain
+        // owner read/write access so a Tlcreate fid remains writable even
+        // when tools such as Git request a final 0444 mode at creation time.
+        // A later Tsetattr still applies real native permissions in this test
+        // backend and exercises executable publication separately.
+        options.read(true).write(true).mode((mode & 0o7777) | 0o600);
         if exclusive {
             options.create_new(true);
         } else {
@@ -551,6 +582,14 @@ impl Plan9FileSystem for NativeTestWorkspace9p {
             .open(self.path(path)?)
             .map_err(map_native_9p_error)?;
         file.set_len(len).map_err(map_native_9p_error)
+    }
+
+    fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), Plan9Errno> {
+        native_fs::set_permissions(
+            self.path(path)?,
+            native_fs::Permissions::from_mode(mode & 0o7777),
+        )
+        .map_err(map_native_9p_error)
     }
 
     fn remove_file(&mut self, path: &str) -> Result<(), Plan9Errno> {
@@ -1123,15 +1162,46 @@ mod tests {
     }
 
     #[test]
-    fn linux_workspace_supplies_modes_when_host_metadata_has_none() {
+    fn linux_workspace_supplies_owner_executable_compatibility_modes() {
         assert_eq!(
             workspace_projection_mode(Plan9NodeKind::Directory, 0),
             0o755
         );
-        assert_eq!(workspace_projection_mode(Plan9NodeKind::File, 0), 0o644);
+        assert_eq!(workspace_projection_mode(Plan9NodeKind::File, 0), 0o744);
         assert_eq!(
             workspace_projection_mode(Plan9NodeKind::File, 0o100755),
-            0o100755
+            0o755
+        );
+    }
+
+    #[test]
+    fn native_9p_workspace_persists_mode_changes() {
+        let mut filesystem = NativeTestWorkspace9p::new().expect("test workspace");
+        filesystem
+            .create_file("tool", 0o644, true, false)
+            .expect("create tool");
+        filesystem.set_mode("tool", 0o755).expect("chmod tool");
+        assert_eq!(
+            filesystem.metadata("tool").expect("metadata").mode & 0o7777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn native_9p_workspace_keeps_new_read_only_files_writable_by_the_open_fid() {
+        let mut filesystem = NativeTestWorkspace9p::new().expect("test workspace");
+        filesystem
+            .create_file("git-object", 0o444, true, false)
+            .expect("create Git-style object");
+        assert_eq!(
+            filesystem
+                .write("git-object", 0, b"object")
+                .expect("the creating fid retains write authority"),
+            6
+        );
+        assert_eq!(
+            filesystem.read("git-object", 0, 16).expect("read object"),
+            b"object"
         );
     }
 

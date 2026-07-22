@@ -565,6 +565,33 @@ impl<S: RealmStore> RealmFs<S> {
         Ok(())
     }
 
+    /// Replace one node's POSIX permission and special bits in a selected
+    /// generation without changing its content or kind.
+    pub fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), FsError> {
+        validate_relative_path(path)?;
+        let mode = mode & 0o7777;
+        self.mutate(|_, manifest| {
+            if let Some(record) = manifest.files.get_mut(path) {
+                if record.mode == mode {
+                    return Ok(ManifestChange::Unchanged(()));
+                }
+                record.mode = mode;
+            } else if let Some(record) = manifest.directories.get_mut(path) {
+                if record.mode == mode {
+                    return Ok(ManifestChange::Unchanged(()));
+                }
+                record.mode = mode;
+            } else {
+                return Err(FsError::NotFound);
+            }
+            Ok(ManifestChange::Changed {
+                value: (),
+                blobs: Vec::new(),
+            })
+        })?;
+        Ok(())
+    }
+
     /// Remove one regular file in a new selected generation.
     pub fn remove_file(&mut self, path: &str) -> Result<(), FsError> {
         validate_relative_path(path)?;
@@ -1350,6 +1377,39 @@ mod tests {
             .remove_dir("archive")
             .expect("empty directory removal commits");
         assert_eq!(filesystem.metadata("archive"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn mode_changes_are_generation_atomic_and_preserve_content_and_kind() {
+        let store = MemoryStore::default();
+        let mut filesystem = RealmFs::new(store);
+        filesystem
+            .create_dir("bin", 0o750)
+            .expect("directory commits");
+        filesystem
+            .create_file("bin/tool", 0o640, true, false)
+            .expect("file commits");
+        filesystem
+            .write_at("bin/tool", 0, b"executable")
+            .expect("content commits");
+        let before = filesystem.status().expect("status").generation;
+
+        filesystem.set_mode("bin/tool", 0o755).expect("chmod file");
+        assert!(filesystem.status().expect("status").generation > before);
+        assert_eq!(
+            filesystem.metadata("bin/tool").expect("file metadata").mode,
+            0o755
+        );
+        assert_eq!(filesystem.read_file("bin/tool"), Ok(b"executable".to_vec()));
+
+        filesystem.set_mode("bin", 0o700).expect("chmod directory");
+        let directory = filesystem.metadata("bin").expect("directory metadata");
+        assert_eq!(directory.kind, FsNodeKind::Directory);
+        assert_eq!(directory.mode, 0o700);
+        assert_eq!(
+            filesystem.set_mode("missing", 0o755),
+            Err(FsError::NotFound)
+        );
     }
 
     #[test]

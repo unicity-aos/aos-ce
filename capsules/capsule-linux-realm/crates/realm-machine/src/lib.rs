@@ -10,13 +10,18 @@
 
 mod checkpoint;
 mod fdt;
+mod floating;
 
 pub use checkpoint::{CheckpointBinding, CheckpointDecodeError, CheckpointDigest};
 use fdt::{LinuxFdtConfig, build_linux_fdt};
+use rustc_apfloat::{
+    Float, FloatConvert, Round, Status as FloatStatus, StatusAnd,
+    ieee::{Double, Single},
+};
 use std::{collections::VecDeque, fmt};
 
 /// Machine profile whose future device tree and Linux image are versioned together.
-pub const MACHINE_MODEL: &str = "aos-rv64-virt-v0";
+pub const MACHINE_MODEL: &str = "aos-rv64-virt-v1";
 
 /// Guest physical address at which admitted RAM begins.
 pub const DRAM_BASE: u64 = 0x8000_0000;
@@ -69,24 +74,60 @@ const MSTATUS_MPIE: u64 = 1 << 7;
 const MSTATUS_SPP: u64 = 1 << 8;
 const MSTATUS_MPP_SHIFT: u32 = 11;
 const MSTATUS_MPP: u64 = 0b11 << MSTATUS_MPP_SHIFT;
+const MSTATUS_FS_SHIFT: u32 = 13;
+const MSTATUS_FS: u64 = 0b11 << MSTATUS_FS_SHIFT;
+const MSTATUS_FS_OFF: u64 = 0;
+#[cfg(test)]
+const MSTATUS_FS_INITIAL: u64 = 0b01 << MSTATUS_FS_SHIFT;
+const MSTATUS_FS_DIRTY: u64 = 0b11 << MSTATUS_FS_SHIFT;
 const MSTATUS_MPRV: u64 = 1 << 17;
 const MSTATUS_SUM: u64 = 1 << 18;
 const MSTATUS_MXR: u64 = 1 << 19;
 const MSTATUS_UXL_RV64: u64 = 0b10 << 32;
 const MSTATUS_SXL_RV64: u64 = 0b10 << 34;
+const MSTATUS_SD: u64 = 1 << 63;
 const MSTATUS_WRITABLE: u64 = MSTATUS_SIE
     | MSTATUS_MIE
     | MSTATUS_SPIE
     | MSTATUS_MPIE
     | MSTATUS_SPP
     | MSTATUS_MPP
+    | MSTATUS_FS
     | MSTATUS_MPRV
     | MSTATUS_SUM
     | MSTATUS_MXR;
-const SSTATUS_VISIBLE: u64 =
-    MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR | MSTATUS_UXL_RV64;
-const SSTATUS_WRITABLE: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR;
-const MISA_RV64_IMASU: u64 = (0b10 << 62) | (1 << 0) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20);
+const SSTATUS_VISIBLE: u64 = MSTATUS_SIE
+    | MSTATUS_SPIE
+    | MSTATUS_SPP
+    | MSTATUS_FS
+    | MSTATUS_SUM
+    | MSTATUS_MXR
+    | MSTATUS_UXL_RV64
+    | MSTATUS_SD;
+const SSTATUS_WRITABLE: u64 =
+    MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_FS | MSTATUS_SUM | MSTATUS_MXR;
+const MISA_RV64_IMAFDCSU: u64 = (0b10 << 62)
+    | (1 << 0)
+    | (1 << 2)
+    | (1 << 3)
+    | (1 << 5)
+    | (1 << 8)
+    | (1 << 12)
+    | (1 << 18)
+    | (1 << 20);
+
+const FFLAGS_NX: u8 = 1 << 0;
+const FFLAGS_UF: u8 = 1 << 1;
+const FFLAGS_OF: u8 = 1 << 2;
+const FFLAGS_DZ: u8 = 1 << 3;
+const FFLAGS_NV: u8 = 1 << 4;
+const FFLAGS_MASK: u8 = 0x1f;
+const FRM_SHIFT: u32 = 5;
+const FRM_MASK: u8 = 0b111 << FRM_SHIFT;
+const FCSR_MASK: u8 = FRM_MASK | FFLAGS_MASK;
+const CANONICAL_NAN_F32: u32 = 0x7fc0_0000;
+const CANONICAL_NAN_F64: u64 = 0x7ff8_0000_0000_0000;
+const NAN_BOX_F32: u64 = 0xffff_ffff_0000_0000;
 const MEDELEG_SUPPORTED: u64 = (1 << 0)
     | (1 << 1)
     | (1 << 2)
@@ -279,7 +320,7 @@ impl fmt::Display for CheckpointError {
             ),
             Self::MultipleHarts { count } => write!(
                 f,
-                "checkpoint format 1 supports one hart, machine has {count}"
+                "durable checkpoints currently support one hart, machine has {count}"
             ),
         }
     }
@@ -332,6 +373,12 @@ impl Privilege {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Csr {
+    /// Accrued floating-point exception flags.
+    Fflags = 0x001,
+    /// Dynamic floating-point rounding mode.
+    Frm = 0x002,
+    /// Combined floating-point control and status register.
+    Fcsr = 0x003,
     /// Supervisor status view of `mstatus`.
     Sstatus = 0x100,
     /// Supervisor interrupt-enable view.
@@ -394,6 +441,9 @@ pub enum Csr {
 impl Csr {
     const fn from_address(address: u16) -> Option<Self> {
         Some(match address {
+            0x001 => Self::Fflags,
+            0x002 => Self::Frm,
+            0x003 => Self::Fcsr,
             0x100 => Self::Sstatus,
             0x104 => Self::Sie,
             0x105 => Self::Stvec,
@@ -678,6 +728,7 @@ impl MachineMetrics {
 #[derive(Clone, Debug)]
 struct Cpu {
     registers: [u64; 32],
+    floating_registers: [u64; 32],
     pc: u64,
     privilege: Privilege,
 }
@@ -686,6 +737,7 @@ impl Cpu {
     fn new() -> Self {
         Self {
             registers: [0; 32],
+            floating_registers: [0; 32],
             pc: DRAM_BASE,
             privilege: Privilege::Machine,
         }
@@ -693,6 +745,7 @@ impl Cpu {
 
     fn reset(&mut self) {
         self.registers.fill(0);
+        self.floating_registers.fill(0);
         self.pc = DRAM_BASE;
         self.privilege = Privilege::Machine;
     }
@@ -706,10 +759,32 @@ impl Cpu {
             self.registers[register] = value;
         }
     }
+
+    fn read_float32(&self, register: usize) -> u32 {
+        let value = self.floating_registers[register];
+        if value >> 32 == u64::from(u32::MAX) {
+            value as u32
+        } else {
+            CANONICAL_NAN_F32
+        }
+    }
+
+    fn write_float32(&mut self, register: usize, value: u32) {
+        self.floating_registers[register] = NAN_BOX_F32 | u64::from(value);
+    }
+
+    fn read_float64(&self, register: usize) -> u64 {
+        self.floating_registers[register]
+    }
+
+    fn write_float64(&mut self, register: usize, value: u64) {
+        self.floating_registers[register] = value;
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 struct CsrFile {
+    fcsr: u8,
     mstatus: u64,
     medeleg: u64,
     mideleg: u64,
@@ -746,6 +821,9 @@ impl CsrFile {
         if privilege < required || write && ((address >> 10) & 0b11) == 0b11 {
             return None;
         }
+        if matches!(csr, Csr::Fflags | Csr::Frm | Csr::Fcsr) && !self.floating_enabled() {
+            return None;
+        }
         if matches!(csr, Csr::Cycle | Csr::Time | Csr::Instret) {
             let bit = 1 << (address - Csr::Cycle.address());
             if privilege < Privilege::Machine && self.mcounteren & bit == 0
@@ -759,7 +837,10 @@ impl CsrFile {
 
     const fn read(&self, csr: Csr) -> u64 {
         match csr {
-            Csr::Sstatus => self.mstatus & SSTATUS_VISIBLE,
+            Csr::Fflags => (self.fcsr & FFLAGS_MASK) as u64,
+            Csr::Frm => ((self.fcsr & FRM_MASK) >> FRM_SHIFT) as u64,
+            Csr::Fcsr => self.fcsr as u64,
+            Csr::Sstatus => self.status() & SSTATUS_VISIBLE,
             Csr::Sie => self.mie & self.mideleg,
             Csr::Sip => self.mip & self.mideleg,
             Csr::Mideleg => self.mideleg,
@@ -768,17 +849,17 @@ impl CsrFile {
             Csr::Stvec => self.stvec,
             Csr::Scounteren => self.scounteren,
             Csr::Sscratch => self.sscratch,
-            Csr::Sepc => self.sepc & !0b11,
+            Csr::Sepc => self.sepc & !0b1,
             Csr::Scause => self.scause,
             Csr::Stval => self.stval,
             Csr::Satp => self.satp,
-            Csr::Mstatus => self.mstatus | MSTATUS_UXL_RV64 | MSTATUS_SXL_RV64,
-            Csr::Misa => MISA_RV64_IMASU,
+            Csr::Mstatus => self.status() | MSTATUS_UXL_RV64 | MSTATUS_SXL_RV64,
+            Csr::Misa => MISA_RV64_IMAFDCSU,
             Csr::Medeleg => self.medeleg,
             Csr::Mtvec => self.mtvec,
             Csr::Mcounteren => self.mcounteren,
             Csr::Mscratch => self.mscratch,
-            Csr::Mepc => self.mepc & !0b11,
+            Csr::Mepc => self.mepc & !0b1,
             Csr::Mcause => self.mcause,
             Csr::Mtval => self.mtval,
             Csr::Mhartid => 0,
@@ -788,6 +869,18 @@ impl CsrFile {
 
     fn write(&mut self, csr: Csr, value: u64) {
         match csr {
+            Csr::Fflags => {
+                self.fcsr = (self.fcsr & !FFLAGS_MASK) | (value as u8 & FFLAGS_MASK);
+                self.mark_float_dirty();
+            }
+            Csr::Frm => {
+                self.fcsr = (self.fcsr & !FRM_MASK) | (((value as u8) << FRM_SHIFT) & FRM_MASK);
+                self.mark_float_dirty();
+            }
+            Csr::Fcsr => {
+                self.fcsr = value as u8 & FCSR_MASK;
+                self.mark_float_dirty();
+            }
             Csr::Sstatus => {
                 self.mstatus = (self.mstatus & !SSTATUS_WRITABLE) | (value & SSTATUS_WRITABLE);
             }
@@ -805,7 +898,7 @@ impl CsrFile {
             Csr::Stvec => self.stvec = legal_trap_vector(value),
             Csr::Scounteren => self.scounteren = value & 0b111,
             Csr::Sscratch => self.sscratch = value,
-            Csr::Sepc => self.sepc = value & !0b11,
+            Csr::Sepc => self.sepc = value & !0b1,
             Csr::Scause => self.scause = value,
             Csr::Stval => self.stval = value,
             Csr::Satp => {
@@ -828,13 +921,34 @@ impl CsrFile {
             Csr::Mtvec => self.mtvec = legal_trap_vector(value),
             Csr::Mcounteren => self.mcounteren = value & 0b111,
             Csr::Mscratch => self.mscratch = value,
-            Csr::Mepc => self.mepc = value & !0b11,
+            Csr::Mepc => self.mepc = value & !0b1,
             Csr::Mcause => self.mcause = value,
             Csr::Mtval => self.mtval = value,
             Csr::Mhartid => {}
             Csr::Cycle | Csr::Time | Csr::Instret => {}
             Csr::Mcycle | Csr::Minstret => {}
         }
+    }
+
+    const fn status(&self) -> u64 {
+        if self.mstatus & MSTATUS_FS == MSTATUS_FS_DIRTY {
+            self.mstatus | MSTATUS_SD
+        } else {
+            self.mstatus
+        }
+    }
+
+    const fn floating_enabled(&self) -> bool {
+        self.mstatus & MSTATUS_FS != MSTATUS_FS_OFF
+    }
+
+    fn mark_float_dirty(&mut self) {
+        self.mstatus = (self.mstatus & !MSTATUS_FS) | MSTATUS_FS_DIRTY;
+    }
+
+    fn accrue_float_flags(&mut self, flags: u8) {
+        self.fcsr |= flags & FFLAGS_MASK;
+        self.mark_float_dirty();
     }
 }
 
@@ -1770,16 +1884,37 @@ impl Machine {
             return Ok(StepEffect::trapped_architecturally());
         }
         let pc = self.cpu.pc;
-        if pc & 3 != 0 {
+        if pc & 1 != 0 {
             return Err(MachineTrap::InstructionAddressMisaligned { address: pc });
         }
         self.metrics.instruction_fetches = self.metrics.instruction_fetches.saturating_add(1);
         let physical_pc = self.translate(pc, AccessType::Instruction)?;
-        let instruction = self
+        let first_half = self
             .devices
-            .read(physical_pc, 4)
+            .read(physical_pc, 2)
             .map_err(|_| MachineTrap::InstructionAccessFault { address: pc })?
-            as u32;
+            as u16;
+        if first_half & 0b11 != 0b11 {
+            let (next_pc, halt) = self.execute_compressed(first_half, pc)?;
+            self.cpu.pc = next_pc;
+            self.cpu.registers[0] = 0;
+            return Ok(StepEffect::retired(halt));
+        }
+        let instruction = if pc & GUEST_PAGE_MASK == GUEST_PAGE_MASK - 1 {
+            let second_pc = pc.wrapping_add(2);
+            let second_physical = self.translate(second_pc, AccessType::Instruction)?;
+            let second_half = self
+                .devices
+                .read(second_physical, 2)
+                .map_err(|_| MachineTrap::InstructionAccessFault { address: second_pc })?
+                as u32;
+            u32::from(first_half) | (second_half << 16)
+        } else {
+            self.devices
+                .read(physical_pc, 4)
+                .map_err(|_| MachineTrap::InstructionAccessFault { address: pc })?
+                as u32
+        };
         let opcode = instruction & 0x7f;
         let rd = ((instruction >> 7) & 0x1f) as usize;
         let funct3 = (instruction >> 12) & 0x7;
@@ -1815,6 +1950,7 @@ impl Machine {
                 };
                 self.cpu.write(rd, value);
             }
+            0x07 => self.execute_float_load(instruction, rd, rs1, funct3, pc)?,
             0x0f => {
                 if funct3 > 1 {
                     return Err(illegal(pc, instruction));
@@ -1845,10 +1981,19 @@ impl Machine {
                         _ => MachineTrap::StoreAccessFault { address, bytes },
                     })?;
             }
+            0x27 => {
+                halt = self.execute_float_store(instruction, rs1, rs2, funct3, pc)?;
+            }
             0x2f => halt = self.execute_atomic(instruction, rd, rs1, rs2, funct3, pc)?,
             0x33 => self.execute_op(instruction, rd, rs1, rs2, funct3, funct7, pc)?,
             0x37 => self.cpu.write(rd, immediate_u(instruction)),
             0x3b => self.execute_op_32(instruction, rd, rs1, rs2, funct3, funct7, pc)?,
+            0x43 | 0x47 | 0x4b | 0x4f => {
+                self.execute_float_fused(instruction, opcode, pc)?;
+            }
+            0x53 => {
+                self.execute_float_op(instruction, rd, rs1, rs2, funct3, funct7, pc)?;
+            }
             0x63 => {
                 let lhs = self.cpu.read(rs1);
                 let rhs = self.cpu.read(rs2);
@@ -1926,6 +2071,293 @@ impl Machine {
         self.cpu.pc = next_pc;
         self.cpu.registers[0] = 0;
         Ok(StepEffect::retired(halt))
+    }
+
+    fn execute_compressed(
+        &mut self,
+        instruction: u16,
+        pc: u64,
+    ) -> Result<(u64, Option<HaltStatus>), MachineTrap> {
+        let quadrant = instruction & 0b11;
+        let funct3 = instruction >> 13;
+        let rd = usize::from((instruction >> 7) & 0x1f);
+        let rs2 = usize::from((instruction >> 2) & 0x1f);
+        let rd_prime = usize::from(8 + ((instruction >> 2) & 0x7));
+        let rs1_prime = usize::from(8 + ((instruction >> 7) & 0x7));
+        let rs2_prime = usize::from(8 + ((instruction >> 2) & 0x7));
+        let mut next_pc = pc.wrapping_add(2);
+        let mut halt = None;
+
+        match (quadrant, funct3) {
+            (0b00, 0b000) => {
+                let immediate = compressed_addi4spn_immediate(instruction);
+                if immediate == 0 {
+                    return Err(illegal(pc, u32::from(instruction)));
+                }
+                self.cpu
+                    .write(rd_prime, self.cpu.read(2).wrapping_add(immediate));
+            }
+            (0b00, 0b001) => {
+                if !self.csrs.floating_enabled() {
+                    return Err(illegal(pc, u32::from(instruction)));
+                }
+                let address = self
+                    .cpu
+                    .read(rs1_prime)
+                    .wrapping_add(compressed_double_immediate(instruction));
+                ensure_aligned(address, 8, false)?;
+                let physical = self.translate(address, AccessType::Load)?;
+                let value = self
+                    .devices
+                    .read(physical, 8)
+                    .map_err(|_| MachineTrap::LoadAccessFault { address, bytes: 8 })?;
+                self.cpu.write_float64(rd_prime, value);
+                self.csrs.mark_float_dirty();
+            }
+            (0b00, 0b010) => {
+                let address = self
+                    .cpu
+                    .read(rs1_prime)
+                    .wrapping_add(compressed_word_immediate(instruction));
+                ensure_aligned(address, 4, false)?;
+                let physical = self.translate(address, AccessType::Load)?;
+                let value = self
+                    .devices
+                    .read(physical, 4)
+                    .map_err(|_| MachineTrap::LoadAccessFault { address, bytes: 4 })?;
+                self.cpu.write(rd_prime, sign_extend(value, 32));
+            }
+            (0b00, 0b011) => {
+                let address = self
+                    .cpu
+                    .read(rs1_prime)
+                    .wrapping_add(compressed_double_immediate(instruction));
+                ensure_aligned(address, 8, false)?;
+                let physical = self.translate(address, AccessType::Load)?;
+                let value = self
+                    .devices
+                    .read(physical, 8)
+                    .map_err(|_| MachineTrap::LoadAccessFault { address, bytes: 8 })?;
+                self.cpu.write(rd_prime, value);
+            }
+            (0b00, 0b101) => {
+                if !self.csrs.floating_enabled() {
+                    return Err(illegal(pc, u32::from(instruction)));
+                }
+                let address = self
+                    .cpu
+                    .read(rs1_prime)
+                    .wrapping_add(compressed_double_immediate(instruction));
+                ensure_aligned(address, 8, true)?;
+                let physical = self.translate(address, AccessType::Store)?;
+                self.invalidate_reservation(physical, 8);
+                halt = self
+                    .devices
+                    .write(physical, self.cpu.read_float64(rs2_prime), 8)
+                    .map_err(|trap| map_store_fault(trap, address, 8))?;
+                self.csrs.mark_float_dirty();
+            }
+            (0b00, 0b110) | (0b00, 0b111) => {
+                let bytes = if funct3 == 0b110 { 4 } else { 8 };
+                let immediate = if bytes == 4 {
+                    compressed_word_immediate(instruction)
+                } else {
+                    compressed_double_immediate(instruction)
+                };
+                let address = self.cpu.read(rs1_prime).wrapping_add(immediate);
+                ensure_aligned(address, bytes, true)?;
+                let physical = self.translate(address, AccessType::Store)?;
+                self.invalidate_reservation(physical, bytes);
+                halt = self
+                    .devices
+                    .write(physical, self.cpu.read(rs2_prime), bytes)
+                    .map_err(|trap| map_store_fault(trap, address, bytes))?;
+            }
+            (0b01, 0b000) => {
+                self.cpu.write(
+                    rd,
+                    self.cpu
+                        .read(rd)
+                        .wrapping_add(compressed_immediate(instruction)),
+                );
+            }
+            (0b01, 0b001) => {
+                if rd == 0 {
+                    return Err(illegal(pc, u32::from(instruction)));
+                }
+                let value = (self.cpu.read(rd) as u32)
+                    .wrapping_add(compressed_immediate(instruction) as u32);
+                self.cpu.write(rd, sign_extend(u64::from(value), 32));
+            }
+            (0b01, 0b010) => self.cpu.write(rd, compressed_immediate(instruction)),
+            (0b01, 0b011) if rd == 2 => {
+                let immediate = compressed_addi16sp_immediate(instruction);
+                if immediate == 0 {
+                    return Err(illegal(pc, u32::from(instruction)));
+                }
+                self.cpu.write(2, self.cpu.read(2).wrapping_add(immediate));
+            }
+            (0b01, 0b011) => {
+                let immediate = compressed_lui_immediate(instruction);
+                if rd == 0 || immediate == 0 {
+                    return Err(illegal(pc, u32::from(instruction)));
+                }
+                self.cpu.write(rd, immediate);
+            }
+            (0b01, 0b100) => {
+                let subop = (instruction >> 10) & 0b11;
+                let lhs = self.cpu.read(rs1_prime);
+                match subop {
+                    0b00 => self.cpu.write(
+                        rs1_prime,
+                        lhs.wrapping_shr(u32::from(compressed_shift(instruction))),
+                    ),
+                    0b01 => self.cpu.write(
+                        rs1_prime,
+                        ((lhs as i64) >> compressed_shift(instruction)) as u64,
+                    ),
+                    0b10 => self
+                        .cpu
+                        .write(rs1_prime, lhs & compressed_immediate(instruction)),
+                    0b11 => {
+                        let rhs = self.cpu.read(rs2_prime);
+                        let operation = ((instruction >> 12) & 1, (instruction >> 5) & 0b11);
+                        let value = match operation {
+                            (0, 0) => lhs.wrapping_sub(rhs),
+                            (0, 1) => lhs ^ rhs,
+                            (0, 2) => lhs | rhs,
+                            (0, 3) => lhs & rhs,
+                            (1, 0) => {
+                                sign_extend(u64::from((lhs as u32).wrapping_sub(rhs as u32)), 32)
+                            }
+                            (1, 1) => {
+                                sign_extend(u64::from((lhs as u32).wrapping_add(rhs as u32)), 32)
+                            }
+                            _ => return Err(illegal(pc, u32::from(instruction))),
+                        };
+                        self.cpu.write(rs1_prime, value);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            (0b01, 0b101) => {
+                next_pc = pc.wrapping_add(compressed_jump_immediate(instruction));
+                ensure_instruction_aligned(next_pc)?;
+            }
+            (0b01, 0b110) | (0b01, 0b111) => {
+                let zero = self.cpu.read(rs1_prime) == 0;
+                if zero == (funct3 == 0b110) {
+                    next_pc = pc.wrapping_add(compressed_branch_immediate(instruction));
+                    ensure_instruction_aligned(next_pc)?;
+                }
+            }
+            (0b10, 0b000) => self.cpu.write(
+                rd,
+                self.cpu
+                    .read(rd)
+                    .wrapping_shl(u32::from(compressed_shift(instruction))),
+            ),
+            (0b10, 0b001) => {
+                if !self.csrs.floating_enabled() {
+                    return Err(illegal(pc, u32::from(instruction)));
+                }
+                let address = self
+                    .cpu
+                    .read(2)
+                    .wrapping_add(compressed_double_sp_immediate(instruction));
+                ensure_aligned(address, 8, false)?;
+                let physical = self.translate(address, AccessType::Load)?;
+                let value = self
+                    .devices
+                    .read(physical, 8)
+                    .map_err(|_| MachineTrap::LoadAccessFault { address, bytes: 8 })?;
+                self.cpu.write_float64(rd, value);
+                self.csrs.mark_float_dirty();
+            }
+            (0b10, 0b010) | (0b10, 0b011) => {
+                if rd == 0 {
+                    return Err(illegal(pc, u32::from(instruction)));
+                }
+                let bytes = if funct3 == 0b010 { 4 } else { 8 };
+                let immediate = if bytes == 4 {
+                    compressed_word_sp_immediate(instruction)
+                } else {
+                    compressed_double_sp_immediate(instruction)
+                };
+                let address = self.cpu.read(2).wrapping_add(immediate);
+                ensure_aligned(address, bytes, false)?;
+                let physical = self.translate(address, AccessType::Load)?;
+                let value = self
+                    .devices
+                    .read(physical, bytes)
+                    .map_err(|_| MachineTrap::LoadAccessFault { address, bytes })?;
+                self.cpu.write(
+                    rd,
+                    if bytes == 4 {
+                        sign_extend(value, 32)
+                    } else {
+                        value
+                    },
+                );
+            }
+            (0b10, 0b100) => {
+                let selector = (instruction >> 12) & 1;
+                match (selector, rd, rs2) {
+                    (0, 0, 0) => return Err(illegal(pc, u32::from(instruction))),
+                    (0, _, 0) => {
+                        next_pc = self.cpu.read(rd) & !1;
+                        ensure_instruction_aligned(next_pc)?;
+                    }
+                    (0, _, _) => self.cpu.write(rd, self.cpu.read(rs2)),
+                    (1, 0, 0) => return Err(MachineTrap::Breakpoint { pc }),
+                    (1, _, 0) => {
+                        next_pc = self.cpu.read(rd) & !1;
+                        ensure_instruction_aligned(next_pc)?;
+                        self.cpu.write(1, pc.wrapping_add(2));
+                    }
+                    (1, _, _) => self
+                        .cpu
+                        .write(rd, self.cpu.read(rd).wrapping_add(self.cpu.read(rs2))),
+                    _ => unreachable!(),
+                }
+            }
+            (0b10, 0b101) => {
+                if !self.csrs.floating_enabled() {
+                    return Err(illegal(pc, u32::from(instruction)));
+                }
+                let address = self
+                    .cpu
+                    .read(2)
+                    .wrapping_add(compressed_double_store_sp_immediate(instruction));
+                ensure_aligned(address, 8, true)?;
+                let physical = self.translate(address, AccessType::Store)?;
+                self.invalidate_reservation(physical, 8);
+                halt = self
+                    .devices
+                    .write(physical, self.cpu.read_float64(rs2), 8)
+                    .map_err(|trap| map_store_fault(trap, address, 8))?;
+                self.csrs.mark_float_dirty();
+            }
+            (0b10, 0b110) | (0b10, 0b111) => {
+                let bytes = if funct3 == 0b110 { 4 } else { 8 };
+                let immediate = if bytes == 4 {
+                    compressed_word_store_sp_immediate(instruction)
+                } else {
+                    compressed_double_store_sp_immediate(instruction)
+                };
+                let address = self.cpu.read(2).wrapping_add(immediate);
+                ensure_aligned(address, bytes, true)?;
+                let physical = self.translate(address, AccessType::Store)?;
+                self.invalidate_reservation(physical, bytes);
+                halt = self
+                    .devices
+                    .write(physical, self.cpu.read(rs2), bytes)
+                    .map_err(|trap| map_store_fault(trap, address, bytes))?;
+            }
+            _ => return Err(illegal(pc, u32::from(instruction))),
+        }
+
+        Ok((next_pc, halt))
     }
 
     fn translate(&mut self, address: u64, access: AccessType) -> Result<u64, MachineTrap> {
@@ -2260,7 +2692,7 @@ impl Machine {
             return (SBI_ERR_ALREADY_AVAILABLE, 0);
         }
         let start_address = arguments[1];
-        if start_address & 3 != 0 || self.devices.ram_range(start_address, 4).is_none() {
+        if start_address & 1 != 0 || self.devices.ram_range(start_address, 2).is_none() {
             return (SBI_ERR_INVALID_ADDRESS, 0);
         }
         let Some(hart) = self.parked_harts[hart_id].as_mut() else {
@@ -2560,7 +2992,7 @@ impl Machine {
         let pc = self.cpu.pc;
         self.reservation = None;
         if delegated {
-            self.csrs.sepc = pc & !0b11;
+            self.csrs.sepc = pc & !0b1;
             self.csrs.scause = INTERRUPT_CAUSE_BIT | cause;
             self.csrs.stval = 0;
             self.csrs.mstatus = if origin == Privilege::User {
@@ -2577,7 +3009,7 @@ impl Machine {
             self.cpu.privilege = Privilege::Supervisor;
             self.cpu.pc = interrupt_vector(self.csrs.stvec, cause);
         } else {
-            self.csrs.mepc = pc & !0b11;
+            self.csrs.mepc = pc & !0b1;
             self.csrs.mcause = INTERRUPT_CAUSE_BIT | cause;
             self.csrs.mtval = 0;
             self.csrs.mstatus =
@@ -2597,7 +3029,7 @@ impl Machine {
         let origin = self.cpu.privilege;
         self.reservation = None;
         if origin != Privilege::Machine && self.csrs.medeleg & (1 << cause) != 0 {
-            self.csrs.sepc = pc & !0b11;
+            self.csrs.sepc = pc & !0b1;
             self.csrs.scause = cause;
             self.csrs.stval = value;
             self.csrs.mstatus = if origin == Privilege::User {
@@ -2614,7 +3046,7 @@ impl Machine {
             self.cpu.privilege = Privilege::Supervisor;
             self.cpu.pc = self.csrs.stvec & !0b11;
         } else {
-            self.csrs.mepc = pc & !0b11;
+            self.csrs.mepc = pc & !0b1;
             self.csrs.mcause = cause;
             self.csrs.mtval = value;
             self.csrs.mstatus =
@@ -2804,6 +3236,86 @@ impl Machine {
     }
 }
 
+fn compressed_immediate(instruction: u16) -> u64 {
+    let value = u64::from((instruction >> 2) & 0x1f) | (u64::from(instruction >> 12) << 5);
+    sign_extend(value, 6)
+}
+
+fn compressed_shift(instruction: u16) -> u8 {
+    (((instruction >> 2) & 0x1f) | (((instruction >> 12) & 1) << 5)) as u8
+}
+
+fn compressed_addi4spn_immediate(instruction: u16) -> u64 {
+    (u64::from((instruction >> 7) & 0xf) << 6)
+        | (u64::from((instruction >> 11) & 0x3) << 4)
+        | (u64::from((instruction >> 5) & 1) << 3)
+        | (u64::from((instruction >> 6) & 1) << 2)
+}
+
+fn compressed_word_immediate(instruction: u16) -> u64 {
+    (u64::from((instruction >> 10) & 0x7) << 3)
+        | (u64::from((instruction >> 6) & 1) << 2)
+        | (u64::from((instruction >> 5) & 1) << 6)
+}
+
+fn compressed_double_immediate(instruction: u16) -> u64 {
+    (u64::from((instruction >> 10) & 0x7) << 3) | (u64::from((instruction >> 5) & 0x3) << 6)
+}
+
+fn compressed_addi16sp_immediate(instruction: u16) -> u64 {
+    let value = (u64::from((instruction >> 12) & 1) << 9)
+        | (u64::from((instruction >> 6) & 1) << 4)
+        | (u64::from((instruction >> 5) & 1) << 6)
+        | (u64::from((instruction >> 3) & 0x3) << 7)
+        | (u64::from((instruction >> 2) & 1) << 5);
+    sign_extend(value, 10)
+}
+
+fn compressed_lui_immediate(instruction: u16) -> u64 {
+    compressed_immediate(instruction).wrapping_shl(12)
+}
+
+fn compressed_jump_immediate(instruction: u16) -> u64 {
+    let value = (u64::from((instruction >> 12) & 1) << 11)
+        | (u64::from((instruction >> 11) & 1) << 4)
+        | (u64::from((instruction >> 9) & 0x3) << 8)
+        | (u64::from((instruction >> 8) & 1) << 10)
+        | (u64::from((instruction >> 7) & 1) << 6)
+        | (u64::from((instruction >> 6) & 1) << 7)
+        | (u64::from((instruction >> 3) & 0x7) << 1)
+        | (u64::from((instruction >> 2) & 1) << 5);
+    sign_extend(value, 12)
+}
+
+fn compressed_branch_immediate(instruction: u16) -> u64 {
+    let value = (u64::from((instruction >> 12) & 1) << 8)
+        | (u64::from((instruction >> 10) & 0x3) << 3)
+        | (u64::from((instruction >> 5) & 0x3) << 6)
+        | (u64::from((instruction >> 3) & 0x3) << 1)
+        | (u64::from((instruction >> 2) & 1) << 5);
+    sign_extend(value, 9)
+}
+
+fn compressed_word_sp_immediate(instruction: u16) -> u64 {
+    (u64::from((instruction >> 12) & 1) << 5)
+        | (u64::from((instruction >> 4) & 0x7) << 2)
+        | (u64::from((instruction >> 2) & 0x3) << 6)
+}
+
+fn compressed_double_sp_immediate(instruction: u16) -> u64 {
+    (u64::from((instruction >> 12) & 1) << 5)
+        | (u64::from((instruction >> 5) & 0x3) << 3)
+        | (u64::from((instruction >> 2) & 0x7) << 6)
+}
+
+fn compressed_word_store_sp_immediate(instruction: u16) -> u64 {
+    (u64::from((instruction >> 9) & 0xf) << 2) | (u64::from((instruction >> 7) & 0x3) << 6)
+}
+
+fn compressed_double_store_sp_immediate(instruction: u16) -> u64 {
+    (u64::from((instruction >> 10) & 0x7) << 3) | (u64::from((instruction >> 7) & 0x7) << 6)
+}
+
 fn ensure_aligned(address: u64, bytes: u8, store: bool) -> Result<(), MachineTrap> {
     if address.is_multiple_of(u64::from(bytes)) {
         return Ok(());
@@ -2816,7 +3328,7 @@ fn ensure_aligned(address: u64, bytes: u8, store: bool) -> Result<(), MachineTra
 }
 
 fn ensure_instruction_aligned(address: u64) -> Result<(), MachineTrap> {
-    if address.is_multiple_of(4) {
+    if address.is_multiple_of(2) {
         Ok(())
     } else {
         Err(MachineTrap::InstructionAddressMisaligned { address })
@@ -3170,6 +3682,13 @@ mod tests {
         words.iter().flat_map(|word| word.to_le_bytes()).collect()
     }
 
+    fn halfwords(halfwords: &[u16]) -> Vec<u8> {
+        halfwords
+            .iter()
+            .flat_map(|halfword| halfword.to_le_bytes())
+            .collect()
+    }
+
     fn paged_machine() -> Machine {
         let mut machine = Machine::new(MachineConfig {
             ram_bytes: 64 * 1024,
@@ -3233,6 +3752,41 @@ mod tests {
 
     const fn encode_atomic(rd: u32, rs1: u32, rs2: u32, funct3: u32, operation: u32) -> u32 {
         (operation << 27) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x2f
+    }
+
+    const fn encode_float_load(rd: u32, rs1: u32, immediate: u32, funct3: u32) -> u32 {
+        ((immediate & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x07
+    }
+
+    const fn encode_float_store(rs1: u32, rs2: u32, immediate: u32, funct3: u32) -> u32 {
+        (((immediate >> 5) & 0x7f) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (funct3 << 12)
+            | ((immediate & 0x1f) << 7)
+            | 0x27
+    }
+
+    const fn encode_float_op(rd: u32, rs1: u32, rs2: u32, funct3: u32, funct7: u32) -> u32 {
+        (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x53
+    }
+
+    const fn encode_float_fused(
+        opcode: u32,
+        rd: u32,
+        rs1: u32,
+        rs2: u32,
+        rs3: u32,
+        format: u32,
+        rounding: u32,
+    ) -> u32 {
+        (rs3 << 27)
+            | (format << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (rounding << 12)
+            | (rd << 7)
+            | opcode
     }
 
     #[test]
@@ -3513,21 +4067,23 @@ mod tests {
     }
 
     #[test]
-    fn misaligned_jump_traps_without_writing_the_link_register() {
+    fn ialign_16_accepts_halfword_jump_targets_and_rejects_odd_fetches() {
         let mut machine = machine(8);
-        // jal x1, +2. The RV64I profile has IALIGN=32, so the jump itself
-        // traps and must not commit x1 before control returns to the Realm.
         machine
             .load_program(&0x0020_00ef_u32.to_le_bytes())
             .expect("load program");
 
         let report = machine.run_slice(1);
         assert_eq!(report.outcome, SliceOutcome::Yielded);
-        assert_eq!(report.instructions_retired, 0);
-        assert_eq!(machine.register(1), Some(0));
-        assert_eq!(machine.pc(), 0);
+        assert_eq!(report.instructions_retired, 1);
+        assert_eq!(machine.register(1), Some(DRAM_BASE + 4));
+        assert_eq!(machine.pc(), DRAM_BASE + 2);
+
+        machine.cpu.pc = DRAM_BASE + 1;
+        let odd = machine.run_slice(1);
+        assert_eq!(odd.instructions_retired, 0);
         assert_eq!(machine.csr(Csr::Mcause), 0);
-        assert_eq!(machine.csr(Csr::Mtval), DRAM_BASE + 2);
+        assert_eq!(machine.csr(Csr::Mtval), DRAM_BASE + 1);
     }
 
     #[test]
@@ -3985,6 +4541,312 @@ mod tests {
     }
 
     #[test]
+    fn rv64c_load_store_and_mixed_width_fetch_preserve_exact_pc_and_values() {
+        let mut machine = machine(8);
+        let mut program = halfwords(&[
+            0x0800, // c.addi4spn x8, sp, 16
+            0xc004, // c.sw x9, 0(x8)
+            0x4008, // c.lw x10, 0(x8)
+            0xe408, // c.sd x10, 8(x8)
+            0x640c, // c.ld x11, 8(x8)
+        ]);
+        program.extend_from_slice(&encode_addi(12, 11, 1).to_le_bytes());
+        machine
+            .load_program(&program)
+            .expect("load mixed RV64C program");
+        machine.cpu.registers[2] = DRAM_BASE + 0x100;
+        machine.cpu.registers[9] = 0xffff_ffff_8000_0007;
+
+        let report = machine.run_slice(6);
+        assert_eq!(report.instructions_retired, 6);
+        assert_eq!(machine.register(8), Some(DRAM_BASE + 0x110));
+        assert_eq!(machine.register(10), Some(0xffff_ffff_8000_0007));
+        assert_eq!(machine.register(11), Some(0xffff_ffff_8000_0007));
+        assert_eq!(machine.register(12), Some(0xffff_ffff_8000_0008));
+        assert_eq!(machine.pc(), DRAM_BASE + 14);
+    }
+
+    #[test]
+    fn rv64c_integer_alu_forms_cover_immediates_registers_and_words() {
+        let immediate_cases: [(u16, usize, u64, u64); 5] = [
+            (0x0285, 5, 41, 42),                             // c.addi x5, 1
+            (0x2285, 5, 0x7fff_ffff, 0xffff_ffff_8000_0000), // c.addiw x5, 1
+            (0x537d, 6, 0, u64::MAX),                        // c.li x6, -1
+            (0x6285, 5, 0, 4096),                            // c.lui x5, 1
+            (0x0286, 5, 21, 42),                             // c.slli x5, 1
+        ];
+        for (instruction, register, initial, expected) in immediate_cases {
+            let mut machine = machine(8);
+            machine
+                .load_program(&instruction.to_le_bytes())
+                .expect("load compressed immediate operation");
+            machine.cpu.registers[register] = initial;
+            assert_eq!(machine.run_slice(1).instructions_retired, 1);
+            assert_eq!(machine.register(register), Some(expected));
+        }
+
+        let mut stack = machine(8);
+        stack
+            .load_program(&0x6141_u16.to_le_bytes())
+            .expect("load c.addi16sp");
+        stack.cpu.registers[2] = DRAM_BASE + 0x100;
+        assert_eq!(stack.run_slice(1).instructions_retired, 1);
+        assert_eq!(stack.register(2), Some(DRAM_BASE + 0x110));
+
+        let register_cases: [(u16, usize, u64, u64, u64); 9] = [
+            (0x8005, 8, 9, 0, 4),                               // c.srli x8, 1
+            (0x8405, 8, u64::MAX - 2, 0, u64::MAX - 1),         // c.srai x8, 1
+            (0x987d, 8, 0x55, 0, 0x55),                         // c.andi x8, -1
+            (0x8c05, 8, 9, 4, 5),                               // c.sub x8, x9
+            (0x8c25, 8, 9, 3, 10),                              // c.xor x8, x9
+            (0x8c45, 8, 8, 3, 11),                              // c.or x8, x9
+            (0x8c65, 8, 11, 3, 3),                              // c.and x8, x9
+            (0x9c05, 8, 0x8000_0000, 1, 0x0000_0000_7fff_ffff), // c.subw
+            (0x9c25, 8, 0x7fff_ffff, 1, 0xffff_ffff_8000_0000), // c.addw
+        ];
+        for (instruction, rd, lhs, rhs, expected) in register_cases {
+            let mut machine = machine(8);
+            machine
+                .load_program(&instruction.to_le_bytes())
+                .expect("load compressed register operation");
+            machine.cpu.registers[rd] = lhs;
+            machine.cpu.registers[9] = rhs;
+            assert_eq!(machine.run_slice(1).instructions_retired, 1);
+            assert_eq!(machine.register(rd), Some(expected));
+        }
+    }
+
+    #[test]
+    fn rv64c_control_transfer_link_and_branch_forms_use_two_byte_ialign() {
+        let mut jump = machine(8);
+        jump.load_program(&0xa829_u16.to_le_bytes())
+            .expect("load c.j");
+        assert_eq!(jump.run_slice(1).instructions_retired, 1);
+        assert_eq!(jump.pc(), DRAM_BASE + 26);
+
+        let mut equal = machine(8);
+        equal
+            .load_program(&0xcc01_u16.to_le_bytes())
+            .expect("load c.beqz");
+        equal.cpu.registers[8] = 0;
+        assert_eq!(equal.run_slice(1).instructions_retired, 1);
+        assert_eq!(equal.pc(), DRAM_BASE + 24);
+
+        let mut not_equal = machine(8);
+        not_equal
+            .load_program(&0xe819_u16.to_le_bytes())
+            .expect("load c.bnez");
+        not_equal.cpu.registers[8] = 1;
+        assert_eq!(not_equal.run_slice(1).instructions_retired, 1);
+        assert_eq!(not_equal.pc(), DRAM_BASE + 22);
+
+        let mut link = machine(8);
+        link.load_program(&0x9282_u16.to_le_bytes())
+            .expect("load c.jalr");
+        link.cpu.registers[5] = DRAM_BASE + 0x100;
+        assert_eq!(link.run_slice(1).instructions_retired, 1);
+        assert_eq!(link.register(1), Some(DRAM_BASE + 2));
+        assert_eq!(link.pc(), DRAM_BASE + 0x100);
+    }
+
+    #[test]
+    fn rv64c_fetch_crosses_a_page_only_after_admitting_both_halfwords() {
+        let mut machine = Machine::new(MachineConfig {
+            ram_bytes: 8192,
+            max_console_bytes: 8,
+        })
+        .expect("valid two-page machine");
+        machine
+            .load_program(&vec![0; 4098])
+            .expect("load two pages");
+        let instruction = encode_addi(5, 0, 42);
+        assert!(
+            machine
+                .devices
+                .write_ram(DRAM_BASE + 4094, u64::from(instruction & 0xffff), 2,)
+        );
+        assert!(
+            machine
+                .devices
+                .write_ram(DRAM_BASE + 4096, u64::from(instruction >> 16), 2,)
+        );
+        machine.cpu.pc = DRAM_BASE + 4094;
+
+        let report = machine.run_slice(1);
+        assert_eq!(report.instructions_retired, 1);
+        assert_eq!(machine.register(5), Some(42));
+        assert_eq!(machine.pc(), DRAM_BASE + 4098);
+        assert_eq!(machine.metrics().instruction_translations, 2);
+    }
+
+    #[test]
+    fn rv64c_rejects_compact_float_while_fs_is_off_and_reserved_encodings() {
+        for instruction in [0x0000_u16, 0x2000, 0xa000] {
+            let mut machine = machine(8);
+            machine
+                .load_program(&instruction.to_le_bytes())
+                .expect("load reserved compressed instruction");
+            let report = machine.run_slice(1);
+            assert_eq!(report.instructions_retired, 0);
+            assert_eq!(machine.csr(Csr::Mcause), 2);
+            assert_eq!(machine.csr(Csr::Mtval), u64::from(instruction));
+        }
+    }
+
+    #[test]
+    fn rv64fd_is_gated_by_fs_and_fcsr_access_marks_state_dirty() {
+        let fadd_s = encode_float_op(3, 1, 2, 0, 0x00);
+        let mut disabled = machine(8);
+        disabled
+            .load_program(&fadd_s.to_le_bytes())
+            .expect("load gated FADD.S");
+        disabled.cpu.write_float32(1, 1.5_f32.to_bits());
+        disabled.cpu.write_float32(2, 2.5_f32.to_bits());
+        let report = disabled.run_slice(1);
+        assert_eq!(report.instructions_retired, 0);
+        assert_eq!(disabled.csr(Csr::Mcause), 2);
+        assert_eq!(disabled.csr(Csr::Mtval), u64::from(fadd_s));
+
+        let mut csr_disabled = machine(8);
+        let read_fcsr = encode_csrr(5, Csr::Fcsr);
+        csr_disabled
+            .load_program(&read_fcsr.to_le_bytes())
+            .expect("load gated FCSR read");
+        assert_eq!(csr_disabled.run_slice(1).instructions_retired, 0);
+        assert_eq!(csr_disabled.csr(Csr::Mcause), 2);
+
+        let mut enabled = machine(8);
+        enabled
+            .load_program(&words(&[
+                encode_csrw(Csr::Frm, 5),
+                encode_csrr(6, Csr::Fcsr),
+            ]))
+            .expect("load FCSR program");
+        enabled.csrs.mstatus = MSTATUS_FS_INITIAL;
+        enabled.cpu.registers[5] = 3;
+        assert_eq!(enabled.run_slice(2).instructions_retired, 2);
+        assert_eq!(enabled.register(6), Some(3 << FRM_SHIFT));
+        assert_eq!(enabled.csrs.fcsr, 3 << FRM_SHIFT);
+        assert_eq!(enabled.csrs.mstatus & MSTATUS_FS, MSTATUS_FS_DIRTY);
+        assert_ne!(enabled.csr(Csr::Mstatus) & MSTATUS_SD, 0);
+    }
+
+    #[test]
+    fn rv64fd_arithmetic_sqrt_fma_nan_boxing_and_flags_are_deterministic() {
+        let mut machine = machine(8);
+        machine
+            .load_program(&words(&[
+                encode_float_op(3, 1, 2, 0, 0x00),          // fadd.s f3, f1, f2
+                encode_float_op(4, 3, 0, 0, 0x2c),          // fsqrt.s f4, f3
+                encode_float_fused(0x43, 8, 5, 6, 7, 1, 0), // fmadd.d f8, f5, f6, f7
+                encode_float_op(11, 9, 10, 0, 0x00),        // fadd.s f11, f9, f10
+                encode_float_op(14, 12, 13, 0, 0x0c),       // fdiv.s f14, f12, f13
+                encode_float_op(16, 15, 0, 0, 0x2c),        // fsqrt.s f16, f15
+            ]))
+            .expect("load RV64FD arithmetic program");
+        machine.csrs.mstatus = MSTATUS_FS_INITIAL;
+        machine.cpu.write_float32(1, 1.5_f32.to_bits());
+        machine.cpu.write_float32(2, 2.5_f32.to_bits());
+        machine.cpu.write_float64(5, 2.0_f64.to_bits());
+        machine.cpu.write_float64(6, 3.0_f64.to_bits());
+        machine.cpu.write_float64(7, 4.0_f64.to_bits());
+        machine.cpu.floating_registers[9] = u64::from(1.0_f32.to_bits());
+        machine.cpu.write_float32(10, 1.0_f32.to_bits());
+        machine.cpu.write_float32(12, 1.0_f32.to_bits());
+        machine.cpu.write_float32(13, 0.0_f32.to_bits());
+        machine.cpu.write_float32(15, (-1.0_f32).to_bits());
+
+        assert_eq!(machine.run_slice(6).instructions_retired, 6);
+        assert_eq!(machine.cpu.read_float32(3), 4.0_f32.to_bits());
+        assert_eq!(machine.cpu.read_float32(4), 2.0_f32.to_bits());
+        assert_eq!(machine.cpu.read_float64(8), 10.0_f64.to_bits());
+        assert_eq!(machine.cpu.read_float32(11), CANONICAL_NAN_F32);
+        assert_eq!(machine.cpu.read_float32(14), f32::INFINITY.to_bits());
+        assert_eq!(machine.cpu.read_float32(16), CANONICAL_NAN_F32);
+        assert_eq!(machine.csrs.fcsr & FFLAGS_MASK, FFLAGS_DZ | FFLAGS_NV);
+    }
+
+    #[test]
+    fn rv64fd_rounding_conversion_comparison_and_signed_zero_edges_are_exact() {
+        let mut edges = machine(8);
+        edges
+            .load_program(&words(&[
+                encode_float_op(5, 1, 2, 0, 0x14),  // fmin.s f5, f1, f2
+                encode_float_op(6, 1, 2, 1, 0x14),  // fmax.s f6, f1, f2
+                encode_float_op(7, 3, 4, 2, 0x50),  // feq.s x7, f3, f4
+                encode_float_op(8, 3, 4, 1, 0x50),  // flt.s x8, f3, f4
+                encode_float_op(9, 3, 0, 0, 0x60),  // fcvt.w.s x9, f3
+                encode_float_op(10, 3, 1, 0, 0x60), // fcvt.wu.s x10, f3
+            ]))
+            .expect("load RV64FD edge program");
+        edges.csrs.mstatus = MSTATUS_FS_INITIAL;
+        edges.cpu.write_float32(1, (-0.0_f32).to_bits());
+        edges.cpu.write_float32(2, 0.0_f32.to_bits());
+        edges.cpu.write_float32(3, CANONICAL_NAN_F32);
+        edges.cpu.write_float32(4, 1.0_f32.to_bits());
+
+        assert_eq!(edges.run_slice(6).instructions_retired, 6);
+        assert_eq!(edges.cpu.read_float32(5), (-0.0_f32).to_bits());
+        assert_eq!(edges.cpu.read_float32(6), 0.0_f32.to_bits());
+        assert_eq!(edges.register(7), Some(0));
+        assert_eq!(edges.register(8), Some(0));
+        assert_eq!(edges.register(9), Some(0x0000_0000_7fff_ffff));
+        assert_eq!(edges.register(10), Some(u64::MAX));
+        assert_eq!(edges.csrs.fcsr & FFLAGS_MASK, FFLAGS_NV);
+
+        let mut invalid_dynamic_round = machine(8);
+        let instruction = encode_float_op(3, 1, 2, 0b111, 0x00);
+        invalid_dynamic_round
+            .load_program(&instruction.to_le_bytes())
+            .expect("load dynamically rounded FADD.S");
+        invalid_dynamic_round.csrs.mstatus = MSTATUS_FS_INITIAL;
+        invalid_dynamic_round.csrs.fcsr = 0b101 << FRM_SHIFT;
+        assert_eq!(invalid_dynamic_round.run_slice(1).instructions_retired, 0);
+        assert_eq!(invalid_dynamic_round.csr(Csr::Mcause), 2);
+        assert_eq!(
+            invalid_dynamic_round.csr(Csr::Mtval),
+            u64::from(instruction)
+        );
+    }
+
+    #[test]
+    fn rv64fd_standard_and_compact_memory_forms_preserve_exact_bits() {
+        let address = DRAM_BASE + 0x100;
+        let mut standard = machine(8);
+        standard
+            .load_program(&words(&[
+                encode_float_store(5, 1, 0, 2),    // fsw f1, 0(x5)
+                encode_float_load(2, 5, 0, 2),     // flw f2, 0(x5)
+                encode_float_op(6, 2, 0, 0, 0x70), // fmv.x.w x6, f2
+            ]))
+            .expect("load standard float memory program");
+        standard.csrs.mstatus = MSTATUS_FS_INITIAL;
+        standard.cpu.registers[5] = address;
+        standard.cpu.write_float32(1, (-3.5_f32).to_bits());
+        assert_eq!(standard.run_slice(3).instructions_retired, 3);
+        assert_eq!(
+            standard.register(6),
+            Some(sign_extend(u64::from((-3.5_f32).to_bits()), 32))
+        );
+
+        let mut compact = machine(8);
+        let mut program = halfwords(&[
+            0xa000, // c.fsd f8, 0(x8)
+            0x2004, // c.fld f9, 0(x8)
+        ]);
+        program.extend_from_slice(&encode_float_op(7, 9, 0, 0, 0x71).to_le_bytes());
+        compact
+            .load_program(&program)
+            .expect("load compact double memory program");
+        compact.csrs.mstatus = MSTATUS_FS_INITIAL;
+        compact.cpu.registers[8] = address;
+        compact.cpu.write_float64(8, (-13.25_f64).to_bits());
+        assert_eq!(compact.run_slice(3).instructions_retired, 3);
+        assert_eq!(compact.register(7), Some((-13.25_f64).to_bits()));
+        assert_eq!(compact.pc(), DRAM_BASE + 8);
+    }
+
+    #[test]
     fn rv64a_lr_sc_and_amo_are_single_hart_atomic_and_sign_extend_words() {
         let mut rv = machine(8);
         let address = DRAM_BASE + 0x100;
@@ -4420,7 +5282,7 @@ mod tests {
             77
         );
 
-        call_sbi(&mut machine, SBI_EXT_HSM, 0, [1, DRAM_BASE + 2, 0, 0, 0, 0]);
+        call_sbi(&mut machine, SBI_EXT_HSM, 0, [1, DRAM_BASE + 1, 0, 0, 0, 0]);
         assert_eq!(machine.register(10), Some(SBI_ERR_INVALID_ADDRESS));
         call_sbi(
             &mut machine,
@@ -4452,8 +5314,10 @@ mod tests {
             max_console_bytes: 64,
         })
         .expect("valid Linux machine");
+        let mut kernel = halfwords(&[0x0001]); // c.nop
+        kernel.extend_from_slice(&words(&[0x0000_0073; 2]));
         machine
-            .boot_linux(&words(&[0x0000_0073; 2]), &[], "earlycon=sbi")
+            .boot_linux(&kernel, &[], "earlycon=sbi")
             .expect("admit Linux boot");
 
         let request_address = DRAM_BASE + 0x1_0000;
@@ -4474,18 +5338,22 @@ mod tests {
         let SliceOutcome::HostRequest(host_request) = first.outcome.clone() else {
             panic!("expected 9P host request, got {:?}", first.outcome);
         };
-        assert_eq!(first.steps_executed, 1);
-        assert_eq!(first.instructions_retired, 0);
+        assert_eq!(first.steps_executed, 2);
+        assert_eq!(first.instructions_retired, 1);
         assert_eq!(host_request.message, request);
         assert_eq!(host_request.channel, 7);
         assert_eq!(host_request.max_response_bytes, 32);
-        assert_eq!(machine.pc(), LINUX_KERNEL_BASE + 4);
+        assert_eq!(machine.pc(), LINUX_KERNEL_BASE + 6);
 
         let repeated = machine.run_slice(10);
         assert_eq!(repeated.outcome, first.outcome);
         assert_eq!(repeated.steps_executed, 0);
         assert_eq!(repeated.total_steps_executed, first.total_steps_executed);
-        assert_eq!(machine.pc(), LINUX_KERNEL_BASE + 4);
+        assert_eq!(machine.pc(), LINUX_KERNEL_BASE + 6);
+        machine.cpu.write_float32(3, (-3.5_f32).to_bits());
+        machine.cpu.write_float64(4, 13.25_f64.to_bits());
+        machine.csrs.mstatus = (machine.csrs.mstatus & !MSTATUS_FS) | MSTATUS_FS_DIRTY;
+        machine.csrs.fcsr = (3 << FRM_SHIFT) | FFLAGS_DZ | FFLAGS_NX;
 
         let checkpoint = machine
             .checkpoint_host_suspension()
@@ -4502,11 +5370,15 @@ mod tests {
         let mut restored = decoded.into_machine();
         assert_eq!(restored.run_slice(10).outcome, first.outcome);
         assert_eq!(
-            restored.physical_ram(LINUX_KERNEL_BASE + 4, 4),
+            restored.physical_ram(LINUX_KERNEL_BASE + 6, 4),
             Some(0x0000_0073_u32.to_le_bytes().as_slice())
         );
-        assert_eq!(restored.pc(), LINUX_KERNEL_BASE + 4);
+        assert_eq!(restored.pc(), LINUX_KERNEL_BASE + 6);
         assert_eq!(restored.privilege(), Privilege::Supervisor);
+        assert_eq!(restored.cpu.read_float32(3), (-3.5_f32).to_bits());
+        assert_eq!(restored.cpu.read_float64(4), 13.25_f64.to_bits());
+        assert_eq!(restored.csrs.fcsr, (3 << FRM_SHIFT) | FFLAGS_DZ | FFLAGS_NX);
+        assert_eq!(restored.csrs.mstatus & MSTATUS_FS, MSTATUS_FS_DIRTY);
 
         let wrong_binding = CheckpointBinding::new(
             CheckpointDigest::new([0x33; 32]),

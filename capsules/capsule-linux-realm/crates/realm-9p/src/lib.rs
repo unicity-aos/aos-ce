@@ -57,6 +57,7 @@ const OPEN_READ_WRITE: u32 = 2;
 const OPEN_EXCLUSIVE: u32 = 0o200;
 const OPEN_TRUNCATE: u32 = 0o1000;
 const AT_REMOVE_DIR: u32 = 0x200;
+const ATTR_MODE: u32 = 1;
 const ATTR_SIZE: u32 = 1 << 3;
 const ATTR_MTIME: u32 = 1 << 5;
 const ATTR_CTIME: u32 = 1 << 6;
@@ -206,6 +207,10 @@ pub trait FileSystem {
     fn create_dir(&mut self, path: &str, mode: u32) -> Result<(), Errno>;
     /// Truncate or extend a regular file.
     fn set_len(&mut self, path: &str, len: u64) -> Result<(), Errno>;
+    /// Replace POSIX permission and special bits while retaining node kind.
+    fn set_mode(&mut self, _path: &str, _mode: u32) -> Result<(), Errno> {
+        Err(Errno::NotSupported)
+    }
     /// Remove one non-directory node.
     fn remove_file(&mut self, path: &str) -> Result<(), Errno>;
     /// Remove one empty directory.
@@ -628,7 +633,7 @@ impl<F: FileSystem> Session<F> {
     fn setattr(&mut self, reader: &mut Reader<'_>) -> Result<(), Errno> {
         let fid = reader.u32()?;
         let valid = reader.u32()?;
-        let _mode = reader.u32()?;
+        let mode = reader.u32()?;
         let _uid = reader.u32()?;
         let _gid = reader.u32()?;
         let size = reader.u64()?;
@@ -638,20 +643,21 @@ impl<F: FileSystem> Session<F> {
         let _mtime_nanoseconds = reader.u64()?;
         reader.finish()?;
         // Linux reports an O_TRUNC metadata change as size + implicit mtime
-        // and ctime (0x68). The backing `set_len` mutation naturally advances
-        // those host-managed timestamps. Continue to reject chmod/chown,
-        // explicit timestamp values, and timestamp-only requests because this
-        // minimal filesystem cannot preserve those semantics yet.
-        if valid & !TRUNCATE_ATTRIBUTES != 0
-            || valid & (ATTR_MTIME | ATTR_CTIME) != 0 && valid & ATTR_SIZE == 0
+        // and ctime (0x68). The backing mutation naturally advances those
+        // host-managed timestamps. Mode changes are required by compilers and
+        // package managers when publishing an executable. Continue to reject
+        // chown, explicit timestamp values, and timestamp-only requests.
+        if valid & !(ATTR_MODE | TRUNCATE_ATTRIBUTES) != 0
+            || valid & (ATTR_MTIME | ATTR_CTIME) != 0 && valid & (ATTR_MODE | ATTR_SIZE) == 0
         {
             return Err(Errno::NotSupported);
         }
+        let path = self.fid(fid)?.path.clone();
         if valid & ATTR_SIZE != 0 {
-            let path = self.fid(fid)?.path.clone();
             self.filesystem.set_len(&path, size)?;
-        } else {
-            self.fid(fid)?;
+        }
+        if valid & ATTR_MODE != 0 {
+            self.filesystem.set_mode(&path, mode)?;
         }
         Ok(())
     }
@@ -1222,6 +1228,14 @@ mod tests {
             Ok(())
         }
 
+        fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), Errno> {
+            let generation = self.next_generation();
+            let node = self.nodes.get_mut(path).ok_or(Errno::NotFound)?;
+            node.metadata.mode = mode & 0o7777;
+            node.metadata.generation = generation;
+            Ok(())
+        }
+
         fn remove_file(&mut self, path: &str) -> Result<(), Errno> {
             match self.nodes.get(path) {
                 Some(node) if node.metadata.kind == NodeKind::File => {}
@@ -1506,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_truncate_metadata_flags_are_admitted_without_broad_setattr_support() {
+    fn linux_truncate_and_chmod_metadata_flags_are_admitted_without_chown() {
         let mut filesystem = MemoryFileSystem::new();
         filesystem
             .create_file("output", 0o644, true, false)
@@ -1548,7 +1562,7 @@ mod tests {
 
         let chmod = message(TSETATTR, 52, |writer| {
             writer.u32(2);
-            writer.u32(1);
+            writer.u32(ATTR_MODE | ATTR_CTIME);
             writer.u32(0o755);
             writer.u32(u32::MAX);
             writer.u32(u32::MAX);
@@ -1557,7 +1571,28 @@ mod tests {
                 writer.u64(0);
             }
         });
-        let response = session.serve(&chmod);
+        assert_success(&session.serve(&chmod), TSETATTR);
+        assert_eq!(
+            session
+                .filesystem_mut()
+                .metadata("output")
+                .expect("metadata")
+                .mode,
+            0o755
+        );
+
+        let chown = message(TSETATTR, 53, |writer| {
+            writer.u32(2);
+            writer.u32(1 << 1);
+            writer.u32(0);
+            writer.u32(0);
+            writer.u32(u32::MAX);
+            writer.u64(0);
+            for _ in 0..4 {
+                writer.u64(0);
+            }
+        });
+        let response = session.serve(&chown);
         assert_eq!(response_type(&response), RLERROR);
         assert_eq!(
             response_body(&response).u32(),

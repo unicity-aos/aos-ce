@@ -2,7 +2,7 @@
 set -eu
 
 if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
-    echo "usage: $0 LINUX_SOURCE ROOTFS_CPIO BUILD_DIR [OUTPUT_IMAGE]" >&2
+    echo "usage: $0 LINUX_SOURCE ROOTFS_CPIO_OR_COMPRESSED_CPIO BUILD_DIR [OUTPUT_IMAGE]" >&2
     exit 64
 fi
 
@@ -26,11 +26,18 @@ fi
 expected_rootfs=10d26184e85add731208050fb3da9fed5e1dda7475b6e66e0d9814a221ecf3f4
 expected_image=7cb62638de9f41c2fe2a237a1c46642189b6d97e373c8592cc931f74f88419ff
 record_image=${AOS_RECORD_IMAGE:-0}
+build_jobs=${AOS_BUILD_JOBS:-8}
 
 if [ "$record_image" != 0 ] && [ "$record_image" != 1 ]; then
     echo "AOS_RECORD_IMAGE must be 0 or 1" >&2
     exit 64
 fi
+case $build_jobs in
+    ''|*[!0-9]*|0)
+        echo "AOS_BUILD_JOBS must be a positive integer" >&2
+        exit 64
+        ;;
+esac
 
 if [ -e "$build_dir" ]; then
     echo "BUILD_DIR must not already exist: $build_dir" >&2
@@ -44,6 +51,16 @@ if [ ! -f "$rootfs_cpio" ]; then
     echo "rootfs cpio does not exist: $rootfs_cpio" >&2
     exit 66
 fi
+case $rootfs_cpio in
+    *.cpio) initramfs_compression=none ;;
+    *.cpio.gz) initramfs_compression=gzip ;;
+    *.cpio.xz) initramfs_compression=xz ;;
+    *.cpio.zst) initramfs_compression=zstd ;;
+    *)
+        echo "rootfs must end in .cpio, .cpio.gz, .cpio.xz, or .cpio.zst" >&2
+        exit 66
+        ;;
+esac
 if [ "$(make -s -C "$kernel_source" kernelversion)" != "6.18.39" ]; then
     echo "build-image.sh requires exact Linux 6.18.39 sources" >&2
     exit 66
@@ -93,8 +110,8 @@ make -C "$kernel_source" O="$build_dir/kernel" \
     --enable NONPORTABLE \
     --enable SMP \
     --set-val NR_CPUS 64 \
-    --disable RISCV_ISA_C \
-    --disable FPU \
+    --enable RISCV_ISA_C \
+    --enable FPU \
     --disable RISCV_ISA_V \
     --disable MODULES \
     --disable EFI \
@@ -103,6 +120,11 @@ make -C "$kernel_source" O="$build_dir/kernel" \
     --enable PRINTK \
     --enable MULTIUSER \
     --enable POSIX_TIMERS \
+    --enable EPOLL \
+    --enable EVENTFD \
+    --enable SIGNALFD \
+    --enable TIMERFD \
+    --enable INOTIFY_USER \
     --enable TTY \
     --disable VT \
     --disable LEGACY_TIOCSTI \
@@ -117,7 +139,7 @@ make -C "$kernel_source" O="$build_dir/kernel" \
     --disable MEDIA_SUPPORT \
     --enable NET \
     --disable PACKET \
-    --disable UNIX \
+    --enable UNIX \
     --disable INET \
     --disable NETDEVICES \
     --disable ETHTOOL_NETLINK \
@@ -141,11 +163,43 @@ make -C "$kernel_source" O="$build_dir/kernel" \
     --enable DEVTMPFS_MOUNT \
     --enable BLK_DEV_INITRD \
     --set-str INITRAMFS_SOURCE "$rootfs_cpio" \
-    --enable INITRAMFS_COMPRESSION_NONE \
+    --disable INITRAMFS_COMPRESSION_NONE \
     --disable INITRAMFS_COMPRESSION_GZIP \
+    --disable INITRAMFS_COMPRESSION_BZIP2 \
+    --disable INITRAMFS_COMPRESSION_LZMA \
+    --disable INITRAMFS_COMPRESSION_XZ \
+    --disable INITRAMFS_COMPRESSION_LZO \
+    --disable INITRAMFS_COMPRESSION_LZ4 \
+    --disable INITRAMFS_COMPRESSION_ZSTD \
+    --disable RD_GZIP \
+    --disable RD_BZIP2 \
+    --disable RD_LZMA \
+    --disable RD_XZ \
+    --disable RD_LZO \
+    --disable RD_LZ4 \
+    --disable RD_ZSTD \
     --disable DEBUG_INFO \
     --disable DEBUG_INFO_BTF \
     --disable WERROR
+
+case $initramfs_compression in
+    none)
+        "$kernel_source/scripts/config" --file "$build_dir/kernel/.config" \
+            --enable INITRAMFS_COMPRESSION_NONE
+        ;;
+    gzip)
+        "$kernel_source/scripts/config" --file "$build_dir/kernel/.config" \
+            --enable RD_GZIP --enable INITRAMFS_COMPRESSION_GZIP
+        ;;
+    xz)
+        "$kernel_source/scripts/config" --file "$build_dir/kernel/.config" \
+            --enable RD_XZ --enable INITRAMFS_COMPRESSION_XZ
+        ;;
+    zstd)
+        "$kernel_source/scripts/config" --file "$build_dir/kernel/.config" \
+            --enable RD_ZSTD --enable INITRAMFS_COMPRESSION_ZSTD
+        ;;
+esac
 
 export KBUILD_BUILD_USER=aos
 export KBUILD_BUILD_HOST=builder
@@ -155,7 +209,7 @@ export SOURCE_DATE_EPOCH=0
 
 make -C "$kernel_source" O="$build_dir/kernel" \
     ARCH=riscv LLVM=1 LLVM_IAS=1 olddefconfig
-make -j8 -C "$kernel_source" O="$build_dir/kernel" \
+make -j"$build_jobs" -C "$kernel_source" O="$build_dir/kernel" \
     ARCH=riscv LLVM=1 LLVM_IAS=1 Image
 
 image="$build_dir/kernel/arch/riscv/boot/Image"

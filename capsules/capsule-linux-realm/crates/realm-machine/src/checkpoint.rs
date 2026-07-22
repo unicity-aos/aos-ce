@@ -130,6 +130,9 @@ impl MachineCheckpoint {
         for register in machine.cpu.registers {
             push_u64(&mut bytes, register);
         }
+        for register in machine.cpu.floating_registers {
+            push_u64(&mut bytes, register);
+        }
         push_u64(&mut bytes, machine.cpu.pc);
         bytes.push(machine.cpu.privilege as u8);
 
@@ -236,8 +239,11 @@ impl MachineCheckpoint {
         if machine.cpu.registers[0] != 0 {
             return Err(CheckpointDecodeError::InvalidField("zero register"));
         }
+        for register in &mut machine.cpu.floating_registers {
+            *register = decoder.u64()?;
+        }
         machine.cpu.pc = decoder.u64()?;
-        if machine.cpu.pc & 3 != 0 {
+        if machine.cpu.pc & 1 != 0 {
             return Err(CheckpointDecodeError::InvalidField("program counter"));
         }
         machine.cpu.privilege = decode_privilege(decoder.byte()?)?;
@@ -339,6 +345,7 @@ impl MachineCheckpoint {
 }
 
 fn encode_csrs(bytes: &mut Vec<u8>, csrs: &CsrFile) {
+    bytes.push(csrs.fcsr);
     for value in [
         csrs.mstatus,
         csrs.medeleg,
@@ -365,6 +372,7 @@ fn encode_csrs(bytes: &mut Vec<u8>, csrs: &CsrFile) {
 
 fn decode_csrs(decoder: &mut Decoder<'_>) -> Result<CsrFile, CheckpointDecodeError> {
     Ok(CsrFile {
+        fcsr: decoder.byte()?,
         mstatus: decoder.u64()?,
         medeleg: decoder.u64()?,
         mideleg: decoder.u64()?,
@@ -398,8 +406,8 @@ fn validate_csrs(csrs: &CsrFile) -> Result<(), CheckpointDecodeError> {
         || !matches!(satp_mode, SATP_MODE_BARE | SATP_MODE_SV39)
         || legal_trap_vector(csrs.mtvec) != csrs.mtvec
         || legal_trap_vector(csrs.stvec) != csrs.stvec
-        || csrs.mepc & 3 != 0
-        || csrs.sepc & 3 != 0
+        || csrs.mepc & 1 != 0
+        || csrs.sepc & 1 != 0
     {
         return Err(CheckpointDecodeError::InvalidField("CSR state"));
     }

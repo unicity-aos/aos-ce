@@ -1,4 +1,4 @@
-//! Deterministic flattened device tree for the `aos-rv64-virt-v0` profile.
+//! Deterministic flattened device tree for the `aos-rv64-virt-v1` profile.
 
 use std::collections::BTreeMap;
 
@@ -33,8 +33,8 @@ pub(crate) fn build_linux_fdt(config: &LinuxFdtConfig<'_>) -> Vec<u8> {
     tree.begin_node("");
     tree.property_u32("#address-cells", 2);
     tree.property_u32("#size-cells", 2);
-    tree.property_string("compatible", "aos,aos-rv64-virt-v0");
-    tree.property_string("model", "AOS RV64 virtual machine v0");
+    tree.property_string("compatible", "aos,aos-rv64-virt-v1");
+    tree.property_string("model", "AOS RV64 virtual machine v1");
 
     tree.begin_node("chosen");
     tree.property_string("bootargs", config.bootargs);
@@ -61,11 +61,11 @@ pub(crate) fn build_linux_fdt(config: &LinuxFdtConfig<'_>) -> Vec<u8> {
         tree.property_u32("reg", hart_id);
         tree.property_string("status", "okay");
         tree.property_string("compatible", "riscv");
-        tree.property_string("riscv,isa", "rv64ima_zicsr_zifencei");
+        tree.property_string("riscv,isa", "rv64imafdc_zicsr_zifencei");
         tree.property_string("riscv,isa-base", "rv64i");
         tree.property_string_list(
             "riscv,isa-extensions",
-            &["i", "m", "a", "zicsr", "zifencei"],
+            &["i", "m", "a", "f", "d", "c", "zicsr", "zifencei"],
         );
         tree.property_string("mmu-type", "riscv,sv39");
         tree.begin_node("interrupt-controller");
@@ -251,8 +251,8 @@ mod tests {
             &[0; 16]
         );
         for expected in [
-            b"aos,aos-rv64-virt-v0\0".as_slice(),
-            b"rv64ima_zicsr_zifencei\0".as_slice(),
+            b"aos,aos-rv64-virt-v1\0".as_slice(),
+            b"rv64imafdc_zicsr_zifencei\0".as_slice(),
             b"riscv,sv39\0".as_slice(),
             b"console=ttyS0 init=/init\0".as_slice(),
             b"ns16550a\0".as_slice(),

@@ -4,14 +4,15 @@ This directory contains the executable seed of AOS Realm: a principal-owned
 agent workbench whose guest interface is Linux-shaped and whose outer authority
 is an ordinary Astrid capsule.
 
-It now keeps Linux resident for each active principal, but it is not yet the
-useful AOS Realm distribution. The capsule runs signed, embedded core WebAssembly
-command modules under Wasmi and a pinned Linux 6.18.39 image inside the bounded
-`aos-rv64-virt-v0` machine. Linux now reaches an AOS-controlled PID 1 and a
-static Buildroot 2026.05.1/musl/BusyBox userland, accepts token-bound bounded
-command frames, and remains alive until an explicit shutdown or runtime eviction.
-Its `ash` shell is useful today, although it is not yet Bash or a development
-distribution.
+It keeps Linux resident for each active principal. The capsule runs signed,
+embedded core WebAssembly command modules under Wasmi and a pinned Linux
+6.18.39 image inside the bounded `aos-rv64-virt-v1` machine. Linux reaches an
+AOS-controlled PID 1, accepts token-bound command frames, and remains alive
+until explicit shutdown or runtime eviction. The checked-in capsule still
+embeds the small BusyBox bootstrap image. A separately built development image
+has also completed the full interpreter test with Bash, Git, Python,
+Clang/C++, Make, CMake, and Ninja; immutable distribution packaging remains the
+step between that proof artifact and the installable capsule.
 Commands receive structured `argv` and an explicit current directory; there is
 no host shell command line and the manifest requests no `host_process`
 capability.
@@ -41,16 +42,16 @@ RV64 instruction images, and the first resident Linux boot image:
   mode with `mret`, delegates a Supervisor `ecall` through `stvec`, returns with
   `sret`, writes `STR\n`, and halts from Supervisor mode. It charges 31 bounded
   steps while retiring 30 instructions because `ecall` does not retire
-- `linux-boot`, which lazily boots the embedded, reproducibly built Linux 6.18.39
-  `Image` in a 32 MiB guest and returns when `/init` reports `AOS READY`; calling
-  it again while warm is a zero-step readiness check
+- `linux-boot`, which lazily boots the embedded Linux 6.18.39 `Image` in the
+  principal's admitted 512 MiB–3 GiB envelope and returns when `/init` reports
+  `AOS READY`; calling it again while warm is a zero-step readiness check
 - `linux-console`, which lazily boots if needed, sends one validated line to the
   resident `/init`, and returns one framed result while preserving Linux RAM;
   the proof commands are `ping`, `counter`, and `echo ...`
-- `linux-sh`, which executes one bounded script with BusyBox `ash` as UID/GID
-  1000 in `/home/agent` or the invocation's mounted `/workspace`, propagates its
-  exact exit status, kills/reaps background descendants, and commits home
-  mutations as crash-consistent principal generations
+- `linux-sh`, which executes one bounded Bash script as UID/GID 1000 in
+  `/home/agent` or the invocation's mounted `/workspace`, propagates its exact
+  exit status, kills/reaps background descendants, and commits home mutations
+  as crash-consistent principal generations
 - `linux-shutdown`, which cleanly powers a warm guest down through SBI and
   releases its RAM; stopping an already-cold realm is an idempotent zero-step
   operation
@@ -248,7 +249,7 @@ than relying on a timed-out or disconnected foreground call.
 `crates/realm-machine` is the host-testable full-system backend seed. It owns only
 admitted guest CPU/CSR state, contiguous RAM, bounded serial input/output, the
 standard test finisher, and slice execution. Its current surface is RV64IMA plus
-Zicsr, typed M/S CSRs, general synchronous
+F, D, C, Zicsr, typed M/S CSRs, general synchronous
 exception delivery/delegation, `mret`/`sret`, Sv39 translation, and `sfence.vma`
 under the ratified RISC-V Machine and Supervisor ISA 1.13. The page walker is
 bounded and checks canonicality, PTE/superpage form, U/S and R/W/X permissions,
@@ -257,7 +258,7 @@ architectural counters, per-hart CLINT timer/software interrupts, deterministic
 round-robin hart scheduling, interrupt selection and vector entry, and bounded
 `wfi`. The Linux boot contract loads a raw RV64
 `Image` at the standard 2 MiB boundary, page-aligns an admitted initramfs after
-it, generates the versioned `aos-rv64-virt-v0` FDT without a host tool, and
+it, generates the versioned `aos-rv64-virt-v1` FDT without a host tool, and
 enters the kernel in S-mode with `a0=hartid` and `a1=FDT`. Its private firmware
 implements the SBI 3.0 Base, TIME, IPI, RFENCE, HSM, DBCN, and SRST subsets
 needed by the SMP profile. The private implementation ID is deliberately unregistered;
@@ -266,13 +267,15 @@ no browser, JavaScript, JIT, host process, host filesystem, or network dependenc
 and compiles for the capsule's `wasm32-unknown-unknown` target.
 
 The pinned kernel, Buildroot rootfs, and AOS-controlled `/init` provide a
-token-bound serial command channel inside this machine. The static BusyBox shell
-is a useful Linux-workbench seed, not a claim of Debian compatibility: Bash,
-Python, an in-guest compiler, networking, durable block storage, and PTYs remain
-absent. The only guest file portals are the synchronous 9P home and workspace
-transports;
-compressed instructions, PLIC, and virtio block are deliberately deferred until
-the selected kernel/device profile requires them.
+token-bound serial command channel inside this machine. The development image
+contains Bash, Git, Python, Clang/LLVM C and C++, binutils, Make, CMake, Ninja,
+pkg-config, patch, CA certificates, and strace. The complete toolchain probe
+compiles and executes C and C++, configures and builds with CMake/Ninja, and
+creates a real Git commit on the governed workspace mount. This is an agent
+workbench, not a claim of Debian compatibility: package management, ambient
+networking, durable block storage, and PTYs remain absent. The only guest file
+portals are the synchronous 9P home and workspace transports; PLIC and virtio
+block remain deferred until the selected device profile requires them.
 
 The private ABI exposes bounded `pipe`, compatibility `spawn-signed`, record-based
 `spawn-signed-record`, `wait`, and `signal` operations. The record form selects an
@@ -328,7 +331,7 @@ per-capsule configuration on every operation:
 
 | Config key | Default | Admitted range | Meaning |
 | --- | ---: | ---: | --- |
-| `linux_memory_bytes` | 0 | 0, or 33554432–3221225472 aligned to 4 KiB | Guest-visible RV64 RAM; zero asks Astrid to size it from current host and principal admission |
+| `linux_memory_bytes` | 0 | 0, or 536870912–3221225472 aligned to 4 KiB | Guest-visible RV64 RAM; zero uses the current host/principal compute admission after reserving worker and safety headroom |
 | `linux_max_steps` | 0 | 0–1000000000000 | Guest steps admitted per invocation; zero delegates to Astrid's outer principal CPU and timeout policy |
 | `linux_max_output_bytes` | 65536 | 1–65536 | Captured Linux output per invocation |
 | `linux_max_file_bytes` | 0 | 0–1099511627776 | Guest `RLIMIT_FSIZE`; zero applies no extra inner cap and leaves Astrid's principal storage quota in force |
@@ -369,11 +372,12 @@ Astrid's outer CPU, timeout, and storage limits still apply. The guest cannot
 raise any boundary. When guest RAM or vCPUs are automatic, Astrid first opens a
 short-lived generic-compute admission probe. The capsule reads effective memory
 and worker parallelism, releases the probe, and retains one exact deterministic
-worker. For RAM it keeps the worker's fixed 64 MiB base and a 128 MiB
-allocator/scheduling reserve outside guest RAM, selects half of the remaining
-usable capacity, aligns down to a guest page, and never exceeds 3 GiB. This
-prevents the first Realm from binding the whole process-wide pool. For vCPUs it
-clamps the parallelism hint to the machine's 1–64-hart range. An explicit
+worker. For RAM it keeps the worker's fixed 64 MiB base, allocator headroom, and
+a 128 MiB safety reserve outside guest RAM, uses the remaining
+principal-admitted capacity, aligns down to a guest page, and never exceeds 3
+GiB. The daemon and principal profile have already bounded the process-wide pool
+before this calculation. For vCPUs it clamps the parallelism hint to the
+machine's 1–64-hart range. An explicit
 `linux_vcpus` value is a logical topology override and does not reserve idle
 native workers. Explicit limits remain useful for repeatable tests and managed
 tiers; insufficient outer admission fails closed.
@@ -474,14 +478,15 @@ python3 scripts/benchmark-linux-realm.py \
 
 The native reference lane measures the AOS-owned RV64 machine in the same
 speed-optimized release profile used to establish interpreter throughput. It
-records three distinct boundaries:
+records two current boundaries:
 
-- `cold-to-init`: allocate 32 MiB, admit the preloaded image, and execute through
-  PID 1's `AOS LINUX /init` marker;
-- `cold-to-principal-bind`: continue through the first principal-home 9P request;
-- `checkpoint-to-bindable`: integrity-check and artifact-bind the preloaded
-  checkpoint, allocate and materialize its sparse 32 MiB machine, and stop at
-  that same unfulfilled principal-home request.
+- `cold-to-init`: allocate the admitted envelope, load the image, and execute
+  through PID 1's `AOS LINUX /init` marker;
+- `cold-to-principal-bind`: continue through the first principal-home 9P request.
+
+Prewarm is not a current capsule operation. A future benchmark may add a
+checkpoint boundary only after a principal-free multi-hart format demonstrates
+lower retained bytes and latency than honest cold boot.
 
 When `qemu-system-riscv64` is installed, the harness boots the exact same Linux
 `Image` under single-threaded TCG and records process start through the same PID
