@@ -21,7 +21,17 @@ if [ "$#" -eq 3 ]; then
 else
     output_cpio=$script_dir/rootfs.cpio.gz
 fi
-expected_cpio=10d26184e85add731208050fb3da9fed5e1dda7475b6e66e0d9814a221ecf3f4
+development_lock=$script_dir/DEVELOPMENT.lock
+if [ ! -f "$development_lock" ] || \
+    ! grep -qxF 'format=aos-realm-development-image-1' "$development_lock"; then
+    echo "missing or invalid development generation lock: $development_lock" >&2
+    exit 66
+fi
+expected_cpio=$(sed -n 's/^rootfs_stage_sha256=//p' "$development_lock")
+if [ -z "$expected_cpio" ]; then
+    echo "development generation lock has no rootfs_stage_sha256" >&2
+    exit 66
+fi
 record_userland=${AOS_RECORD_USERLAND:-0}
 # LLVM translation units can individually consume several GiB. Keep the
 # reproducible default safe for an 8 GiB builder; operators with a larger
