@@ -192,30 +192,38 @@ principal KV: realm/default/fs/head
   -> { format, generation, manifest_digest }
 
 principal file store: .../store/blobs/<blake3>
-  -> immutable file bytes or immutable manifest bytes
+  -> immutable 64 KiB chunks, radix nodes, or manifest bytes
 ```
 
-A create-or-truncate close writes and verifies the file blob, writes and verifies
-a new manifest whose parent is the prior selected manifest, then swaps the head
-with KV compare-and-swap. A crash before the swap can leave unreachable blobs but
-cannot select a partial generation. A losing concurrent writer reloads the winner,
-merges its own replacement, and retries up to a fixed bound.
+A file record selects a sparse three-level radix tree over immutable 64 KiB
+content chunks. The chunk is a storage unit, not a logical file ceiling:
+missing subtrees read as zeroes, positional writes replace only one chunk and
+its ancestor path, and the tree addresses up to one TiB. The guest's optional
+`linux_max_file_bytes` and Astrid's mandatory aggregate principal storage
+ledger remain the policy boundaries.
 
-Existing format-0 and format-1 homes are not discarded. Before first format-2
-execution, the dedicated direct-home tree is enumerated in stable order and any
-node absent from the selected generation is imported within explicit entry and
-file bounds. Format-1 manifests materialize their implicit parent directories in
-memory and upgrade on the next mutation. The old direct path remains a
-rebuildable compatibility projection; selected-generation nodes always win.
+A mutation writes and verifies its new chunks and tree nodes, writes and
+verifies a new manifest whose parent is the prior selected manifest, then swaps
+the head with KV compare-and-swap. A crash before the swap can leave unreachable
+blobs but cannot select a partial generation. A losing concurrent writer reloads
+the winner, merges its own replacement, and retries up to a fixed bound.
+
+Existing format-0, format-1, and format-2 homes are not discarded. Before first
+format-3 execution, the dedicated direct-home tree is enumerated in stable order
+and any node absent from the selected generation is imported within explicit
+entry and file bounds. Format-1 manifests materialize their implicit parent
+directories in memory. Format-2 whole-file records remain readable and upgrade
+lazily on their first content mutation.
 
 The current seed supports regular-file create/read/positional-write/truncate,
 directory create/read/remove, tree rename, unlink, persisted permission bits,
-and synchronous flush semantics, with a 64 KiB per-file limit and 1 MiB
-manifest limit. Every successful mutation is already durable at its generation
-head; `fsync` therefore has no deferred dirty bytes. Links, timestamps, garbage
-collection, named checkpoints, and diff/reset remain absent. The component does
-not yet receive the outer principal storage quota, so 9P `statfs` capacity fields
-remain unspecified rather than fabricating free space.
+sparse extension, and synchronous flush semantics. There is no 64 KiB logical
+file limit; one MiB bounds metadata blobs independently of file content. Every
+successful mutation is already durable at its generation head; `fsync` therefore
+has no deferred dirty bytes. Links, timestamps, quota-aware garbage collection,
+named checkpoints, and diff/reset remain absent. The component does not yet
+receive the outer principal storage quota, so 9P `statfs` capacity fields remain
+unspecified rather than fabricating free space.
 `linux_realm_status` exposes the format, selected generation, file count, and
 manifest digest without exposing a physical path.
 

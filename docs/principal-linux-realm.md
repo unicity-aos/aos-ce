@@ -931,15 +931,35 @@ an atomic compare-and-swap. The principal file store is not the transaction log.
 It contains immutable, read-after-write-verified blobs identified by BLAKE3. Both
 outer stores are already scoped by the kernel-stamped principal and capsule.
 
-One create-or-truncate commit is:
+Format 3 stores regular-file contents in a sparse, fixed-depth radix tree:
 
-1. normalize and bound the realm-relative path and bytes;
-2. materialize and verify the immutable file blob;
-3. load the currently selected head and manifest;
-4. build, materialize, and verify a new manifest containing the replacement and
+```text
+manifest file record { bytes, mode, tree? }
+  -> level-2 node (256 children)
+     -> level-1 node (256 children)
+        -> level-0 node (256 children)
+           -> 64 KiB immutable content chunk
+```
+
+The chunk size is an internal transfer and deduplication unit, not a file-size
+policy. Missing nodes and chunks read as zeroes. Three levels address one TiB
+per file, matching the largest optional guest `RLIMIT_FSIZE`; the principal's
+outer aggregate storage ledger decides how many physical bytes the Realm may
+actually retain. A positional mutation materializes only the touched chunks and
+three ancestor paths. Sparse extension materializes no content. Truncation
+prunes complete subtrees and zeroes the retained tail, so a later extension
+cannot reveal discarded bytes.
+
+One commit is:
+
+1. normalize the realm-relative path and validate offset arithmetic;
+2. load or construct only the affected chunk-tree paths;
+3. materialize and read-after-write verify the new immutable chunks and nodes;
+4. load the currently selected head and manifest;
+5. build, materialize, and verify a new manifest containing the replacement and
    the prior manifest digest as its parent;
-5. compare-and-swap the exact old head bytes to the new head;
-6. if another writer won, reload its generation, merge, and retry up to eight
+6. compare-and-swap the exact old head bytes to the new head;
+7. if another writer won, reload its generation, merge, and retry up to eight
    attempts.
 
 A crash before step 5 may leave an orphan content or manifest blob, but it cannot
@@ -948,22 +968,24 @@ generation. Missing, tampered, malformed, or newer selected metadata fails close
 Garbage collection can later remove objects unreachable from retained heads and
 named checkpoints.
 
-Before first format-2 execution, the dedicated format-0/1 direct-home tree is
+Before first format-3 execution, the dedicated format-0/1 direct-home tree is
 enumerated in stable order and nodes absent from the selected generation are
 imported within explicit entry and per-file bounds. Format-1 manifests
-materialize their formerly implicit parent directories and upgrade on the next
-mutation. The direct path is maintained as a best-effort compatibility
-projection, never as the selected truth. This preserves deployed seed data
-without requiring a separate stop-the-world migration window.
+materialize their formerly implicit parent directories. Format-2 whole-file
+records remain readable and each file upgrades lazily to a chunk tree on its
+first content mutation. Updating the format marker therefore does not require a
+stop-the-world rewrite or discard deployed principal data.
 
 The present semantic boundary is intentionally bounded: regular-file create,
 read, positional write, truncate and unlink; directory create, stable readdir and
 empty removal; atomic file replacement and directory-tree rename; persisted
-permission bits; a 64 KiB per-file limit; and a 1 MiB manifest. Successful
-mutations select and verify a complete generation before returning, so guest
-`fsync` has no deferred dirty state. Links, timestamps, named checkpoints,
-diff/reset, garbage collection, and quota-backed `statfs` capacity remain absent
-rather than implied POSIX behavior.
+permission bits; sparse files; and a one MiB metadata-blob validation bound.
+There is no fixed 64 KiB logical-file ceiling. The optional
+`linux_max_file_bytes` guest limit and mandatory outer principal storage ledger
+are the policy boundaries. Successful mutations select and verify a complete
+generation before returning, so guest `fsync` has no deferred dirty state.
+Links, timestamps, named checkpoints, diff/reset, garbage collection, and
+quota-backed `statfs` capacity remain absent rather than implied POSIX behavior.
 
 ### 6.4 Base and overlay
 
@@ -1236,6 +1258,38 @@ Astrid administrator's principal profile
 ∩ invoking principal's per-capsule Realm configuration
 ∩ optional lower per-command request
 ```
+
+### 7.2 Bound provenance
+
+Every finite value must name why it exists. Realm bounds fall into four valid
+classes:
+
+1. a wire or storage unit that never limits the logical object;
+2. a mathematical addressability or target-ABI limit;
+3. a principal or operator resource policy, with an explicit configuration
+   surface and outer enforcement;
+4. a compatibility-migration bound that is unreachable during normal operation.
+
+A small implementation seed is not a fifth class. The audit after the first
+live `rustc` attempt classifies the current values as follows:
+
+| Value | Current role | Disposition |
+| --- | --- | --- |
+| 64 KiB file chunk | content-addressed transfer/deduplication unit | retained; format 3 makes it invisible to logical file size |
+| 64 KiB 9P `msize` | negotiated request/response unit in admitted guest RAM | retained; reads and writes stream across messages |
+| one TiB file address space | three 256-way radix levels and guest `RLIMIT_FSIZE` maximum | retained as format addressability, not default allocation |
+| one MiB manifest/node validation | hostile-metadata decode and current host-call bound | retain until manifests are paged; never apply it to file content |
+| three GiB guest RAM | leaves the controller and machine regions outside RV64 RAM in one wasm32 address space | retain while the worker is wasm32; native/wasm64 workers need their own derivation |
+| 64 harts | machine protocol/static topology maximum | retain only while derived from the machine type; native workers may declare a different maximum |
+| 64 KiB captured result | seed result-envelope policy | remove in favor of principal-configured streaming or durable job logs |
+| 1,024-byte script and 64-byte CWD | seed console-frame buffers | remove with a length-framed, multi-message command portal; do not merely raise both constants |
+| 1,024 FIDs, 4,096 directory entries, 16,384 QIDs | fixed 9P-session memory controls | page directory state and charge live session objects to the principal; exhaustion must remain explicit |
+| eight CAS retries | fixed optimistic-contention policy | replace with bounded backoff against the admitted operation deadline and cancellation token |
+| 64 KiB/4,096-node format-0 import | one-time compatibility migration | retain and label as historical; it is not reachable after the format marker advances |
+
+This table is a review gate: a new constant affecting useful work is rejected
+unless it derives from one of the four classes and has a test showing that it
+cannot silently become a smaller semantic ceiling.
 
 The host pool is dynamic when
 `capsule.compute_host_max_workers` and
@@ -3215,6 +3269,16 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
 - [x] attach Linux `/home/agent` over a second 9P channel to the selected
   principal generation; implement file, directory, positional, rename, unlink,
   and flush semantics; and prove cold-boot persistence separately from RAM;
+- [x] replace the seed's 64 KiB whole-file persistence with format-3 sparse
+  chunk trees; preserve format-1/2 reads and lazily upgrade old files; prove
+  multi-megabyte reads, bounded-path mutation, sparse growth, safe truncation,
+  corruption failure, and one-TiB address arithmetic;
+- [ ] batch sequential writes into one selected generation at close/fsync
+  without weakening crash consistency, then benchmark compiler-output metadata
+  amplification through the real Linux 9P path;
+- [ ] implement quota-aware reachability garbage collection and bounded retained
+  checkpoints so deleted files and superseded chunks cannot consume a
+  principal's storage allocation indefinitely;
 - [x] verify principal-scoped home persistence across daemon restart and reject a
   second principal's read of those bytes;
 - [x] invoke the packaged capsule through a live Astrid 0.10.1 daemon and MCP
@@ -3332,6 +3396,12 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
 - [ ] replace the fixed 64 KiB captured-result ceiling with principal-configured
   bounded streaming or durable job logs; a compiler must not lose its diagnostic
   tail merely because a foreground result envelope is intentionally small;
+- [ ] replace the one-line 1,024-byte script and 64-byte CWD console frame with
+  a length-framed multi-message command portal charged to the invocation;
+- [ ] page 9P directory enumeration and derive FID/QID residency from the
+  principal's admitted session budget instead of fixed seed constants;
+- [ ] replace the fixed eight-attempt filesystem CAS loop with cancellation-aware
+  backoff bounded by the outer invocation deadline;
 - [ ] propagate foreground disconnect, CLI expiry, and principal epoch traps to
   one correlated terminal command result; a timed-out caller must not leave an
   unobserved invocation running, and an interrupted capsule must not leave the
