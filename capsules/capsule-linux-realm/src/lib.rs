@@ -1827,7 +1827,7 @@ fn status_response(
             },
         ],
         home: "/home/agent",
-        home_storage: "kv-cas-head+content-addressed-file-blobs",
+        home_storage: "kv-cas-head+content-addressed-chunk-tree",
         home_format: home_status.format,
         home_generation: home_status.generation,
         home_files: home_status.files,
@@ -3080,7 +3080,7 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
 
         assert!(json.contains("/workspace"));
         assert!(json.contains("/home/agent"));
-        assert!(json.contains("kv-cas-head+content-addressed-file-blobs"));
+        assert!(json.contains("kv-cas-head+content-addressed-chunk-tree"));
         assert!(json.contains("\"home_generation\":7"));
         assert!(json.contains("\"realm_boot_sequence\":9"));
         assert!(json.contains("\"commands_completed\":4"));
