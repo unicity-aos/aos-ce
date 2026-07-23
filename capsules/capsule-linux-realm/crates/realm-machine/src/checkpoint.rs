@@ -126,32 +126,53 @@ impl MachineCheckpoint {
         bytes.extend_from_slice(binding.distribution.as_bytes());
         push_u64(&mut bytes, machine.config.ram_bytes as u64);
         push_u64(&mut bytes, machine.config.max_console_bytes as u64);
-
-        for register in machine.cpu.registers {
-            push_u64(&mut bytes, register);
+        push_u32(
+            &mut bytes,
+            u32::try_from(machine.hart_count).expect("admitted hart count fits u32"),
+        );
+        push_u32(
+            &mut bytes,
+            u32::try_from(machine.active_hart_id).expect("admitted hart id fits u32"),
+        );
+        push_u64(&mut bytes, machine.scheduler_quantum_remaining);
+        encode_hart(
+            &mut bytes,
+            machine.active_hart_lifecycle,
+            &machine.cpu,
+            &machine.csrs,
+            machine.cycle,
+            machine.instret,
+            machine.reservation,
+            machine.devices.mtimecmp,
+            machine.devices.msip,
+        );
+        for hart_id in 0..machine.hart_count {
+            if hart_id == machine.active_hart_id {
+                continue;
+            }
+            let hart = machine.parked_harts[hart_id]
+                .as_ref()
+                .expect("every inactive admitted hart is parked");
+            push_u32(
+                &mut bytes,
+                u32::try_from(hart.id).expect("admitted hart id fits u32"),
+            );
+            encode_hart(
+                &mut bytes,
+                hart.lifecycle,
+                &hart.cpu,
+                &hart.csrs,
+                hart.cycle,
+                hart.instret,
+                hart.reservation,
+                hart.mtimecmp,
+                hart.msip,
+            );
         }
-        for register in machine.cpu.floating_registers {
-            push_u64(&mut bytes, register);
-        }
-        push_u64(&mut bytes, machine.cpu.pc);
-        bytes.push(machine.cpu.privilege as u8);
 
-        encode_csrs(&mut bytes, &machine.csrs);
         push_u64(&mut bytes, machine.devices.mtime);
-        push_u64(&mut bytes, machine.devices.mtimecmp);
-        bytes.push(u8::from(machine.devices.msip));
         push_u64(&mut bytes, machine.steps_executed);
         push_u64(&mut bytes, machine.instructions_retired);
-        push_u64(&mut bytes, machine.cycle);
-        push_u64(&mut bytes, machine.instret);
-        match machine.reservation {
-            Some((address, width)) => {
-                bytes.push(1);
-                push_u64(&mut bytes, address);
-                bytes.push(width);
-            }
-            None => bytes.push(0),
-        }
         bytes.push(u8::from(machine.firmware.enabled));
         push_u64(&mut bytes, machine.next_host_request_id);
 
@@ -164,6 +185,10 @@ impl MachineCheckpoint {
         push_len_bytes(&mut bytes, &pending.request.message);
         push_u64(&mut bytes, pending.request.max_response_bytes as u64);
         push_u64(&mut bytes, pending.response_address);
+        push_u32(
+            &mut bytes,
+            u32::try_from(pending.hart_id).expect("admitted request hart id fits u32"),
+        );
 
         let populated_pages = machine.devices.ram.nonzero_pages(PAGE_BYTES);
         push_u32(
@@ -223,44 +248,57 @@ impl MachineCheckpoint {
             ram_bytes,
             max_console_bytes,
         };
-        let mut machine = Machine::new(config)?;
+        let hart_count = decoder.u32_usize()?;
+        let active_hart_id = decoder.u32_usize()?;
+        let scheduler_quantum_remaining = decoder.u64()?;
+        if !(1..=MAX_HARTS).contains(&hart_count) || active_hart_id >= hart_count {
+            return Err(CheckpointDecodeError::InvalidField("hart topology"));
+        }
+        if scheduler_quantum_remaining > HART_SCHEDULER_QUANTUM {
+            return Err(CheckpointDecodeError::InvalidField(
+                "hart scheduler quantum",
+            ));
+        }
+        let mut machine = Machine::new_with_harts(config, hart_count)?;
+        let active = decode_hart(&mut decoder, &machine.devices)?;
+        let mut parked_harts = (0..hart_count).map(|_| None).collect::<Vec<_>>();
+        for expected_hart_id in 0..hart_count {
+            if expected_hart_id == active_hart_id {
+                continue;
+            }
+            let hart_id = decoder.u32_usize()?;
+            if hart_id != expected_hart_id {
+                return Err(CheckpointDecodeError::InvalidField("parked hart order"));
+            }
+            let hart = decode_hart(&mut decoder, &machine.devices)?;
+            parked_harts[hart_id] = Some(ParkedHart {
+                id: hart_id,
+                lifecycle: hart.lifecycle,
+                cpu: hart.cpu,
+                csrs: hart.csrs,
+                cycle: hart.cycle,
+                instret: hart.instret,
+                reservation: hart.reservation,
+                mtimecmp: hart.mtimecmp,
+                msip: hart.msip,
+                translation_cache: TranslationCache::default(),
+            });
+        }
+        machine.active_hart_id = active_hart_id;
+        machine.active_hart_lifecycle = active.lifecycle;
+        machine.parked_harts = parked_harts;
+        machine.scheduler_quantum_remaining = scheduler_quantum_remaining;
+        machine.cpu = active.cpu;
+        machine.csrs = active.csrs;
+        machine.cycle = active.cycle;
+        machine.instret = active.instret;
+        machine.reservation = active.reservation;
+        machine.devices.mtimecmp = active.mtimecmp;
+        machine.devices.msip = active.msip;
 
-        for register in &mut machine.cpu.registers {
-            *register = decoder.u64()?;
-        }
-        if machine.cpu.registers[0] != 0 {
-            return Err(CheckpointDecodeError::InvalidField("zero register"));
-        }
-        for register in &mut machine.cpu.floating_registers {
-            *register = decoder.u64()?;
-        }
-        machine.cpu.pc = decoder.u64()?;
-        if machine.cpu.pc & 1 != 0 {
-            return Err(CheckpointDecodeError::InvalidField("program counter"));
-        }
-        machine.cpu.privilege = decode_privilege(decoder.byte()?)?;
-
-        machine.csrs = decode_csrs(&mut decoder)?;
-        validate_csrs(&machine.csrs)?;
         machine.devices.mtime = decoder.u64()?;
-        machine.devices.mtimecmp = decoder.u64()?;
-        machine.devices.msip = decoder.boolean("software interrupt state")?;
         machine.steps_executed = decoder.u64()?;
         machine.instructions_retired = decoder.u64()?;
-        machine.cycle = decoder.u64()?;
-        machine.instret = decoder.u64()?;
-        machine.reservation = match decoder.byte()? {
-            0 => None,
-            1 => {
-                let address = decoder.u64()?;
-                let width = decoder.byte()?;
-                if !matches!(width, 4 | 8) || machine.devices.ram_range(address, width).is_none() {
-                    return Err(CheckpointDecodeError::InvalidField("reservation"));
-                }
-                Some((address, width))
-            }
-            _ => return Err(CheckpointDecodeError::InvalidField("reservation marker")),
-        };
         machine.firmware.enabled = decoder.boolean("firmware state")?;
         if !machine.firmware.enabled {
             return Err(CheckpointDecodeError::InvalidField("firmware state"));
@@ -280,15 +318,17 @@ impl MachineCheckpoint {
             ));
         }
         let response_address = decoder.u64()?;
+        let request_hart_id = decoder.u32_usize()?;
         if machine
             .devices
             .ram_range_len(response_address, max_response_bytes)
             .is_none()
             || request_id.get() == 0
             || machine.next_host_request_id <= request_id.get()
+            || request_hart_id >= hart_count
         {
             return Err(CheckpointDecodeError::InvalidField(
-                "host request identity or response buffer",
+                "host request identity, hart, or response buffer",
             ));
         }
         machine.pending_9p_request = Some(PendingPlan9Request {
@@ -299,7 +339,7 @@ impl MachineCheckpoint {
                 max_response_bytes,
             },
             response_address,
-            hart_id: 0,
+            hart_id: request_hart_id,
         });
 
         let populated_pages = decoder.u32_usize()?;
@@ -326,6 +366,9 @@ impl MachineCheckpoint {
         machine.state = RunState::Runnable;
         machine.metrics = MachineMetrics::default();
         machine.translation_cache.clear();
+        for hart in machine.parked_harts.iter_mut().flatten() {
+            hart.translation_cache.clear();
+        }
         Ok(Self { machine })
     }
 
@@ -335,6 +378,109 @@ impl MachineCheckpoint {
         self.machine.translation_cache.clear();
         self.machine
     }
+}
+
+fn encode_hart(
+    bytes: &mut Vec<u8>,
+    lifecycle: HartLifecycle,
+    cpu: &Cpu,
+    csrs: &CsrFile,
+    cycle: u64,
+    instret: u64,
+    reservation: Option<(u64, u8)>,
+    mtimecmp: u64,
+    msip: bool,
+) {
+    bytes.push(match lifecycle {
+        HartLifecycle::Started => 1,
+        HartLifecycle::Stopped => 0,
+    });
+    for register in cpu.registers {
+        push_u64(bytes, register);
+    }
+    for register in cpu.floating_registers {
+        push_u64(bytes, register);
+    }
+    push_u64(bytes, cpu.pc);
+    bytes.push(cpu.privilege as u8);
+    encode_csrs(bytes, csrs);
+    push_u64(bytes, cycle);
+    push_u64(bytes, instret);
+    match reservation {
+        Some((address, width)) => {
+            bytes.push(1);
+            push_u64(bytes, address);
+            bytes.push(width);
+        }
+        None => bytes.push(0),
+    }
+    push_u64(bytes, mtimecmp);
+    bytes.push(u8::from(msip));
+}
+
+struct DecodedHart {
+    lifecycle: HartLifecycle,
+    cpu: Cpu,
+    csrs: CsrFile,
+    cycle: u64,
+    instret: u64,
+    reservation: Option<(u64, u8)>,
+    mtimecmp: u64,
+    msip: bool,
+}
+
+fn decode_hart(
+    decoder: &mut Decoder<'_>,
+    devices: &Devices,
+) -> Result<DecodedHart, CheckpointDecodeError> {
+    let lifecycle = match decoder.byte()? {
+        0 => HartLifecycle::Stopped,
+        1 => HartLifecycle::Started,
+        _ => return Err(CheckpointDecodeError::InvalidField("hart lifecycle")),
+    };
+    let mut cpu = Cpu::new();
+    for register in &mut cpu.registers {
+        *register = decoder.u64()?;
+    }
+    if cpu.registers[0] != 0 {
+        return Err(CheckpointDecodeError::InvalidField("zero register"));
+    }
+    for register in &mut cpu.floating_registers {
+        *register = decoder.u64()?;
+    }
+    cpu.pc = decoder.u64()?;
+    if cpu.pc & 1 != 0 {
+        return Err(CheckpointDecodeError::InvalidField("program counter"));
+    }
+    cpu.privilege = decode_privilege(decoder.byte()?)?;
+    let csrs = decode_csrs(decoder)?;
+    validate_csrs(&csrs)?;
+    let cycle = decoder.u64()?;
+    let instret = decoder.u64()?;
+    let reservation = match decoder.byte()? {
+        0 => None,
+        1 => {
+            let address = decoder.u64()?;
+            let width = decoder.byte()?;
+            if !matches!(width, 4 | 8) || devices.ram_range(address, width).is_none() {
+                return Err(CheckpointDecodeError::InvalidField("reservation"));
+            }
+            Some((address, width))
+        }
+        _ => return Err(CheckpointDecodeError::InvalidField("reservation marker")),
+    };
+    let mtimecmp = decoder.u64()?;
+    let msip = decoder.boolean("software interrupt state")?;
+    Ok(DecodedHart {
+        lifecycle,
+        cpu,
+        csrs,
+        cycle,
+        instret,
+        reservation,
+        mtimecmp,
+        msip,
+    })
 }
 
 fn encode_csrs(bytes: &mut Vec<u8>, csrs: &CsrFile) {

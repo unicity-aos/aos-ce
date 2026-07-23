@@ -3,11 +3,13 @@ use aos_realm_machine::{
 };
 use std::{env, fs, process::ExitCode, time::Instant};
 
-const RAM_BYTES: usize = 32 * 1024 * 1024;
+const RAM_BYTES: usize = 1024 * 1024 * 1024;
+const HART_COUNT: usize = 2;
 const CONSOLE_BYTES: usize = 64 * 1024;
-const SLICE_STEPS: u64 = 100_000;
-const MAX_STEPS: u64 = 250_000_000;
+const SLICE_STEPS: u64 = 10_000_000;
+const MAX_STEPS: u64 = 2_000_000_000;
 const HOME_9P_CHANNEL: u32 = 1;
+const SYSTEM_BLOCK_CHANNEL: u32 = 3;
 
 fn main() -> ExitCode {
     match run() {
@@ -23,32 +25,42 @@ fn run() -> Result<(), String> {
     let mut args = env::args_os().skip(1);
     let image_path = args
         .next()
-        .ok_or_else(|| "usage: build_prewarm IMAGE SOURCES_LOCK OUTPUT".to_string())?;
-    let sources_path = args
+        .ok_or_else(|| "usage: build_prewarm IMAGE SYSTEM_SQUASHFS OUTPUT".to_string())?;
+    let system_path = args
         .next()
-        .ok_or_else(|| "usage: build_prewarm IMAGE SOURCES_LOCK OUTPUT".to_string())?;
+        .ok_or_else(|| "usage: build_prewarm IMAGE SYSTEM_SQUASHFS OUTPUT".to_string())?;
     let output_path = args
         .next()
-        .ok_or_else(|| "usage: build_prewarm IMAGE SOURCES_LOCK OUTPUT".to_string())?;
+        .ok_or_else(|| "usage: build_prewarm IMAGE SYSTEM_SQUASHFS OUTPUT".to_string())?;
     if args.next().is_some() {
-        return Err("usage: build_prewarm IMAGE SOURCES_LOCK OUTPUT".to_string());
+        return Err("usage: build_prewarm IMAGE SYSTEM_SQUASHFS OUTPUT".to_string());
     }
 
     let image = fs::read(&image_path)
         .map_err(|error| format!("could not read Linux image {image_path:?}: {error}"))?;
-    let sources = fs::read(&sources_path)
-        .map_err(|error| format!("could not read sources lock {sources_path:?}: {error}"))?;
+    let system = fs::read(&system_path)
+        .map_err(|error| format!("could not read system image {system_path:?}: {error}"))?;
+    if system.len() < 4096 || !system.len().is_multiple_of(512) {
+        return Err("system image must be a sector-aligned SquashFS artifact".to_string());
+    }
     let binding = CheckpointBinding::new(
         CheckpointDigest::hash(&image),
-        CheckpointDigest::hash(&sources),
+        CheckpointDigest::hash(&system),
     );
-    let mut machine = Machine::new(MachineConfig {
-        ram_bytes: RAM_BYTES,
-        max_console_bytes: CONSOLE_BYTES,
-    })
+    let mut machine = Machine::new_with_harts(
+        MachineConfig {
+            ram_bytes: RAM_BYTES,
+            max_console_bytes: CONSOLE_BYTES,
+        },
+        HART_COUNT,
+    )
     .map_err(|error| format!("could not admit prewarm machine: {error}"))?;
+    let bootargs = format!(
+        "earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time=1 aos.system_bytes={}",
+        system.len()
+    );
     machine
-        .boot_linux(&image, &[], "earlycon=sbi console=hvc0 init=/init panic=-1")
+        .boot_linux(&image, &[], &bootargs)
         .map_err(|error| format!("could not admit Linux image: {error}"))?;
 
     let started = Instant::now();
@@ -65,6 +77,23 @@ fn run() -> Result<(), String> {
         console.extend_from_slice(&report.console);
         match report.outcome {
             SliceOutcome::Yielded => {}
+            SliceOutcome::HostRequest(request) if request.channel == SYSTEM_BLOCK_CHANNEL => {
+                let offset = request
+                    .message
+                    .as_slice()
+                    .try_into()
+                    .map(u64::from_le_bytes)
+                    .map_err(|_| "system block request has an invalid offset".to_string())?;
+                let offset = usize::try_from(offset)
+                    .map_err(|_| "system block offset is not addressable".to_string())?;
+                let end = offset
+                    .checked_add(request.max_response_bytes)
+                    .filter(|end| *end <= system.len())
+                    .ok_or_else(|| "system block request exceeds the image".to_string())?;
+                machine
+                    .complete_9p_request(request.id, &system[offset..end])
+                    .map_err(|error| format!("could not complete system block read: {error}"))?;
+            }
             SliceOutcome::HostRequest(request) => break request,
             outcome => {
                 return Err(format!(

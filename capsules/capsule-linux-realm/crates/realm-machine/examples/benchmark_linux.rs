@@ -5,11 +5,13 @@ use aos_realm_machine::{
 use serde::Serialize;
 use std::{env, fs, process::ExitCode, time::Instant};
 
-const RAM_BYTES: usize = 32 * 1024 * 1024;
+const RAM_BYTES: usize = 1024 * 1024 * 1024;
+const HART_COUNT: usize = 2;
 const CONSOLE_BYTES: usize = 64 * 1024;
-const SLICE_STEPS: u64 = 100_000;
-const MAX_STEPS: u64 = 250_000_000;
+const SLICE_STEPS: u64 = 10_000_000;
+const MAX_STEPS: u64 = 2_000_000_000;
 const HOME_9P_CHANNEL: u32 = 1;
+const SYSTEM_BLOCK_CHANNEL: u32 = 3;
 const INIT_MARKER: &[u8] = b"AOS LINUX /init";
 const DEFAULT_SAMPLES: u32 = 10;
 const DEFAULT_WARMUPS: u32 = 2;
@@ -56,7 +58,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let mut args = env::args_os().skip(1);
     let image_path = args.next().ok_or_else(usage)?;
-    let sources_path = args.next().ok_or_else(usage)?;
+    let system_path = args.next().ok_or_else(usage)?;
     let checkpoint_path = args.next().ok_or_else(usage)?;
     let samples = parse_count(args.next(), DEFAULT_SAMPLES, "SAMPLES")?;
     let warmups = parse_count(args.next(), DEFAULT_WARMUPS, "WARMUPS")?;
@@ -66,13 +68,13 @@ fn run() -> Result<(), String> {
 
     let image = fs::read(&image_path)
         .map_err(|error| format!("could not read Linux image {image_path:?}: {error}"))?;
-    let sources = fs::read(&sources_path)
-        .map_err(|error| format!("could not read sources lock {sources_path:?}: {error}"))?;
+    let system = fs::read(&system_path)
+        .map_err(|error| format!("could not read system image {system_path:?}: {error}"))?;
     let checkpoint = fs::read(&checkpoint_path)
         .map_err(|error| format!("could not read checkpoint {checkpoint_path:?}: {error}"))?;
     let binding = CheckpointBinding::new(
         CheckpointDigest::hash(&image),
-        CheckpointDigest::hash(&sources),
+        CheckpointDigest::hash(&system),
     );
 
     // Validate every immutable input before warmup. Timed checkpoint samples
@@ -82,12 +84,12 @@ fn run() -> Result<(), String> {
     validate_checkpoint(&admitted)?;
 
     for _ in 0..warmups {
-        let _ = cold_to_principal_bind(&image)?;
+        let _ = cold_to_principal_bind(&image, &system)?;
         let _ = checkpoint_to_bindable(&checkpoint, binding)?;
     }
 
     for iteration in 0..samples {
-        let (init, principal_bind) = cold_to_principal_bind(&image)?;
+        let (init, principal_bind) = cold_to_principal_bind(&image, &system)?;
         emit(measured_sample(
             "cold-to-init",
             iteration,
@@ -155,7 +157,7 @@ fn measured_sample(
 }
 
 fn usage() -> String {
-    "usage: benchmark_linux IMAGE SOURCES_LOCK CHECKPOINT [SAMPLES] [WARMUPS]".to_string()
+    "usage: benchmark_linux IMAGE SYSTEM_SQUASHFS CHECKPOINT [SAMPLES] [WARMUPS]".to_string()
 }
 
 fn parse_count(value: Option<std::ffi::OsString>, default: u32, name: &str) -> Result<u32, String> {
@@ -173,15 +175,25 @@ fn parse_count(value: Option<std::ffi::OsString>, default: u32, name: &str) -> R
     Ok(parsed)
 }
 
-fn cold_to_principal_bind(image: &[u8]) -> Result<(Measurement, Measurement), String> {
+fn cold_to_principal_bind(
+    image: &[u8],
+    system: &[u8],
+) -> Result<(Measurement, Measurement), String> {
     let started = Instant::now();
-    let mut machine = Machine::new(MachineConfig {
-        ram_bytes: RAM_BYTES,
-        max_console_bytes: CONSOLE_BYTES,
-    })
+    let mut machine = Machine::new_with_harts(
+        MachineConfig {
+            ram_bytes: RAM_BYTES,
+            max_console_bytes: CONSOLE_BYTES,
+        },
+        HART_COUNT,
+    )
     .map_err(|error| format!("could not admit Linux machine: {error}"))?;
+    let bootargs = format!(
+        "earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time=1 aos.system_bytes={}",
+        system.len()
+    );
     machine
-        .boot_linux(image, &[], "earlycon=sbi console=hvc0 init=/init panic=-1")
+        .boot_linux(image, &[], &bootargs)
         .map_err(|error| format!("could not admit Linux image: {error}"))?;
 
     let mut console = Vec::new();
@@ -199,6 +211,23 @@ fn cold_to_principal_bind(image: &[u8]) -> Result<(Measurement, Measurement), St
         }
         match report.outcome {
             SliceOutcome::Yielded if report.total_steps_executed < MAX_STEPS => {}
+            SliceOutcome::HostRequest(request) if request.channel == SYSTEM_BLOCK_CHANNEL => {
+                let offset = request
+                    .message
+                    .as_slice()
+                    .try_into()
+                    .map(u64::from_le_bytes)
+                    .map_err(|_| "system block request has an invalid offset".to_string())?;
+                let offset = usize::try_from(offset)
+                    .map_err(|_| "system block offset is not addressable".to_string())?;
+                let end = offset
+                    .checked_add(request.max_response_bytes)
+                    .filter(|end| *end <= system.len())
+                    .ok_or_else(|| "system block request exceeds the image".to_string())?;
+                machine
+                    .complete_9p_request(request.id, &system[offset..end])
+                    .map_err(|error| format!("could not complete system block read: {error}"))?;
+            }
             SliceOutcome::HostRequest(request) => {
                 if request.channel != HOME_9P_CHANNEL {
                     return Err(format!(
@@ -248,6 +277,12 @@ fn validate_checkpoint(checkpoint: &MachineCheckpoint) -> Result<(), String> {
         return Err(format!(
             "checkpoint RAM is {}, expected {RAM_BYTES}",
             checkpoint.ram_bytes()
+        ));
+    }
+    if checkpoint.hart_count() != HART_COUNT {
+        return Err(format!(
+            "checkpoint has {} harts, expected {HART_COUNT}",
+            checkpoint.hart_count()
         ));
     }
     if checkpoint.pending_host_request().channel != HOME_9P_CHANNEL {
