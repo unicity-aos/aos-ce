@@ -1607,6 +1607,38 @@ Implementation and proof order:
   time-sliced SMP, and parallel SMP without conflating boot latency, warm command
   latency, and throughput.
 
+The unchecked item begins at a concrete code boundary, not at a configuration
+switch. The current signed vCPU worker rejects every `worker_index != 0`, stores
+the complete `Machine` behind one mutex, and opens a deterministic one-worker
+compute group. Raising the group size today would therefore either continue to
+serialize all hart work on that mutex or introduce unsound races in RAM,
+interrupt, device, allocation, and checkpoint state.
+
+The implementation cut is:
+
+1. Evolve the still-private, unshipped vCPU protocol in place with
+   coordinator-only operations and an exact `run-hart-slice(hart, budget)`
+   operation. Do not add or merge public WIT for this.
+2. Move registers, CSRs, TLB, LR/SC reservation, timers, software interrupts,
+   and counters into independently owned hart cells. Keep UART, monotonic time,
+   finisher, 9P effects, scheduler epochs, and checkpoint control behind one
+   machine coordinator.
+3. Give every admitted worker an exact hart affinity and a disjoint stack/local
+   state region while sharing only the declared guest-RAM/device-control
+   region. The Rust allocator and worker start path must be proven
+   thread-compatible before more than one instance enters the module.
+4. Run harts concurrently only within a coordinator-issued epoch. All workers
+   join a barrier before device effects, RFENCE completion, cancellation,
+   topology change, or checkpoint. A stalled or trapped worker fails the whole
+   epoch and retires its group; it never leaves a partially reusable machine.
+5. Preserve the deterministic engine as the semantic oracle. Differential
+   tests replay interrupt/effect schedules and compare architectural state at
+   every barrier, including conflicting AMOs, LR/SC invalidation, simultaneous
+   IPIs, timer expiry, 9P suspension, cancellation, and checkpoint/restore.
+6. Expose native worker count separately from `linux_vcpus`. Automatic mode may
+   allocate fewer workers than harts and must report the real mapping. Only
+   measured concurrent progress permits the `parallel SMP` label.
+
 Normative references for this increment are the
 [Linux RISC-V boot requirements](https://docs.kernel.org/next/arch/riscv/boot.html),
 the ratified [SBI HSM](https://docs.riscv.org/reference/sbi/v3.0/ext-hsm.html),
@@ -2563,6 +2595,23 @@ CE set rather than test-installed companions.
   1,169 suspensions. This proves guest source creation, native Rust compilation,
   cross-turn workspace continuity, artifact inspection, and execution through
   the live principal boundary. The next image config includes `file(1)`;
+- after durable home migrated to sparse chunk-tree format 3, a clean public
+  `codex-code` build created and executed a 4,236,800-byte Rust ELF directly in
+  `/home/agent`. The single attached invocation returned exit status 0, printed
+  ELF magic `7f 45 4c 46`, and executed
+  `hello from Astrid Linux format 3`. It consumed 20,199,293,807 interpreted
+  guest steps, crossed 4,384 governed host suspensions, and advanced the
+  atomic home from generation 1,696 to 2,934 in about 42 minutes. The first
+  attempt had exposed two independent hidden ceilings: the former whole-file
+  store preallocated a zero-filled partial linker output, and the outer
+  interceptor eventually drained a finite fuel reservoir despite an unlimited
+  principal policy. Runtime commit `0b77158` now accounts and replenishes
+  unlimited Wasmtime fuel at cooperative epoch yields while retaining the
+  wall-time deadline; the optimized installed daemon had SHA-256
+  `74bedc2077d8a100cbce1b7325607b63486a5a676b1339635134642f110aed45`.
+  The successful build is end-to-end evidence for the chunk tree and runtime
+  fix, while its 1,238 selected filesystem generations make sequential-write
+  batching and true parallel hart execution the immediate performance work;
 - a fresh 68-package Astrid SDK capsule build remained active for 5 hours 40
   minutes under the reference interpreter before the proof daemon was
   deliberately restarted. It neither faulted nor exhausted its admitted
