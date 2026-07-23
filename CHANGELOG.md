@@ -91,6 +91,14 @@
   admission; explicit per-principal values select 1–64 logical CPUs without
   reserving unused native workers. Multi-hart machines cold-boot while the
   existing format-1 prewarm artifact remains exactly one hart.
+- Private-stack isolation for parallel core-Wasm workers. Rust workers may
+  declare one linker-reserved stack arena; Astrid Compute validates the complete
+  optional ABI extension and relocates each admitted Store's LLVM stack pointer
+  to a disjoint slot before concurrent work. The signed Linux vCPU worker
+  reserves 64 independently addressable 512 KiB stacks and proves two targeted
+  workers cross a real shared-memory barrier without descriptor or stack
+  aliasing. Linux hart state remains deterministic until its separate
+  coordinator/state split is complete.
 - A reproducibly pinned Buildroot 2026.05.1, static musl, and BusyBox `ash`
   workbench for the resident Linux guest, with an unprivileged `agent` shell,
   token-bound command framing, bounded process resources, descendant cleanup,

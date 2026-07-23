@@ -20,6 +20,7 @@ use aos_realm_vcpu_protocol::{
     self as protocol, Operation, Outcome, RequestFailure, Status, field,
 };
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const ABI_VERSION: i32 = 1;
 #[cfg(target_arch = "wasm32")]
@@ -61,11 +62,24 @@ struct WorkerState {
 }
 
 static STATE: Mutex<Option<WorkerState>> = Mutex::new(None);
+static PARALLEL_PROBE_ARRIVALS: AtomicU64 = AtomicU64::new(0);
 
 /// Generic-compute worker ABI version.
 #[unsafe(no_mangle)]
 pub extern "C" fn astrid_compute_abi_version() -> i32 {
     ABI_VERSION
+}
+
+/// Total linear-memory stack arena reserved by the signed worker linker.
+#[unsafe(no_mangle)]
+pub extern "C" fn astrid_compute_stack_reserve_bytes() -> i32 {
+    protocol::WORKER_STACK_RESERVE_BYTES as i32
+}
+
+/// One worker's private stack stride inside the reserved arena.
+#[unsafe(no_mangle)]
+pub extern "C" fn astrid_compute_stack_stride_bytes() -> i32 {
+    protocol::WORKER_STACK_STRIDE_BYTES as i32
 }
 
 /// Execute one bounded vCPU control operation.
@@ -81,7 +95,7 @@ pub extern "C" fn astrid_compute_run(
     descriptor_length: i64,
     descriptor_tag: i64,
 ) -> i32 {
-    if worker_index != 0 {
+    if worker_index < 0 {
         return -1;
     }
     let Ok(offset) = usize::try_from(descriptor_offset) else {
@@ -98,10 +112,15 @@ pub extern "C" fn astrid_compute_run(
     // memory before dispatch. wasm32 pointers are offsets into that same memory,
     // and this invocation is the sole owner of the descriptor region.
     let bytes = unsafe { std::slice::from_raw_parts_mut(offset as *mut u8, length) };
-    dispatch(bytes, descriptor_tag)
+    dispatch_worker(worker_index as u32, bytes, descriptor_tag)
 }
 
+#[cfg(test)]
 fn dispatch(bytes: &mut [u8], descriptor_tag: i64) -> i32 {
+    dispatch_worker(0, bytes, descriptor_tag)
+}
+
+fn dispatch_worker(worker_index: u32, bytes: &mut [u8], descriptor_tag: i64) -> i32 {
     if protocol::read_u32(bytes, field::MAGIC) != Some(protocol::MAGIC)
         || protocol::read_u32(bytes, field::VERSION) != Some(protocol::VERSION)
     {
@@ -124,6 +143,10 @@ fn dispatch(bytes: &mut [u8], descriptor_tag: i64) -> i32 {
         return 0;
     }
     let result = match operation {
+        Some(Operation::ParallelProbe) => parallel_probe(worker_index, bytes),
+        Some(_) if worker_index != 0 => {
+            Err(invalid("machine control operations require worker zero"))
+        }
         Some(Operation::InitCold) => initialize(bytes),
         Some(Operation::InitCheckpoint) => initialize_checkpoint(bytes),
         Some(Operation::RunSlice) => run_slice(bytes),
@@ -144,6 +167,48 @@ fn dispatch(bytes: &mut [u8], descriptor_tag: i64) -> i32 {
 }
 
 type WorkerResult = Result<(), (Status, String)>;
+
+fn parallel_probe(worker_index: u32, bytes: &mut [u8]) -> WorkerResult {
+    if !input(bytes)?.is_empty() {
+        return Err(invalid("parallel probe does not accept an input payload"));
+    }
+    let workers = protocol::read_u32(bytes, field::HART_COUNT).unwrap_or_default();
+    if !(2..=protocol::MAX_WORKER_STACKS as u32).contains(&workers) || worker_index >= workers {
+        return Err(invalid(
+            "parallel probe worker count or identity is outside the admitted group",
+        ));
+    }
+
+    let expected = if workers == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << workers) - 1
+    };
+    let own_bit = 1_u64 << worker_index;
+    let previous = PARALLEL_PROBE_ARRIVALS.fetch_or(own_bit, Ordering::AcqRel);
+    if previous & own_bit != 0 {
+        return Err(invalid("parallel probe worker identity arrived twice"));
+    }
+
+    // The bounded barrier is deliberate: a serial worker implementation
+    // cannot satisfy it and therefore cannot accidentally pass this proof.
+    let mut observed = previous | own_bit;
+    for _ in 0..10_000_000_u64 {
+        observed = PARALLEL_PROBE_ARRIVALS.load(Ordering::Acquire);
+        if observed & expected == expected {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+    if observed & expected != expected {
+        return Err(machine_error(
+            "parallel probe did not observe concurrent workers",
+        ));
+    }
+
+    protocol::write_u32(bytes, field::HART_COUNT, worker_index);
+    Ok(())
+}
 
 fn initialize(bytes: &mut [u8]) -> WorkerResult {
     if STATE.lock().expect("worker state lock").is_some() {
@@ -685,7 +750,7 @@ mod tests {
     use super::*;
 
     const SIGNED_WORKER_HASH: &str =
-        "blake3:058845e34fe70156721e62d68badd8c6809622c460f5dc981ea80bb7978836fd";
+        "blake3:236900e6cee131ec9617859ae346f7a4be1bc0bed5710e066b1183cbdb4b209a";
     const SIGNED_KERNEL_HASH: &str =
         "blake3:60cc6c3c01222a3a33b108593974de5636747b32cacc10bf8c0f45c1cdd8b285";
     const SIGNED_TEST_SYSTEM_HASH: &str =
@@ -794,6 +859,10 @@ mod tests {
         let mut bytes = request(Operation::Reset as u32, &[]);
         assert_eq!(dispatch(&mut bytes, Operation::Reset as i64), 0);
         assert_bounded_response(&bytes, Status::Ok);
+
+        let mut bytes = request(Operation::Reset as u32, &[]);
+        assert_eq!(dispatch_worker(1, &mut bytes, Operation::Reset as i64), 0);
+        assert_bounded_response(&bytes, Status::Invalid);
     }
 
     #[test]
@@ -816,7 +885,8 @@ mod tests {
     }
 
     #[test]
-    fn transport_rejects_invalid_worker_and_descriptor_geometry_before_dereference() {
+    fn transport_rejects_negative_worker_and_descriptor_geometry_before_dereference() {
+        assert_eq!(astrid_compute_run(-1, 0, 0, 0), -1);
         assert_eq!(astrid_compute_run(1, 0, 0, 0), -1);
         assert_eq!(
             astrid_compute_run(0, -1, protocol::HEADER_BYTES as i64, 0),
@@ -831,6 +901,95 @@ mod tests {
             astrid_compute_run(0, 64, (protocol::CONTROL_BYTES + 1) as i64, 0),
             -1
         );
+    }
+
+    #[test]
+    fn signed_rust_workers_cross_a_real_parallel_compute_barrier() {
+        use astrid_compute::{
+            ComputeLedger, ComputeLimits, ComputeRuntime, ExecutionMode, GroupRequest, Parallelism,
+            WorkDescriptor, WorkerArtifact,
+        };
+        use astrid_core::principal::PrincipalId;
+        use std::path::Path;
+
+        let capsule_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("capsule root");
+        let artifact = WorkerArtifact::from_capsule_path(
+            protocol::WORKER_ID,
+            capsule_root,
+            Path::new("assets/linux-vcpu.wasm"),
+            SIGNED_WORKER_HASH,
+        )
+        .expect("signed Rust worker");
+        let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
+            .expect("compute runtime");
+        let group = runtime
+            .open_group(
+                &PrincipalId::new("linux-parallel-worker-conformance").expect("principal"),
+                &artifact,
+                GroupRequest {
+                    mode: ExecutionMode::Parallel,
+                    parallelism: Parallelism::Exact(2),
+                    initial_memory_pages: 1024,
+                    maximum_memory_pages: 2048,
+                },
+            )
+            .expect("two-worker admission");
+
+        let offsets = [(62 * 1024 * 1024) as u64, (63 * 1024 * 1024) as u64];
+        let mut jobs = Vec::new();
+        for (worker_index, offset) in offsets.into_iter().enumerate() {
+            let mut request = vec![0_u8; protocol::HEADER_BYTES];
+            protocol::write_u32(&mut request, field::MAGIC, protocol::MAGIC);
+            protocol::write_u32(&mut request, field::VERSION, protocol::VERSION);
+            protocol::write_u32(
+                &mut request,
+                field::OPERATION,
+                Operation::ParallelProbe as u32,
+            );
+            protocol::write_u32(&mut request, field::INPUT_LEN, 0);
+            protocol::write_u32(&mut request, field::HART_COUNT, 2);
+            group.write(offset, &request).expect("write probe");
+            jobs.push(
+                group
+                    .submit(WorkDescriptor {
+                        offset,
+                        length: protocol::CONTROL_BYTES as u64,
+                        tag: Operation::ParallelProbe as u64,
+                        worker_index: Some(worker_index as u32),
+                        fuel: None,
+                    })
+                    .expect("submit targeted probe"),
+            );
+        }
+
+        for (worker_index, (job, offset)) in jobs.into_iter().zip(offsets).enumerate() {
+            let result = job.join().expect("parallel probe completion");
+            assert_eq!(result.worker_index, worker_index as u32);
+            assert_eq!(result.worker_status, 0);
+            let response = group
+                .read(offset, protocol::HEADER_BYTES as u32)
+                .expect("read probe response");
+            let response_len =
+                protocol::read_u32(&response, field::RESPONSE_LEN).unwrap_or_default();
+            let detail = group
+                .read(offset + protocol::HEADER_BYTES as u64, response_len)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            assert_eq!(
+                protocol::read_u32(&response, field::STATUS),
+                Some(Status::Ok as u32),
+                "{detail}"
+            );
+            assert_eq!(
+                protocol::read_u32(&response, field::HART_COUNT),
+                Some(worker_index as u32)
+            );
+        }
+        assert_eq!(group.parallelism(), 2);
+        assert_eq!(group.mode(), ExecutionMode::Parallel);
     }
 
     #[test]

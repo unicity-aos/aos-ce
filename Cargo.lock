@@ -269,7 +269,7 @@ dependencies = [
  "aos-realm-machine",
  "aos-realm-vcpu-protocol",
  "astrid-compute",
- "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=0bbd8e389ef96d8b3447ce4f97b67c48523952b4)",
+ "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=ff85b21fdce761f7453487063744a622998b196e)",
 ]
 
 [[package]]
@@ -368,9 +368,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 [[package]]
 name = "astrid-capsule-types"
 version = "0.10.4"
-source = "git+https://github.com/astrid-runtime/astrid.git?rev=0bbd8e389ef96d8b3447ce4f97b67c48523952b4#0bbd8e389ef96d8b3447ce4f97b67c48523952b4"
+source = "git+https://github.com/astrid-runtime/astrid.git?rev=ff85b21fdce761f7453487063744a622998b196e#ff85b21fdce761f7453487063744a622998b196e"
 dependencies = [
- "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=0bbd8e389ef96d8b3447ce4f97b67c48523952b4)",
+ "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=ff85b21fdce761f7453487063744a622998b196e)",
  "dashmap",
  "nix",
  "parking_lot",
@@ -385,10 +385,10 @@ dependencies = [
 [[package]]
 name = "astrid-compute"
 version = "0.10.4"
-source = "git+https://github.com/astrid-runtime/astrid.git?rev=0bbd8e389ef96d8b3447ce4f97b67c48523952b4#0bbd8e389ef96d8b3447ce4f97b67c48523952b4"
+source = "git+https://github.com/astrid-runtime/astrid.git?rev=ff85b21fdce761f7453487063744a622998b196e#ff85b21fdce761f7453487063744a622998b196e"
 dependencies = [
  "astrid-capsule-types",
- "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=0bbd8e389ef96d8b3447ce4f97b67c48523952b4)",
+ "astrid-core 0.10.4 (git+https://github.com/astrid-runtime/astrid.git?rev=ff85b21fdce761f7453487063744a622998b196e)",
  "blake3",
  "memmap2",
  "thiserror 2.0.19",
@@ -420,7 +420,7 @@ dependencies = [
 [[package]]
 name = "astrid-core"
 version = "0.10.4"
-source = "git+https://github.com/astrid-runtime/astrid.git?rev=0bbd8e389ef96d8b3447ce4f97b67c48523952b4#0bbd8e389ef96d8b3447ce4f97b67c48523952b4"
+source = "git+https://github.com/astrid-runtime/astrid.git?rev=ff85b21fdce761f7453487063744a622998b196e#ff85b21fdce761f7453487063744a622998b196e"
 dependencies = [
  "async-trait",
  "base64",
