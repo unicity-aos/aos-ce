@@ -304,8 +304,6 @@ pub enum CheckpointError {
     PendingConsoleInput { bytes: usize },
     /// Console bytes must be drained into the checkpoint build receipt first.
     UndrainedConsoleOutput { bytes: usize },
-    /// Checkpoint format 1 represents exactly one hart.
-    MultipleHarts { count: usize },
 }
 
 impl fmt::Display for CheckpointError {
@@ -322,10 +320,6 @@ impl fmt::Display for CheckpointError {
             Self::UndrainedConsoleOutput { bytes } => write!(
                 f,
                 "prewarm checkpoint contains {bytes} bytes of undrained console output"
-            ),
-            Self::MultipleHarts { count } => write!(
-                f,
-                "durable checkpoints currently support one hart, machine has {count}"
             ),
         }
     }
@@ -1637,6 +1631,12 @@ impl MachineCheckpoint {
         self.machine.config.max_console_bytes
     }
 
+    /// Exact logical CPU topology encoded by this checkpoint.
+    #[must_use]
+    pub const fn hart_count(&self) -> usize {
+        self.machine.hart_count
+    }
+
     /// Host request that every restored machine must complete through a newly
     /// admitted principal-scoped provider.
     #[must_use]
@@ -2037,11 +2037,6 @@ impl Machine {
     /// suspension. The pending request is retained and must be completed by a
     /// fresh principal-scoped provider after every restore.
     pub fn checkpoint_host_suspension(&self) -> Result<MachineCheckpoint, CheckpointError> {
-        if self.hart_count != 1 {
-            return Err(CheckpointError::MultipleHarts {
-                count: self.hart_count,
-            });
-        }
         if !matches!(self.state, RunState::Runnable) {
             return Err(CheckpointError::NotRunnable);
         }
@@ -5762,19 +5757,6 @@ mod tests {
 
     #[test]
     fn prewarm_checkpoint_rejects_unstable_or_principal_bearing_state() {
-        let multi_hart = Machine::new_with_harts(
-            MachineConfig {
-                ram_bytes: 4096,
-                max_console_bytes: 64,
-            },
-            2,
-        )
-        .expect("admit two-hart topology");
-        assert!(matches!(
-            multi_hart.checkpoint_host_suspension(),
-            Err(CheckpointError::MultipleHarts { count: 2 })
-        ));
-
         let mut machine = machine(64);
         machine
             .load_program(&RV64_SMOKE_PROGRAM)
@@ -5831,10 +5813,36 @@ mod tests {
             .id;
         assert!(machine.switch_active_hart(0));
         machine.cpu.write(10, 0xdead);
+        machine.firmware.enabled = true;
+
+        let checkpoint = machine
+            .checkpoint_host_suspension()
+            .expect("multi-hart host suspension is checkpointable");
+        let binding = CheckpointBinding::new(
+            CheckpointDigest::new([0x44; 32]),
+            CheckpointDigest::new([0x55; 32]),
+        );
+        let encoded = checkpoint.encode(binding);
+        let mut restored = MachineCheckpoint::decode(&encoded, binding)
+            .expect("decode multi-hart checkpoint")
+            .into_machine();
+        assert_eq!(restored.hart_count(), 2);
+        assert_eq!(restored.active_hart_id(), 0);
+        assert_eq!(
+            restored
+                .pending_9p_request
+                .as_ref()
+                .expect("restored request")
+                .hart_id,
+            1
+        );
 
         machine
             .complete_9p_request(request_id, &response)
             .expect("complete requesting hart");
+        restored
+            .complete_9p_request(request_id, &response)
+            .expect("complete restored requesting hart");
 
         assert_eq!(machine.active_hart_id(), 1);
         assert_eq!(machine.register(10), Some(SBI_SUCCESS));
@@ -5843,6 +5851,16 @@ mod tests {
             machine.parked_harts[0]
                 .as_ref()
                 .expect("parked hart 0")
+                .cpu
+                .registers[10],
+            0xdead
+        );
+        assert_eq!(restored.active_hart_id(), machine.active_hart_id());
+        assert_eq!(restored.register(10), machine.register(10));
+        assert_eq!(
+            restored.parked_harts[0]
+                .as_ref()
+                .expect("restored parked hart 0")
                 .cpu
                 .registers[10],
             0xdead
