@@ -333,7 +333,7 @@ impl AosHome {
         let runtime_bin = executable.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "bundled runtime executable must have a parent directory",
+                "bundled executable must have a parent directory",
             )
         })?;
         let mut command = Command::new(executable);
@@ -480,7 +480,20 @@ impl AosHome {
     }
 
     fn ensure_runtime_executable(&self, binary: &Path, label: &str) -> io::Result<()> {
-        if !binary.is_file() {
+        let metadata = fs::metadata(binary).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "bundled {label} executable not found at {}",
+                        binary.display()
+                    ),
+                )
+            } else {
+                error
+            }
+        })?;
+        if !metadata.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
@@ -488,6 +501,19 @@ impl AosHome {
                     binary.display()
                 ),
             ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "bundled {label} executable is not executable at {}",
+                        binary.display()
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -873,6 +899,16 @@ mod tests {
         let runtime_bin = home.runtime_home().join("bin");
         fs::create_dir_all(&runtime_bin).expect("create runtime bin");
         fs::write(home.runtime_daemon_binary(), b"daemon").expect("write daemon fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let daemon = home.runtime_daemon_binary();
+            let mut permissions = fs::metadata(&daemon)
+                .expect("read daemon fixture metadata")
+                .permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&daemon, permissions).expect("make daemon fixture executable");
+        }
 
         let command = home
             .foreground_daemon_command(Some(std::path::Path::new("/workspace")), true)
@@ -900,6 +936,29 @@ mod tests {
         assert_eq!(
             env_value("ASTRID_ENFORCED_DISTRO"),
             home.unicity_ce_manifest_path()
+        );
+        fs::remove_dir_all(fixture).expect("remove foreground daemon fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_daemon_rejects_a_non_executable_fixture() {
+        let fixture = temporary_home();
+        let home = AosHome::from_root(&fixture);
+        install_capsule_fixtures(home.root());
+        let runtime_bin = home.runtime_home().join("bin");
+        fs::create_dir_all(&runtime_bin).expect("create runtime bin");
+        fs::write(home.runtime_daemon_binary(), b"daemon").expect("write daemon fixture");
+
+        let error = home
+            .foreground_daemon_command(None, false)
+            .expect_err("non-executable daemon must fail before spawn");
+
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert!(
+            error
+                .to_string()
+                .contains("daemon executable is not executable")
         );
         fs::remove_dir_all(fixture).expect("remove foreground daemon fixture");
     }
