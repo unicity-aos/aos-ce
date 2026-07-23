@@ -2450,15 +2450,37 @@ CE set rather than test-installed companions.
 - that exact capsule was installed and granted to the live `codex-code`
   principal under the requested 3 GiB/automatic-vCPU envelope. Its cold boot
   reached `AOS READY` on Linux 6.18.39 with two logical CPUs after
-  36,669,444,487 charged guest steps and 3,672 audited suspensions. A following
-  warm invocation reported RISC-V 64-bit Linux, rustup 1.29.0, rustc/cargo
+  36,662,322,250 charged guest steps and 3,672 audited suspensions. Repeating
+  that cold boot under an optimized outer daemon took about 33 minutes and
+  consumed the same guest work, proving that the nested interpreter and audited
+  slice loop, rather than host debug compilation, dominate this backend. A
+  following warm invocation reported RISC-V 64-bit Linux, rustup 1.29.0, rustc/cargo
   1.97.1, `astrid-build` 0.10.4, Git 2.54.0, Python 3.14.6, Clang 22.1.7,
   `CWD=/workspace`, `RUSTUP_HOME=/run/aos/rustup`, and
   `CARGO_HOME=/run/aos/cargo`; it exited cleanly after 620,580,831 more guest
   steps and 277 suspensions. This closes installation, cold-start, and live
-  toolchain discovery for the exact packaged bytes. The separate
-  dependency-heavy in-guest capsule-build proof remains a performance and
-  artifact gate.
+  toolchain discovery for the exact packaged bytes;
+- the live principal then created `hello-realm.rs` through its governed
+  `/workspace` mount and compiled it with that guest `rustc`. Compilation
+  completed in 1,456,064,567 guest steps and 2,442 suspensions; the command's
+  later `file(1)` probe failed because that utility was not yet present, not
+  because compilation failed. A separate invocation retained the artifact,
+  identified it with `readelf` as a 4,236,776-byte ELF64 RISC-V PIE using RVC
+  and the double-float ABI, hashed it as
+  `1877688a15f51c5c814977ccd0c85848dab350d613cf70d4288ec0f879e19a39`,
+  executed it, and received `Hello from Rust inside the AOS Linux Realm.` plus
+  `REALM_RUST_BUILD_OK`. The second invocation consumed 954,583,818 steps and
+  1,169 suspensions. This proves guest source creation, native Rust compilation,
+  cross-turn workspace continuity, artifact inspection, and execution through
+  the live principal boundary. The next image config includes `file(1)`;
+- a fresh 68-package Astrid SDK capsule build remained active for 5 hours 40
+  minutes under the reference interpreter before the proof daemon was
+  deliberately restarted. It neither faulted nor exhausted its admitted
+  resources, but produced no streaming progress and did not reach an artifact.
+  This is durability evidence, not a successful performance result. The full
+  in-guest capsule receipt therefore remains open until dependency-cache seeding
+  and a snapshot or faster governed backend make a clean build operationally
+  meaningful.
 
 ## 16. Ordered implementation milestones
 
@@ -3191,6 +3213,15 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   exact principal accounting; benchmark the new ten-million-step slice selected
   after the live compiler-image cold-boot trace, and fail closed on audit-pipeline
   saturation instead of producing warning storms;
+- [ ] define and integrity-bind a sparse post-boot machine checkpoint that
+  contains no principal data or live capability tokens, restores registers and
+  dirty pages, and reattaches home/workspace capabilities only after admission;
+- [ ] expose command progress and cancellation through an out-of-band control
+  plane rather than queueing status behind the foreground command it must
+  inspect;
+- [ ] seed signed, immutable Astrid SDK compiler artifacts separately from each
+  principal's writable Cargo target/cache so Alice and Bob share trusted inputs
+  without sharing mutable build state;
 - [x] build a reproducible immutable AOS Realm development-image candidate with
   glibc 2.43/LP64D, the official Rust 1.97.1 RISC-V host toolchain, guest-native
   rustup 1.29.0 and `astrid-build` 0.10.4, and enough admitted memory for the
@@ -3199,6 +3230,8 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   checkpoints for the new register state, and enable Linux FPU context support;
 - [ ] source-build Node 24.18.0 LTS with its RISC-V experimental status visible
   in provenance; the glibc/Rust half of this compatibility generation is built;
+- [x] create, compile, retain across invocations, inspect, hash, and execute a
+  native Rust program through the live `codex-code` Linux Realm;
 - [ ] complete the seven-step in-guest Rust build/run/artifact receipt proof;
 - [ ] define the attenuating capsule-to-realm job contract and migrate Forge as the
   first non-interactive consumer after artifact verification exists;

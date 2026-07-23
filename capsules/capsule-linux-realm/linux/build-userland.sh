@@ -104,6 +104,7 @@ for required in \
     'BR2_PACKAGE_CA_CERTIFICATES=y' \
     'BR2_PACKAGE_CLANG=y' \
     'BR2_PACKAGE_CMAKE_CTEST=y' \
+    'BR2_PACKAGE_FILE=y' \
     'BR2_PACKAGE_GIT=y' \
     'BR2_PACKAGE_MAKE=y' \
     'BR2_PACKAGE_AOS_NINJA=y' \
@@ -139,6 +140,7 @@ for executable in \
     usr/bin/clang-22 \
     usr/bin/cmake \
     usr/bin/ctest \
+    usr/bin/file \
     usr/bin/git \
     usr/bin/make \
     usr/bin/ninja \
