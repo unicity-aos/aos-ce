@@ -13,17 +13,32 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{collections::BTreeMap, fmt};
 
 /// On-disk metadata format understood by this implementation.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 const LEGACY_FORMAT_VERSION: u32 = 1;
+const WHOLE_BLOB_FORMAT_VERSION: u32 = 2;
 const DEFAULT_FILE_MODE: u32 = 0o644;
 const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
 const ROOT_DIRECTORY_MODE: u32 = 0o700;
 
-/// Maximum bytes in one file admitted by the current command seed.
-pub const MAX_FILE_BYTES: usize = 64 * 1024;
+/// Bytes in one immutable file-content chunk.
+///
+/// This is an internal storage and 9P transfer unit, not a logical file-size
+/// policy. Sparse files and chunk trees can address much larger files.
+pub const FILE_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Maximum serialized manifest size admitted by the seed.
+const CHUNK_TREE_FANOUT: u64 = 256;
+const CHUNK_TREE_LEVELS: u8 = 3;
+
+/// Maximum logical file size addressable by the fixed-depth chunk tree.
+///
+/// Aggregate durable bytes remain governed by the outer principal storage
+/// ledger. This ceiling protects offset arithmetic and the persistent format;
+/// it is not the default allocation granted to a Realm.
+pub const MAX_LOGICAL_FILE_BYTES: u64 =
+    FILE_CHUNK_BYTES as u64 * CHUNK_TREE_FANOUT * CHUNK_TREE_FANOUT * CHUNK_TREE_FANOUT;
+
+/// Maximum serialized manifest or chunk-node size accepted from storage.
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
 const MAX_HEAD_BYTES: usize = 1024;
@@ -187,10 +202,23 @@ pub trait RealmStore {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileRecord {
-    blob: BlobDigest,
+    /// Format-1/2 whole-file content. Format 3 retains this only while a
+    /// pre-existing file has not yet been mutated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blob: Option<BlobDigest>,
+    /// Root of the sparse format-3 content tree. Absence denotes all zeroes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tree: Option<BlobDigest>,
     bytes: u64,
     #[serde(default = "default_file_mode")]
     mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChunkNode {
+    level: u8,
+    children: BTreeMap<u8, BlobDigest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,12 +306,13 @@ struct LoadedSnapshot {
     manifest: Manifest,
 }
 
+type StagedBlob = (BlobDigest, Vec<u8>);
+type StagedBlobs = Vec<StagedBlob>;
+type BuiltTree = (Option<BlobDigest>, StagedBlobs);
+
 enum ManifestChange<T> {
     Unchanged(T),
-    Changed {
-        value: T,
-        blobs: Vec<(BlobDigest, Vec<u8>)>,
-    },
+    Changed { value: T, blobs: StagedBlobs },
 }
 
 struct MutationResult<T> {
@@ -312,8 +341,10 @@ pub struct CommitReceipt {
     pub generation: u64,
     /// New selected manifest identity.
     pub manifest: BlobDigest,
-    /// File-content identity selected by this write.
-    pub file_blob: BlobDigest,
+    /// Root content identity selected by this write.
+    ///
+    /// `None` denotes an empty or entirely sparse-zero file.
+    pub content_root: Option<BlobDigest>,
 }
 
 /// Versioned filesystem over a caller-supplied principal store.
@@ -382,15 +413,27 @@ impl<S: RealmStore> RealmFs<S> {
         read_record_bytes(&self.store, path, record)
     }
 
+    /// Read at most `count` bytes from one file without materializing the rest
+    /// of its content.
+    pub fn read_at(&self, path: &str, offset: u64, count: usize) -> Result<Vec<u8>, FsError> {
+        validate_relative_path(path)?;
+        let snapshot = self.load_snapshot()?;
+        if snapshot.manifest.directories.contains_key(path) {
+            return Err(FsError::IsDirectory);
+        }
+        let record = snapshot.manifest.files.get(path).ok_or(FsError::NotFound)?;
+        read_record_at(&self.store, path, record, offset, count)
+    }
+
     /// Commit a create-or-truncate file replacement as one new generation.
     pub fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<CommitReceipt, FsError> {
         validate_relative_path(path)?;
-        if bytes.len() > MAX_FILE_BYTES {
+        let byte_len = u64::try_from(bytes.len()).map_err(|_| FsError::TooLarge)?;
+        if byte_len > MAX_LOGICAL_FILE_BYTES {
             return Err(FsError::TooLarge);
         }
 
-        let file_blob = BlobDigest::for_bytes(bytes);
-        let result = self.mutate(|_, manifest| {
+        let result = self.mutate(|store, manifest| {
             if manifest.directories.contains_key(path) {
                 return Err(FsError::IsDirectory);
             }
@@ -399,34 +442,33 @@ impl<S: RealmStore> RealmFs<S> {
                 .files
                 .get(path)
                 .map_or(DEFAULT_FILE_MODE, |record| record.mode);
+            let (tree, blobs) = build_tree(store, bytes)?;
             manifest.files.insert(
                 path.to_string(),
                 FileRecord {
-                    blob: file_blob.clone(),
-                    bytes: u64::try_from(bytes.len()).map_err(|_| FsError::TooLarge)?,
+                    blob: None,
+                    tree: tree.clone(),
+                    bytes: byte_len,
                     mode,
                 },
             );
-            Ok(ManifestChange::Changed {
-                value: (),
-                blobs: vec![(file_blob.clone(), bytes.to_vec())],
-            })
+            Ok(ManifestChange::Changed { value: tree, blobs })
         })?;
         Ok(CommitReceipt {
             generation: result.generation,
             manifest: result.manifest.ok_or_else(|| {
                 FsError::Corrupt("a file replacement selected no manifest".to_string())
             })?,
-            file_blob,
+            content_root: result.value,
         })
     }
 
     /// Replace a byte range and atomically select the resulting file.
     pub fn write_at(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<u32, FsError> {
         validate_relative_path(path)?;
-        let offset = usize::try_from(offset).map_err(|_| FsError::TooLarge)?;
-        let end = offset.checked_add(data.len()).ok_or(FsError::TooLarge)?;
-        if end > MAX_FILE_BYTES {
+        let data_len = u64::try_from(data.len()).map_err(|_| FsError::TooLarge)?;
+        let end = offset.checked_add(data_len).ok_or(FsError::TooLarge)?;
+        if end > MAX_LOGICAL_FILE_BYTES {
             return Err(FsError::TooLarge);
         }
         let result = self.mutate(|store, manifest| {
@@ -437,23 +479,35 @@ impl<S: RealmStore> RealmFs<S> {
             if data.is_empty() {
                 return Ok(ManifestChange::Unchanged(0));
             }
-            let mut bytes = read_record_bytes(store, path, &record)?;
-            if bytes.len() < end {
-                bytes.resize(end, 0);
+            let (mut tree, mut blobs) = tree_for_mutation(store, path, &record)?;
+            let mut source_offset = 0_usize;
+            let first_chunk = offset / FILE_CHUNK_BYTES as u64;
+            let last_chunk = (end - 1) / FILE_CHUNK_BYTES as u64;
+            for chunk_index in first_chunk..=last_chunk {
+                let mut chunk = read_chunk_with_pending(store, tree.as_ref(), chunk_index, &blobs)?;
+                let chunk_start = chunk_index * FILE_CHUNK_BYTES as u64;
+                let write_start = offset.max(chunk_start) - chunk_start;
+                let write_end = end.min(chunk_start + FILE_CHUNK_BYTES as u64) - chunk_start;
+                let write_len =
+                    usize::try_from(write_end - write_start).map_err(|_| FsError::TooLarge)?;
+                let destination = usize::try_from(write_start).map_err(|_| FsError::TooLarge)?;
+                chunk[destination..destination + write_len]
+                    .copy_from_slice(&data[source_offset..source_offset + write_len]);
+                source_offset += write_len;
+                tree = update_chunk(store, tree.as_ref(), chunk_index, &chunk, &mut blobs)?;
             }
-            bytes[offset..end].copy_from_slice(data);
-            let blob = BlobDigest::for_bytes(&bytes);
             manifest.files.insert(
                 path.to_string(),
                 FileRecord {
-                    blob: blob.clone(),
-                    bytes: u64::try_from(bytes.len()).map_err(|_| FsError::TooLarge)?,
+                    blob: None,
+                    tree,
+                    bytes: record.bytes.max(end),
                     mode: record.mode,
                 },
             );
             Ok(ManifestChange::Changed {
                 value: u32::try_from(data.len()).map_err(|_| FsError::TooLarge)?,
-                blobs: vec![(blob, bytes)],
+                blobs,
             })
         })?;
         Ok(result.value)
@@ -469,7 +523,6 @@ impl<S: RealmStore> RealmFs<S> {
         truncate: bool,
     ) -> Result<(), FsError> {
         validate_relative_path(path)?;
-        let empty_blob = BlobDigest::for_bytes(&[]);
         self.mutate(|_, manifest| {
             require_parent_directory(manifest, path)?;
             if manifest.directories.contains_key(path) {
@@ -486,7 +539,8 @@ impl<S: RealmStore> RealmFs<S> {
                 manifest.files.insert(
                     path.to_string(),
                     FileRecord {
-                        blob: empty_blob.clone(),
+                        blob: None,
+                        tree: None,
                         bytes: 0,
                         mode: retained_mode,
                     },
@@ -495,7 +549,8 @@ impl<S: RealmStore> RealmFs<S> {
                 manifest.files.insert(
                     path.to_string(),
                     FileRecord {
-                        blob: empty_blob.clone(),
+                        blob: None,
+                        tree: None,
                         bytes: 0,
                         mode: mode & 0o7777,
                     },
@@ -503,7 +558,7 @@ impl<S: RealmStore> RealmFs<S> {
             }
             Ok(ManifestChange::Changed {
                 value: (),
-                blobs: vec![(empty_blob.clone(), Vec::new())],
+                blobs: Vec::new(),
             })
         })?;
         Ok(())
@@ -534,8 +589,7 @@ impl<S: RealmStore> RealmFs<S> {
     /// Truncate or zero-extend one regular file atomically.
     pub fn set_len(&mut self, path: &str, len: u64) -> Result<(), FsError> {
         validate_relative_path(path)?;
-        let len = usize::try_from(len).map_err(|_| FsError::TooLarge)?;
-        if len > MAX_FILE_BYTES {
+        if len > MAX_LOGICAL_FILE_BYTES {
             return Err(FsError::TooLarge);
         }
         self.mutate(|store, manifest| {
@@ -543,24 +597,33 @@ impl<S: RealmStore> RealmFs<S> {
                 return Err(FsError::IsDirectory);
             }
             let record = manifest.files.get(path).ok_or(FsError::NotFound)?.clone();
-            if usize::try_from(record.bytes).map_err(|_| FsError::TooLarge)? == len {
+            if record.bytes == len {
                 return Ok(ManifestChange::Unchanged(()));
             }
-            let mut bytes = read_record_bytes(store, path, &record)?;
-            bytes.resize(len, 0);
-            let blob = BlobDigest::for_bytes(&bytes);
+            let (mut tree, mut blobs) = tree_for_mutation(store, path, &record)?;
+            if len < record.bytes {
+                let retained_chunks = len.div_ceil(FILE_CHUNK_BYTES as u64);
+                tree = prune_tree(store, tree.as_ref(), retained_chunks, &mut blobs)?;
+                let tail = len % FILE_CHUNK_BYTES as u64;
+                if tail != 0 {
+                    let chunk_index = len / FILE_CHUNK_BYTES as u64;
+                    let mut chunk =
+                        read_chunk_with_pending(store, tree.as_ref(), chunk_index, &blobs)?;
+                    let tail = usize::try_from(tail).map_err(|_| FsError::TooLarge)?;
+                    chunk[tail..].fill(0);
+                    tree = update_chunk(store, tree.as_ref(), chunk_index, &chunk, &mut blobs)?;
+                }
+            }
             manifest.files.insert(
                 path.to_string(),
                 FileRecord {
-                    blob: blob.clone(),
-                    bytes: len as u64,
+                    blob: None,
+                    tree,
+                    bytes: len,
                     mode: record.mode,
                 },
             );
-            Ok(ManifestChange::Changed {
-                value: (),
-                blobs: vec![(blob, bytes)],
-            })
+            Ok(ManifestChange::Changed { value: (), blobs })
         })?;
         Ok(())
     }
@@ -757,7 +820,10 @@ impl<S: RealmStore> RealmFs<S> {
             return Err(FsError::Corrupt("selected head is oversized".to_string()));
         }
         let head: HeadRecord = decode(&raw_head)?;
-        if !matches!(head.format, LEGACY_FORMAT_VERSION | FORMAT_VERSION) {
+        if !matches!(
+            head.format,
+            LEGACY_FORMAT_VERSION | WHOLE_BLOB_FORMAT_VERSION | FORMAT_VERSION
+        ) {
             return Err(FsError::Corrupt(format!(
                 "unsupported head format {}",
                 head.format
@@ -800,10 +866,40 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), FsError> {
     }
     for (path, record) in &manifest.files {
         validate_stored_path(path)?;
-        if record.bytes > MAX_FILE_BYTES as u64 || record.mode & !0o7777 != 0 {
+        if record.bytes > MAX_LOGICAL_FILE_BYTES || record.mode & !0o7777 != 0 {
             return Err(FsError::Corrupt(format!(
                 "file metadata is outside bounds for {path:?}"
             )));
+        }
+        match manifest.format {
+            LEGACY_FORMAT_VERSION | WHOLE_BLOB_FORMAT_VERSION => {
+                if record.blob.is_none()
+                    || record.tree.is_some()
+                    || record.bytes > FILE_CHUNK_BYTES as u64
+                {
+                    return Err(FsError::Corrupt(format!(
+                        "legacy file content is invalid for {path:?}"
+                    )));
+                }
+            }
+            FORMAT_VERSION => {
+                if record.blob.is_some() && record.tree.is_some() {
+                    return Err(FsError::Corrupt(format!(
+                        "file selects two content representations for {path:?}"
+                    )));
+                }
+                if record.blob.is_some() && record.bytes > FILE_CHUNK_BYTES as u64 {
+                    return Err(FsError::Corrupt(format!(
+                        "unmigrated file content is oversized for {path:?}"
+                    )));
+                }
+            }
+            _ => {
+                return Err(FsError::Corrupt(format!(
+                    "unsupported manifest format {}",
+                    manifest.format
+                )));
+            }
         }
         if manifest.directories.contains_key(path)
             || node_kind(manifest, parent_path(path)) != Some(FsNodeKind::Directory)
@@ -837,16 +933,280 @@ fn read_record_bytes<S: RealmStore>(
     path: &str,
     record: &FileRecord,
 ) -> Result<Vec<u8>, FsError> {
-    let bytes = store
-        .get_blob(&record.blob)?
-        .ok_or_else(|| FsError::Corrupt(format!("missing file blob {}", record.blob.as_str())))?;
-    verify_blob(&record.blob, &bytes)?;
-    if u64::try_from(bytes.len()).map_err(|_| FsError::TooLarge)? != record.bytes {
+    let length = usize::try_from(record.bytes).map_err(|_| FsError::TooLarge)?;
+    read_record_at(store, path, record, 0, length)
+}
+
+fn read_record_at<S: RealmStore>(
+    store: &S,
+    path: &str,
+    record: &FileRecord,
+    offset: u64,
+    count: usize,
+) -> Result<Vec<u8>, FsError> {
+    if offset >= record.bytes || count == 0 {
+        return Ok(Vec::new());
+    }
+    let count = u64::try_from(count).map_err(|_| FsError::TooLarge)?;
+    let end = offset.saturating_add(count).min(record.bytes);
+    if let Some(blob) = &record.blob {
+        let bytes = store
+            .get_blob(blob)?
+            .ok_or_else(|| FsError::Corrupt(format!("missing file blob {}", blob.as_str())))?;
+        verify_blob(blob, &bytes)?;
+        if u64::try_from(bytes.len()).map_err(|_| FsError::TooLarge)? != record.bytes {
+            return Err(FsError::Corrupt(format!(
+                "file length does not match manifest for {path}"
+            )));
+        }
+        let start = usize::try_from(offset).map_err(|_| FsError::TooLarge)?;
+        let end = usize::try_from(end).map_err(|_| FsError::TooLarge)?;
+        return Ok(bytes[start..end].to_vec());
+    }
+
+    let output_len = usize::try_from(end - offset).map_err(|_| FsError::TooLarge)?;
+    let mut output = Vec::with_capacity(output_len);
+    let first_chunk = offset / FILE_CHUNK_BYTES as u64;
+    let last_chunk = (end - 1) / FILE_CHUNK_BYTES as u64;
+    for chunk_index in first_chunk..=last_chunk {
+        let chunk = read_chunk(store, record.tree.as_ref(), chunk_index)?;
+        let chunk_start = chunk_index * FILE_CHUNK_BYTES as u64;
+        let read_start = offset.max(chunk_start) - chunk_start;
+        let read_end = end.min(chunk_start + FILE_CHUNK_BYTES as u64) - chunk_start;
+        let read_start = usize::try_from(read_start).map_err(|_| FsError::TooLarge)?;
+        let read_end = usize::try_from(read_end).map_err(|_| FsError::TooLarge)?;
+        output.extend_from_slice(&chunk[read_start..read_end]);
+    }
+    Ok(output)
+}
+
+fn build_tree<S: RealmStore>(store: &S, bytes: &[u8]) -> Result<BuiltTree, FsError> {
+    let mut tree = None;
+    let mut blobs = Vec::new();
+    for (chunk_index, source) in bytes.chunks(FILE_CHUNK_BYTES).enumerate() {
+        let mut chunk = vec![0; FILE_CHUNK_BYTES];
+        chunk[..source.len()].copy_from_slice(source);
+        tree = update_chunk(
+            store,
+            tree.as_ref(),
+            u64::try_from(chunk_index).map_err(|_| FsError::TooLarge)?,
+            &chunk,
+            &mut blobs,
+        )?;
+    }
+    Ok((tree, blobs))
+}
+
+fn tree_for_mutation<S: RealmStore>(
+    store: &S,
+    path: &str,
+    record: &FileRecord,
+) -> Result<BuiltTree, FsError> {
+    if record.blob.is_none() {
+        return Ok((record.tree.clone(), Vec::new()));
+    }
+    let bytes = read_record_bytes(store, path, record)?;
+    build_tree(store, &bytes)
+}
+
+fn read_chunk<S: RealmStore>(
+    store: &S,
+    root: Option<&BlobDigest>,
+    chunk_index: u64,
+) -> Result<Vec<u8>, FsError> {
+    read_chunk_with_pending(store, root, chunk_index, &[])
+}
+
+fn read_chunk_with_pending<S: RealmStore>(
+    store: &S,
+    root: Option<&BlobDigest>,
+    chunk_index: u64,
+    pending: &[StagedBlob],
+) -> Result<Vec<u8>, FsError> {
+    if chunk_index >= CHUNK_TREE_FANOUT.pow(u32::from(CHUNK_TREE_LEVELS)) {
+        return Err(FsError::TooLarge);
+    }
+    let mut current = root.cloned();
+    for level in (0..CHUNK_TREE_LEVELS).rev() {
+        let Some(digest) = current else {
+            return Ok(vec![0; FILE_CHUNK_BYTES]);
+        };
+        let node = load_chunk_node(store, &digest, level, pending)?;
+        current = node.children.get(&chunk_digit(chunk_index, level)).cloned();
+    }
+    let Some(digest) = current else {
+        return Ok(vec![0; FILE_CHUNK_BYTES]);
+    };
+    let bytes = load_verified_blob(store, &digest, "file chunk", pending)?;
+    if bytes.len() != FILE_CHUNK_BYTES {
         return Err(FsError::Corrupt(format!(
-            "file length does not match manifest for {path}"
+            "file chunk {} has non-canonical length",
+            digest.as_str()
         )));
     }
     Ok(bytes)
+}
+
+fn update_chunk<S: RealmStore>(
+    store: &S,
+    root: Option<&BlobDigest>,
+    chunk_index: u64,
+    chunk: &[u8],
+    blobs: &mut StagedBlobs,
+) -> Result<Option<BlobDigest>, FsError> {
+    if chunk.len() != FILE_CHUNK_BYTES
+        || chunk_index >= CHUNK_TREE_FANOUT.pow(u32::from(CHUNK_TREE_LEVELS))
+    {
+        return Err(FsError::TooLarge);
+    }
+
+    let mut nodes = Vec::with_capacity(usize::from(CHUNK_TREE_LEVELS));
+    let mut current = root.cloned();
+    for level in (0..CHUNK_TREE_LEVELS).rev() {
+        let node = match &current {
+            Some(digest) => load_chunk_node(store, digest, level, blobs)?,
+            None => ChunkNode {
+                level,
+                children: BTreeMap::new(),
+            },
+        };
+        current = node.children.get(&chunk_digit(chunk_index, level)).cloned();
+        nodes.push(node);
+    }
+
+    let mut child = if chunk.iter().all(|byte| *byte == 0) {
+        None
+    } else {
+        Some(stage_blob(chunk.to_vec(), blobs))
+    };
+    for mut node in nodes.into_iter().rev() {
+        let digit = chunk_digit(chunk_index, node.level);
+        if let Some(digest) = child {
+            node.children.insert(digit, digest);
+        } else {
+            node.children.remove(&digit);
+        }
+        child = if node.children.is_empty() {
+            None
+        } else {
+            Some(stage_blob(encode(&node)?, blobs))
+        };
+    }
+    Ok(child)
+}
+
+fn prune_tree<S: RealmStore>(
+    store: &S,
+    root: Option<&BlobDigest>,
+    retained_chunks: u64,
+    blobs: &mut StagedBlobs,
+) -> Result<Option<BlobDigest>, FsError> {
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    prune_node(
+        store,
+        root,
+        CHUNK_TREE_LEVELS - 1,
+        0,
+        retained_chunks,
+        blobs,
+    )
+}
+
+fn prune_node<S: RealmStore>(
+    store: &S,
+    digest: &BlobDigest,
+    level: u8,
+    first_chunk: u64,
+    retained_chunks: u64,
+    blobs: &mut StagedBlobs,
+) -> Result<Option<BlobDigest>, FsError> {
+    let mut node = load_chunk_node(store, digest, level, blobs)?;
+    let span = CHUNK_TREE_FANOUT.pow(u32::from(level));
+    let children: Vec<_> = node.children.keys().copied().collect();
+    for digit in children {
+        let child_start = first_chunk + u64::from(digit) * span;
+        if child_start >= retained_chunks {
+            node.children.remove(&digit);
+        } else if level > 0 && child_start + span > retained_chunks {
+            let child =
+                node.children.get(&digit).cloned().ok_or_else(|| {
+                    FsError::Corrupt("chunk node changed during pruning".to_string())
+                })?;
+            match prune_node(
+                store,
+                &child,
+                level - 1,
+                child_start,
+                retained_chunks,
+                blobs,
+            )? {
+                Some(replacement) => {
+                    node.children.insert(digit, replacement);
+                }
+                None => {
+                    node.children.remove(&digit);
+                }
+            }
+        }
+    }
+    if node.children.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(stage_blob(encode(&node)?, blobs)))
+    }
+}
+
+fn load_chunk_node<S: RealmStore>(
+    store: &S,
+    digest: &BlobDigest,
+    expected_level: u8,
+    pending: &[StagedBlob],
+) -> Result<ChunkNode, FsError> {
+    let bytes = load_verified_blob(store, digest, "chunk node", pending)?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(FsError::Corrupt("chunk node is oversized".to_string()));
+    }
+    let node: ChunkNode = decode(&bytes)?;
+    if node.level != expected_level || node.children.is_empty() {
+        return Err(FsError::Corrupt(format!(
+            "chunk node {} is non-canonical",
+            digest.as_str()
+        )));
+    }
+    Ok(node)
+}
+
+fn load_verified_blob<S: RealmStore>(
+    store: &S,
+    digest: &BlobDigest,
+    kind: &str,
+    pending: &[StagedBlob],
+) -> Result<Vec<u8>, FsError> {
+    let bytes = if let Some((_, bytes)) = pending
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate == digest)
+    {
+        bytes.clone()
+    } else {
+        store
+            .get_blob(digest)?
+            .ok_or_else(|| FsError::Corrupt(format!("missing {kind} {}", digest.as_str())))?
+    };
+    verify_blob(digest, &bytes)?;
+    Ok(bytes)
+}
+
+fn stage_blob(bytes: Vec<u8>, blobs: &mut StagedBlobs) -> BlobDigest {
+    let digest = BlobDigest::for_bytes(&bytes);
+    blobs.push((digest.clone(), bytes));
+    digest
+}
+
+fn chunk_digit(chunk_index: u64, level: u8) -> u8 {
+    ((chunk_index >> (u32::from(level) * 8)) & 0xff) as u8
 }
 
 fn metadata_in(manifest: &Manifest, path: &str) -> Result<FsMetadata, FsError> {
@@ -1071,13 +1431,18 @@ mod tests {
             self.inner.borrow_mut().blobs.insert(digest, bytes);
         }
 
+        fn stored_blob_bytes(&self) -> usize {
+            self.inner.borrow().blobs.values().map(Vec::len).sum()
+        }
+
         fn stage_competing_file(&self, path: &str, bytes: &[u8]) -> BlobDigest {
             let file_blob = BlobDigest::for_bytes(bytes);
             let mut files = BTreeMap::new();
             files.insert(
                 path.to_string(),
                 FileRecord {
-                    blob: file_blob.clone(),
+                    blob: Some(file_blob.clone()),
+                    tree: None,
                     bytes: u64::try_from(bytes.len()).expect("test file length fits"),
                     mode: DEFAULT_FILE_MODE,
                 },
@@ -1188,6 +1553,113 @@ mod tests {
     }
 
     #[test]
+    fn multi_megabyte_files_are_chunked_and_support_bounded_reads() {
+        let store = MemoryStore::default();
+        let mut filesystem = RealmFs::new(store);
+        let bytes: Vec<_> = (0..(4 * 1024 * 1024 + 137))
+            .map(|index| (index % 251) as u8)
+            .collect();
+
+        filesystem
+            .write_file("target/debug/app", &bytes)
+            .expect("large file commits");
+
+        assert_eq!(
+            filesystem.read_at("target/debug/app", 65_500, 80_000),
+            Ok(bytes[65_500..145_500].to_vec())
+        );
+        assert_eq!(
+            filesystem.read_at(
+                "target/debug/app",
+                u64::try_from(bytes.len() - 29).expect("length fits"),
+                200,
+            ),
+            Ok(bytes[bytes.len() - 29..].to_vec())
+        );
+        assert_eq!(filesystem.read_file("target/debug/app"), Ok(bytes));
+    }
+
+    #[test]
+    fn one_byte_edit_materializes_one_chunk_path_not_the_whole_file() {
+        let store = MemoryStore::default();
+        let mut filesystem = RealmFs::new(store.clone());
+        let bytes: Vec<_> = (0..(4 * 1024 * 1024))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        filesystem
+            .write_file("compiler-output", &bytes)
+            .expect("large file commits");
+        let before = store.stored_blob_bytes();
+
+        filesystem
+            .write_at("compiler-output", 2 * 1024 * 1024 + 17, &[0xff])
+            .expect("single-byte patch commits");
+
+        let added = store.stored_blob_bytes() - before;
+        assert!(
+            added < FILE_CHUNK_BYTES + 32 * 1024,
+            "single-byte edit stored {added} new bytes"
+        );
+        assert_eq!(
+            filesystem.read_at("compiler-output", 2 * 1024 * 1024 + 16, 3),
+            Ok(vec![63, 0xff, 65])
+        );
+    }
+
+    #[test]
+    fn sparse_growth_does_not_materialize_zero_ranges() {
+        let store = MemoryStore::default();
+        let mut filesystem = RealmFs::new(store.clone());
+        filesystem
+            .create_file("sparse", 0o600, true, false)
+            .expect("file creates");
+        let before = store.stored_blob_bytes();
+
+        filesystem
+            .set_len("sparse", 512 * 1024 * 1024)
+            .expect("sparse extension commits");
+        filesystem
+            .write_at("sparse", 512 * 1024 * 1024 - 3, b"end")
+            .expect("tail write commits");
+
+        assert_eq!(filesystem.read_at("sparse", 0, 32), Ok(vec![0; 32]));
+        assert_eq!(
+            filesystem.read_at("sparse", 512 * 1024 * 1024 - 5, 5),
+            Ok(b"\0\0end".to_vec())
+        );
+        assert!(
+            store.stored_blob_bytes() - before < FILE_CHUNK_BYTES + 64 * 1024,
+            "sparse extension unexpectedly materialized its holes"
+        );
+    }
+
+    #[test]
+    fn truncate_then_extend_never_reveals_discarded_bytes() {
+        let store = MemoryStore::default();
+        let mut filesystem = RealmFs::new(store);
+        let original = vec![0xa5; FILE_CHUNK_BYTES * 3];
+        filesystem
+            .write_file("state", &original)
+            .expect("initial content commits");
+
+        filesystem
+            .set_len("state", FILE_CHUNK_BYTES as u64 + 13)
+            .expect("truncate commits");
+        filesystem
+            .set_len("state", (FILE_CHUNK_BYTES * 3) as u64)
+            .expect("extension commits");
+
+        assert_eq!(
+            filesystem.read_at("state", FILE_CHUNK_BYTES as u64, 32),
+            Ok([vec![0xa5; 13], vec![0; 19]].concat())
+        );
+        assert_eq!(
+            filesystem.read_at("state", (FILE_CHUNK_BYTES * 2) as u64, 32),
+            Ok(vec![0; 32])
+        );
+    }
+
+    #[test]
     fn a_new_filesystem_instance_reconstructs_the_selected_generation() {
         let store = MemoryStore::default();
         let mut before_restart = RealmFs::new(store.clone());
@@ -1272,7 +1744,10 @@ mod tests {
         let receipt = filesystem
             .write_file("important", b"correct")
             .expect("write commits");
-        store.replace_blob(receipt.file_blob, b"tampered".to_vec());
+        store.replace_blob(
+            receipt.content_root.expect("non-empty file has a tree"),
+            b"tampered".to_vec(),
+        );
 
         assert!(matches!(
             filesystem.read_file("important"),
@@ -1307,7 +1782,7 @@ mod tests {
             Err(FsError::InvalidPath)
         );
         assert_eq!(
-            filesystem.write_file("large", &vec![0; MAX_FILE_BYTES + 1]),
+            filesystem.set_len("large", MAX_LOGICAL_FILE_BYTES + 1),
             Err(FsError::TooLarge)
         );
         assert!(store.read_head().expect("head reads").is_none());
@@ -1456,7 +1931,10 @@ mod tests {
         filesystem
             .write_at("state/session.json", 6, b"-migrated")
             .expect("mutation upgrades the manifest");
-        assert_eq!(filesystem.status().expect("current status").format, 2);
+        assert_eq!(
+            filesystem.status().expect("current status").format,
+            FORMAT_VERSION
+        );
         assert_eq!(
             filesystem.read_file("state/session.json"),
             Ok(b"legacy-migrated".to_vec())
@@ -1468,6 +1946,66 @@ mod tests {
                 .first()
                 .map(|entry| entry.name.as_str()),
             Some("state")
+        );
+    }
+
+    #[test]
+    fn format_two_whole_files_read_then_upgrade_lazily_on_mutation() {
+        let store = MemoryStore::default();
+        let file_bytes = b"deployed-format-two".to_vec();
+        let file_blob = BlobDigest::for_bytes(&file_bytes);
+        let manifest = Manifest {
+            format: WHOLE_BLOB_FORMAT_VERSION,
+            generation: 1,
+            parent_manifest: None,
+            files: BTreeMap::from([(
+                "state".to_string(),
+                FileRecord {
+                    blob: Some(file_blob.clone()),
+                    tree: None,
+                    bytes: u64::try_from(file_bytes.len()).expect("test length fits"),
+                    mode: DEFAULT_FILE_MODE,
+                },
+            )]),
+            directories: BTreeMap::new(),
+        };
+        let manifest_bytes = encode(&manifest).expect("format-two manifest encodes");
+        let manifest_digest = BlobDigest::for_bytes(&manifest_bytes);
+        {
+            let mut state = store.inner.borrow_mut();
+            state.blobs.insert(file_blob, file_bytes);
+            state.blobs.insert(manifest_digest.clone(), manifest_bytes);
+            state.head = Some(
+                encode(&HeadRecord {
+                    format: WHOLE_BLOB_FORMAT_VERSION,
+                    generation: 1,
+                    manifest: manifest_digest,
+                })
+                .expect("format-two head encodes"),
+            );
+        }
+        let mut filesystem = RealmFs::new(store.clone());
+
+        assert_eq!(
+            filesystem.read_file("state"),
+            Ok(b"deployed-format-two".to_vec())
+        );
+        assert_eq!(
+            filesystem.status().expect("old format reads").format,
+            WHOLE_BLOB_FORMAT_VERSION
+        );
+        filesystem
+            .write_at("state", 9, b"three")
+            .expect("first content mutation upgrades");
+
+        let snapshot = filesystem.load_snapshot().expect("new snapshot loads");
+        let record = snapshot.manifest.files.get("state").expect("file remains");
+        assert_eq!(snapshot.manifest.format, FORMAT_VERSION);
+        assert!(record.blob.is_none());
+        assert!(record.tree.is_some());
+        assert_eq!(
+            filesystem.read_file("state"),
+            Ok(b"deployed-threet-two".to_vec())
         );
     }
 
@@ -1510,7 +2048,8 @@ mod tests {
                 files: BTreeMap::from([(
                     "missing/parent".to_string(),
                     FileRecord {
-                        blob: BlobDigest::for_bytes(b"x"),
+                        blob: Some(BlobDigest::for_bytes(b"x")),
+                        tree: None,
                         bytes: 1,
                         mode: DEFAULT_FILE_MODE,
                     },

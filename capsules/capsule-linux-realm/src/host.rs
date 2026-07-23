@@ -32,8 +32,13 @@ const BLOB_ROOT: &str = "home://.local/share/aos-realm/default/store/blobs";
 const HEAD_KEY: &str = "realm/default/fs/head";
 const LEGACY_FORMAT_MARKER_V0: &[u8] = b"aos-realm-format=0\n";
 const LEGACY_FORMAT_MARKER_V1: &[u8] = b"aos-realm-format=1\n";
-const CURRENT_FORMAT_MARKER: &[u8] = b"aos-realm-format=2\n";
-const MAX_SEED_FILE_BYTES: usize = 64 * 1024;
+const LEGACY_FORMAT_MARKER_V2: &[u8] = b"aos-realm-format=2\n";
+const CURRENT_FORMAT_MARKER: &[u8] = b"aos-realm-format=3\n";
+const MAX_LEGACY_IMPORT_FILE_BYTES: usize = 64 * 1024;
+// The old nested-WASM host adapter still uses Astrid's whole-file call. Keep
+// that transport-specific lane bounded independently of the streaming Linux
+// home; it must not become a Realm filesystem policy.
+const MAX_WHOLE_FILE_ADAPTER_BYTES: usize = MAX_MANIFEST_BYTES;
 const MAX_LEGACY_HOME_ENTRIES: usize = 4096;
 
 pub(crate) const LINUX_HOME_9P_CHANNEL: u32 = 1;
@@ -71,18 +76,13 @@ impl Plan9FileSystem for AstridHome9p {
     }
 
     fn read(&mut self, path: &str, offset: u64, count: u32) -> Result<Vec<u8>, Plan9Errno> {
-        let bytes = RealmFs::new(AstridRealmStore)
-            .read_file(path)
-            .map_err(map_vfs_9p_error)?;
-        let offset = usize::try_from(offset).map_err(|_| Plan9Errno::InvalidArgument)?;
-        if offset >= bytes.len() {
-            return Ok(Vec::new());
-        }
-        let end = offset
-            .checked_add(usize::try_from(count).map_err(|_| Plan9Errno::MessageTooLarge)?)
-            .ok_or(Plan9Errno::MessageTooLarge)?
-            .min(bytes.len());
-        Ok(bytes[offset..end].to_vec())
+        RealmFs::new(AstridRealmStore)
+            .read_at(
+                path,
+                offset,
+                usize::try_from(count).map_err(|_| Plan9Errno::MessageTooLarge)?,
+            )
+            .map_err(map_vfs_9p_error)
     }
 
     fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<u32, Plan9Errno> {
@@ -155,10 +155,9 @@ impl Plan9FileSystem for AstridHome9p {
         let _ = RealmFs::new(AstridRealmStore)
             .status()
             .map_err(map_vfs_9p_error)?;
-        // The capsule has per-file and manifest bounds, but the outer
-        // principal storage quota is not yet imported into this component.
-        // Zeroes mean unspecified; do not misreport the current used-file count
-        // as a total inode capacity.
+        // Aggregate capacity is governed by the outer principal storage
+        // ledger, which is not yet imported into this component. Zeroes mean
+        // unspecified; do not invent a smaller inner filesystem quota.
         Ok(Plan9FileSystemStats::default())
     }
 }
@@ -646,6 +645,7 @@ pub(crate) fn ensure_layout() -> Result<(), SysError> {
                 import_legacy_home_projection()?;
                 fs::write(FORMAT_MARKER, CURRENT_FORMAT_MARKER)?;
             }
+            LEGACY_FORMAT_MARKER_V2 => fs::write(FORMAT_MARKER, CURRENT_FORMAT_MARKER)?,
             _ => {
                 return Err(SysError::ApiError(
                     "unsupported AOS Realm storage format marker".to_string(),
@@ -658,7 +658,7 @@ pub(crate) fn ensure_layout() -> Result<(), SysError> {
     Ok(())
 }
 
-/// Import every bounded legacy direct-home entry before declaring format 2.
+/// Import every bounded legacy direct-home entry before declaring format 3.
 ///
 /// Earlier formats imported files only when the nested-WASM lane read that
 /// exact path. Linux directory traversal cannot safely guess those names, so
@@ -710,9 +710,9 @@ fn import_legacy_home_projection() -> Result<(), SysError> {
                         )));
                     }
                     Err(FsError::NotFound) => {
-                        if metadata.len() > MAX_SEED_FILE_BYTES as u64 {
+                        if metadata.len() > MAX_LEGACY_IMPORT_FILE_BYTES as u64 {
                             return Err(SysError::ApiError(format!(
-                                "legacy Realm home file exceeds {MAX_SEED_FILE_BYTES} bytes: {relative}"
+                                "legacy Realm home file exceeds {MAX_LEGACY_IMPORT_FILE_BYTES} bytes: {relative}"
                             )));
                         }
                         let bytes = fs::read(entry.path())?;
@@ -739,7 +739,9 @@ pub(crate) fn layout_state() -> Result<&'static str, SysError> {
     }
     match fs::read(FORMAT_MARKER)?.as_slice() {
         CURRENT_FORMAT_MARKER => Ok("ready"),
-        LEGACY_FORMAT_MARKER_V0 | LEGACY_FORMAT_MARKER_V1 => Ok("migration-required"),
+        LEGACY_FORMAT_MARKER_V0 | LEGACY_FORMAT_MARKER_V1 | LEGACY_FORMAT_MARKER_V2 => {
+            Ok("migration-required")
+        }
         _ => Err(SysError::ApiError(
             "unsupported AOS Realm storage format marker".to_string(),
         )),
@@ -868,29 +870,27 @@ impl RealmHost for AstridRealmHost {
             .and_then(|suffix| suffix.strip_prefix('/'))
             .map(str::to_string);
         let backing = match mode {
-            // Astrid's current component host exposes reliable whole-file I/O;
-            // its positional FileHandle port is not live yet. Buffering here
-            // keeps that host limitation out of the private nested-WASM ABI.
             OpenMode::Read => {
-                let bytes = if let Some(relative) = home_relative.as_deref() {
-                    read_versioned_home_file(relative, &resolved)?
+                if let Some(relative) = home_relative {
+                    ensure_versioned_home_file(&relative, &resolved)?;
+                    AstridFileBacking::VersionedRead { relative }
                 } else {
-                    fs::read(&resolved).map_err(map_sdk_error)?
-                };
-                if bytes.len() > MAX_SEED_FILE_BYTES {
-                    return Err(RealmIoError::TooLarge);
-                }
-                AstridFileBacking::Read { bytes }
-            }
-            // Defer replacement until `close`, so a trapped guest cannot leave
-            // a partially written file behind.
-            OpenMode::WriteTruncate => {
-                if let Some(relative) = home_relative.as_deref() {
-                    AstridFileBacking::VersionedWrite {
-                        relative: relative.to_string(),
-                        projection_path: resolved,
-                        bytes: Vec::new(),
+                    // Astrid's current component host exposes reliable
+                    // whole-file I/O for the invocation workspace. Keep that
+                    // transport limitation out of the versioned Realm home.
+                    let bytes = fs::read(&resolved).map_err(map_sdk_error)?;
+                    if bytes.len() > MAX_WHOLE_FILE_ADAPTER_BYTES {
+                        return Err(RealmIoError::TooLarge);
                     }
+                    AstridFileBacking::DirectRead { bytes }
+                }
+            }
+            OpenMode::WriteTruncate => {
+                if let Some(relative) = home_relative {
+                    RealmFs::new(AstridRealmStore)
+                        .create_file(&relative, 0o644, false, true)
+                        .map_err(map_vfs_error)?;
+                    AstridFileBacking::VersionedWrite { relative }
                 } else {
                     AstridFileBacking::DirectWrite {
                         path: resolved,
@@ -909,83 +909,89 @@ struct AstridRealmFile {
 }
 
 enum AstridFileBacking {
-    Read {
-        bytes: Vec<u8>,
-    },
-    DirectWrite {
-        path: String,
-        bytes: Vec<u8>,
-    },
-    VersionedWrite {
-        relative: String,
-        projection_path: String,
-        bytes: Vec<u8>,
-    },
+    DirectRead { bytes: Vec<u8> },
+    VersionedRead { relative: String },
+    DirectWrite { path: String, bytes: Vec<u8> },
+    VersionedWrite { relative: String },
 }
 
 impl RealmFile for AstridRealmFile {
     fn read(&mut self, max_bytes: usize) -> Result<Vec<u8>, RealmIoError> {
-        let AstridFileBacking::Read { bytes } = &self.backing else {
-            return Err(RealmIoError::Unsupported);
+        let chunk = match &self.backing {
+            AstridFileBacking::DirectRead { bytes } => {
+                let end = self
+                    .offset
+                    .checked_add(max_bytes)
+                    .ok_or(RealmIoError::TooLarge)?
+                    .min(bytes.len());
+                bytes
+                    .get(self.offset..end)
+                    .ok_or(RealmIoError::InvalidPath)?
+                    .to_vec()
+            }
+            AstridFileBacking::VersionedRead { relative } => RealmFs::new(AstridRealmStore)
+                .read_at(
+                    relative,
+                    u64::try_from(self.offset).map_err(|_| RealmIoError::TooLarge)?,
+                    max_bytes,
+                )
+                .map_err(map_vfs_error)?,
+            AstridFileBacking::DirectWrite { .. } | AstridFileBacking::VersionedWrite { .. } => {
+                return Err(RealmIoError::Unsupported);
+            }
         };
-        let end = self
+        self.offset = self
             .offset
-            .checked_add(max_bytes)
-            .ok_or(RealmIoError::TooLarge)?
-            .min(bytes.len());
-        let chunk = bytes
-            .get(self.offset..end)
-            .ok_or(RealmIoError::InvalidPath)?
-            .to_vec();
-        self.offset = end;
+            .checked_add(chunk.len())
+            .ok_or(RealmIoError::TooLarge)?;
         Ok(chunk)
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<usize, RealmIoError> {
-        let buffered = match &mut self.backing {
-            AstridFileBacking::DirectWrite { bytes, .. }
-            | AstridFileBacking::VersionedWrite { bytes, .. } => bytes,
-            AstridFileBacking::Read { .. } => return Err(RealmIoError::Unsupported),
-        };
-        let end = self
-            .offset
-            .checked_add(bytes.len())
-            .ok_or(RealmIoError::TooLarge)?;
-        if end > MAX_SEED_FILE_BYTES {
-            return Err(RealmIoError::TooLarge);
+        match &mut self.backing {
+            AstridFileBacking::DirectWrite {
+                bytes: buffered, ..
+            } => {
+                let end = self
+                    .offset
+                    .checked_add(bytes.len())
+                    .ok_or(RealmIoError::TooLarge)?;
+                if end > MAX_WHOLE_FILE_ADAPTER_BYTES {
+                    return Err(RealmIoError::TooLarge);
+                }
+                if end > buffered.len() {
+                    buffered.resize(end, 0);
+                }
+                buffered[self.offset..end].copy_from_slice(bytes);
+                self.offset = end;
+            }
+            AstridFileBacking::VersionedWrite { relative } => {
+                RealmFs::new(AstridRealmStore)
+                    .write_at(
+                        relative,
+                        u64::try_from(self.offset).map_err(|_| RealmIoError::TooLarge)?,
+                        bytes,
+                    )
+                    .map_err(map_vfs_error)?;
+                self.offset = self
+                    .offset
+                    .checked_add(bytes.len())
+                    .ok_or(RealmIoError::TooLarge)?;
+            }
+            AstridFileBacking::DirectRead { .. } | AstridFileBacking::VersionedRead { .. } => {
+                return Err(RealmIoError::Unsupported);
+            }
         }
-        if end > buffered.len() {
-            buffered.resize(end, 0);
-        }
-        buffered[self.offset..end].copy_from_slice(bytes);
-        self.offset = end;
         Ok(bytes.len())
     }
 
     fn close(&mut self) -> Result<(), RealmIoError> {
         match &self.backing {
-            AstridFileBacking::Read { .. } => Ok(()),
+            AstridFileBacking::DirectRead { .. }
+            | AstridFileBacking::VersionedRead { .. }
+            | AstridFileBacking::VersionedWrite { .. } => Ok(()),
             AstridFileBacking::DirectWrite { path, bytes } => {
                 fs::write(path, bytes).map_err(map_sdk_error)
-            }
-            AstridFileBacking::VersionedWrite {
-                relative,
-                projection_path,
-                bytes,
-            } => {
-                let mut filesystem = RealmFs::new(AstridRealmStore);
-                filesystem
-                    .write_file(relative, bytes)
-                    .map_err(map_vfs_error)?;
-                // This plain-file projection is a rebuildable compatibility
-                // view. The CAS-selected content-addressed generation above is
-                // authoritative if projection refresh fails or is interrupted.
-                if let Err(error) = fs::write(projection_path, bytes) {
-                    astrid_sdk::log::warn(format!(
-                        "AOS Realm committed {relative} but could not refresh its legacy projection: {error}"
-                    ));
-                }
-                Ok(())
             }
         }
     }
@@ -1045,18 +1051,22 @@ fn blob_path(digest: &BlobDigest) -> String {
     format!("{BLOB_ROOT}/{}", digest.as_str())
 }
 
-fn read_versioned_home_file(relative: &str, legacy_path: &str) -> Result<Vec<u8>, RealmIoError> {
+fn ensure_versioned_home_file(relative: &str, legacy_path: &str) -> Result<(), RealmIoError> {
     let mut filesystem = RealmFs::new(AstridRealmStore);
-    match filesystem.read_file(relative) {
-        Ok(bytes) => Ok(bytes),
+    match filesystem.metadata(relative) {
+        Ok(metadata) if metadata.kind == RealmNodeKind::File => Ok(()),
+        Ok(_) => Err(RealmIoError::IsDirectory),
         Err(FsError::NotFound) => {
             // Format-0 stored files directly beneath REALM_HOME. Import each
             // one lazily into the immutable store when it is first observed.
             let bytes = fs::read(legacy_path).map_err(map_sdk_error)?;
+            if bytes.len() > MAX_LEGACY_IMPORT_FILE_BYTES {
+                return Err(RealmIoError::TooLarge);
+            }
             filesystem
                 .write_file(relative, &bytes)
                 .map_err(map_vfs_error)?;
-            Ok(bytes)
+            Ok(())
         }
         Err(error) => Err(map_vfs_error(error)),
     }
@@ -1322,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_seed_files_are_bounded() {
+    fn whole_file_workspace_adapter_is_bounded_by_its_transport() {
         let mut file = AstridRealmFile {
             backing: AstridFileBacking::DirectWrite {
                 path: "unused".to_string(),
@@ -1332,7 +1342,7 @@ mod tests {
         };
 
         assert_eq!(
-            file.write(&vec![0; MAX_SEED_FILE_BYTES + 1]),
+            file.write(&vec![0; MAX_WHOLE_FILE_ADAPTER_BYTES + 1]),
             Err(RealmIoError::TooLarge)
         );
     }
