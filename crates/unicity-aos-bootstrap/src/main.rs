@@ -781,9 +781,9 @@ fn handle_hook(principal: Option<String>, args: hook::HookArgs) -> ExitCode {
 
 fn status_principal(
     leading_principal: Option<String>,
-    status_principal: Option<String>,
+    trailing_principal: Option<String>,
 ) -> Result<PrincipalId, String> {
-    let principal = match (leading_principal, status_principal) {
+    let principal = match (leading_principal, trailing_principal) {
         (Some(_), Some(_)) => {
             return Err(
                 "'--principal' was provided both before and after `status`; provide it once"
