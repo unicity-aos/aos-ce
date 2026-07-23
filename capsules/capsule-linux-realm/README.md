@@ -533,14 +533,18 @@ nested descriptor closes, so a trapped command does not leave a partial guest
 file. Durable-home closes select a content-addressed generation with a KV CAS;
 workspace and temporary files retain their outer mount semantics.
 
-The packaged, hash-bound kernel asset executes general RV64 Linux syscalls, including PID 1's
-console, mount, credential, process, and reboot paths; the earlier nested
-core-WASM process lane still uses the private Realm ABI. Static musl, BusyBox
-`execve`, and `ash` are live. This slice does not yet provide shared or inherited
-open-file descriptions, sequential POSIX file actions, Bash, package management,
-networking, PTYs, surviving background jobs, or an in-guest compiler. Those
-belong behind the same realm boundary; they must not be simulated by granting a
-host process.
+The packaged, hash-bound kernel asset executes general RV64 Linux syscalls,
+including PID 1's console, mount, credential, process, futex, and reboot paths;
+the earlier nested core-WASM process lane still uses the private Realm ABI. The
+development image includes glibc, BusyBox, Bash, Git, Python, Clang/LLVM, CMake,
+Make, Ninja, pkg-config, rustup 1.29.0, Rust/Cargo 1.97.1 with
+`wasm32-unknown-unknown`, and `astrid-build` 0.10.4. A live principal has created,
+compiled, retained across invocations, inspected, hashed, and executed a native
+RISC-V Rust program inside this boundary. The next reproducible image config also
+includes `file(1)`, which the live probe found missing. Package management,
+networking, PTYs, surviving background jobs, streamed command progress, and a
+fast execution backend remain absent. Those belong behind the same realm
+boundary; they must not be simulated by granting a host process.
 
 The Linux storage driver is intentionally split at authority boundaries. The
 GPL-2.0-only in-kernel `trans=aos` module turns Linux 9P calls into one synchronous
