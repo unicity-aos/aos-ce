@@ -1,0 +1,29 @@
+diff --git a/drivers/block/Kconfig b/drivers/block/Kconfig
+index 79c8be4de149..f5e03e6646f8 100644
+--- a/drivers/block/Kconfig
++++ b/drivers/block/Kconfig
+@@ -375,4 +375,13 @@ config BLK_DEV_ZONED_LOOP
+ 
+ 	  If unsure, say N.
+ 
++config BLK_DEV_AOS_SYSTEM
++	bool "AOS Realm immutable system device"
++	depends on RISCV && RISCV_SBI
++	help
++	  Exposes one read-only block device backed by a hash-pinned immutable
++	  asset attached to the signed AOS Linux vCPU worker. Reads cross the
++	  private synchronous SBI boundary in bounded chunks. There is no
++	  writable command, DMA surface, host path, or guest-selected asset.
++
+ endif # BLK_DEV
+diff --git a/drivers/block/Makefile b/drivers/block/Makefile
+index b68920fd30eb..adf1405398e7 100644
+--- a/drivers/block/Makefile
++++ b/drivers/block/Makefile
+@@ -39,5 +39,6 @@ obj-$(CONFIG_BLK_DEV_RUST_NULL) += rnull/
+ 
+ obj-$(CONFIG_BLK_DEV_UBLK)			+= ublk_drv.o
+ obj-$(CONFIG_BLK_DEV_ZONED_LOOP) += zloop.o
++obj-$(CONFIG_BLK_DEV_AOS_SYSTEM) += aos_system.o
+ 
+ swim_mod-y	:= swim.o swim_asm.o

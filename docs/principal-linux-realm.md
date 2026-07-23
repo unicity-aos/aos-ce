@@ -247,7 +247,7 @@ page walks for this boot. It selects address translation as a proven fast path;
 it does not predict core-WASM throughput. The measurement example now emits
 these counters so native and Astrid-hosted builds can be compared explicitly.
 
-The next route is also implemented for the default 32 MiB Realm. The AOS machine
+The first checkpoint route was implemented for the default 32 MiB Realm. The AOS machine
 boots the exact checked-in image to its first unanswered home-9P request, drains
 the boot console into the build receipt, verifies that no console input exists,
 and emits a sparse durable checkpoint. The current artifact is 9,172,369 bytes
@@ -268,6 +268,28 @@ boundary; this is covered separately so fuel-boundary behavior remains explicit.
 Non-32-MiB envelopes use the measured full boot rather than accepting a mismatched
 checkpoint. Full capsule tests preserve UID-1000 commands, durable home readback,
 workspace remounting, shutdown, restart, denied paths, and accounting.
+
+The development-system increment keeps the same authority rule while changing
+what is checkpointed. The kernel now contains only a static PID 1 bootstrap.
+That bootstrap mounts a separately hash-bound, read-only SquashFS through a
+purpose-built AOS block driver, moves devtmpfs into it, chroots, creates
+ephemeral `/run` and `/tmp`, and only then asks for the principal home.
+Checkpoint format 1 was private and never shipped as a public protocol, so it is
+extended in place to bind all admitted harts, lifecycle state, scheduler cursor,
+interrupt state, reservations, counters, and the requesting hart. Its binding is
+the exact kernel plus immutable system digests. A restore therefore contains no
+principal home, workspace FID, host path, capability token, or stale wall-clock
+authority; each shell frame refreshes realtime and the first pending home request
+must still be completed by the newly admitted principal provider.
+
+The signed compute worker owns immutable-system channel 3 internally. Linux can
+supply only one 512-byte-aligned offset and bounded read length; it cannot name
+an asset, path, provider, or principal. Asset index 1 is selected by the signed
+manifest and admitted by the generic compute runtime. Channels 1 and 2 continue
+outward to the principal-affine controller for home and invocation workspace.
+The production auto envelope is 1 GiB RAM, two logical harts, and a 64 KiB
+console so it can select the reusable checkpoint. Every other admitted topology
+performs an honest cold boot.
 
 A same-session attempt to prioritize RAM before MMIO dispatch and bypass the
 generic instruction-fetch device path measured 50,994,179 steps/s versus the
@@ -845,22 +867,33 @@ does not change the path identity or Astrid's outer workspace policy.
 The Linux storage driver is a protocol stack, not one privileged binary:
 
 ```text
-Linux VFS and 9P client
-  -> GPL-2.0-only trans=aos kernel transport
-  -> experimental SBI request in admitted guest RAM
-  -> MIT/Apache AOS machine host-request boundary
-  -> bounded Rust 9P server
-  -> channel 1: CAS-selected principal-home adapter
-     channel 2: Astrid cwd:// adapter
-  -> invocation-scoped host-managed workspace capability
+immutable system:
+  Linux block and SquashFS
+    -> GPL-2.0-only aos-system read-only block driver
+    -> private SBI channel 3 with aligned offset and bounded response buffer
+    -> MIT/Apache AOS machine host-request boundary
+    -> signed compute worker reads fixed immutable asset index 1
+
+mutable state:
+  Linux VFS and 9P client
+    -> GPL-2.0-only trans=aos kernel transport
+    -> private SBI request in admitted guest RAM
+    -> MIT/Apache AOS machine host-request boundary
+    -> bounded Rust 9P server
+    -> channel 1: CAS-selected principal-home adapter
+       channel 2: Astrid cwd:// adapter
+    -> invocation-scoped host-managed workspace capability
 ```
 
-The in-kernel transport is the guest driver in the conventional Linux sense. It
-knows 9P request buffers and SBI, but has no Astrid credentials, physical path,
-network socket, shared ring, DMA, or direct host handle. The Rust 9P server is the
-device model: it defines bounded filesystem behavior and rejects unsupported or
-escaping operations. The final adapter is the authority driver: it can exercise
-only the kernel-stamped invocation's `cwd://` capability.
+The in-kernel transports are the guest drivers in the conventional Linux sense.
+The block driver knows sectors and SBI but cannot select an asset or issue a
+write. The 9P transport knows request buffers and SBI, but neither has Astrid
+credentials, a physical path, network socket, shared ring, ambient DMA, or a
+direct host handle. The compute worker is the immutable block-device model. The
+Rust 9P server is the mutable filesystem device model: it defines bounded
+behavior and rejects unsupported or escaping operations. The final 9P adapters
+are authority drivers: they can exercise only the current kernel-stamped
+principal's home namespace and invocation `cwd://` capability.
 
 One mount admits at most 64 KiB per message, 1,024 live FIDs, 4,096 materialized
 directory entries, and 16,384 retained QID path identities. Exhaustion returns a
@@ -1474,9 +1507,11 @@ The versioned machine contract is:
    defined at instruction boundaries in the time-sliced engine. The later
    shared-memory engine must preserve the same RISC-V result set with atomics or
    bounded locks rather than relying on a Wasm data race.
-8. Existing single-hart checkpoints remain format 1. Multi-hart machines cold
-   boot until format 2 binds every hart, HSM state, scheduler cursor, interrupt,
-   reservation, and translation state to the machine/image identity.
+8. Checkpoint format 1 is an unshipped private artifact format, not the capsule
+   or WIT protocol. It now binds every hart, HSM lifecycle, scheduler cursor,
+   interrupt, reservation, counter, and pending-request owner to the exact
+   machine/kernel/system identity. Translation caches are derived state and are
+   cleared on encode and restore. A mismatched resource envelope cold-boots.
 
 The two execution modes share that machine protocol but make distinct claims:
 
@@ -1495,8 +1530,8 @@ unmerged before Astrid 1.0.
 Implementation and proof order:
 
 - [x] admit a bounded hart count, emit exact FDT CPU nodes and interrupt-controller
-  phandles, preserve the existing one-hart constructor, and reject multi-hart
-  state from checkpoint format 1;
+  phandles, preserve the existing one-hart constructor, and initially reject
+  multi-hart checkpoint state until its full codec landed;
 - [x] split per-hart architectural state from machine-wide devices, expose exact
   `mhartid`, add the deterministic round-robin scheduler and aggregate step
   accounting, invalidate overlapping LR/SC reservations across every hart, and
@@ -1509,10 +1544,11 @@ Implementation and proof order:
 - [x] resolve `linux_vcpus` from principal-scoped capsule configuration, derive
   zero from generic compute admission, expose configured versus effective values,
   and cold-restart only that principal when topology changes;
-- [x] retain checkpoint format 1 as exactly one hart, reject multi-hart restores,
-  and prove an admitted multi-hart topology cold-boots even when the 32 MiB
-  prewarm path is requested; shutdown, failure, eviction, and topology changes
-  continue to discard machine state;
+- [x] evolve the still-private checkpoint format 1 to encode and validate every
+  admitted hart and the pending request's owner, clear derived translation
+  caches, bind the exact kernel and immutable system, and reject resource
+  envelope drift; shutdown, failure, eviction, and topology changes continue to
+  discard machine state;
 - [ ] move harts onto the generic compute group, then benchmark one hart,
   time-sliced SMP, and parallel SMP without conflating boot latency, warm command
   latency, and throughput.
@@ -2313,11 +2349,11 @@ CE set rather than test-installed companions.
   Apple M2 Ultra reference host. Those totals include both harts. The fixed
   scheduler is time-sliced on one native thread; this proves Linux-visible SMP
   correctness, not parallel speedup;
-- the format-1 prewarm remains deliberately one-hart and was regenerated against
+- at this evidence point, the format-1 prewarm remained deliberately one-hart and was regenerated against
   the SMP-capable image and updated source lock. Its SHA-256 is
   `3de27c49129483c34e5956d23f44fed87ea3d4876db3f30e2276a1662cc5800d`;
-  multi-hart machines cold boot until checkpoint format 2 binds every hart and
-  scheduler field;
+  multi-hart machines cold-booted until the later still-private format-1
+  evolution bound every hart and scheduler field;
 - private controller/worker protocol 1 carries the admitted hart count and cold
   boot clock in its fixed descriptor. The reproducible signed worker is
   5,306,109 bytes with BLAKE3
@@ -2482,6 +2518,88 @@ CE set rather than test-installed companions.
   and a snapshot or faster governed backend make a clean build operationally
   meaningful.
 
+### Immutable-system checkpoint implementation recorded on 2026-07-23
+
+- the machine checkpoint codec now round-trips 1–64 admitted harts, their HSM
+  lifecycle, integer/floating/CSR state, timer/software interrupts, LR/SC
+  reservations, scheduler cursor, counters, and the pending request's exact hart.
+  Decode rejects topology drift and clears every derived translation cache.
+  All 50 machine unit tests pass, including a request issued by hart 1 while
+  hart 0 is the active scheduler slot;
+- the guest kernel source contains a read-only `aos-system` block driver. Its
+  only command is a synchronous channel-3 read with a 512-byte-aligned asset
+  offset and an admitted response buffer. The compute worker fixes that channel
+  to immutable asset index 1, bounds the asset at 2 GiB, rejects unaligned or
+  out-of-range reads, and never exposes it to the principal-affine controller;
+- the kernel bootstrap mounts the SquashFS read-only with `nosuid,nodev`, moves
+  devtmpfs into the new root, chroots, creates bounded tmpfs instances for
+  `/run` and `/tmp`, mounts proc/sysfs, and reaches its first principal-bearing
+  operation only when it mounts `/home/agent`. `sh2` refreshes realtime from the
+  current host-admitted value before every command;
+- private controller/worker protocol 1 appends checkpoint initialization without
+  changing any public WIT. The checkpoint init binds 32-byte kernel and system
+  BLAKE3 identities and independently verifies the requested RAM, console, and
+  hart envelope. The reproducible 211,040-byte worker is
+  `blake3:058845e34fe70156721e62d68badd8c6809622c460f5dc981ea80bb7978836fd`;
+  its eight unit tests include malformed descriptors, sector geometry, exact
+  asset admission, and a real two-CPU Linux boot under the generic compute
+  runtime;
+- two clean builds produced the exact same 3,775,848-byte kernel
+  (`sha256:1a010ecb701ff5397ebb92a12ac739993a05ef12ec76283392df2531e727a981`)
+  and 333,258,752-byte immutable system
+  (`sha256:4460e0cdc883922a4ab68180f4ed8f0752cf34fe4659d14e3260826d20d1063a`).
+  The 472,576-byte bootstrap is
+  `sha256:813700a6e5bf4c9f465f2f8e50cbaebeba5e520e15127766cecba6d0b6c1ed8e`;
+- the reproduced sparse checkpoint is 22,773,044 bytes,
+  `sha256:59aaa5e2f6764b9f027874be9d137aa100e47ad73f5eaf2bd889ded7ecd0a379`
+  and
+  `blake3:c5434f61273eed03cba7eb5db724a134373446a0e9819b12a53c4682347c2b33`.
+  It contains 46,431,093 retired pre-principal steps. On the identified M2
+  Ultra acceptance host, 30 post-warmup native samples measured 907.93 ms
+  median from cold allocation to the first home request and 21.57 ms median
+  from checkpoint bytes to the same bindable request: a 42.09-times reduction
+  with zero restored guest steps;
+- the complete external-image test booted this exact kernel/system pair and
+  exercised Bash 5.2.37, Git 2.54.0, Python 3.14.6, Clang 22.1.7, Make 4.4.1,
+  CMake 4.3.2, Ninja 1.13.2, rustc/cargo 1.97.1, rustup 1.29.0, and
+  `astrid-build` 0.10.4 inside RV64 Linux. C and C++ binaries, Make/CMake/Ninja
+  builds, a native Rust binary, a `wasm32-unknown-unknown` link, and a local Git
+  commit all completed without host-process authority;
+- the independently extracted installable archive is 338,240,688 bytes,
+  `sha256:ad62ccf16fb2fa483f472f92d471e3e66ae518b3bffc877fe2b03e2a21808c07`.
+  Its 1,732,925-byte controller is
+  `blake3:e77183371a4a51242dcf702080220a6b1ec0c0ab9126d2425a6e019d8721017c`.
+  Its controller, worker, kernel, system, and checkpoint bytes exactly match
+  their admitted inputs. An isolated Astrid 0.10.4 daemon loaded the capsule;
+  Alice and Bob each booted Linux 6.18.39 with 1 GiB and two logical CPUs,
+  wrote a private durable-home marker, and proved the other marker absent.
+  Alice's second call reused the warm machine in 7.17 seconds;
+- this live run exposed and fixed a runtime-wide Store-affinity defect rather
+  than hiding it in the capsule. Compute-worker components now serialize one
+  retained Store per active principal and may admit distinct-principal Stores
+  concurrently up to the normal pool ceiling. Idle Stores are evictable cache;
+  principal home is durable. The same fix replaces the wrapping `u64::MAX`
+  lazy-Store epoch delta with an effectively unbounded non-wrapping horizon.
+  All 585 active `astrid-capsule` tests and Clippy with warnings denied pass;
+- the live denied-path probe attempted upward-target symlink creation through
+  both `/workspace` and `/home/agent`. Both mounts returned
+  `EOPNOTSUPP`; reading the nonexistent workspace link returned `ENOENT`, and
+  cleanup left no entry behind. This closes the creation route but also records
+  a real compatibility limit for source trees that require symlinks.
+  A separately pre-seeded host workspace link to `/etc/passwd` was invisible
+  through 9P: guest `cat` returned `ENOENT` and zero bytes. During 50 further
+  guest reads, a host fixture continuously swapped that entry between an
+  in-root target and `/etc/passwd`; all 50 reads were denied and no bytes
+  crossed the boundary. Guest hard-link creation returned
+  `EOPNOTSUPP`, and device-node creation returned `EPERM`; cleanup left no
+  entries;
+- foreground transport expiry still does not cancel the running target. A long
+  compiler command can therefore retain its principal Store until the outer
+  invocation returns or its principal deadline interrupts it. Correlated
+  cancellation, progress, and durable background-job handles remain release
+  work; this successful acceptance does not relabel an abandoned foreground
+  call as a background process.
+
 ## 16. Ordered implementation milestones
 
 ### Milestone A: nested process proof
@@ -2572,9 +2690,11 @@ CE set rather than test-installed companions.
   exact serial evidence, and run it through the capsule command adapter;
 - [x] expose the current lazy Linux lifecycle, admitted virtual-SMP topology, evictable
   resident RAM, and per-principal Store-residency guest-step totals;
-- [x] add a principal-affine resident service Store to Astrid with permanent
-  owner binding, per-call charging, exact resident-memory accounting, live quota
-  enforcement, cancellation-safe construction, and idle LRU eviction;
+- [x] add principal-affine compute-worker Stores to Astrid: at most one retained
+  Store per active verified principal, same-principal serialization,
+  distinct-principal concurrency up to the pool ceiling, per-call charging,
+  compute-memory accounting, live quota enforcement, cancellation-safe
+  construction, and idle LRU eviction;
 - [x] keep one RV64 machine in the affined Store, leave PID 1 alive, and add a
   bounded framed console command transport with cross-invocation userspace-state
   proof, clean shutdown, restart, and fail-closed RAM destruction;
@@ -3052,9 +3172,14 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   audience-specific renderings, and projection state without physical host paths;
 - [ ] carry an opaque workspace attachment ID and epoch from runtime admission to
   Realm receipts and the already-live Linux file transport;
-- [ ] add the live denied-path matrix: unsupported guest symlink creation,
-  pre-seeded symlink traversal, concurrent link-swap opens, special nodes, and a
-  conservative hard-link admission rule or private attachment materialization;
+- [x] live-prove that both mounted 9P filesystems reject guest symlink creation
+  and that the rejected workspace entry cannot subsequently be read;
+- [x] pre-seed an absolute host symlink outside the workspace, prove guest
+  traversal returns `ENOENT` with zero bytes, and remove the test entry;
+- [x] live-prove conservative hard-link denial and special-node denial through
+  the workspace mount;
+- [x] race 50 guest opens against continuous host link swaps between an in-root
+  file and `/etc/passwd`; deny every read and observe zero escaped bytes;
 - [ ] make Realm build export immutable candidates by digest and receipt rather
   than approving mutable workspace paths;
 - [ ] enforce an installer delegable-capability ceiling before any Realm-built
@@ -3134,7 +3259,8 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
 - [x] implement aggregate-metered signed worker groups and prove deterministic
   and parallel modes against the same protocol; Linux now consumes the
   deterministic one-worker mode for guest-visible time-sliced SMP, while native
-  parallel harts and multi-hart snapshot format 2 remain separate work;
+  parallel harts and checkpoints taken during truly concurrent execution remain
+  separate work;
 - [x] expose bounded pipe creation, signed child creation, direct-child wait, and
   direct-child signal through the private guest ABI without allowing jobs to
   escape foreground actor accounting;
@@ -3181,8 +3307,9 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
 - [ ] pass reference-trace and denied-path conformance before selecting the
   accelerated backend for a principal;
 - [x] define a principal-free host-suspension checkpoint, add the sparse bound
-  codec and reproducible builder, embed the 32 MiB artifact, and prove each
-  restore attaches fresh home/workspace providers before ready;
+  codec and reproducible builder, prove the historical 32 MiB seed, then replace
+  it with the current 1 GiB/two-hart post-system-mount artifact; every restore
+  attaches fresh home/workspace providers before ready;
 - [x] move the Linux kernel out of the worker into a separately hash-bound,
   read-only compute asset; make wasm32 guest RAM demand-zero; package, install,
   boot, execute a warm shell, report effective resources, and shut down through
@@ -3192,12 +3319,12 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   explicit `/etc/os-release` identity;
 - [x] execute Bash and Python probes, local Git operations, C and C++
   compile/run loops, and Make/CMake/Ninja builds entirely inside the Realm;
-- [ ] measure the bootstrap image size, minimum useful RAM, cold-boot steps,
-  retained pages, and prewarm trade-off before replacing the 32 MiB seed;
-- [ ] use those measurements to decide whether the immutable toolchain base
-  graduates from an eager initramfs to a verified, demand-paged SquashFS or
-  content-block portal; do not spend every principal's RAM on cold compiler
-  bytes merely because initramfs was sufficient for the seed proof;
+- [ ] extend the recorded minimal-bootstrap/SquashFS/checkpoint step counts and
+  wall times with touched-page and peak-host-memory measurements under the same
+  exact kernel/system/resource envelope;
+- [x] replace the eager compiler initramfs with a verified read-only SquashFS
+  reached through an exact hash-bound channel-3 block portal; retain only the
+  static PID 1 bootstrap in the kernel;
 - [x] replace fixed guest `RLIMIT_NOFILE` and `RLIMIT_NPROC` values with bounded
   per-principal resource fields, preserve the original and intermediate command
   frames for already admitted images, and leave zero delegated to the inherited
@@ -3213,9 +3340,12 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   exact principal accounting; benchmark the new ten-million-step slice selected
   after the live compiler-image cold-boot trace, and fail closed on audit-pipeline
   saturation instead of producing warning storms;
-- [ ] define and integrity-bind a sparse post-boot machine checkpoint that
-  contains no principal data or live capability tokens, restores registers and
-  dirty pages, and reattaches home/workspace capabilities only after admission;
+- [x] define and implement a sparse post-system-mount machine checkpoint that
+  contains no principal data or live capability tokens, binds every hart plus
+  the exact kernel/system pair, restores registers and dirty pages, and
+  reattaches home/workspace capabilities only after admission;
+- [ ] extend the generated, packaged, installed, live-executed default
+  checkpoint proof with a multi-sample signed outer-Wasm/MCP latency benchmark;
 - [ ] expose command progress and cancellation through an out-of-band control
   plane rather than queueing status behind the foreground command it must
   inspect;
@@ -3232,7 +3362,7 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   in provenance; the glibc/Rust half of this compatibility generation is built;
 - [x] create, compile, retain across invocations, inspect, hash, and execute a
   native Rust program through the live `codex-code` Linux Realm;
-- [ ] complete the seven-step in-guest Rust build/run/artifact receipt proof;
+- [x] complete the seven-step in-guest Rust build/run/artifact receipt proof;
 - [ ] define the attenuating capsule-to-realm job contract and migrate Forge as the
   first non-interactive consumer after artifact verification exists;
 - [ ] make `realm_shell` the default distro shell route now that it executes the
@@ -3247,12 +3377,14 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
     coupling until evidence requires them.
 
 The Linux-bearing executable artifact is now a useful static workbench: pinned
-Linux 6.18.39 serial-boots the Buildroot 2026.05.1 rootfs, executes token-bound
-BusyBox `ash` commands as UID 1000 across separate invocations, preserves warm
-userspace RAM, mounts the invocation's host-managed workspace through a bounded
-9P/SBI portal, mounts the selected principal-home generation through a second channel,
+Linux 6.18.39 boots a minimal static PID 1, mounts the separately hash-bound
+Buildroot 2026.05.1 development system read-only, and executes token-bound Bash
+commands as UID 1000 across separate invocations. It preserves warm userspace
+RAM, mounts the invocation's host-managed workspace through a bounded 9P/SBI
+portal, mounts the selected principal-home generation through a second channel,
 powers down cleanly, restarts, and reads the same home bytes after cold boot.
-The next storage artifact is an immutable base plus durable root overlay; the
+Its in-guest C/C++/Rust/Wasm toolchain is executable evidence, not a version-list
+claim. The next storage artifact is a durable writable root overlay; the
 workspace remains a narrower invocation-scoped capability. The firmware contract
 beneath it is executable:
 exact image/initramfs placement, generated FDT bytes, S-mode register state,
@@ -3262,5 +3394,6 @@ fail with an exact architectural trap before virtio block, root persistence,
 networking, or broader distribution packages are added. The parallel process track still needs
 guest-visible executable lookup, the realm-wide open-file-description table,
 sequential spawn actions, and explicit foreground job records. The storage track
-adds named checkpoint/diff/reset and outer workspace promotion. Bash and a
-compiler remain acceptance workloads, not claims made by this seed.
+adds named checkpoint/diff/reset and outer workspace promotion. Networking,
+package installation, Node/npm, progress streaming, correlated cancellation,
+and surviving background jobs remain explicit future work.

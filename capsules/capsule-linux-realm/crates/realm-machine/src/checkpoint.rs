@@ -137,14 +137,16 @@ impl MachineCheckpoint {
         push_u64(&mut bytes, machine.scheduler_quantum_remaining);
         encode_hart(
             &mut bytes,
-            machine.active_hart_lifecycle,
-            &machine.cpu,
-            &machine.csrs,
-            machine.cycle,
-            machine.instret,
-            machine.reservation,
-            machine.devices.mtimecmp,
-            machine.devices.msip,
+            HartCheckpointRef {
+                lifecycle: machine.active_hart_lifecycle,
+                cpu: &machine.cpu,
+                csrs: &machine.csrs,
+                cycle: machine.cycle,
+                instret: machine.instret,
+                reservation: machine.reservation,
+                mtimecmp: machine.devices.mtimecmp,
+                msip: machine.devices.msip,
+            },
         );
         for hart_id in 0..machine.hart_count {
             if hart_id == machine.active_hart_id {
@@ -159,14 +161,16 @@ impl MachineCheckpoint {
             );
             encode_hart(
                 &mut bytes,
-                hart.lifecycle,
-                &hart.cpu,
-                &hart.csrs,
-                hart.cycle,
-                hart.instret,
-                hart.reservation,
-                hart.mtimecmp,
-                hart.msip,
+                HartCheckpointRef {
+                    lifecycle: hart.lifecycle,
+                    cpu: &hart.cpu,
+                    csrs: &hart.csrs,
+                    cycle: hart.cycle,
+                    instret: hart.instret,
+                    reservation: hart.reservation,
+                    mtimecmp: hart.mtimecmp,
+                    msip: hart.msip,
+                },
             );
         }
 
@@ -380,33 +384,34 @@ impl MachineCheckpoint {
     }
 }
 
-fn encode_hart(
-    bytes: &mut Vec<u8>,
+struct HartCheckpointRef<'a> {
     lifecycle: HartLifecycle,
-    cpu: &Cpu,
-    csrs: &CsrFile,
+    cpu: &'a Cpu,
+    csrs: &'a CsrFile,
     cycle: u64,
     instret: u64,
     reservation: Option<(u64, u8)>,
     mtimecmp: u64,
     msip: bool,
-) {
-    bytes.push(match lifecycle {
+}
+
+fn encode_hart(bytes: &mut Vec<u8>, hart: HartCheckpointRef<'_>) {
+    bytes.push(match hart.lifecycle {
         HartLifecycle::Started => 1,
         HartLifecycle::Stopped => 0,
     });
-    for register in cpu.registers {
+    for register in hart.cpu.registers {
         push_u64(bytes, register);
     }
-    for register in cpu.floating_registers {
+    for register in hart.cpu.floating_registers {
         push_u64(bytes, register);
     }
-    push_u64(bytes, cpu.pc);
-    bytes.push(cpu.privilege as u8);
-    encode_csrs(bytes, csrs);
-    push_u64(bytes, cycle);
-    push_u64(bytes, instret);
-    match reservation {
+    push_u64(bytes, hart.cpu.pc);
+    bytes.push(hart.cpu.privilege as u8);
+    encode_csrs(bytes, hart.csrs);
+    push_u64(bytes, hart.cycle);
+    push_u64(bytes, hart.instret);
+    match hart.reservation {
         Some((address, width)) => {
             bytes.push(1);
             push_u64(bytes, address);
@@ -414,8 +419,8 @@ fn encode_hart(
         }
         None => bytes.push(0),
     }
-    push_u64(bytes, mtimecmp);
-    bytes.push(u8::from(msip));
+    push_u64(bytes, hart.mtimecmp);
+    bytes.push(u8::from(hart.msip));
 }
 
 struct DecodedHart {

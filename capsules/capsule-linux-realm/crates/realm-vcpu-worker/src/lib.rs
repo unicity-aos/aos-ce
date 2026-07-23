@@ -13,7 +13,8 @@
 )]
 
 use aos_realm_machine::{
-    HaltStatus, HostRequestFailure, HostRequestId, Machine, MachineConfig, SliceOutcome,
+    CheckpointBinding, CheckpointDigest, HaltStatus, HostRequestFailure, HostRequestId, Machine,
+    MachineCheckpoint, MachineConfig, SliceOutcome,
 };
 use aos_realm_vcpu_protocol::{
     self as protocol, Operation, Outcome, RequestFailure, Status, field,
@@ -23,11 +24,21 @@ use std::sync::Mutex;
 const ABI_VERSION: i32 = 1;
 #[cfg(target_arch = "wasm32")]
 const LINUX_KERNEL_ASSET_INDEX: i32 = 0;
-// The reproducible agent-workbench image is 364,642,752 bytes. Keep a finite
-// admission ceiling with enough headroom for patch releases; the worker's
-// linear memory is still charged to the principal by generic compute.
+#[cfg(target_arch = "wasm32")]
+const LINUX_SYSTEM_ASSET_INDEX: i32 = 1;
+#[cfg(target_arch = "wasm32")]
+const LINUX_CHECKPOINT_ASSET_INDEX: i32 = 2;
+const LINUX_SYSTEM_BLOCK_CHANNEL: u32 = 3;
+const LINUX_SYSTEM_SECTOR_BYTES: usize = 512;
+// Keep finite admission ceilings with ample room for patch releases. The exact
+// attached objects are hash-bound and worker memory remains charged to the
+// principal by generic compute.
 #[cfg(any(target_arch = "wasm32", test))]
 const MAX_LINUX_KERNEL_BYTES: usize = 512 * 1024 * 1024;
+#[cfg(target_arch = "wasm32")]
+const MAX_LINUX_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
+#[cfg(target_arch = "wasm32")]
+const MAX_LINUX_SYSTEM_BYTES: usize = 2 * 1024 * 1024 * 1024;
 #[cfg(target_arch = "wasm32")]
 const MAX_ASSET_READ_BYTES: usize = 64 * 1024;
 #[cfg(target_arch = "wasm32")]
@@ -114,6 +125,7 @@ fn dispatch(bytes: &mut [u8], descriptor_tag: i64) -> i32 {
     }
     let result = match operation {
         Some(Operation::InitCold) => initialize(bytes),
+        Some(Operation::InitCheckpoint) => initialize_checkpoint(bytes),
         Some(Operation::RunSlice) => run_slice(bytes),
         Some(Operation::PushConsole) => push_console(bytes),
         Some(Operation::Complete9p) => complete_9p(bytes),
@@ -170,8 +182,10 @@ fn initialize(bytes: &mut [u8]) -> WorkerResult {
     )
     .map_err(|error| machine_error(error.to_string()))?;
     let linux_image = load_linux_image()?;
-    let bootargs =
-        format!("earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time={wall_time_seconds}");
+    let system_bytes = system_asset_size()?;
+    let bootargs = format!(
+        "earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time={wall_time_seconds} aos.system_bytes={system_bytes}"
+    );
     machine
         .boot_linux(&linux_image, &[], &bootargs)
         .map_err(|error| machine_error(error.to_string()))?;
@@ -182,20 +196,147 @@ fn initialize(bytes: &mut [u8]) -> WorkerResult {
     Ok(())
 }
 
+fn initialize_checkpoint(bytes: &mut [u8]) -> WorkerResult {
+    if STATE.lock().expect("worker state lock").is_some() {
+        return Err(invalid("Linux vCPU is already initialized"));
+    }
+    let checkpoint_input = input(bytes)?;
+    if checkpoint_input.len() != protocol::CHECKPOINT_BINDING_BYTES {
+        return Err(invalid(
+            "checkpoint init must contain the kernel and system digests",
+        ));
+    }
+    let linux_image = checkpoint_input[..32]
+        .try_into()
+        .map(CheckpointDigest::new)
+        .map_err(|_| invalid("checkpoint kernel digest is malformed"))?;
+    let immutable_system = checkpoint_input[32..]
+        .try_into()
+        .map(CheckpointDigest::new)
+        .map_err(|_| invalid("checkpoint system digest is malformed"))?;
+    let binding = CheckpointBinding::new(linux_image, immutable_system);
+    let checkpoint_bytes = load_checkpoint()?;
+    let checkpoint = MachineCheckpoint::decode(&checkpoint_bytes, binding)
+        .map_err(|error| machine_error(format!("checkpoint admission failed: {error}")))?;
+    let ram_bytes =
+        usize::try_from(protocol::read_u64(bytes, field::RAM_BYTES).unwrap_or_default())
+            .map_err(|_| invalid("RAM size is not addressable"))?;
+    let max_console_bytes =
+        usize::try_from(protocol::read_u64(bytes, field::MAX_CONSOLE_BYTES).unwrap_or_default())
+            .map_err(|_| invalid("console size is not addressable"))?;
+    let hart_count =
+        usize::try_from(protocol::read_u32(bytes, field::HART_COUNT).unwrap_or_default())
+            .map_err(|_| invalid("hart count is not addressable"))?;
+    if checkpoint.ram_bytes() != ram_bytes
+        || checkpoint.max_console_bytes() != max_console_bytes
+        || checkpoint.hart_count() != hart_count
+    {
+        return Err(machine_error(
+            "checkpoint resources do not match the admitted Linux envelope",
+        ));
+    }
+    let pending_request = Some(checkpoint.pending_host_request().id);
+    let machine = checkpoint.into_machine();
+    *STATE.lock().expect("worker state lock") = Some(WorkerState {
+        machine,
+        pending_request,
+    });
+    Ok(())
+}
+
 #[cfg(target_arch = "wasm32")]
 fn load_linux_image() -> Result<Vec<u8>, (Status, String)> {
+    load_asset(
+        LINUX_KERNEL_ASSET_INDEX,
+        MAX_LINUX_KERNEL_BYTES,
+        "Linux kernel",
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_checkpoint() -> Result<Vec<u8>, (Status, String)> {
+    load_asset(
+        LINUX_CHECKPOINT_ASSET_INDEX,
+        MAX_LINUX_CHECKPOINT_BYTES,
+        "Linux checkpoint",
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_system_block(offset: u64, length: usize) -> Result<Vec<u8>, (Status, String)> {
+    let system_bytes = system_asset_size()?;
+    let offset =
+        usize::try_from(offset).map_err(|_| invalid("Linux system block offset is too large"))?;
+    offset
+        .checked_add(length)
+        .filter(|end| *end <= system_bytes)
+        .ok_or_else(|| invalid("Linux system block read exceeds the immutable asset"))?;
+    let mut response = vec![0_u8; length];
+    let destination = i64::try_from(response.as_mut_ptr() as usize)
+        .map_err(|_| machine_error("Linux system block destination is not addressable"))?;
+    let offset = i64::try_from(offset)
+        .map_err(|_| machine_error("Linux system block offset is not addressable"))?;
+    let length = i64::try_from(length)
+        .map_err(|_| machine_error("Linux system block length is not addressable"))?;
+    // SAFETY: `response` is a live allocation of exactly `length` bytes and
+    // the source range was checked against the immutable asset size above.
+    let status = unsafe { host_asset_read(LINUX_SYSTEM_ASSET_INDEX, offset, destination, length) };
+    if status != ASSET_OK {
+        return Err(machine_error(format!(
+            "Linux system block read failed with status {status}"
+        )));
+    }
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn system_asset_size() -> Result<usize, (Status, String)> {
+    // SAFETY: the attached asset list is admitted by Astrid before this signed
+    // worker starts. The index names the hash-pinned immutable system image.
+    let asset_count = unsafe { host_asset_count() };
+    if asset_count <= LINUX_SYSTEM_ASSET_INDEX {
+        return Err(machine_error("Linux system asset is not attached"));
+    }
+    // SAFETY: the asset index was admitted above.
+    let asset_size = unsafe { host_asset_size(LINUX_SYSTEM_ASSET_INDEX) };
+    admitted_asset_size(asset_size, MAX_LINUX_SYSTEM_BYTES)
+        .filter(|bytes| bytes.is_multiple_of(512))
+        .ok_or_else(|| machine_error("Linux system asset size is outside the admitted range"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_system_block(_offset: u64, _length: usize) -> Result<Vec<u8>, (Status, String)> {
+    Err(machine_error(
+        "Linux system asset reads require the signed compute worker",
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn system_asset_size() -> Result<usize, (Status, String)> {
+    Ok(4096)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_asset(
+    asset_index: i32,
+    max_asset_bytes: usize,
+    asset_name: &str,
+) -> Result<Vec<u8>, (Status, String)> {
     // SAFETY: these exact imports are validated and linked by Astrid before the
     // worker can start. They expose no path and read only the hash-bound asset
     // list attached to this signed compute worker.
     let asset_count = unsafe { host_asset_count() };
-    if asset_count <= LINUX_KERNEL_ASSET_INDEX {
-        return Err(machine_error("Linux kernel asset is not attached"));
+    if asset_count <= asset_index {
+        return Err(machine_error(format!("{asset_name} asset is not attached")));
     }
     // SAFETY: the index was admitted above; a negative status still fails
     // closed before allocation.
-    let asset_size = unsafe { host_asset_size(LINUX_KERNEL_ASSET_INDEX) };
-    let size = admitted_linux_kernel_size(asset_size)
-        .ok_or_else(|| machine_error("Linux kernel asset size is outside the admitted range"))?;
+    let asset_size = unsafe { host_asset_size(asset_index) };
+    let size = admitted_asset_size(asset_size, max_asset_bytes).ok_or_else(|| {
+        machine_error(format!(
+            "{asset_name} asset size is outside the admitted range"
+        ))
+    })?;
     let mut image = Vec::new();
     image
         .try_reserve_exact(size)
@@ -212,27 +353,36 @@ fn load_linux_image() -> Result<Vec<u8>, (Status, String)> {
         // SAFETY: `destination..destination+length` is the live mutable chunk
         // in `image`; Astrid bounds the source and destination and returns only
         // after the atomic copy has completed.
-        let status =
-            unsafe { host_asset_read(LINUX_KERNEL_ASSET_INDEX, offset, destination, length) };
+        let status = unsafe { host_asset_read(asset_index, offset, destination, length) };
         if status != ASSET_OK {
             return Err(machine_error(format!(
-                "Linux kernel asset read failed with status {status}"
+                "{asset_name} asset read failed with status {status}"
             )));
         }
     }
     Ok(image)
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(test)]
 fn admitted_linux_kernel_size(asset_size: i64) -> Option<usize> {
+    admitted_asset_size(asset_size, MAX_LINUX_KERNEL_BYTES)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn admitted_asset_size(asset_size: i64, max_asset_bytes: usize) -> Option<usize> {
     usize::try_from(asset_size)
         .ok()
-        .filter(|size| (1..=MAX_LINUX_KERNEL_BYTES).contains(size))
+        .filter(|size| (1..=max_asset_bytes).contains(size))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn load_linux_image() -> Result<Vec<u8>, (Status, String)> {
     Ok(include_bytes!("../../../assets/linux-kernel.img").to_vec())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_checkpoint() -> Result<Vec<u8>, (Status, String)> {
+    Ok(include_bytes!("../../../assets/linux-prewarm-1g-2h.aos-machine").to_vec())
 }
 
 fn run_slice(bytes: &mut [u8]) -> WorkerResult {
@@ -250,53 +400,98 @@ fn run_slice(bytes: &mut [u8]) -> WorkerResult {
             "Linux vCPU is not initialized".to_string(),
         )
     })?;
-    let report = state.machine.run_slice(budget);
-    protocol::write_u64(bytes, field::STEPS_EXECUTED, report.steps_executed);
-    protocol::write_u64(
-        bytes,
-        field::TOTAL_STEPS_EXECUTED,
-        report.total_steps_executed,
-    );
-    protocol::write_u64(
-        bytes,
-        field::INSTRUCTIONS_RETIRED,
-        report.instructions_retired,
-    );
-    protocol::write_u64(
-        bytes,
-        field::TOTAL_INSTRUCTIONS_RETIRED,
-        report.total_instructions_retired,
-    );
+    let mut steps_executed = 0_u64;
+    let mut instructions_retired = 0_u64;
+    let mut console = Vec::new();
+    loop {
+        let report = state.machine.run_slice(budget - steps_executed);
+        steps_executed = steps_executed.saturating_add(report.steps_executed);
+        instructions_retired = instructions_retired.saturating_add(report.instructions_retired);
+        console.extend_from_slice(&report.console);
+        protocol::write_u64(bytes, field::STEPS_EXECUTED, steps_executed);
+        protocol::write_u64(
+            bytes,
+            field::TOTAL_STEPS_EXECUTED,
+            report.total_steps_executed,
+        );
+        protocol::write_u64(bytes, field::INSTRUCTIONS_RETIRED, instructions_retired);
+        protocol::write_u64(
+            bytes,
+            field::TOTAL_INSTRUCTIONS_RETIRED,
+            report.total_instructions_retired,
+        );
 
-    let mut message = &[][..];
-    let mut error = String::new();
-    match &report.outcome {
-        SliceOutcome::Yielded => {
+        if let SliceOutcome::HostRequest(request) = &report.outcome
+            && request.channel == LINUX_SYSTEM_BLOCK_CHANNEL
+        {
+            complete_system_block_request(&mut state.machine, request)?;
+            if steps_executed < budget {
+                continue;
+            }
             protocol::write_u32(bytes, field::OUTCOME, Outcome::Yielded as u32);
+            return encode_payload(bytes, &console, &[], &[]);
         }
-        SliceOutcome::Halted(HaltStatus { passed, code }) => {
-            protocol::write_u32(bytes, field::OUTCOME, Outcome::Halted as u32);
-            protocol::write_u32(bytes, field::HALT_CODE, *code);
-            protocol::write_u32(bytes, field::HALT_PASSED, u32::from(*passed));
+
+        let mut message = &[][..];
+        let mut error = String::new();
+        match &report.outcome {
+            SliceOutcome::Yielded => {
+                protocol::write_u32(bytes, field::OUTCOME, Outcome::Yielded as u32);
+            }
+            SliceOutcome::Halted(HaltStatus { passed, code }) => {
+                protocol::write_u32(bytes, field::OUTCOME, Outcome::Halted as u32);
+                protocol::write_u32(bytes, field::HALT_CODE, *code);
+                protocol::write_u32(bytes, field::HALT_PASSED, u32::from(*passed));
+            }
+            SliceOutcome::HostRequest(request) => {
+                protocol::write_u32(bytes, field::OUTCOME, Outcome::HostRequest as u32);
+                protocol::write_u64(bytes, field::REQUEST_ID, request.id.get());
+                protocol::write_u32(bytes, field::REQUEST_CHANNEL, request.channel);
+                protocol::write_u32(
+                    bytes,
+                    field::MAX_RESPONSE_BYTES,
+                    u32::try_from(request.max_response_bytes).unwrap_or(u32::MAX),
+                );
+                message = &request.message;
+                state.pending_request = Some(request.id);
+            }
+            SliceOutcome::Trapped(trap) => {
+                protocol::write_u32(bytes, field::OUTCOME, Outcome::Trapped as u32);
+                error = trap.to_string();
+            }
         }
-        SliceOutcome::HostRequest(request) => {
-            protocol::write_u32(bytes, field::OUTCOME, Outcome::HostRequest as u32);
-            protocol::write_u64(bytes, field::REQUEST_ID, request.id.get());
-            protocol::write_u32(bytes, field::REQUEST_CHANNEL, request.channel);
-            protocol::write_u32(
-                bytes,
-                field::MAX_RESPONSE_BYTES,
-                u32::try_from(request.max_response_bytes).unwrap_or(u32::MAX),
-            );
-            message = &request.message;
-            state.pending_request = Some(request.id);
-        }
-        SliceOutcome::Trapped(trap) => {
-            protocol::write_u32(bytes, field::OUTCOME, Outcome::Trapped as u32);
-            error = trap.to_string();
-        }
+        return encode_payload(bytes, &console, message, error.as_bytes());
     }
-    encode_payload(bytes, &report.console, message, error.as_bytes())
+}
+
+fn complete_system_block_request(
+    machine: &mut Machine,
+    request: &aos_realm_machine::Plan9Request,
+) -> WorkerResult {
+    let offset = system_block_offset(&request.message, request.max_response_bytes)?;
+    let response = read_system_block(offset, request.max_response_bytes)?;
+    machine
+        .complete_9p_request(request.id, &response)
+        .map_err(|error| machine_error(format!("complete Linux system block read: {error}")))
+}
+
+fn system_block_offset(message: &[u8], response_bytes: usize) -> Result<u64, (Status, String)> {
+    if !(LINUX_SYSTEM_SECTOR_BYTES..=aos_realm_machine::MAX_9P_MESSAGE_BYTES)
+        .contains(&response_bytes)
+        || !response_bytes.is_multiple_of(LINUX_SYSTEM_SECTOR_BYTES)
+    {
+        return Err(invalid(
+            "Linux system block read length is outside the admitted range",
+        ));
+    }
+    let offset = message
+        .try_into()
+        .map(u64::from_le_bytes)
+        .map_err(|_| invalid("Linux system block request has an invalid offset"))?;
+    if !offset.is_multiple_of(LINUX_SYSTEM_SECTOR_BYTES as u64) {
+        return Err(invalid("Linux system block offset is not sector aligned"));
+    }
+    Ok(offset)
 }
 
 fn push_console(bytes: &mut [u8]) -> WorkerResult {
@@ -490,9 +685,11 @@ mod tests {
     use super::*;
 
     const SIGNED_WORKER_HASH: &str =
-        "blake3:67467b9e020bed847a04ba55b4f7d8728bb172714eb0a4d23543752635773ad1";
+        "blake3:058845e34fe70156721e62d68badd8c6809622c460f5dc981ea80bb7978836fd";
     const SIGNED_KERNEL_HASH: &str =
-        "blake3:fd3bff3a266b66fc1596c16414a5cd7ef7d2c68eb76684627ab8d4d6e74647e8";
+        "blake3:60cc6c3c01222a3a33b108593974de5636747b32cacc10bf8c0f45c1cdd8b285";
+    const SIGNED_TEST_SYSTEM_HASH: &str =
+        "blake3:0ba0ad681b5d03178bfc8b3c308e67164c8daf3301386ca573a6838945078aad";
 
     fn request(operation: u32, input: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0_u8; protocol::HEADER_BYTES + input.len()];
@@ -652,6 +849,41 @@ mod tests {
     }
 
     #[test]
+    fn immutable_system_requests_admit_only_one_bounded_offset() {
+        assert_eq!(
+            system_block_offset(&4096_u64.to_le_bytes(), 4096).expect("page read"),
+            4096
+        );
+        for malformed in [&[][..], &[0; 7], &[0; 9]] {
+            assert_eq!(
+                system_block_offset(malformed, 4096)
+                    .expect_err("offset must be exactly eight bytes")
+                    .0,
+                Status::Invalid
+            );
+        }
+        for response_bytes in [
+            0,
+            LINUX_SYSTEM_SECTOR_BYTES - 1,
+            LINUX_SYSTEM_SECTOR_BYTES + 1,
+            aos_realm_machine::MAX_9P_MESSAGE_BYTES + 1,
+        ] {
+            assert_eq!(
+                system_block_offset(&0_u64.to_le_bytes(), response_bytes)
+                    .expect_err("response range must stay machine-bounded")
+                    .0,
+                Status::Invalid
+            );
+        }
+        assert_eq!(
+            system_block_offset(&1_u64.to_le_bytes(), LINUX_SYSTEM_SECTOR_BYTES)
+                .expect_err("offset must be sector aligned")
+                .0,
+            Status::Invalid
+        );
+    }
+
+    #[test]
     fn signed_worker_cold_boots_two_linux_cpus_inside_the_real_compute_runtime() {
         use astrid_compute::{
             ComputeLedger, ComputeLimits, ComputeRuntime, ExecutionMode, GroupRequest, Parallelism,
@@ -664,16 +896,35 @@ mod tests {
             .parent()
             .and_then(Path::parent)
             .expect("capsule root");
+        let test_root =
+            std::env::temp_dir().join(format!("aos-realm-worker-assets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&test_root);
+        std::fs::create_dir_all(test_root.join("assets")).expect("test asset directory");
+        for (source, target) in [
+            ("assets/linux-vcpu.wasm", "assets/linux-vcpu.wasm"),
+            ("assets/linux-kernel.img", "assets/linux-kernel.img"),
+            ("linux/rootfs.cpio", "assets/linux-system-test.img"),
+        ] {
+            std::fs::copy(capsule_root.join(source), test_root.join(target))
+                .expect("copy signed test asset");
+        }
         let artifact = WorkerArtifact::from_capsule_path_with_assets(
             protocol::WORKER_ID,
-            capsule_root,
+            &test_root,
             Path::new("assets/linux-vcpu.wasm"),
             SIGNED_WORKER_HASH,
-            &[WorkerAssetSpec {
-                id: "linux-kernel".to_owned(),
-                relative_path: PathBuf::from("assets/linux-kernel.img"),
-                expected_hash: SIGNED_KERNEL_HASH.to_owned(),
-            }],
+            &[
+                WorkerAssetSpec {
+                    id: "linux-kernel".to_owned(),
+                    relative_path: PathBuf::from("assets/linux-kernel.img"),
+                    expected_hash: SIGNED_KERNEL_HASH.to_owned(),
+                },
+                WorkerAssetSpec {
+                    id: "linux-system-test".to_owned(),
+                    relative_path: PathBuf::from("assets/linux-system-test.img"),
+                    expected_hash: SIGNED_TEST_SYSTEM_HASH.to_owned(),
+                },
+            ],
         )
         .expect("signed worker and kernel asset");
         let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
@@ -695,7 +946,10 @@ mod tests {
             offset: control_offset,
             length: protocol::CONTROL_BYTES as u64,
             tag: Operation::InitCold as u64,
-            worker_index: Some(0),
+            // The group has exactly one worker. Unspecified affinity exercises
+            // the production queueing path without racing targeted-slot
+            // bookkeeping immediately after `join`.
+            worker_index: None,
             fuel: None,
         };
         let mut request = vec![0_u8; protocol::HEADER_BYTES + protocol::COLD_BOOT_INPUT_BYTES];
@@ -750,12 +1004,15 @@ mod tests {
             }
             let total_steps =
                 protocol::read_u64(&header, field::TOTAL_STEPS_EXECUTED).expect("total steps");
-            if protocol::read_u32(&header, field::OUTCOME) == Some(Outcome::HostRequest as u32) {
+            if console
+                .windows(b"smp: Brought up 1 node, 2 CPUs".len())
+                .any(|window| window == b"smp: Brought up 1 node, 2 CPUs")
+            {
                 break total_steps;
             }
             assert!(
                 total_steps < 50_000_000,
-                "Linux did not reach its first host request"
+                "Linux did not bring both CPUs online"
             );
         };
 
@@ -765,6 +1022,10 @@ mod tests {
             console.contains("smp: Brought up 1 node, 2 CPUs"),
             "{console}"
         );
-        assert!((30_000_000..50_000_000).contains(&total_steps));
+        assert!(
+            (1..50_000_000).contains(&total_steps),
+            "unexpected Linux SMP bring-up cost: {total_steps}"
+        );
+        std::fs::remove_dir_all(test_root).expect("remove test assets");
     }
 }

@@ -10,6 +10,7 @@ const HART_COUNT: usize = 2;
 const CONSOLE_BYTES: usize = 64 * 1024;
 const SLICE_STEPS: u64 = 10_000_000;
 const MAX_STEPS: u64 = 2_000_000_000;
+const BENCHMARK_WALL_SECONDS: u64 = 1_784_143_900;
 const HOME_9P_CHANNEL: u32 = 1;
 const SYSTEM_BLOCK_CHANNEL: u32 = 3;
 const INIT_MARKER: &[u8] = b"AOS LINUX /init";
@@ -189,7 +190,7 @@ fn cold_to_principal_bind(
     )
     .map_err(|error| format!("could not admit Linux machine: {error}"))?;
     let bootargs = format!(
-        "earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time=1 aos.system_bytes={}",
+        "earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time={BENCHMARK_WALL_SECONDS} aos.system_bytes={}",
         system.len()
     );
     machine

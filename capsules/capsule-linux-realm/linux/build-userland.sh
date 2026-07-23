@@ -21,6 +21,7 @@ if [ "$#" -eq 3 ]; then
 else
     output_cpio=$script_dir/rootfs.cpio.gz
 fi
+output_system=${AOS_SYSTEM_OUTPUT:-"$(dirname -- "$output_cpio")/system.squashfs"}
 development_lock=$script_dir/DEVELOPMENT.lock
 if [ ! -f "$development_lock" ] || \
     ! grep -qxF 'format=aos-realm-development-image-1' "$development_lock"; then
@@ -33,6 +34,7 @@ if [ -z "$expected_cpio" ]; then
     exit 66
 fi
 record_userland=${AOS_RECORD_USERLAND:-0}
+expected_system=$(sed -n 's/^system_stage_sha256=//p' "$development_lock")
 # LLVM translation units can individually consume several GiB. Keep the
 # reproducible default safe for an 8 GiB builder; operators with a larger
 # envelope may raise this explicitly.
@@ -42,6 +44,10 @@ downloads_dir=${BR2_DL_DIR:-"$build_dir.downloads"}
 if [ "$record_userland" != 0 ] && [ "$record_userland" != 1 ]; then
     echo "AOS_RECORD_USERLAND must be 0 or 1" >&2
     exit 64
+fi
+if [ "$record_userland" = 0 ] && [ -z "$expected_system" ]; then
+    echo "development generation lock has no system_stage_sha256" >&2
+    exit 66
 fi
 case $build_jobs in
     ''|*[!0-9]*|0)
@@ -118,7 +124,11 @@ for required in \
     "BR2_ROOTFS_STATIC_DEVICE_TABLE=\"\$(BR2_EXTERNAL_AOS_PATH)/board/aos/device-table.txt\"" \
     '# BR2_TARGET_ENABLE_ROOT_LOGIN is not set' \
     'BR2_TARGET_ROOTFS_CPIO=y' \
-    'BR2_TARGET_ROOTFS_CPIO_GZIP=y'
+    'BR2_TARGET_ROOTFS_CPIO_GZIP=y' \
+    'BR2_TARGET_ROOTFS_SQUASHFS=y' \
+    'BR2_TARGET_ROOTFS_SQUASHFS_BS_128K=y' \
+    'BR2_TARGET_ROOTFS_SQUASHFS4_ZSTD=y' \
+    'BR2_TARGET_ROOTFS_SQUASHFS_EXTREME_COMP=y'
 do
     if ! grep -qxF "$required" "$config"; then
         echo "generated Buildroot config is missing: $required" >&2
@@ -260,17 +270,26 @@ if [ -n "$leaked_path" ]; then
 fi
 
 cpio="$build_dir/images/rootfs.cpio.gz"
-if [ ! -f "$cpio" ]; then
-    echo "Buildroot did not produce rootfs.cpio.gz" >&2
+system="$build_dir/images/rootfs.squashfs"
+if [ ! -f "$cpio" ] || [ ! -f "$system" ]; then
+    echo "Buildroot did not produce both rootfs.cpio.gz and rootfs.squashfs" >&2
     exit 70
 fi
 actual_cpio=$(sha256sum "$cpio" | cut -d ' ' -f 1)
+actual_system=$(sha256sum "$system" | cut -d ' ' -f 1)
 if [ "$record_userland" = 0 ] && [ "$actual_cpio" != "$expected_cpio" ]; then
     echo "rootfs digest mismatch: expected $expected_cpio, got $actual_cpio" >&2
     exit 70
 fi
+if [ "$record_userland" = 0 ] && [ "$actual_system" != "$expected_system" ]; then
+    echo "system digest mismatch: expected $expected_system, got $actual_system" >&2
+    exit 70
+fi
 cp "$cpio" "$output_cpio"
+cp "$system" "$output_system"
 if [ "$record_userland" = 1 ]; then
-    printf 'rootfs_cpio_sha256=%s\n' "$actual_cpio"
+    printf 'rootfs_stage_sha256=%s\nsystem_stage_sha256=%s\n' \
+        "$actual_cpio" "$actual_system"
 fi
 printf '%s  %s\n' "$actual_cpio" "$output_cpio"
+printf '%s  %s\n' "$actual_system" "$output_system"

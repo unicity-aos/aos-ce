@@ -29,7 +29,7 @@ if [ ! -f "$development_lock" ] || \
     echo "missing or invalid development generation lock: $development_lock" >&2
     exit 66
 fi
-expected_rootfs=$(sed -n 's/^rootfs_cpio_sha256=//p' "$development_lock")
+expected_rootfs=$(sed -n 's/^bootstrap_cpio_sha256=//p' "$development_lock")
 expected_image=$(sed -n 's/^image_sha256=//p' "$development_lock")
 if [ -z "$expected_rootfs" ] || [ -z "$expected_image" ]; then
     echo "development generation lock is missing rootfs or image identity" >&2
@@ -86,8 +86,11 @@ fi
 
 transport_patch=$script_dir/kernel/net-9p-aos.patch
 transport_source=$script_dir/kernel/trans_aos.c
-if [ ! -f "$transport_patch" ] || [ ! -f "$transport_source" ]; then
-    echo "AOS 9P kernel transport sources are missing" >&2
+system_patch=$script_dir/kernel/drivers-block-aos.patch
+system_source=$script_dir/kernel/aos_system.c
+if [ ! -f "$transport_patch" ] || [ ! -f "$transport_source" ] ||
+   [ ! -f "$system_patch" ] || [ ! -f "$system_source" ]; then
+    echo "AOS kernel boundary sources are missing" >&2
     exit 66
 fi
 if grep -qxF 'config NET_9P_AOS' "$kernel_source/net/9p/Kconfig" \
@@ -102,6 +105,18 @@ else
     exit 66
 fi
 cp "$transport_source" "$kernel_source/net/9p/trans_aos.c"
+if grep -qxF 'config BLK_DEV_AOS_SYSTEM' "$kernel_source/drivers/block/Kconfig" \
+    && grep -qF 'obj-$(CONFIG_BLK_DEV_AOS_SYSTEM) += aos_system.o' \
+        "$kernel_source/drivers/block/Makefile"; then
+    : # The exact source tree was already prepared by an earlier build.
+elif patch --batch --forward --dry-run -d "$kernel_source" -p1 \
+    < "$system_patch" >/dev/null 2>&1; then
+    patch --batch --forward -d "$kernel_source" -p1 < "$system_patch"
+else
+    echo "AOS immutable-system block patch does not apply cleanly" >&2
+    exit 66
+fi
+cp "$system_source" "$kernel_source/drivers/block/aos_system.c"
 
 actual_rootfs=$(sha256sum "$rootfs_cpio" | cut -d ' ' -f 1)
 if [ "$record_image" = 0 ] && [ "$actual_rootfs" != "$expected_rootfs" ]; then
@@ -172,8 +187,20 @@ make -C "$kernel_source" O="$build_dir/kernel" \
     --enable BINFMT_SCRIPT \
     --enable PROC_FS \
     --enable SYSFS \
+    --enable SHMEM \
+    --enable TMPFS \
+    --disable TMPFS_XATTR \
     --enable DEVTMPFS \
     --enable DEVTMPFS_MOUNT \
+    --enable BLOCK \
+    --enable BLK_DEV \
+    --enable BLK_DEV_AOS_SYSTEM \
+    --enable MISC_FILESYSTEMS \
+    --enable SQUASHFS \
+    --enable SQUASHFS_ZSTD \
+    --disable SQUASHFS_XATTR \
+    --disable SQUASHFS_FILE_CACHE \
+    --disable SQUASHFS_CHOICE_DECOMP_BY_MOUNT \
     --enable BLK_DEV_INITRD \
     --set-str INITRAMFS_SOURCE "$rootfs_cpio" \
     --disable INITRAMFS_COMPRESSION_NONE \
@@ -225,7 +252,13 @@ make -C "$kernel_source" O="$build_dir/kernel" \
 for required_kernel_config in \
     CONFIG_FUTEX=y \
     CONFIG_FUTEX_PI=y \
-    CONFIG_FILE_LOCKING=y
+    CONFIG_FILE_LOCKING=y \
+    CONFIG_SHMEM=y \
+    CONFIG_TMPFS=y \
+    CONFIG_BLK_DEV_AOS_SYSTEM=y \
+    CONFIG_MISC_FILESYSTEMS=y \
+    CONFIG_SQUASHFS=y \
+    CONFIG_SQUASHFS_ZSTD=y
 do
     if ! grep -qxF "$required_kernel_config" "$build_dir/kernel/.config"; then
         echo "required kernel config is missing: $required_kernel_config" >&2
@@ -243,6 +276,7 @@ if [ "$record_image" = 0 ] && [ "$actual_image" != "$expected_image" ]; then
 fi
 cp "$image" "$output_image"
 if [ "$record_image" = 1 ]; then
-    printf 'rootfs_cpio_sha256=%s\nimage_sha256=%s\n' "$actual_rootfs" "$actual_image"
+    printf 'bootstrap_cpio_sha256=%s\nimage_sha256=%s\n' \
+        "$actual_rootfs" "$actual_image"
 fi
 printf '%s  %s\n' "$actual_image" "$output_image"

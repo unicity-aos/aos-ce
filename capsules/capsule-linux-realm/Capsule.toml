@@ -17,18 +17,28 @@ file = "aos_linux_realm.wasm"
 type = "executable"
 
 # Hash-pinned core-Wasm machine object. It imports shared memory and bounded
-# reads of the immutable kernel asset below; the executable controller retains
+# reads of the three immutable assets below; the executable controller retains
 # every Astrid host capability and 9P provider.
 [[component]]
 id = "linux-vcpu"
 file = "assets/linux-vcpu.wasm"
 type = "compute-worker"
-hash = "blake3:67467b9e020bed847a04ba55b4f7d8728bb172714eb0a4d23543752635773ad1"
+hash = "blake3:058845e34fe70156721e62d68badd8c6809622c460f5dc981ea80bb7978836fd"
 
 [[component.asset]]
 id = "linux-kernel"
 file = "assets/linux-kernel.img"
-hash = "blake3:fd3bff3a266b66fc1596c16414a5cd7ef7d2c68eb76684627ab8d4d6e74647e8"
+hash = "blake3:60cc6c3c01222a3a33b108593974de5636747b32cacc10bf8c0f45c1cdd8b285"
+
+[[component.asset]]
+id = "linux-system"
+file = "assets/linux-system.squashfs"
+hash = "blake3:c436bb2bfe0941f183f58f0e2e56df05a4bc03f01147ad1d095f48df0004afaa"
+
+[[component.asset]]
+id = "linux-checkpoint"
+file = "assets/linux-prewarm-1g-2h.aos-machine"
+hash = "blake3:c5434f61273eed03cba7eb5db724a134373446a0e9819b12a53c4682347c2b33"
 
 # The realm sees only the invocation CWD, its private subtree of the caller's
 # principal home, and its principal-scoped tmp subtree. It has no host_process.
