@@ -9,6 +9,9 @@ rustflags = [
     # follows the data. The controller's bounded descriptor lives at 63 MiB.
     "-C", "link-arg=--no-stack-first",
     "-C", "link-arg=--global-base=65536",
+    "-C", "link-arg=-z",
+    "-C", "link-arg=stack-size=33554432",
+    "-C", "link-arg=--export=__stack_pointer",
     "-C", "link-arg=--import-memory=astrid_compute,memory",
     "-C", "link-arg=--shared-memory",
     "-C", "link-arg=--initial-memory=67108864",

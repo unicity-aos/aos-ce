@@ -28,6 +28,13 @@ pub const WORKER_HEAP_OVERHEAD_BYTES: usize = 64 * 1024 * 1024;
 pub const WORKER_MIN_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// Largest shared memory accepted by the worker import.
 pub const WORKER_MAX_MEMORY_BYTES: usize = 3584 * 1024 * 1024;
+/// Maximum private worker stacks admitted by the signed machine object.
+pub const MAX_WORKER_STACKS: usize = 64;
+/// Linear-memory stack bytes reserved for each possible compute worker.
+pub const WORKER_STACK_STRIDE_BYTES: usize = 512 * 1024;
+/// Total LLVM stack arena split by Astrid into one disjoint slot per worker.
+pub const WORKER_STACK_RESERVE_BYTES: usize = MAX_WORKER_STACKS * WORKER_STACK_STRIDE_BYTES;
+const _: () = assert!(WORKER_STACK_RESERVE_BYTES < WORKER_MIN_MEMORY_BYTES);
 /// WebAssembly linear-memory page size.
 pub const WASM_PAGE_BYTES: usize = 65_536;
 /// Exact `InitCold` payload: admitted wall-clock seconds since Unix epoch.
@@ -115,6 +122,13 @@ pub enum Operation {
     Reset = 6,
     /// Restore the hash-bound, principal-free Linux boot checkpoint.
     InitCheckpoint = 7,
+    /// Prove that distinct admitted workers can enter this signed Rust module
+    /// concurrently over disjoint descriptors.
+    ///
+    /// This private operation is a substrate check, not a Linux-visible
+    /// device. `hart-count` carries the expected worker count and is replaced
+    /// by the executing worker index in the response.
+    ParallelProbe = 8,
 }
 
 impl TryFrom<u32> for Operation {
@@ -129,6 +143,7 @@ impl TryFrom<u32> for Operation {
             5 => Ok(Self::Fail9p),
             6 => Ok(Self::Reset),
             7 => Ok(Self::InitCheckpoint),
+            8 => Ok(Self::ParallelProbe),
             _ => Err(()),
         }
     }
@@ -304,10 +319,18 @@ mod tests {
         assert_eq!(Operation::Fail9p as u32, 5);
         assert_eq!(Operation::Reset as u32, 6);
         assert_eq!(Operation::InitCheckpoint as u32, 7);
-        for value in 1..=7 {
+        assert_eq!(Operation::ParallelProbe as u32, 8);
+        for value in 1..=8 {
             assert!(Operation::try_from(value).is_ok());
         }
         assert!(Operation::try_from(0).is_err());
-        assert!(Operation::try_from(8).is_err());
+        assert!(Operation::try_from(9).is_err());
+    }
+
+    #[test]
+    fn private_worker_stack_arena_matches_the_machine_topology() {
+        assert_eq!(MAX_WORKER_STACKS, 64);
+        assert_eq!(WORKER_STACK_STRIDE_BYTES, 512 * 1024);
+        assert_eq!(WORKER_STACK_RESERVE_BYTES, 32 * 1024 * 1024);
     }
 }

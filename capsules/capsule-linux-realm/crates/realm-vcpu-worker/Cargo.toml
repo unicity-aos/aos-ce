@@ -19,5 +19,5 @@ aos-realm-machine = { workspace = true }
 aos-realm-vcpu-protocol = { workspace = true }
 
 [dev-dependencies]
-astrid-compute = { git = "https://github.com/astrid-runtime/astrid.git", rev = "0bbd8e389ef96d8b3447ce4f97b67c48523952b4" }
-astrid-core = { git = "https://github.com/astrid-runtime/astrid.git", rev = "0bbd8e389ef96d8b3447ce4f97b67c48523952b4" }
+astrid-compute = { git = "https://github.com/astrid-runtime/astrid.git", rev = "ff85b21fdce761f7453487063744a622998b196e" }
+astrid-core = { git = "https://github.com/astrid-runtime/astrid.git", rev = "ff85b21fdce761f7453487063744a622998b196e" }

@@ -1603,6 +1603,11 @@ Implementation and proof order:
   caches, bind the exact kernel and immutable system, and reject resource
   envelope drift; shutdown, failure, eviction, and topology changes continue to
   discard machine state;
+- [x] make signed Rust compute workers safe to enter concurrently: reserve one
+  linker-owned stack arena, let generic Astrid Compute relocate every Store's
+  mutable LLVM stack pointer to a disjoint slot, fail incomplete declarations
+  closed, and prove two targeted Linux workers cross a real shared-memory
+  barrier;
 - [ ] move harts onto the generic compute group, then benchmark one hart,
   time-sliced SMP, and parallel SMP without conflating boot latency, warm command
   latency, and throughput.
@@ -1623,10 +1628,11 @@ The implementation cut is:
    and counters into independently owned hart cells. Keep UART, monotonic time,
    finisher, 9P effects, scheduler epochs, and checkpoint control behind one
    machine coordinator.
-3. Give every admitted worker an exact hart affinity and a disjoint stack/local
-   state region while sharing only the declared guest-RAM/device-control
-   region. The Rust allocator and worker start path must be proven
-   thread-compatible before more than one instance enters the module.
+3. Give every admitted worker an exact hart affinity and a disjoint local-state
+   region while sharing only the declared guest-RAM/device-control region.
+   Disjoint Rust stacks and concurrent module entry are now proven; allocator
+   activity during parallel epochs and hart-state ownership remain part of the
+   machine split.
 4. Run harts concurrently only within a coordinator-issued epoch. All workers
    join a barrier before device effects, RFENCE completion, cancellation,
    topology change, or checkpoint. A stalled or trapped worker fails the whole
@@ -1638,6 +1644,29 @@ The implementation cut is:
 6. Expose native worker count separately from `linux_vcpus`. Automatic mode may
    allocate fewer workers than harts and must report the real mapping. Only
    measured concurrent progress permits the `parallel SMP` label.
+
+### Parallel Rust-worker substrate evidence recorded on 2026-07-24
+
+- Astrid core commit
+  `ff85b21fdce761f7453487063744a622998b196e` adds an optional ABI-1
+  private-stack extension to generic compute. Legacy workers remain valid.
+  Workers that declare any stack export must provide the mutable
+  `__stack_pointer`, total arena size, and per-worker stride together; malformed,
+  zero, overflowing, or undersized declarations fail group admission.
+- The signed Linux worker links a 32 MiB stack arena after static data and
+  divides it into 64 independent 512 KiB slots. Astrid relocates each Store
+  before it becomes runnable, so sharing the worker's linear memory no longer
+  aliases LLVM call frames across native worker threads.
+- Private protocol operation `parallel-probe` targets exact worker indices over
+  two disjoint one-MiB descriptors and uses an atomic shared-memory barrier. The
+  first run against the old runtime reproduced the defect: Astrid stamped
+  worker 1 while the worker returned worker 0. The pinned runtime fix makes both
+  identities and descriptors exact and the barrier passes.
+- The reproducible worker is 211,856 bytes with BLAKE3
+  `236900e6cee131ec9617859ae346f7a4be1bc0bed5710e066b1183cbdb4b209a`.
+  This proves the execution substrate needed by parallel harts. It does not yet
+  claim that the current monolithic `Machine` mutex or deterministic
+  round-robin hart scheduler runs Linux concurrently.
 
 Normative references for this increment are the
 [Linux RISC-V boot requirements](https://docs.kernel.org/next/arch/riscv/boot.html),
