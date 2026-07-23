@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
-    echo "usage: $0 BUILDROOT_SOURCE BUILDROOT_OUTPUT GUEST_TOOLS OUTPUT_CPIO [DOWNLOADS_DIR]" >&2
+if [ "$#" -lt 5 ] || [ "$#" -gt 6 ]; then
+    echo "usage: $0 BUILDROOT_SOURCE BUILDROOT_OUTPUT GUEST_TOOLS OUTPUT_CPIO OUTPUT_SQUASHFS [DOWNLOADS_DIR]" >&2
     exit 64
 fi
 
@@ -13,8 +13,12 @@ case $4 in
     /*) output_cpio=$4 ;;
     *) output_cpio=$(pwd)/$4 ;;
 esac
-if [ "$#" -eq 5 ]; then
-    downloads_dir=$(CDPATH='' cd -- "$5" && pwd)
+case $5 in
+    /*) output_system=$5 ;;
+    *) output_system=$(pwd)/$5 ;;
+esac
+if [ "$#" -eq 6 ]; then
+    downloads_dir=$(CDPATH='' cd -- "$6" && pwd)
 else
     downloads_dir=$buildroot_output.downloads
 fi
@@ -79,16 +83,18 @@ install -m 0755 "$guest_tools/rustup" "$target/usr/bin/rustup"
 # added. Package and toolchain build products remain untouched.
 rm -f \
     "$buildroot_output/images/rootfs.cpio" \
-    "$buildroot_output/images/rootfs.cpio.gz"
+    "$buildroot_output/images/rootfs.cpio.gz" \
+    "$buildroot_output/images/rootfs.squashfs"
 make -C "$buildroot_source" \
     BR2_EXTERNAL="$script_dir/buildroot" \
     BR2_DL_DIR="$downloads_dir" \
     O="$buildroot_output" \
-    rootfs-cpio
+    rootfs-cpio rootfs-squashfs
 
 cpio=$buildroot_output/images/rootfs.cpio.gz
-if [ ! -f "$cpio" ]; then
-    echo "Buildroot did not regenerate rootfs.cpio.gz" >&2
+system=$buildroot_output/images/rootfs.squashfs
+if [ ! -f "$cpio" ] || [ ! -f "$system" ]; then
+    echo "Buildroot did not regenerate both rootfs.cpio.gz and rootfs.squashfs" >&2
     exit 70
 fi
 for executable in usr/bin/astrid-build usr/bin/rustup; do
@@ -123,6 +129,15 @@ if [ "$actual_cpio" != "$expected_cpio" ]; then
     echo "final rootfs digest mismatch: expected $expected_cpio, got $actual_cpio" >&2
     exit 70
 fi
+expected_system=$(lock_value system_squashfs_sha256)
+actual_system=$(sha256sum "$system" | cut -d ' ' -f 1)
+if [ "$actual_system" != "$expected_system" ]; then
+    echo "final system digest mismatch: expected $expected_system, got $actual_system" >&2
+    exit 70
+fi
 mkdir -p "$(dirname -- "$output_cpio")"
+mkdir -p "$(dirname -- "$output_system")"
 cp "$cpio" "$output_cpio"
+cp "$system" "$output_system"
 sha256sum "$output_cpio"
+sha256sum "$output_system"

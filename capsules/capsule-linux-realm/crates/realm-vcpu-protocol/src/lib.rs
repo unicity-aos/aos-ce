@@ -32,6 +32,8 @@ pub const WORKER_MAX_MEMORY_BYTES: usize = 3584 * 1024 * 1024;
 pub const WASM_PAGE_BYTES: usize = 65_536;
 /// Exact `InitCold` payload: admitted wall-clock seconds since Unix epoch.
 pub const COLD_BOOT_INPUT_BYTES: usize = 8;
+/// Exact `InitCheckpoint` payload: kernel and immutable-system BLAKE3 digests.
+pub const CHECKPOINT_BINDING_BYTES: usize = 64;
 /// Largest scheduling slice one descriptor may request.
 ///
 /// Ten million interpreted steps keeps the worker cooperatively cancellable
@@ -111,6 +113,8 @@ pub enum Operation {
     Fail9p = 5,
     /// Drop all machine state held by this worker instance.
     Reset = 6,
+    /// Restore the hash-bound, principal-free Linux boot checkpoint.
+    InitCheckpoint = 7,
 }
 
 impl TryFrom<u32> for Operation {
@@ -124,6 +128,7 @@ impl TryFrom<u32> for Operation {
             4 => Ok(Self::Complete9p),
             5 => Ok(Self::Fail9p),
             6 => Ok(Self::Reset),
+            7 => Ok(Self::InitCheckpoint),
             _ => Err(()),
         }
     }
@@ -298,10 +303,11 @@ mod tests {
         assert_eq!(Operation::Complete9p as u32, 4);
         assert_eq!(Operation::Fail9p as u32, 5);
         assert_eq!(Operation::Reset as u32, 6);
-        for value in 1..=6 {
+        assert_eq!(Operation::InitCheckpoint as u32, 7);
+        for value in 1..=7 {
             assert!(Operation::try_from(value).is_ok());
         }
         assert!(Operation::try_from(0).is_err());
-        assert!(Operation::try_from(7).is_err());
+        assert!(Operation::try_from(8).is_err());
     }
 }

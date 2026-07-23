@@ -31,11 +31,18 @@ const AUTO_INTERPRETER_RAM_BYTES: usize = 1024 * 1024 * 1024;
 const AUTO_INTERPRETER_HARTS: u32 = 2;
 #[cfg(any(target_arch = "wasm32", test))]
 const MAX_GUEST_RAM_BYTES: usize = 3 * 1024 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const LINUX_SYSTEM_BLOCK_CHANNEL: u32 = 3;
+#[cfg(target_arch = "wasm32")]
+const PREWARM_LOCK: &str = include_str!("../linux/PREWARM.lock");
 
 #[cfg(not(target_arch = "wasm32"))]
 const LINUX_IMAGE: &[u8] = include_bytes!("../assets/linux-kernel.img");
+#[cfg(not(target_arch = "wasm32"))]
+const LINUX_SYSTEM_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/assets/linux-system.squashfs");
 
-fn wall_time_seconds() -> Result<u64, String> {
+pub(crate) fn wall_time_seconds() -> Result<u64, String> {
     #[cfg(target_arch = "wasm32")]
     let now =
         astrid_sdk::time::now().map_err(|error| format!("read admitted wall clock: {error}"))?;
@@ -47,8 +54,10 @@ fn wall_time_seconds() -> Result<u64, String> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn linux_bootargs(wall_time_seconds: u64) -> String {
-    format!("earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time={wall_time_seconds}")
+fn linux_bootargs(wall_time_seconds: u64, system_bytes: usize) -> String {
+    format!(
+        "earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time={wall_time_seconds} aos.system_bytes={system_bytes}"
+    )
 }
 
 /// Normalized host request produced by the machine backend.
@@ -91,6 +100,8 @@ pub(crate) enum LinuxMachine {
 pub(crate) struct ReferenceMachine {
     machine: Machine,
     pending_request: Option<HostRequestId>,
+    system: Vec<u8>,
+    shell_v2: bool,
     ram_bytes: usize,
     hart_count: u32,
 }
@@ -111,12 +122,21 @@ impl LinuxMachine {
             }
             let mut machine = Machine::new_with_harts(config, hart_count as usize)
                 .map_err(|error| error.to_string())?;
+            let (system, shell_v2) = std::fs::read(LINUX_SYSTEM_PATH)
+                .map(|system| (system, true))
+                .unwrap_or_else(|_| (vec![0; 4096], false));
             machine
-                .boot_linux(LINUX_IMAGE, &[], &linux_bootargs(wall_time_seconds))
+                .boot_linux(
+                    LINUX_IMAGE,
+                    &[],
+                    &linux_bootargs(wall_time_seconds, system.len()),
+                )
                 .map_err(|error| error.to_string())?;
             Ok(Self::Reference(ReferenceMachine {
                 machine,
                 pending_request: None,
+                system,
+                shell_v2,
                 ram_bytes: config.ram_bytes,
                 hart_count,
             }))
@@ -133,6 +153,8 @@ impl LinuxMachine {
                 Self::Reference(ReferenceMachine {
                     machine,
                     pending_request: None,
+                    system: Vec::new(),
+                    shell_v2: false,
                     ram_bytes: config.ram_bytes,
                     hart_count: 1,
                 })
@@ -145,17 +167,20 @@ impl LinuxMachine {
         config: MachineConfig,
         hart_count: u32,
         image: &[u8],
+        system: &[u8],
     ) -> Result<Self, String> {
         let hart_count = reference_hart_count(hart_count)?;
         let wall_time_seconds = wall_time_seconds()?;
         let mut machine = Machine::new_with_harts(config, hart_count as usize)
             .map_err(|error| error.to_string())?;
         machine
-            .boot_linux(image, &[], &linux_bootargs(wall_time_seconds))
+            .boot_linux(image, &[], &linux_bootargs(wall_time_seconds, system.len()))
             .map_err(|error| error.to_string())?;
         Ok(Self::Reference(ReferenceMachine {
             machine,
             pending_request: None,
+            system: system.to_vec(),
+            shell_v2: !system.is_empty(),
             ram_bytes: config.ram_bytes,
             hart_count,
         }))
@@ -180,6 +205,15 @@ impl LinuxMachine {
             Self::Reference(reference) => reference.hart_count,
             #[cfg(target_arch = "wasm32")]
             Self::Compute(compute) => compute.hart_count,
+        }
+    }
+
+    pub(crate) const fn supports_shell_v2(&self) -> bool {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Reference(reference) => reference.shell_v2,
+            #[cfg(target_arch = "wasm32")]
+            Self::Compute(_) => true,
         }
     }
 
@@ -233,29 +267,64 @@ impl LinuxMachine {
 #[cfg(not(target_arch = "wasm32"))]
 impl ReferenceMachine {
     fn run_slice(&mut self, instruction_budget: u64) -> Result<LinuxSliceReport, String> {
-        let report = self.machine.run_slice(instruction_budget);
-        let outcome = match report.outcome {
-            SliceOutcome::Yielded => LinuxSliceOutcome::Yielded,
-            SliceOutcome::Halted(status) => LinuxSliceOutcome::Halted {
-                passed: status.passed,
-                code: status.code,
-            },
-            SliceOutcome::HostRequest(request) => {
-                self.pending_request = Some(request.id);
-                LinuxSliceOutcome::HostRequest(LinuxHostRequest {
-                    id: request.id.get(),
-                    channel: request.channel,
-                    message: request.message,
-                    max_response_bytes: request.max_response_bytes,
-                })
+        let mut steps_executed = 0_u64;
+        let mut console = Vec::new();
+        loop {
+            let report = self.machine.run_slice(instruction_budget - steps_executed);
+            steps_executed = steps_executed.saturating_add(report.steps_executed);
+            console.extend_from_slice(&report.console);
+            if let SliceOutcome::HostRequest(request) = &report.outcome
+                && request.channel == LINUX_SYSTEM_BLOCK_CHANNEL
+            {
+                let offset = request
+                    .message
+                    .as_slice()
+                    .try_into()
+                    .map(u64::from_le_bytes)
+                    .map_err(|_| "Linux system block request has an invalid offset".to_string())?;
+                let offset = usize::try_from(offset)
+                    .map_err(|_| "Linux system block offset is too large".to_string())?;
+                let end = offset
+                    .checked_add(request.max_response_bytes)
+                    .filter(|end| *end <= self.system.len())
+                    .ok_or_else(|| {
+                        "Linux system block read exceeds the immutable image".to_string()
+                    })?;
+                self.machine
+                    .complete_9p_request(request.id, &self.system[offset..end])
+                    .map_err(|error| error.to_string())?;
+                if steps_executed < instruction_budget {
+                    continue;
+                }
+                return Ok(LinuxSliceReport {
+                    outcome: LinuxSliceOutcome::Yielded,
+                    console,
+                    steps_executed,
+                });
             }
-            SliceOutcome::Trapped(trap) => LinuxSliceOutcome::Trapped(trap.to_string()),
-        };
-        Ok(LinuxSliceReport {
-            outcome,
-            console: report.console,
-            steps_executed: report.steps_executed,
-        })
+            let outcome = match report.outcome {
+                SliceOutcome::Yielded => LinuxSliceOutcome::Yielded,
+                SliceOutcome::Halted(status) => LinuxSliceOutcome::Halted {
+                    passed: status.passed,
+                    code: status.code,
+                },
+                SliceOutcome::HostRequest(request) => {
+                    self.pending_request = Some(request.id);
+                    LinuxSliceOutcome::HostRequest(LinuxHostRequest {
+                        id: request.id.get(),
+                        channel: request.channel,
+                        message: request.message,
+                        max_response_bytes: request.max_response_bytes,
+                    })
+                }
+                SliceOutcome::Trapped(trap) => LinuxSliceOutcome::Trapped(trap.to_string()),
+            };
+            return Ok(LinuxSliceReport {
+                outcome,
+                console,
+                steps_executed,
+            });
+        }
     }
 
     fn pending_request(&self, raw: u64) -> Result<HostRequestId, String> {
@@ -304,6 +373,14 @@ struct ComputeResponse {
 }
 
 #[cfg(target_arch = "wasm32")]
+struct PrewarmSpec {
+    ram_bytes: usize,
+    max_console_bytes: usize,
+    hart_count: u32,
+    binding: [u8; protocol::CHECKPOINT_BINDING_BYTES],
+}
+
+#[cfg(target_arch = "wasm32")]
 impl ComputeMachine {
     fn new(
         mut config: MachineConfig,
@@ -346,19 +423,27 @@ impl ComputeMachine {
             ram_bytes: config.ram_bytes,
             hart_count,
         };
-        machine.invoke(
-            Operation::InitCold,
-            &wall_time_seconds.to_le_bytes(),
-            |header| {
-                protocol::write_u64(header, field::RAM_BYTES, config.ram_bytes as u64);
-                protocol::write_u64(
-                    header,
-                    field::MAX_CONSOLE_BYTES,
-                    config.max_console_bytes as u64,
-                );
-                protocol::write_u32(header, field::HART_COUNT, hart_count);
-            },
-        )?;
+        let prewarm = prewarm_spec()?;
+        let (operation, input) = if prewarm.ram_bytes == config.ram_bytes
+            && prewarm.max_console_bytes == config.max_console_bytes
+            && prewarm.hart_count == hart_count
+        {
+            (Operation::InitCheckpoint, prewarm.binding.to_vec())
+        } else {
+            (
+                Operation::InitCold,
+                wall_time_seconds.to_le_bytes().to_vec(),
+            )
+        };
+        machine.invoke(operation, &input, |header| {
+            protocol::write_u64(header, field::RAM_BYTES, config.ram_bytes as u64);
+            protocol::write_u64(
+                header,
+                field::MAX_CONSOLE_BYTES,
+                config.max_console_bytes as u64,
+            );
+            protocol::write_u32(header, field::HART_COUNT, hart_count);
+        })?;
         Ok(machine)
     }
 
@@ -465,14 +550,17 @@ impl ComputeMachine {
             .map_err(|error| format!("write Linux vCPU request: {error}"))?;
         let result = self
             .group
-            .submit(
-                WorkDescriptor::new(
-                    self.control_offset,
-                    protocol::CONTROL_BYTES as u64,
-                    operation as u64,
-                )
-                .on_worker(0),
-            )
+            // The deterministic group admits exactly one worker. Leave
+            // affinity unspecified so the compute queue can accept the next
+            // operation during the tiny interval between job completion and
+            // worker-slot bookkeeping. Explicitly targeting worker zero would
+            // expose that interval as a spurious `Busy` after a successful
+            // join, without adding any state-affinity guarantee.
+            .submit(WorkDescriptor::new(
+                self.control_offset,
+                protocol::CONTROL_BYTES as u64,
+                operation as u64,
+            ))
             .map_err(|error| format!("submit Linux vCPU operation: {error}"))?
             .join()
             .map_err(|error| format!("join Linux vCPU operation: {error}"))?;
@@ -516,6 +604,57 @@ impl ComputeMachine {
         }
         Ok(ComputeResponse { header, payload })
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn prewarm_spec() -> Result<PrewarmSpec, String> {
+    let value = |name: &str| {
+        PREWARM_LOCK
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(name)
+                    .and_then(|line| line.strip_prefix('='))
+            })
+            .ok_or_else(|| format!("Linux prewarm lock is missing {name}"))
+    };
+    let ram_bytes = value("ram_bytes")?
+        .parse::<usize>()
+        .map_err(|error| format!("Linux prewarm RAM is invalid: {error}"))?;
+    let max_console_bytes = value("max_console_bytes")?
+        .parse::<usize>()
+        .map_err(|error| format!("Linux prewarm console limit is invalid: {error}"))?;
+    let hart_count = value("hart_count")?
+        .parse::<u32>()
+        .map_err(|error| format!("Linux prewarm hart count is invalid: {error}"))?;
+    let mut binding = [0_u8; protocol::CHECKPOINT_BINDING_BYTES];
+    decode_hex_digest(value("linux_image_blake3")?, &mut binding[..32])?;
+    decode_hex_digest(value("system_image_blake3")?, &mut binding[32..])?;
+    Ok(PrewarmSpec {
+        ram_bytes,
+        max_console_bytes,
+        hart_count,
+        binding,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn decode_hex_digest(value: &str, output: &mut [u8]) -> Result<(), String> {
+    if value.len() != output.len() * 2 {
+        return Err("Linux prewarm digest has the wrong length".to_string());
+    }
+    for (byte, pair) in output.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        let nibble = |value: u8| match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            _ => None,
+        };
+        let high = nibble(pair[0])
+            .ok_or_else(|| "Linux prewarm digest is not lowercase hexadecimal".to_string())?;
+        let low = nibble(pair[1])
+            .ok_or_else(|| "Linux prewarm digest is not lowercase hexadecimal".to_string())?;
+        *byte = (high << 4) | low;
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -570,12 +709,15 @@ fn explicit_hart_count(configured: u32) -> Result<Option<u32>, String> {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-fn auto_guest_hart_count(admitted_parallelism: u32) -> u32 {
+fn auto_guest_hart_count(_admitted_parallelism: u32) -> u32 {
     // This backend has one deterministic worker today. More logical harts add
     // Linux bring-up and scheduler work without running concurrently, so auto
-    // mode proves SMP with two harts instead of mirroring host CPU count.
-    // Explicit configuration remains available for topology testing.
-    admitted_parallelism.clamp(1, AUTO_INTERPRETER_HARTS)
+    // mode proves SMP with two harts instead of mirroring host CPU count. The
+    // host worker quota controls how many principals can execute concurrently;
+    // it is not a guest topology signal because one interpreter worker
+    // time-slices every logical hart. Explicit configuration remains available
+    // for topology testing.
+    AUTO_INTERPRETER_HARTS
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -738,7 +880,8 @@ mod tests {
             (1..=MAX_HARTS as u32)
                 .contains(&reference_hart_count(0).expect("native auto topology"))
         );
-        assert_eq!(auto_guest_hart_count(0), 1);
+        assert_eq!(auto_guest_hart_count(0), AUTO_INTERPRETER_HARTS);
+        assert_eq!(auto_guest_hart_count(1), AUTO_INTERPRETER_HARTS);
         assert_eq!(auto_guest_hart_count(8), AUTO_INTERPRETER_HARTS);
         assert_eq!(auto_guest_hart_count(128), AUTO_INTERPRETER_HARTS);
     }

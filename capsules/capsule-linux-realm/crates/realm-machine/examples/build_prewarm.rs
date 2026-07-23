@@ -8,6 +8,7 @@ const HART_COUNT: usize = 2;
 const CONSOLE_BYTES: usize = 64 * 1024;
 const SLICE_STEPS: u64 = 10_000_000;
 const MAX_STEPS: u64 = 2_000_000_000;
+const PREWARM_WALL_SECONDS: u64 = 1_784_143_900;
 const HOME_9P_CHANNEL: u32 = 1;
 const SYSTEM_BLOCK_CHANNEL: u32 = 3;
 
@@ -56,7 +57,7 @@ fn run() -> Result<(), String> {
     )
     .map_err(|error| format!("could not admit prewarm machine: {error}"))?;
     let bootargs = format!(
-        "earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time=1 aos.system_bytes={}",
+        "earlycon=sbi console=hvc0 init=/init panic=-1 aos.wall_time={PREWARM_WALL_SECONDS} aos.system_bytes={}",
         system.len()
     );
     machine
@@ -97,7 +98,8 @@ fn run() -> Result<(), String> {
             SliceOutcome::HostRequest(request) => break request,
             outcome => {
                 return Err(format!(
-                    "Linux reached {outcome:?} before the prewarm host suspension"
+                    "Linux reached {outcome:?} before the prewarm host suspension:\n{}",
+                    String::from_utf8_lossy(&console)
                 ));
             }
         }

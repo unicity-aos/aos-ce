@@ -94,7 +94,12 @@ class BenchmarkTests(unittest.TestCase):
         command = BENCHMARK.qemu_command("qemu-system-riscv64")
         self.assertIn("tcg,thread=single", command)
         self.assertIn(str(BENCHMARK.IMAGE), command)
-        self.assertIn("32M", command)
+        self.assertEqual(command[command.index("-m") + 1], "1G")
+        self.assertEqual(command[command.index("-smp") + 1], "2")
+        self.assertIn(
+            f"aos.system_bytes={BENCHMARK.SYSTEM.stat().st_size}",
+            command[command.index("-append") + 1],
+        )
 
 
 if __name__ == "__main__":

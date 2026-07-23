@@ -23,10 +23,9 @@ from typing import Any, Sequence
 SCHEMA = "aos-linux-realm-benchmark/v1"
 ROOT = Path(__file__).resolve().parent.parent
 REALM = ROOT / "capsules" / "capsule-linux-realm"
-IMAGE = REALM / "linux" / "Image"
-SOURCES = REALM / "linux" / "SOURCES.lock"
-CHECKPOINT = REALM / "linux" / "prewarm-32m.aos-machine"
-REFERENCE_BINARY = ROOT / "target" / "release" / "examples" / "benchmark_linux"
+IMAGE = REALM / "assets" / "linux-kernel.img"
+SYSTEM = REALM / "assets" / "linux-system.squashfs"
+CHECKPOINT = REALM / "assets" / "linux-prewarm-1g-2h.aos-machine"
 INIT_MARKER = b"AOS LINUX /init"
 MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024
 
@@ -74,6 +73,21 @@ def command_output(command: Sequence[str]) -> str | None:
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
     return completed.stdout.strip()
+
+
+def host_target() -> str:
+    version = command_output(["rustc", "-vV"])
+    target = next(
+        (
+            line.removeprefix("host: ")
+            for line in (version or "").splitlines()
+            if line.startswith("host: ")
+        ),
+        None,
+    )
+    if not target:
+        raise RuntimeError("could not determine the Rust host target")
+    return target
 
 
 def sha256(path: Path) -> str:
@@ -133,23 +147,26 @@ def metadata() -> dict[str, Any]:
         },
         "artifacts": {
             "linux_image_sha256": sha256(IMAGE),
+            "linux_system_sha256": sha256(SYSTEM),
             "checkpoint_sha256": sha256(CHECKPOINT),
             "checkpoint_bytes": CHECKPOINT.stat().st_size,
         },
         "boundaries": {
             "cold-to-init": (
-                "preloaded image; includes 32 MiB machine allocation, image admission, "
+                "preloaded image and immutable system; includes 1 GiB sparse machine "
+                "allocation, two-hart image admission, "
                 "and RV64 execution through PID 1's AOS LINUX /init marker; observation "
-                "is rounded up to the next 100,000-step cooperative slice boundary"
+                "is captured at the first slice containing that marker"
             ),
             "cold-to-principal-bind": (
-                "preloaded image; includes 32 MiB machine allocation, image admission, "
-                "and RV64 execution through PID 1's first principal-home request"
+                "preloaded image and immutable system; includes 1 GiB sparse machine "
+                "allocation, two-hart image admission, SquashFS mount, and RV64 execution "
+                "through PID 1's first principal-home request"
             ),
             "checkpoint-to-bindable": (
                 "preloaded checkpoint; includes integrity and artifact-binding validation, "
-                "32 MiB machine allocation, sparse RAM materialization, and handoff at the "
-                "pending principal-home request; excludes provider completion"
+                "1 GiB sparse two-hart RAM materialization, and handoff at the pending "
+                "principal-home request; excludes provider completion"
             ),
             "qemu-tcg-cold-to-init": (
                 "fresh QEMU process with the exact AOS Image through PID 1's init marker; "
@@ -164,11 +181,14 @@ def metadata() -> dict[str, Any]:
 
 
 def build_reference() -> None:
+    target = host_target()
     subprocess.run(
         [
             "cargo",
             "build",
             "--release",
+            "--target",
+            target,
             "-p",
             "aos-realm-machine",
             "--example",
@@ -180,11 +200,14 @@ def build_reference() -> None:
 
 
 def run_reference(samples: int, warmups: int) -> list[dict[str, Any]]:
+    reference_binary = (
+        ROOT / "target" / host_target() / "release" / "examples" / "benchmark_linux"
+    )
     completed = subprocess.run(
         [
-            str(REFERENCE_BINARY),
+            str(reference_binary),
             str(IMAGE),
-            str(SOURCES),
+            str(SYSTEM),
             str(CHECKPOINT),
             str(samples),
             str(warmups),
@@ -215,14 +238,17 @@ def qemu_command(qemu: str) -> list[str]:
         "-accel",
         "tcg,thread=single",
         "-m",
-        "32M",
+        "1G",
         "-smp",
-        "1",
+        "2",
         "-nographic",
         "-kernel",
         str(IMAGE),
         "-append",
-        "earlycon=sbi console=hvc0 init=/init panic=-1",
+        (
+            "earlycon=sbi console=hvc0 init=/init panic=-1 "
+            f"aos.system_bytes={SYSTEM.stat().st_size}"
+        ),
         "-no-reboot",
     ]
 

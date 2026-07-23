@@ -891,7 +891,7 @@ fn execute_linux_resident(
     #[cfg(target_arch = "wasm32")]
     {
         let cooperate = ipc::subscribe(LINUX_COOPERATE_TOPIC)?;
-        return execute_linux_resident_cooperatively(
+        execute_linux_resident_cooperatively(
             LinuxResidentState::new(machine, home_9p, workspace_9p),
             action,
             command,
@@ -905,7 +905,7 @@ fn execute_linux_resident(
                 let _ = cooperate.recv(0)?;
                 Ok(())
             },
-        );
+        )
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1093,7 +1093,19 @@ fn execute_linux_resident_cooperatively(
     })?;
     validate_linux_frame_token(frame_token)?;
     let framed_command = if action == LinuxAction::Shell {
-        linux_shell_command_frame(max_file_bytes, max_processes, max_open_files, cwd, command)
+        let wall_time_seconds = backend::wall_time_seconds().map_err(SysError::ApiError)?;
+        linux_shell_command_frame(
+            machine
+                .as_ref()
+                .expect("booted or pre-existing machine")
+                .supports_shell_v2(),
+            wall_time_seconds,
+            max_file_bytes,
+            max_processes,
+            max_open_files,
+            cwd,
+            command,
+        )
     } else {
         command.to_string()
     };
@@ -1174,16 +1186,20 @@ fn execute_linux_resident_cooperatively(
 }
 
 fn linux_shell_command_frame(
+    supports_v2: bool,
+    wall_time_seconds: u64,
     max_file_bytes: u64,
     max_processes: u32,
     max_open_files: u32,
     cwd: &str,
     command: &str,
 ) -> String {
-    if max_processes == 0 && max_open_files == 0 {
-        // Preserve the original private frame for existing pinned images. New
-        // PID 1 generations accept both forms; an explicit process ceiling is
-        // the unambiguous opt-in to the extended frame below.
+    if supports_v2 {
+        format!(
+            "sh2 {wall_time_seconds} {max_file_bytes} {max_processes} {max_open_files} {} {cwd} {command}",
+            cwd.len()
+        )
+    } else if max_processes == 0 && max_open_files == 0 {
         format!("sh {max_file_bytes} {} {cwd} {command}", cwd.len())
     } else if max_open_files == 0 {
         format!(
@@ -1885,7 +1901,7 @@ fn status_response(
         next_process_id: actor.machine.next_process_id.map(|process| process.get()),
         linux_lifecycle: "lazy-principal-resident",
         linux_backend: DEFAULT_LINUX_BACKEND_ID,
-        linux_cold_start: "full-boot-then-principal-resident",
+        linux_cold_start: "checkpoint-if-envelope-matches-else-full-boot",
         linux_state: actor.linux.state,
         linux_residency: "principal-affine-store",
         linux_vcpus: actor
@@ -2026,16 +2042,44 @@ mod tests {
     #[test]
     fn shell_frame_preserves_bootstrap_compatibility_and_opts_into_resource_limits() {
         assert_eq!(
-            linux_shell_command_frame(0, 0, 0, "/workspace", "cargo test"),
-            "sh 0 10 /workspace cargo test"
+            linux_shell_command_frame(true, 1_700_000_000, 0, 0, 0, "/workspace", "cargo test"),
+            "sh2 1700000000 0 0 0 10 /workspace cargo test"
         );
         assert_eq!(
-            linux_shell_command_frame(4096, 2048, 0, "/home/agent", "rustup show"),
+            linux_shell_command_frame(
+                true,
+                1_700_000_000,
+                4096,
+                2048,
+                0,
+                "/home/agent",
+                "rustup show"
+            ),
+            "sh2 1700000000 4096 2048 0 11 /home/agent rustup show"
+        );
+        assert_eq!(
+            linux_shell_command_frame(
+                true,
+                1_700_000_000,
+                4096,
+                0,
+                65_536,
+                "/workspace",
+                "cargo build"
+            ),
+            "sh2 1700000000 4096 0 65536 10 /workspace cargo build"
+        );
+        assert_eq!(
+            linux_shell_command_frame(
+                false,
+                1_700_000_000,
+                4096,
+                2048,
+                0,
+                "/home/agent",
+                "rustup show"
+            ),
             "sh 4096 2048 11 /home/agent rustup show"
-        );
-        assert_eq!(
-            linux_shell_command_frame(4096, 0, 65_536, "/workspace", "cargo build"),
-            "sh 4096 0 65536 10 /workspace cargo build"
         );
     }
 
@@ -2343,7 +2387,7 @@ mod tests {
             LinuxResidentState::new(&mut machine, &mut home_9p, &mut workspace_9p),
             LinuxAction::Shell,
             Some(
-                "set -e; test ! -r /dev/console; test ! -r /proc/1/fd/0; test ! -r /proc/self/fd/1; test ! -r /proc/self/fd/2; test \"$(find /dev -type b -o -type c | wc -l)\" -eq 5; id -u; uname -m; pwd; mkdir -p .config/aos; printf persisted > .config/aos/proof.tmp; mv .config/aos/proof.tmp .config/aos/proof",
+                "set -e; test ! -r /dev/console; test ! -r /proc/1/fd/0; test ! -r /proc/self/fd/1; test ! -r /proc/self/fd/2; test -b /dev/aos-system; test ! -r /dev/aos-system; test ! -w /dev/aos-system; for denied in /dev/mem /dev/kmem /dev/port /dev/kvm /dev/net/tun /dev/dri /dev/input /dev/video0; do test ! -e \"$denied\"; done; id -u; uname -m; pwd; mkdir -p .config/aos; printf persisted > .config/aos/proof.tmp; mv .config/aos/proof.tmp .config/aos/proof",
             ),
             LINUX_DEFAULT_CWD,
             Some("11223344556677889900aabbccddeeff"),
@@ -2353,7 +2397,7 @@ mod tests {
         .expect("BusyBox ash command");
         let shell_stdout = String::from_utf8_lossy(&shell.stdout);
         assert_eq!(shell.outcome, "completed", "shell output:\n{shell_stdout}");
-        assert_eq!(shell.exit_status, Some(0));
+        assert_eq!(shell.exit_status, Some(0), "shell output:\n{shell_stdout}");
         assert!(shell_stdout.contains("1000\r\n"));
         assert!(shell_stdout.contains("riscv64\r\n"));
         assert!(shell_stdout.contains("/home/agent\r\n"));
@@ -2536,6 +2580,9 @@ mod tests {
         let image_path = std::env::var_os("AOS_REALM_TEST_LINUX_IMAGE")
             .expect("set AOS_REALM_TEST_LINUX_IMAGE to the recorded Linux Image");
         let image = std::fs::read(&image_path).expect("read external developer image");
+        let system_path = std::env::var_os("AOS_REALM_TEST_SYSTEM_IMAGE")
+            .expect("set AOS_REALM_TEST_SYSTEM_IMAGE to the recorded SquashFS image");
+        let system = std::fs::read(&system_path).expect("read external system image");
         let limits = RunLimits {
             fuel: u64::MAX,
             memory_bytes: 3 * 1024 * 1024 * 1024,
@@ -2549,6 +2596,7 @@ mod tests {
                 },
                 1,
                 &image,
+                &system,
             )
             .expect("admit external developer image"),
         );
@@ -3038,7 +3086,9 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
         assert!(json.contains("\"commands_completed\":4"));
         assert!(json.contains("\"linux_lifecycle\":\"lazy-principal-resident\""));
         assert!(json.contains("\"linux_backend\":\"aos-rv64-interpreter\""));
-        assert!(json.contains("\"linux_cold_start\":\"full-boot-then-principal-resident\""));
+        assert!(
+            json.contains("\"linux_cold_start\":\"checkpoint-if-envelope-matches-else-full-boot\"")
+        );
         assert!(json.contains("\"linux-sh\""));
         assert!(json.contains("\"linux_state\":\"cold\""));
         assert!(json.contains("\"linux_boot_executions_this_actor_boot\":2"));

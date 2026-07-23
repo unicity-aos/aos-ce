@@ -6,14 +6,13 @@ is an ordinary Astrid capsule.
 
 It keeps Linux resident for each active principal. The capsule runs signed,
 embedded core WebAssembly command modules under Wasmi and a signed core-Wasm
-RV64 worker whose pinned Linux 6.18.39 image is a separate hash-bound,
-read-only capsule asset. Linux reaches an
+RV64 worker with three ordered, hash-bound assets: a pinned Linux 6.18.39
+kernel containing only a tiny bootstrap, the read-only AOS Realm development
+SquashFS, and a principal-free post-mount checkpoint. Linux reaches an
 AOS-controlled PID 1, accepts token-bound command frames, and remains alive
-until explicit shutdown or runtime eviction. The checked-in kernel asset still
-contains the small BusyBox bootstrap initramfs. A separately built development image
-has also completed the full interpreter test with Bash, Git, Python,
-Clang/C++, Make, CMake, and Ninja; immutable distribution packaging remains the
-step between that proof artifact and the installable capsule.
+until explicit shutdown or runtime eviction. The immutable system contains
+Bash, Git, Python, Clang/C++, Make, CMake, Ninja, Rust/Cargo/rustup, and
+`astrid-build`; mutable home and workspace bytes never enter it.
 Commands receive structured `argv` and an explicit current directory; there is
 no host shell command line and the manifest requests no `host_process`
 capability.
@@ -49,11 +48,11 @@ images, and the first resident Linux boot image:
   mode with `mret`, delegates a Supervisor `ecall` through `stvec`, returns with
   `sret`, writes `STR\n`, and halts from Supervisor mode. It charges 31 bounded
   steps while retiring 30 instructions because `ecall` does not retire
-- `linux-boot`, which lazily boots the hash-bound Linux 6.18.39 image in the
-  principal's admitted 512 MiB–3 GiB envelope and returns when `/init` reports
-  `AOS READY`; interpreter auto mode selects at most 1 GiB and two logical
-  harts, while explicit principal configuration retains the full ceiling;
-  calling it again while warm is a zero-step readiness check
+- `linux-boot`, which restores the bound 1 GiB/two-hart principal-free
+  checkpoint when the admitted envelope matches, otherwise cold-boots the
+  hash-bound Linux 6.18.39 kernel and immutable system in the principal's
+  admitted 512 MiB–3 GiB envelope; it returns when `/init` reports `AOS READY`,
+  and calling it again while warm is a zero-step readiness check
 - `linux-console`, which lazily boots if needed, sends one validated line to the
   resident `/init`, and returns one framed result while preserving Linux RAM;
   the proof commands are `ping`, `counter`, and `echo ...`
@@ -109,17 +108,19 @@ backend and require outer promotion. The capsule cannot distinguish or enlarge
 that policy, so its receipt reports `host-managed` rather than claiming one
 durability model. `/tmp` is not durable state.
 
-The Linux lane mounts the principal's selected Realm generation at
-`/home/agent` and the invocation's `cwd://` resource at `/workspace` before
-every `linux-sh` call. Linux 9P requests cross two bounded private SBI channels
-into the capsule's Rust 9P server. Home operations select a complete
+The Linux lane mounts the read-only system asset as `/`, the principal's
+selected Realm generation at `/home/agent`, and the invocation's `cwd://`
+resource at `/workspace`. Immutable system reads cross private SBI channel 3
+and are completed inside the compute worker from an exact manifest-selected
+asset; Linux supplies only an aligned offset and length. Linux 9P requests
+cross channels 1 and 2 into the capsule's Rust 9P server. Home operations select a complete
 content-addressed generation; workspace operations resolve through the current
 Astrid filesystem imports. Because the runtime does not yet expose a stable
 workspace attachment ID or epoch, the workspace mount is torn down and
 recreated for every call; no workspace FID or path reference is allowed to
 outlive the invocation. The home session is principal-resident, while its
 authoritative generation survives guest shutdown, component eviction, and
-daemon restart. Linux `/tmp` and the initramfs root remain guest RAM.
+daemon restart. Linux `/run` and `/tmp` remain guest RAM.
 
 Astrid reports host POSIX mode bits through the workspace projection. On hosts
 without a portable POSIX-mode projection, mode `0` falls back to `0755` for
@@ -407,21 +408,27 @@ principals against the remainder, and the signed worker still imposes its own
 finite maximum. Status exposes configured, active, and effective envelopes plus
 the currently resident `linux_ram_bytes`.
 
-Astrid Runtime now has the experimental primitive required to make this boundary
-honest: an opt-in Store permanently keyed by `(capsule, component, verified
-principal)`, with per-call fuel charging, exact aggregate resident-memory
-accounting, live quota enforcement, bounded LRU residency, and idle-only
-eviction. `Capsule.toml` requests it through fail-closed package metadata and
-requires Astrid `>=0.10.2`; 0.10.1 must not silently run this capsule with its old
-free-pool or shared-run-loop semantics.
+Astrid Runtime now has the primitive required to make this boundary honest:
+compute-worker capsules use one retained component Store per active verified
+principal. Same-principal calls serialize on that Store-local machine;
+different principals may run concurrently up to the ordinary instance-pool
+ceiling. Idle Stores are bounded, least-recently-used, evictable RAM cache—not
+durable principal state. Per-call fuel charging, principal quota enforcement,
+and generic compute memory accounting remain mandatory below the pool.
+`Capsule.toml` requests principal component residency through fail-closed
+package metadata and requires Astrid `>=0.10.2`; older runtimes must not silently
+run this capsule with free-pool or one-global-Store semantics.
 
 This closes outer component affinity, the first inner Linux lifecycle, and the
 durable home attachment: lazy boot, ready, bounded command, clean stop, and
 restart are executable. Exact RV64 step counts remain separate principal-local
 records for the current Store residency. Durable root storage remains an
 independent block-overlay problem rather than a promise made by resident RAM.
-The pinned Buildroot 2026.05.1 userland, durable principal home, and
-invocation-scoped workspace are now behind this lifecycle.
+The pinned Buildroot 2026.05.1 userland is a separately hash-bound read-only
+SquashFS. The kernel and immutable system are restored from a principal-free
+post-mount checkpoint when the exact 1 GiB/two-hart envelope matches; durable
+principal home and invocation-scoped workspace capabilities are attached only
+after restore.
 
 ## Build and install
 
@@ -492,15 +499,14 @@ python3 scripts/benchmark-linux-realm.py \
 
 The native reference lane measures the AOS-owned RV64 machine in the same
 speed-optimized release profile used to establish interpreter throughput. It
-records two current boundaries:
+records three current boundaries:
 
 - `cold-to-init`: allocate the admitted envelope, load the image, and execute
   through PID 1's `AOS LINUX /init` marker;
 - `cold-to-principal-bind`: continue through the first principal-home 9P request.
-
-Prewarm is not a current capsule operation. A future benchmark may add a
-checkpoint boundary only after a principal-free multi-hart format demonstrates
-lower retained bytes and latency than honest cold boot.
+- `checkpoint-to-bindable`: validate and restore the principal-free two-hart
+  checkpoint at that same pending home request, before any principal authority
+  is attached.
 
 When `qemu-system-riscv64` is installed, the harness boots the exact same Linux
 `Image` under single-threaded TCG and records process start through the same PID
@@ -521,6 +527,16 @@ The native reference lane is not the full outer-Wasm/MCP path. Governed
 request-to-result latency, QEMU snapshot restore, Docker/CRIU restore, RSS, and
 per-principal scaling remain separate required lanes before cross-system product
 claims are made.
+
+The recorded 2026-07-23 M2 Ultra acceptance run used Linux 6.18.39, the
+333,258,752-byte immutable system, a 1 GiB/two-hart machine, and 30 measured
+samples after three warmups. Cold-to-init retired 42,197,024 guest steps with a
+813.39 ms native median. Cold-to-principal-bind retired 46,431,093 steps with a
+907.93 ms median. The 22,773,044-byte sparse checkpoint restored to the same
+pending principal-home request in a 21.57 ms median and zero guest steps:
+42.09 times faster than the corresponding cold-to-bind boundary. These are
+native machine/checkpoint measurements, not a claim that the outer component,
+333 MiB asset admission, IPC, and CLI transport complete in 21.57 ms.
 
 ## Current boundary
 

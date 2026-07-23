@@ -36,6 +36,7 @@
 #define AGENT_GID 1000
 
 static uint64_t command_count;
+static int refresh_wall_clock(unsigned long long seconds);
 
 static int set_limit(int resource, rlim_t value)
 {
@@ -60,6 +61,53 @@ static void write_all(const char *bytes, size_t length)
 static void write_text(const char *text)
 {
     write_all(text, strlen(text));
+}
+
+static int mount_bootstrap_devices(void)
+{
+    if (mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID | MS_NOEXEC,
+              "mode=0755") < 0 && errno != EBUSY)
+        return 70;
+    return 0;
+}
+
+static int attach_immutable_system(void)
+{
+    if (mkdir("/system", 0755) < 0 && errno != EEXIST) {
+        write_text("system mount point failed\n");
+        return 70;
+    }
+    if (mount("/dev/aos-system", "/system", "squashfs",
+              MS_RDONLY | MS_NOSUID | MS_NODEV, "") < 0) {
+        write_text("immutable system mount failed\n");
+        return 70;
+    }
+    if (mount("/dev", "/system/dev", NULL, MS_MOVE, NULL) < 0) {
+        write_text("device filesystem move failed\n");
+        return 70;
+    }
+    if (chdir("/system") < 0 || chroot(".") < 0 || chdir("/") < 0) {
+        write_text("immutable system root failed\n");
+        return 70;
+    }
+    return 0;
+}
+
+static int prepare_ephemeral_filesystems(void)
+{
+    if ((mkdir("/run", 0755) < 0 && errno != EEXIST) ||
+        (mkdir("/tmp", 01777) < 0 && errno != EEXIST)) {
+        write_text("ephemeral mount point failed\n");
+        return 70;
+    }
+    if (mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV,
+              "mode=0755,size=64m") < 0 ||
+        mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV,
+              "mode=1777,size=256m") < 0) {
+        write_text("ephemeral filesystem mount failed\n");
+        return 70;
+    }
+    return 0;
 }
 
 static bool valid_token(const char *token)
@@ -356,6 +404,60 @@ static int shell_command_status(char *payload)
                         (rlim_t)max_processes, (rlim_t)max_open_files);
 }
 
+static bool parse_u64_token(char **cursor, unsigned long long maximum,
+                            unsigned long long *value)
+{
+    char *end;
+
+    if (**cursor < '0' || **cursor > '9')
+        return false;
+    errno = 0;
+    *value = strtoull(*cursor, &end, 10);
+    if (errno != 0 || end == *cursor || *end != ' ' || *value > maximum)
+        return false;
+    *cursor = end + 1;
+    return true;
+}
+
+static int shell_command_v2_status(char *payload)
+{
+    unsigned long long wall_seconds;
+    unsigned long long max_file_bytes;
+    unsigned long long max_processes;
+    unsigned long long max_open_files;
+    unsigned long long cwd_length;
+    char *cwd;
+    char *script;
+
+    if (!parse_u64_token(&payload, (unsigned long long)INT64_MAX,
+                         &wall_seconds) ||
+        wall_seconds == 0 ||
+        !parse_u64_token(&payload, MAX_FILE_BYTES, &max_file_bytes) ||
+        !parse_u64_token(&payload, MAX_PROCESSES, &max_processes) ||
+        !parse_u64_token(&payload, MAX_OPEN_FILES, &max_open_files) ||
+        !parse_u64_token(&payload, MAX_CWD_BYTES, &cwd_length) ||
+        cwd_length == 0)
+        return 64;
+    cwd = payload;
+    if (strlen(cwd) <= cwd_length || cwd[cwd_length] != ' ')
+        return 64;
+    cwd[cwd_length] = '\0';
+    script = cwd + cwd_length + 1;
+    if (!valid_shell_cwd(cwd) || *script == '\0')
+        return 64;
+    int status = refresh_wall_clock(wall_seconds);
+    if (status != 0)
+        return status;
+    status = refresh_home();
+    if (status != 0)
+        return status;
+    status = refresh_workspace();
+    if (status != 0)
+        return status;
+    return shell_status(cwd, script, (rlim_t)max_file_bytes,
+                        (rlim_t)max_processes, (rlim_t)max_open_files);
+}
+
 static int execute_command(char *command)
 {
     if (strcmp(command, "ping") == 0) {
@@ -377,6 +479,8 @@ static int execute_command(char *command)
     }
     if (strncmp(command, "sh ", 3) == 0 && command[3] != '\0')
         return shell_command_status(command + 3);
+    if (strncmp(command, "sh2 ", 4) == 0 && command[4] != '\0')
+        return shell_command_v2_status(command + 4);
     write_text("unknown command\n");
     return 64;
 }
@@ -453,18 +557,47 @@ static int configure_wall_clock(void)
     return 0;
 }
 
+static int refresh_wall_clock(unsigned long long seconds)
+{
+    if (seconds == 0 || seconds > (unsigned long long)INT64_MAX)
+        return 64;
+    struct timespec wall_time = {
+        .tv_sec = (time_t)seconds,
+        .tv_nsec = 0,
+    };
+    if (clock_settime(CLOCK_REALTIME, &wall_time) == 0)
+        return 0;
+    struct timeval legacy_wall_time = {
+        .tv_sec = (time_t)seconds,
+        .tv_usec = 0,
+    };
+    return settimeofday(&legacy_wall_time, NULL) == 0 ? 0 : 70;
+}
+
 int main(void)
 {
     char line[MAX_COMMAND_BYTES + PROTOCOL_OVERHEAD_BYTES];
 
+    int mount_status = mount_bootstrap_devices();
     configure_console();
     (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-    (void)mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, "");
-    (void)mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "");
     umask(0077);
     write_text("AOS LINUX /init\n");
-    write_text("AOS USERLAND dev-2026.07 buildroot-2026.05.1 bash-5.2.37\n");
-    int mount_status = configure_wall_clock();
+    write_text("AOS BOOTSTRAP buildroot-2026.05.1\n");
+    if (mount_status == 0)
+        mount_status = attach_immutable_system();
+    if (mount_status == 0)
+        mount_status = prepare_ephemeral_filesystems();
+    if (mount_status == 0 &&
+        mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, "") < 0)
+        mount_status = 70;
+    if (mount_status == 0 &&
+        mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "") < 0)
+        mount_status = 70;
+    if (mount_status == 0)
+        write_text("AOS SYSTEM dev-2026.07 buildroot-2026.05.1 bash-5.2.37\n");
+    if (mount_status == 0)
+        mount_status = configure_wall_clock();
     if (mount_status != 0)
         write_text("AOS CLOCK FAILED\n");
     if (mount_status == 0)
