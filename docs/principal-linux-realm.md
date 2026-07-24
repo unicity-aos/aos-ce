@@ -3301,6 +3301,18 @@ resident. This is still a native machine/checkpoint result; guest command work,
 fresh provider completion, signed outer-Wasm execution, and broker/client
 transport remain outside the measured boundary.
 
+After hot installation for `codex-code`, the corrected workspace-aware MCP shim
+invoked the installed `realm_shell` with a real heredoc against the agent1
+worktree. Linux observed `/workspace`, returned both exact lines plus
+`LIVE_SH3_OK`, removed the proof file, exited zero, and retained no process. The
+first call on boot sequence 12 included guest environment initialization and
+consumed 632,976,878 metered steps across 249 suspensions. A second multiline
+call through a new MCP connection reused the same boot sequence, consumed
+16,848,520 steps across 21 suspensions, and completed in 4.68 seconds of observed
+outer wall time. These are functional live observations, not a statistically
+valid MCP latency baseline; the checked task for a multi-sample signed
+outer-Wasm/MCP benchmark remains open.
+
 ## 19. AOS Realm distribution and image policy
 
 The project should own the image recipe, package selection, signatures, and update
