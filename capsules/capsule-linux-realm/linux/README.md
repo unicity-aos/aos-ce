@@ -69,11 +69,23 @@ input; principal state never enters it.
 
 ## Command protocol
 
-PID 1 disables terminal echo and accepts one canonical console line:
+PID 1 disables terminal echo and canonical input. Ordinary short scripts retain
+the compatibility `sh2` frame:
 
 ```text
 AOS/1 <32-lowercase-hex-token> sh2 <wall-seconds> <max-file-bytes> <max-processes> <max-open-files> <cwd-byte-length> <cwd> <script>\n
 ```
+
+Multiline and larger scripts use the length-framed `sh3` stream:
+
+```text
+AOS/1 <32-lowercase-hex-token> sh3 <wall-seconds> <max-file-bytes> <max-processes> <max-open-files> <cwd-byte-length> <script-byte-length> <cwd> <base64-script>\n
+```
+
+PID 1 reads that stream across arbitrarily split console reads, validates the
+declared lengths and canonical RFC 4648 encoding, rejects NUL, then gives Bash
+the exact decoded bytes. The 512 KiB raw-script ceiling leaves envelope and
+base64 headroom beneath Astrid's one MiB capsule-IPC/control-transfer boundary.
 
 The wall clock is refreshed from the host-admitted value for every invocation,
 so restoring a checkpoint cannot expose its build-time clock. Lifecycle and
@@ -83,8 +95,9 @@ additional inner `RLIMIT_FSIZE`, `RLIMIT_NPROC`, or `RLIMIT_NOFILE`, while
 Astrid's outer principal storage, memory, CPU, and timeout policy remains
 mandatory. For compatibility with already admitted bootstrap images, trailing
 zero process and open-file fields may be omitted from the older `sh` frame. New
-PID 1 generations accept both `sh` and `sh2`; the controller uses `sh2` for the
-immutable-system generation.
+PID 1 generations accept `sh`, `sh2`, and `sh3`; the controller uses `sh2` for
+short compatibility-safe scripts and `sh3` when exact line breaks or a larger
+script require it.
 The frame's CWD length makes the absolute guest CWD unambiguous; only
 `/home/agent`, `/workspace`, and their normalized descendants are admitted.
 
@@ -130,9 +143,25 @@ binaries with Buildroot's admitted RISC-V linker and rejects host path leakage.
 reproducibly rebuild the final CPIO and SquashFS, then verifies the guest
 binaries and both filesystem artifacts against `DEVELOPMENT.lock`.
 `build-bootstrap.sh` compiles only the static PID 1 and creates the deterministic
-kernel initramfs. `build-image.sh` requires Linux 6.18.39, Clang/LLD 18.1.3,
-that recorded bootstrap, and a clean output directory before accepting the
-kernel image.
+kernel initramfs. When PID 1 is compiled inside an admitted RISC-V Realm instead,
+the host-independent `build_bootstrap` Rust example validates the resulting
+little-endian RISC-V ELF and creates the same minimal deterministic `newc`
+layout:
+
+```sh
+cc -std=c11 -Os -Wall -Wextra -Werror \
+  -march=rv64gc_zicsr_zifencei -mabi=lp64d \
+  -static -fno-pie -Wl,--build-id=none \
+  -o /work/init-riscv64 linux/buildroot/board/aos/init.c
+strip --strip-all /work/init-riscv64
+cargo run -p aos-realm-machine --example build_bootstrap -- \
+  /work/init-riscv64 /work/bootstrap.cpio
+```
+
+The example deliberately owns only archive assembly; compiler and init-source
+identity still belong in `DEVELOPMENT.lock`. `build-image.sh` requires Linux
+6.18.39, Clang/LLD 18.1.3, that recorded bootstrap, and a clean output directory
+before accepting the kernel image.
 
 The earlier 32 MiB seed proved that an AOS-owned RV64 checkpoint can stop at a
 principal-free 9P suspension and attach fresh providers after restore. The new
@@ -140,14 +169,15 @@ checkpoint occurs after the immutable SquashFS is mounted but before the first
 principal-home response. It therefore retains kernel state and only the system
 pages Linux actually touched during boot, not a decompressed compiler
 initramfs. The codec binds every hart and scheduler field to the exact kernel
-and system digests. The current 1 GiB/one-hart artifact is 22,505,847 bytes and
-removes all 35,932,587 pre-principal guest steps. It replaces the measured
+and system digests. The current 1 GiB/one-hart artifact is 22,526,347 bytes and
+removes all 35,978,939 pre-principal guest steps. It replaces the measured
 two-hart artifact because the serialized topology matrix found that a second
 logical hart added 33.3% to cold principal-bind latency without adding host
-execution parallelism. On the recorded M2 Ultra it restores to the pending
-principal bind in a 20.904 ms median (p95 21.367 ms), 38.9 times faster than the
-matching one-hart cold bind. The outer signed-component and CLI path remains a
-separately measured boundary.
+execution parallelism. A 30-sample post-build run after three discarded warmups
+on the recorded M2 Ultra restored it to the pending principal bind in a 20.886
+ms median (p95 21.697 ms), 37.0 times faster than the matching 772.132 ms
+one-hart cold bind. The outer signed-component and CLI path remains a separately
+measured boundary.
 
 The active Buildroot output directory must be on a Linux filesystem. GNU
 package configure probes create path patterns that macOS file-sharing mounts do

@@ -28,8 +28,10 @@ agent -> realm tool -> signed nested WASM command -> private realm ABI
 
 `realm_shell` is the normal agent-facing shell tool. Its `command` is executed
 by Bash as UID/GID 1000 inside the caller's resident Linux Realm, starting at
-`/workspace`. It has no CWD, executable, step-limit, or output-limit selector:
-the authenticated client/runtime supplies the workspace attachment and
+`/workspace`. The exact command may be a multiline Bash script, including
+heredocs, up to the transport-derived 512 KiB boundary. It has no CWD,
+executable, step-limit, or output-limit selector: the authenticated
+client/runtime supplies the workspace attachment and
 `linux_max_steps`, `linux_max_output_bytes`, and the outer principal profile own
 the ceilings. It has no host execution mode and never falls back to `aos-shell`.
 
@@ -66,7 +68,7 @@ instruction images, and the resident Linux boot image:
 - `linux-console`, which lazily boots if needed, sends one validated line to the
   resident `/init`, and returns one framed result while preserving Linux RAM;
   the proof commands are `ping`, `counter`, and `echo ...`
-- `linux-sh`, which executes one bounded Bash script as UID/GID 1000 in
+- `linux-sh`, which executes one bounded, possibly multiline Bash script as UID/GID 1000 in
   `/home/agent` or the invocation's mounted `/workspace`, propagates its exact
   exit status, kills/reaps background descendants, and commits home mutations
   as crash-consistent principal generations
