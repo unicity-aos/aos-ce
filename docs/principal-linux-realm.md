@@ -1278,6 +1278,26 @@ Astrid administrator's principal profile
 ∩ optional lower per-command request
 ```
 
+The administrator-assigned principal budget is the authoritative product
+policy. It is shared across that principal's capsules, resident Realms,
+foreground invocations, and background leases; a Realm does not receive a
+private quota merely because it is implemented by a separate worker. An
+automatic value asks admission to select a useful reservation from the
+principal's currently uncommitted budget. An explicit value is a reservation
+request, not an entitlement: it is rejected or, only when the request opted into
+clamping, reduced with the effective value reported before execution. Retained
+RAM is charged once for its full residency, CPU is charged as consumed, and
+durable storage is charged for physical bytes rather than sparse logical extent.
+Reservations are released on eviction, shutdown, cancellation cleanup, or
+principal revocation.
+
+The host-wide pool is an additional safety and scheduling boundary. It may delay
+or deny admission when physical capacity is unavailable, but it does not invent
+a smaller per-principal policy. Below that boundary, the only valid
+backend-specific ceilings are reported addressability or machine-topology
+limits. The current wasm32 worker's 3 GiB ceiling is therefore an implementation
+capability to replace, not a default Astrid budget.
+
 ### 7.2 Bound provenance
 
 Every finite value must name why it exists. Realm bounds fall into four valid
