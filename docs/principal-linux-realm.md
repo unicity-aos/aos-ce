@@ -147,7 +147,7 @@ The decision was made against current upstream state rather than project names:
 The first `aos-rv64-virt-v0` slice is intentionally smaller than all four. It has
 explicitly admitted contiguous RAM, a slice-driven interpreter for the initial
 RV64I integer surface, a bounded 16550 UART subset, and the standard test finisher.
-`linux_realm_exec({"command":"rv64-smoke"})` executes 23 real RISC-V
+The operator `realm exec rv64-smoke` diagnostic executes 23 real RISC-V
 instructions, returns `AOS RV64\n` from virtual UART, and halts with the standard
 pass value. The result names `aos-rv64-interpreter` as its backend. Fuel exhaustion,
 architectural traps, RAM bounds, and serial-output exhaustion all remain bounded
@@ -987,6 +987,24 @@ generation before returning, so guest `fsync` has no deferred dirty state.
 Links, timestamps, named checkpoints, diff/reset, garbage collection, and
 quota-backed `statfs` capacity remain absent rather than implied POSIX behavior.
 
+This means the current durable home is intentionally not a materialized POSIX
+directory in the principal's host-visible home. For principal `codex-code`, a
+guest `/home/agent/meet-demo.txt` is represented by the selected KV head,
+manifest, radix nodes, and chunks beneath
+`$ASTRID_HOME/home/codex-code/.local/share/aos-realm/default/store/blobs`; there
+is no required `$ASTRID_HOME/home/codex-code/meet-demo.txt`. That is safe and
+crash-consistent, but surprising for a human. A host-visible view needs one
+authoritative direction:
+
+- make a dedicated visible principal subtree canonical and derive checkpoints
+  into CAS; or
+- keep CAS canonical and expose a read-through materialized view with explicit
+  import/commit semantics.
+
+The design must not let both trees accept unsynchronized writes. The first
+production release should either implement one of those contracts or make the
+opaque-home behavior explicit in UI and receipts.
+
 ### 6.4 Base and overlay
 
 - The base image is immutable, signed, content-addressed, and globally cacheable.
@@ -1357,8 +1375,8 @@ Runtime idle eviction, unload, and daemon restart destroy the Store and therefor
 the VM. Principal Realm home state is attached to Linux over channel 1 and remains
 durable across those boundaries. The invocation workspace is attached
 independently on every shell call and retains Astrid's host-selected semantics.
-`linux_realm_status` exposes home and workspace as mounted, temporary storage as
-guest-RAM-only, `linux_home_persistent=true`, and
+The operator status command reports home and workspace as mounted, temporary
+storage as guest-RAM-only, `linux_home_persistent=true`, and
 `linux_rootfs_persistent=false` rather than calling the whole VM durable.
 
 The missing runtime primitive was implemented from freshly fetched Astrid Runtime
@@ -1978,16 +1996,21 @@ outer principal identity.
 ## 13. Agent and human interfaces
 
 The capsule uses existing tool-bus conventions without creating a public WIT
-package. The live seed exports:
+package. The production capsule exports one model-facing tool:
 
 - `realm_shell`: the normal agent-facing foreground shell; it always executes
   Bash inside the caller's principal-affine Linux Realm and has no host-process
-  mode or host executable selector;
-- `linux_realm_exec`: run one exact signed program with structured arguments, CWD,
-  and caller-reducible fuel/output limits; the temporary `rv64-smoke` diagnostic
-  selects the bounded RV64 backend explicitly rather than a signed core-WASM guest;
-- `linux_realm_status`: report the guest-visible mounts, supported programs, owner
-  principal, and workspace commit policy without physical host paths.
+  mode, host executable selector, CWD selector, or caller-controlled budget
+  override. It starts in the kernel-stamped `/workspace`; principal env and the
+  outer profile own execution limits.
+
+Structured exec, lifecycle, and status operations remain on the authenticated
+`astrid capsule aos-linux-realm realm ...` operator command. They are not
+advertised to the model. Astrid currently derives a capsule's tool list
+statically from `#[astrid::tool]`, so an env boolean would leave a disabled
+debug tool visible. If model-callable diagnostics are ever required, ship an
+explicit debug artifact/profile or first add a kernel-supported conditional
+tool-discovery primitive.
 
 The longer contract may add:
 
@@ -2145,7 +2168,8 @@ The proof deliberately avoids Bash, Debian, networking, and a large image.
   descriptors, open/read/write/close, pipe/spawn/wait/signal, monotonic time,
   and exit;
 - Wasmi configured with fuel and memory limits;
-- structured `linux_realm_exec` and read-only `linux_realm_status` tools;
+- authenticated operator diagnostics for structured exec and read-only status,
+  outside the model tool surface;
 - one principal-affine Wasmtime Store and Realm machine per verified principal,
   with CAS-allocated boot identity, runtime-bounded aggregate admission, and
   idle LRU eviction;
@@ -2155,7 +2179,8 @@ The proof deliberately avoids Bash, Debian, networking, and a large image.
 ### Behavior
 
 ```text
-agent invokes linux_realm_exec(write-file, ["notes.txt", "hello"], /home/agent)
+operator invokes:
+  astrid capsule aos-linux-realm realm exec --cwd /home/agent write-file notes.txt hello
   -> outer capsule resolves kernel-stamped principal
   -> realm initializes only that principal's layout
   -> realm validates the guest CWD and exact command name
@@ -3498,6 +3523,10 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
 - [x] expose `realm_shell` directly from the Realm capsule, map it only to the
   resident Linux Bash action, and provide no native-host fallback or executable
   selector;
+- [x] reduce the production model surface to `realm_shell` alone; keep
+  structured exec/lifecycle/status on the authenticated operator CLI; and remove
+  model-controlled CWD, step, and output overrides so workspace and budgets come
+  from runtime/principal policy;
 - [x] test malformed modules, undeclared imports, invalid pointers, unknown
   descriptors, fuel exhaustion, output exhaustion, memory admission, and forged
   principal input;
@@ -3509,6 +3538,10 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   audience-specific renderings, and projection state without physical host paths;
 - [ ] carry an opaque workspace attachment ID and epoch from runtime admission to
   Realm receipts and the already-live Linux file transport;
+- [ ] bind each authenticated client connection to its launch CWD as that opaque
+  workspace attachment, stamp it on every invocation, resolve `cwd://` against
+  it, and reject missing/stale attachments instead of falling back to the
+  daemon-global workspace;
 - [x] live-prove that both mounted 9P filesystems reject guest symlink creation
   and that the rejected workspace entry cannot subsequently be read;
 - [x] pre-seed an absolute host symlink outside the workspace, prove guest
@@ -3573,6 +3606,9 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   selected and verified a complete generation;
 - [ ] add retained named checkpoints, diff/reset, and unreachable-blob garbage
   collection;
+- [ ] choose and implement one authoritative human-visible Realm-home contract:
+  either a canonical visible principal subtree with CAS checkpoints or a
+  CAS-canonical materialized view with explicit import/commit semantics;
 - [x] implement `aos-realm-core` as the backend-independent process/descriptor
   oracle, including monotonic PIDs, zombies, direct-child wait/reap, reparenting,
   deterministic admission, bounded pipes, endpoint inheritance, wakeups, EOF,

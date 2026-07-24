@@ -13,9 +13,10 @@ AOS-controlled PID 1, accepts token-bound command frames, and remains alive
 until explicit shutdown or runtime eviction. The immutable system contains
 Bash, Git, Python, Clang/C++, Make, CMake, Ninja, Rust/Cargo/rustup, and
 `astrid-build`; mutable home and workspace bytes never enter it.
-Commands receive structured `argv` and an explicit current directory; there is
-no host shell command line and the manifest requests no `host_process`
-capability.
+The normal shell receives only a script. Its current directory is the
+kernel-stamped invocation workspace and its execution ceilings come from the
+caller's principal configuration; neither is model-selected. There is no host
+shell command line and the manifest requests no `host_process` capability.
 
 ```text
 agent -> realm tool -> signed nested WASM command -> private realm ABI
@@ -26,13 +27,22 @@ agent -> realm tool -> signed nested WASM command -> private realm ABI
 ## What works
 
 `realm_shell` is the normal agent-facing shell tool. Its `command` is executed
-by Bash as UID/GID 1000 inside the caller's resident Linux Realm, with an
-optional guest `cwd`, lower guest-step ceiling, and lower output ceiling. It has
-no host execution mode and never falls back to `aos-shell`.
+by Bash as UID/GID 1000 inside the caller's resident Linux Realm, starting at
+`/workspace`. It has no CWD, executable, step-limit, or output-limit selector:
+the authenticated client/runtime supplies the workspace attachment and
+`linux_max_steps`, `linux_max_output_bytes`, and the outer principal profile own
+the ceilings. It has no host execution mode and never falls back to `aos-shell`.
 
-`linux_realm_exec` is the lower-level structured and diagnostic surface. It
-currently admits signed core-WASM workloads, two diagnostic RV64 instruction
-images, and the first resident Linux boot image:
+The installable production capsule advertises no structured exec or status
+tools. Those operations remain available to an authenticated operator through
+`astrid capsule aos-linux-realm realm ...`; they do not enter the model's tool
+list. A runtime env switch cannot safely hide a statically described
+`#[astrid::tool]`, so a future model-callable diagnostic profile must be a
+separate, explicit artifact or gain a runtime-native conditional-discovery
+primitive rather than advertising a disabled tool.
+
+The operator surface admits signed core-WASM workloads, two diagnostic RV64
+instruction images, and the resident Linux boot image:
 
 - `pwd`
 - `echo`
@@ -67,8 +77,9 @@ images, and the first resident Linux boot image:
 - `cat`
 - `smoke-write`, the original interpreter smoke test
 
-`linux_realm_status` reports the guest-visible mount and command surface without
-exposing physical host paths. It also reports the caller's actor boot sequence,
+`astrid capsule aos-linux-realm realm status` reports the guest-visible mount
+and command surface without exposing physical host paths. It also reports the
+caller's actor boot sequence,
 completed-command count, next process identifier, and live process/pipe resource
 accounting. Linux-specific fields state whether the admitted virtual-CPU topology
 is cold or running, the configured and effective vCPU counts, whether RAM is
@@ -100,7 +111,13 @@ The nested core-WASM lane can use all three projections today. Its `/home/agent`
 is a versioned filesystem. One principal-scoped KV value atomically selects its
 current generation; immutable manifests and file contents are stored as
 BLAKE3-addressed blobs beneath the caller's private realm store. It survives
-daemon restart. Its `/workspace` follows the policy of the outer Astrid
+daemon restart. Consequently, a guest file such as
+`/home/agent/meet-demo.txt` is not currently materialized as
+`$ASTRID_HOME/home/<principal>/meet-demo.txt`: the selected manifest and chunks
+live under `.local/share/aos-realm/default/store/blobs`. A normal host-visible
+home view requires a coherent materialization/import contract; it cannot be
+added as a second mutable source of truth beside the atomic generation head.
+Its `/workspace` follows the policy of the outer Astrid
 attachment. Git-managed workspaces are shared directly so edits are immediately
 visible to the person and ordinary Git remains the rollback mechanism. A
 non-Git workspace may instead be supplied through Astrid's OS-level copy-on-write
@@ -121,6 +138,15 @@ recreated for every call; no workspace FID or path reference is allowed to
 outlive the invocation. The home session is principal-resident, while its
 authoritative generation survives guest shutdown, component eviction, and
 daemon restart. Linux `/run` and `/tmp` remain guest RAM.
+
+The production shell contract requires `cwd://` to be
+connection/invocation-scoped. For example, a client launched in
+`~/dev/astrid.worktrees/agent1` must attach that directory and Linux must see it
+as `/workspace`. The current daemon still resolves one daemon-global workspace,
+so this capsule must not be selected as the default shell until the runtime
+stamps an opaque workspace attachment and epoch onto each authenticated
+invocation. Falling back to the daemon's own working directory would silently
+edit the wrong tree.
 
 Astrid reports host POSIX mode bits through the workspace projection. On hosts
 without a portable POSIX-mode projection, mode `0` falls back to `0755` for
@@ -224,8 +250,8 @@ has no deferred dirty bytes. Links, timestamps, quota-aware garbage collection,
 named checkpoints, and diff/reset remain absent. The component does not yet
 receive the outer principal storage quota, so 9P `statfs` capacity fields remain
 unspecified rather than fabricating free space.
-`linux_realm_status` exposes the format, selected generation, file count, and
-manifest digest without exposing a physical path.
+The operator status command exposes the format, selected generation, file
+count, and manifest digest without exposing a physical path.
 
 ## Process-kernel model
 
