@@ -997,11 +997,11 @@ mod tests {
     const SIGNED_WORKER_HASH: &str =
         "blake3:894aa90f028e7f90ddfc4085420838476f60a3a1bb447c9cde2f5e0fac7576f6";
     const SIGNED_KERNEL_HASH: &str =
-        "blake3:60cc6c3c01222a3a33b108593974de5636747b32cacc10bf8c0f45c1cdd8b285";
+        "blake3:0139c1ec8d514df182fc760e623ff5850dba8b012719e7f6789081779ef65c05";
     const SIGNED_SYSTEM_HASH: &str =
         "blake3:c436bb2bfe0941f183f58f0e2e56df05a4bc03f01147ad1d095f48df0004afaa";
     const SIGNED_CHECKPOINT_HASH: &str =
-        "blake3:59c7a2cb08f4fec01d6bd0ba1351a9c7d4b3fa3eecff7578ed9bbfc6229835fd";
+        "blake3:15fe4d8789182917fc90b3f939ffadac0d65ab38304edfa49506007e87a4ab43";
 
     fn digest(hex: &str) -> Vec<u8> {
         hex.as_bytes()
@@ -1144,7 +1144,7 @@ mod tests {
         assert_bounded_response(&bytes, Status::Invalid);
 
         let mut binding =
-            digest("60cc6c3c01222a3a33b108593974de5636747b32cacc10bf8c0f45c1cdd8b285");
+            digest("0139c1ec8d514df182fc760e623ff5850dba8b012719e7f6789081779ef65c05");
         binding.extend(digest(
             "c436bb2bfe0941f183f58f0e2e56df05a4bc03f01147ad1d095f48df0004afaa",
         ));
@@ -1417,7 +1417,7 @@ mod tests {
             fuel: None,
         };
         let mut binding =
-            digest("60cc6c3c01222a3a33b108593974de5636747b32cacc10bf8c0f45c1cdd8b285");
+            digest("0139c1ec8d514df182fc760e623ff5850dba8b012719e7f6789081779ef65c05");
         binding.extend(digest(
             "c436bb2bfe0941f183f58f0e2e56df05a4bc03f01147ad1d095f48df0004afaa",
         ));

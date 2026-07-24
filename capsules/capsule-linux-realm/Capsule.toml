@@ -28,7 +28,7 @@ hash = "blake3:894aa90f028e7f90ddfc4085420838476f60a3a1bb447c9cde2f5e0fac7576f6"
 [[component.asset]]
 id = "linux-kernel"
 file = "assets/linux-kernel.img"
-hash = "blake3:60cc6c3c01222a3a33b108593974de5636747b32cacc10bf8c0f45c1cdd8b285"
+hash = "blake3:0139c1ec8d514df182fc760e623ff5850dba8b012719e7f6789081779ef65c05"
 
 [[component.asset]]
 id = "linux-system"
@@ -38,7 +38,7 @@ hash = "blake3:c436bb2bfe0941f183f58f0e2e56df05a4bc03f01147ad1d095f48df0004afaa"
 [[component.asset]]
 id = "linux-checkpoint"
 file = "assets/linux-prewarm-1g-1h.aos-machine"
-hash = "blake3:59c7a2cb08f4fec01d6bd0ba1351a9c7d4b3fa3eecff7578ed9bbfc6229835fd"
+hash = "blake3:15fe4d8789182917fc90b3f939ffadac0d65ab38304edfa49506007e87a4ab43"
 
 # The realm sees only the invocation CWD, its private subtree of the caller's
 # principal home, and its principal-scoped tmp subtree. It has no host_process.

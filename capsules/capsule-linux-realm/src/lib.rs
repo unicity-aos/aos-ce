@@ -53,7 +53,12 @@ const LINUX_READY_MARKER: &[u8] = b"AOS READY\r\n";
 const LINUX_PROTOCOL_PREFIX: &str = "AOS/1 ";
 const LINUX_FRAME_TOKEN_BYTES: usize = 16;
 const LINUX_FRAME_TOKEN_HEX_BYTES: usize = LINUX_FRAME_TOKEN_BYTES * 2;
-const MAX_LINUX_COMMAND_BYTES: usize = 1024;
+const MAX_LINUX_CONSOLE_COMMAND_BYTES: usize = 1024;
+/// The tool bus admits at most one MiB per capsule IPC payload. A 512-KiB
+/// script remains comfortably below that boundary after the MCP/tool envelope,
+/// while its base64 serial frame remains below the compute control-transfer
+/// ceiling. This is a transport-derived ceiling, not a user-resource default.
+const MAX_LINUX_SCRIPT_BYTES: usize = 512 * 1024;
 const MAX_LINUX_CWD_BYTES: usize = 64;
 const LINUX_DEFAULT_CWD: &str = "/home/agent";
 const LINUX_SHELL_DEFAULT_CWD: &str = "/workspace";
@@ -1164,7 +1169,7 @@ fn execute_linux_resident_cooperatively(
 }
 
 fn linux_shell_command_frame(
-    supports_v2: bool,
+    supports_v3: bool,
     wall_time_seconds: u64,
     max_file_bytes: u64,
     max_processes: u32,
@@ -1172,7 +1177,18 @@ fn linux_shell_command_frame(
     cwd: &str,
     command: &str,
 ) -> String {
-    if supports_v2 {
+    if supports_v3
+        && (command.len() > MAX_LINUX_CONSOLE_COMMAND_BYTES.saturating_sub(3)
+            || command.contains('\n')
+            || command.contains('\r'))
+    {
+        let encoded = base64_encode(command.as_bytes());
+        format!(
+            "sh3 {wall_time_seconds} {max_file_bytes} {max_processes} {max_open_files} {} {} {cwd} {encoded}",
+            cwd.len(),
+            command.len(),
+        )
+    } else if supports_v3 {
         format!(
             "sh2 {wall_time_seconds} {max_file_bytes} {max_processes} {max_open_files} {} {cwd} {command}",
             cwd.len()
@@ -1190,6 +1206,29 @@ fn linux_shell_command_frame(
             cwd.len()
         )
     }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(DIGITS[(first >> 2) as usize] as char);
+        output.push(DIGITS[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(DIGITS[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(DIGITS[(third & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
 }
 
 fn drive_linux_until(
@@ -1644,7 +1683,7 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
             }
             let command = args.args.join(" ");
             if command.is_empty()
-                || command.len() > MAX_LINUX_COMMAND_BYTES
+                || command.len() > MAX_LINUX_CONSOLE_COMMAND_BYTES
                 || command
                     .as_bytes()
                     .iter()
@@ -1665,15 +1704,12 @@ fn select_program(args: &ExecArgs) -> Result<SelectedProgram, SysError> {
             require_arity("linux-sh", &args.args, 1)?;
             let script = args.args[0].clone();
             if script.is_empty()
-                || script.len() > MAX_LINUX_COMMAND_BYTES.saturating_sub(3)
-                || script
-                    .as_bytes()
-                    .iter()
-                    .any(|byte| *byte == 0 || *byte == b'\n' || *byte == b'\r')
+                || script.len() > MAX_LINUX_SCRIPT_BYTES
+                || script.as_bytes().contains(&0)
             {
-                return Err(SysError::ApiError(
-                    "linux-sh script is empty, too large, or contains a line break".to_string(),
-                ));
+                return Err(SysError::ApiError(format!(
+                    "linux-sh script is empty, contains NUL, or exceeds {MAX_LINUX_SCRIPT_BYTES} bytes"
+                )));
             }
             (
                 "linux-sh",
@@ -2010,7 +2046,7 @@ mod tests {
     fn developer_toolchain_probes_respect_guest_command_boundary() {
         for probe in EXTERNAL_DEVELOPER_TOOLCHAIN_PROBES {
             assert!(
-                probe.len() <= MAX_LINUX_COMMAND_BYTES,
+                probe.len() <= MAX_LINUX_SCRIPT_BYTES,
                 "{} bytes",
                 probe.len()
             );
@@ -2059,6 +2095,34 @@ mod tests {
             ),
             "sh 4096 2048 11 /home/agent rustup show"
         );
+    }
+
+    #[test]
+    fn shell_v3_frame_preserves_multiline_and_heredoc_bytes() {
+        let script = "set -eu\ncat <<'EOF' > result.txt\nline one\nline two\nEOF\n";
+        let frame = linux_shell_command_frame(true, 1_700_000_000, 0, 0, 0, "/workspace", script);
+
+        assert_eq!(
+            frame,
+            "sh3 1700000000 0 0 0 10 55 /workspace c2V0IC1ldQpjYXQgPDwnRU9GJyA+IHJlc3VsdC50eHQKbGluZSBvbmUKbGluZSB0d28KRU9GCg=="
+        );
+        assert!(!frame.contains('\n'));
+        assert!(!frame.contains('\r'));
+    }
+
+    #[test]
+    fn base64_encoder_matches_rfc_4648_vectors() {
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(plain.as_bytes()), encoded);
+        }
     }
 
     #[test]
@@ -2460,6 +2524,28 @@ mod tests {
         assert_eq!(workspace_remounted.exit_status, Some(0));
         assert!(String::from_utf8_lossy(&workspace_remounted.stdout).contains("written-by-linux"));
 
+        let mut multiline_script = "# sh3 streaming frame padding\n".repeat(1024);
+        multiline_script.push_str(
+            "set -eu\ncat <<'AOS_EOF' > multiline-proof\nline one\nline two\nAOS_EOF\ncat multiline-proof\nrm multiline-proof\n",
+        );
+        let multiline = execute_linux_resident_cooperatively(
+            LinuxResidentState::new(&mut machine, &mut home_9p, &mut workspace_9p),
+            LinuxAction::Shell,
+            Some(multiline_script.as_str()),
+            "/workspace/bridge",
+            Some("cdddeeff00112233445566778899aabb"),
+            limits,
+            || Ok(()),
+        )
+        .expect("streamed sh3 frame preserves multiline Bash input");
+        let multiline_stdout = String::from_utf8_lossy(&multiline.stdout);
+        assert_eq!(
+            multiline.exit_status,
+            Some(0),
+            "multiline shell output:\n{multiline_stdout}"
+        );
+        assert!(multiline_stdout.contains("line one\r\nline two\r\n"));
+
         let exit_seven = execute_linux_resident_cooperatively(
             LinuxResidentState::new(&mut machine, &mut home_9p, &mut workspace_9p),
             LinuxAction::Shell,
@@ -2851,8 +2937,8 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
         for args in [
             Vec::new(),
             vec!["echo one".to_string(), "echo two".to_string()],
-            vec!["echo one\necho two".to_string()],
-            vec!["x".repeat(MAX_LINUX_COMMAND_BYTES)],
+            vec!["echo one\0echo two".to_string()],
+            vec!["x".repeat(MAX_LINUX_SCRIPT_BYTES + 1)],
         ] {
             let error = select_program(&ExecArgs {
                 command: Some("linux-sh".to_string()),
@@ -2862,6 +2948,14 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
             .expect_err("ambiguous or unframeable Linux shell input is rejected");
             assert!(error.to_string().contains("linux-sh"));
         }
+
+        let multiline = select_program(&ExecArgs {
+            command: Some("linux-sh".to_string()),
+            args: vec!["set -eu\necho one\necho two".to_string()],
+            ..ExecArgs::default()
+        })
+        .expect("multiline Linux shell input is one bounded script");
+        assert_eq!(multiline.argv, ["linux-sh", "set -eu\necho one\necho two"]);
 
         let bypass = select_program(&ExecArgs {
             command: Some("linux-console".to_string()),

@@ -1301,7 +1301,7 @@ live `rustc` attempt classifies the current values as follows:
 | three GiB guest RAM | leaves the controller and machine regions outside RV64 RAM in one wasm32 address space | retain while the worker is wasm32; native/wasm64 workers need their own derivation |
 | 64 harts | machine protocol/static topology maximum | retain only while derived from the machine type; native workers may declare a different maximum |
 | 64 KiB captured result | seed result-envelope policy | remove in favor of principal-configured streaming or durable job logs |
-| 1,024-byte script and 64-byte CWD | seed console-frame buffers | remove with a length-framed, multi-message command portal; do not merely raise both constants |
+| 512 KiB script and 64-byte operator CWD | script derives from the one MiB IPC/control-transfer envelope; CWD remains a compatibility seed | retain the `sh3` script bound while IPC is one MiB; replace the operator-only CWD seed with a path-context token before exposing model-supplied CWD |
 | 1,024 FIDs, 4,096 directory entries, 16,384 QIDs | fixed 9P-session memory controls | page directory state and charge live session objects to the principal; exhaustion must remain explicit |
 | eight CAS retries | fixed optimistic-contention policy | replace with bounded backoff against the admitted operation deadline and cancellation token |
 | 64 KiB/4,096-node format-0 import | one-time compatibility migration | retain and label as historical; it is not reachable after the format marker advances |
@@ -3697,6 +3697,11 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   read-only compute asset; make wasm32 guest RAM demand-zero; package, install,
   boot, execute a warm shell, report effective resources, and shut down through
   a fresh default Astrid home;
+- [ ] replace the wasm32 worker's current 3 GiB implementation ceiling with a
+  backend-reported sparse paged-memory resource; admit automatic and explicit
+  Realm reservations from the sysadmin-assigned principal RAM budget, charge
+  every concurrent Realm and background lease to that shared ledger, and leave
+  only physical-host emergency admission outside principal policy;
 - [x] build and boot the first AOS Realm development bootstrap with pinned Bash,
   Git, Python, Clang/binutils, Make, CMake, Ninja, target headers, CA roots, and
   explicit `/etc/os-release` identity;
@@ -3715,8 +3720,11 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
 - [ ] replace the fixed 64 KiB captured-result ceiling with principal-configured
   bounded streaming or durable job logs; a compiler must not lose its diagnostic
   tail merely because a foreground result envelope is intentionally small;
-- [ ] replace the one-line 1,024-byte script and 64-byte CWD console frame with
-  a length-framed multi-message command portal charged to the invocation;
+- [x] replace the one-line 1,024-byte script frame with the noncanonical,
+  length-validated `sh3` stream: exact multiline/heredoc bytes are base64
+  framed up to 512 KiB beneath the one MiB IPC/control-transfer boundary;
+- [ ] replace the operator-only 64-byte initial CWD compatibility field with a
+  kernel-stamped path-context token before any model-facing tool may select CWD;
 - [ ] page 9P directory enumeration and derive FID/QID residency from the
   principal's admitted session budget instead of fixed seed constants;
 - [ ] replace the fixed eight-attempt filesystem CAS loop with cancellation-aware

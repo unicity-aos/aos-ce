@@ -27,8 +27,12 @@
 #define TOKEN_BYTES 16
 #define TOKEN_HEX_BYTES (TOKEN_BYTES * 2)
 #define MAX_COMMAND_BYTES 1024
+#define MAX_SCRIPT_BYTES (512U * 1024U)
+#define MAX_BASE64_SCRIPT_BYTES (((MAX_SCRIPT_BYTES + 2U) / 3U) * 4U)
 #define MAX_CWD_BYTES 64
 #define PROTOCOL_OVERHEAD_BYTES 128
+#define MAX_PROTOCOL_LINE_BYTES \
+    (MAX_BASE64_SCRIPT_BYTES + MAX_CWD_BYTES + PROTOCOL_OVERHEAD_BYTES)
 #define MAX_FILE_BYTES (1ULL << 40)
 #define MAX_PROCESSES 65536UL
 #define MAX_OPEN_FILES 1048576UL
@@ -61,6 +65,39 @@ static void write_all(const char *bytes, size_t length)
 static void write_text(const char *text)
 {
     write_all(text, strlen(text));
+}
+
+static ssize_t read_protocol_line(char *line, size_t capacity)
+{
+    size_t length = 0;
+
+    while (length < capacity) {
+        ssize_t count = read(STDIN_FILENO, line + length, capacity - length);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+            return count;
+        size_t previous = length;
+        length += (size_t)count;
+        for (size_t index = previous; index < length; index++) {
+            if (line[index] != '\n')
+                continue;
+            if (index + 1 != length)
+                return -2;
+            return (ssize_t)length;
+        }
+    }
+
+    /* Drain an oversized frame before accepting the next command. */
+    char byte;
+    for (;;) {
+        ssize_t count = read(STDIN_FILENO, &byte, 1);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0 || byte == '\n')
+            break;
+    }
+    return -2;
 }
 
 static int mount_bootstrap_devices(void)
@@ -419,6 +456,74 @@ static bool parse_u64_token(char **cursor, unsigned long long maximum,
     return true;
 }
 
+static int base64_digit(unsigned char byte)
+{
+    if (byte >= 'A' && byte <= 'Z')
+        return byte - 'A';
+    if (byte >= 'a' && byte <= 'z')
+        return byte - 'a' + 26;
+    if (byte >= '0' && byte <= '9')
+        return byte - '0' + 52;
+    if (byte == '+')
+        return 62;
+    if (byte == '/')
+        return 63;
+    return -1;
+}
+
+static char *decode_base64_script(const char *encoded, size_t script_length)
+{
+    size_t encoded_length = strlen(encoded);
+    size_t expected_length = ((script_length + 2U) / 3U) * 4U;
+    char *script;
+    size_t input = 0;
+    size_t output = 0;
+
+    if (script_length == 0 || script_length > MAX_SCRIPT_BYTES ||
+        encoded_length != expected_length)
+        return NULL;
+    script = malloc(script_length + 1U);
+    if (script == NULL)
+        return NULL;
+
+    while (input < encoded_length) {
+        int first = base64_digit((unsigned char)encoded[input]);
+        int second = base64_digit((unsigned char)encoded[input + 1]);
+        unsigned char third_byte = (unsigned char)encoded[input + 2];
+        unsigned char fourth_byte = (unsigned char)encoded[input + 3];
+        int third = third_byte == '=' ? 0 : base64_digit(third_byte);
+        int fourth = fourth_byte == '=' ? 0 : base64_digit(fourth_byte);
+        size_t remaining = script_length - output;
+        bool final = input + 4U == encoded_length;
+
+        if (first < 0 || second < 0 || third < 0 || fourth < 0 ||
+            (!final && (third_byte == '=' || fourth_byte == '=')) ||
+            (remaining >= 3U && (third_byte == '=' || fourth_byte == '=')) ||
+            (remaining == 2U &&
+             (third_byte == '=' || fourth_byte != '=' || (third & 0x03) != 0)) ||
+            (remaining == 1U &&
+             (third_byte != '=' || fourth_byte != '=' || (second & 0x0f) != 0)) ||
+            remaining == 0) {
+            free(script);
+            return NULL;
+        }
+
+        script[output++] = (char)((first << 2) | (second >> 4));
+        if (remaining > 1U)
+            script[output++] = (char)((second << 4) | (third >> 2));
+        if (remaining > 2U)
+            script[output++] = (char)((third << 6) | fourth);
+        input += 4U;
+    }
+
+    if (output != script_length || memchr(script, '\0', script_length) != NULL) {
+        free(script);
+        return NULL;
+    }
+    script[script_length] = '\0';
+    return script;
+}
+
 static int shell_command_v2_status(char *payload)
 {
     unsigned long long wall_seconds;
@@ -458,6 +563,54 @@ static int shell_command_v2_status(char *payload)
                         (rlim_t)max_processes, (rlim_t)max_open_files);
 }
 
+static int shell_command_v3_status(char *payload)
+{
+    unsigned long long wall_seconds;
+    unsigned long long max_file_bytes;
+    unsigned long long max_processes;
+    unsigned long long max_open_files;
+    unsigned long long cwd_length;
+    unsigned long long script_length;
+    char *cwd;
+    char *encoded;
+    char *script;
+    int status;
+
+    if (!parse_u64_token(&payload, (unsigned long long)INT64_MAX,
+                         &wall_seconds) ||
+        wall_seconds == 0 ||
+        !parse_u64_token(&payload, MAX_FILE_BYTES, &max_file_bytes) ||
+        !parse_u64_token(&payload, MAX_PROCESSES, &max_processes) ||
+        !parse_u64_token(&payload, MAX_OPEN_FILES, &max_open_files) ||
+        !parse_u64_token(&payload, MAX_CWD_BYTES, &cwd_length) ||
+        cwd_length == 0 ||
+        !parse_u64_token(&payload, MAX_SCRIPT_BYTES, &script_length) ||
+        script_length == 0)
+        return 64;
+    cwd = payload;
+    if (strlen(cwd) <= cwd_length || cwd[cwd_length] != ' ')
+        return 64;
+    cwd[cwd_length] = '\0';
+    encoded = cwd + cwd_length + 1;
+    if (!valid_shell_cwd(cwd) || *encoded == '\0')
+        return 64;
+    script = decode_base64_script(encoded, (size_t)script_length);
+    if (script == NULL)
+        return 64;
+
+    status = refresh_wall_clock(wall_seconds);
+    if (status == 0)
+        status = refresh_home();
+    if (status == 0)
+        status = refresh_workspace();
+    if (status == 0)
+        status = shell_status(cwd, script, (rlim_t)max_file_bytes,
+                              (rlim_t)max_processes,
+                              (rlim_t)max_open_files);
+    free(script);
+    return status;
+}
+
 static int execute_command(char *command)
 {
     if (strcmp(command, "ping") == 0) {
@@ -481,6 +634,8 @@ static int execute_command(char *command)
         return shell_command_status(command + 3);
     if (strncmp(command, "sh2 ", 4) == 0 && command[4] != '\0')
         return shell_command_v2_status(command + 4);
+    if (strncmp(command, "sh3 ", 4) == 0 && command[4] != '\0')
+        return shell_command_v3_status(command + 4);
     write_text("unknown command\n");
     return 64;
 }
@@ -498,7 +653,9 @@ static void configure_console(void)
 
     struct termios attributes;
     if (tcgetattr(STDIN_FILENO, &attributes) == 0) {
-        attributes.c_lflag &= (tcflag_t)~(ECHO | ECHONL);
+        attributes.c_lflag &= (tcflag_t)~(ECHO | ECHONL | ICANON);
+        attributes.c_cc[VMIN] = 1;
+        attributes.c_cc[VTIME] = 0;
         (void)tcsetattr(STDIN_FILENO, TCSANOW, &attributes);
     }
 }
@@ -576,7 +733,10 @@ static int refresh_wall_clock(unsigned long long seconds)
 
 int main(void)
 {
-    char line[MAX_COMMAND_BYTES + PROTOCOL_OVERHEAD_BYTES];
+    char *line = malloc(MAX_PROTOCOL_LINE_BYTES + 1U);
+
+    if (line == NULL)
+        return 70;
 
     int mount_status = mount_bootstrap_devices();
     configure_console();
@@ -615,10 +775,11 @@ int main(void)
 
     for (;;) {
         write_text("AOS READY\n");
-        ssize_t length;
-        do {
-            length = read(STDIN_FILENO, line, sizeof(line) - 1);
-        } while (length < 0 && errno == EINTR);
+        ssize_t length = read_protocol_line(line, MAX_PROTOCOL_LINE_BYTES);
+        if (length == -2) {
+            write_text("AOS PROTOCOL ERROR\n");
+            continue;
+        }
         if (length <= 0)
             continue;
         line[length] = '\0';
