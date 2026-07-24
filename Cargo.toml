@@ -23,6 +23,7 @@ members = [
     "capsules/capsule-shell",
     "capsules/capsule-skills",
     "capsules/capsule-system",
+    "capsules/capsule-trace",
     "capsules/capsule-users",
 ]
 resolver = "3"
