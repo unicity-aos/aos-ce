@@ -151,6 +151,14 @@ pub struct ExecArgs {
 pub struct RealmShellArgs {
     /// Exact script to execute inside the Linux Realm.
     pub command: String,
+    /// Guest-visible working directory for this command.
+    ///
+    /// Omit to use `/workspace`, which is the kernel-stamped invocation
+    /// workspace. Explicit paths must remain beneath `/workspace`,
+    /// `/home/agent`, or `/tmp`. Like a normal process execution tool, a `cd`
+    /// inside `command` ends with that process; use `workdir` on a later call
+    /// when the same directory is required again.
+    pub workdir: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,6 +178,12 @@ struct ExecResponse {
     fault: Option<String>,
     stdout: String,
     stderr: String,
+    /// Exact command output with supervisor framing removed.
+    ///
+    /// Operator receipts retain the full console transcript in `stdout`; this
+    /// private projection is used only by the normal agent-facing shell.
+    #[serde(skip)]
+    agent_output: Option<String>,
     fuel_consumed: u64,
     memory_limit_bytes: u64,
     suspensions: u64,
@@ -424,17 +438,21 @@ impl LinuxRealm {
     /// shell and the capsule declares no `host_process` capability. Files built
     /// in the invocation workspace therefore remain data on the host and
     /// execute only in the guest unless a separate, explicitly privileged
-    /// boundary promotes them. Its CWD and execution ceilings come from the
-    /// kernel-stamped workspace attachment and principal configuration, not
-    /// model-supplied tool arguments.
+    /// boundary promotes them. The workspace root and execution ceilings come
+    /// from the kernel-stamped attachment and principal configuration. Commands
+    /// start in `/workspace`; `$HOME` is the invoking principal's durable
+    /// `/home/agent`, not the user's host home. An optional guest `workdir` may
+    /// only select within `/workspace`, `/home/agent`, or `/tmp`.
     #[astrid::tool("realm_shell", mutable)]
-    pub fn shell(&self, args: RealmShellArgs) -> Result<String, SysError> {
-        let principal = caller_principal()?;
-        actor::execute_resident(
+    pub fn shell(&self, args: RealmShellArgs) -> Result<String, String> {
+        let principal = caller_principal().map_err(agent_tool_error)?;
+        let response = actor::execute_response(
             &principal,
-            realm_shell_exec_args(args),
-            RealmResources::load()?,
+            realm_shell_exec_args(args).map_err(agent_tool_error)?,
+            RealmResources::load().map_err(agent_tool_error)?,
         )
+        .map_err(agent_tool_error)?;
+        render_agent_shell_result(response)
     }
 
     /// Serve the provider-scoped `astrid capsule ... realm` command without
@@ -562,15 +580,104 @@ fn cli_exec(command: &str, args: Vec<String>, cwd: Option<String>) -> ExecArgs {
     }
 }
 
-fn realm_shell_exec_args(args: RealmShellArgs) -> ExecArgs {
-    ExecArgs {
+fn realm_shell_exec_args(args: RealmShellArgs) -> Result<ExecArgs, SysError> {
+    let command = match args.workdir {
+        Some(requested) => {
+            let workdir = agent_shell_workdir(&requested)?;
+            format!(
+                "cd -- {} || exit $?\n{}",
+                shell_single_quote(&workdir),
+                args.command
+            )
+        }
+        None => args.command,
+    };
+    Ok(ExecArgs {
         program: Some(RealmProgram::LinuxSh),
         command: None,
-        args: vec![args.command],
+        args: vec![command],
         cwd: Some(LINUX_SHELL_DEFAULT_CWD.to_string()),
         fuel: None,
         max_output_bytes: None,
+    })
+}
+
+fn agent_shell_workdir(requested: &str) -> Result<String, SysError> {
+    if !requested.starts_with('/') {
+        return Err(SysError::ApiError(format!(
+            "realm_shell workdir `{requested}` must be an absolute guest path"
+        )));
     }
+    let normalized = host::canonical_guest_path("/", requested)
+        .map_err(|error| SysError::ApiError(format!("invalid realm_shell workdir: {error}")))?;
+    if normalized == "/workspace"
+        || normalized.starts_with("/workspace/")
+        || normalized == "/home/agent"
+        || normalized.starts_with("/home/agent/")
+        || normalized == "/tmp"
+        || normalized.starts_with("/tmp/")
+    {
+        Ok(normalized)
+    } else {
+        Err(SysError::ApiError(format!(
+            "realm_shell workdir `{requested}` is outside the admitted /workspace, /home/agent, and /tmp roots"
+        )))
+    }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn agent_tool_error(error: SysError) -> String {
+    match error {
+        SysError::ApiError(message) => message,
+        other => other.to_string(),
+    }
+}
+
+fn render_agent_shell_result(response: ExecResponse) -> Result<String, String> {
+    render_agent_shell_output(
+        response.outcome,
+        response.exit_status,
+        response.fault.as_deref(),
+        response.agent_output.unwrap_or_default(),
+    )
+}
+
+fn render_agent_shell_output(
+    outcome: &str,
+    exit_status: Option<i32>,
+    fault: Option<&str>,
+    output: String,
+) -> Result<String, String> {
+    if outcome == "completed" && exit_status == Some(0) {
+        return Ok(if output.is_empty() {
+            "Process exited with code 0".to_string()
+        } else {
+            output
+        });
+    }
+
+    let mut message = output;
+    if !message.is_empty() && !message.ends_with('\n') {
+        message.push('\n');
+    }
+    match exit_status {
+        Some(status) => message.push_str(&format!("Process exited with code {status}")),
+        None => {
+            message.push_str("Linux Realm command failed");
+            if !outcome.is_empty() {
+                message.push_str(": ");
+                message.push_str(outcome);
+            }
+        }
+    }
+    if let Some(fault) = fault {
+        message.push('\n');
+        message.push_str(fault);
+    }
+    Err(message)
 }
 
 fn cli_usage() -> String {
@@ -693,6 +800,7 @@ fn run_command_in_machine(
         fault,
         stdout: String::from_utf8_lossy(&report.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&report.stderr).into_owned(),
+        agent_output: None,
         fuel_consumed: report.fuel_consumed,
         memory_limit_bytes: u64::try_from(report.memory_limit_bytes)
             .expect("nested Realm memory limit fits u64"),
@@ -835,6 +943,7 @@ struct LinuxInvocationReport {
     exit_status: Option<i32>,
     fault: Option<String>,
     stdout: Vec<u8>,
+    command_output: Option<Vec<u8>>,
     fuel_consumed: u64,
     suspensions: u64,
     booted: bool,
@@ -995,6 +1104,7 @@ fn execute_linux_resident_cooperatively(
             exit_status: Some(0),
             fault: None,
             stdout: Vec::new(),
+            command_output: None,
             fuel_consumed: 0,
             suspensions: 0,
             booted: false,
@@ -1065,6 +1175,7 @@ fn execute_linux_resident_cooperatively(
             exit_status: None,
             fault: None,
             stdout,
+            command_output: None,
             fuel_consumed,
             suspensions,
             booted,
@@ -1131,6 +1242,21 @@ fn execute_linux_resident_cooperatively(
     fuel_consumed = fuel_consumed.saturating_add(report.fuel_consumed);
     suspensions = suspensions.saturating_add(report.suspensions);
     stdout.extend_from_slice(&report.stdout);
+    let command_output = if matches!(&report.outcome, LinuxDriveOutcome::Command(_)) {
+        Some(
+            linux_command_frame(&stdout, frame_token)
+                .ok_or_else(|| {
+                    SysError::ApiError(
+                        "Linux command completed without its authenticated result frame"
+                            .to_string(),
+                    )
+                })?
+                .output
+                .to_vec(),
+        )
+    } else {
+        None
+    };
 
     match report.outcome {
         LinuxDriveOutcome::Command(status) => Ok(LinuxInvocationReport {
@@ -1139,6 +1265,7 @@ fn execute_linux_resident_cooperatively(
             exit_status: Some(status),
             fault: None,
             stdout,
+            command_output,
             fuel_consumed,
             suspensions,
             booted,
@@ -1154,6 +1281,7 @@ fn execute_linux_resident_cooperatively(
                 exit_status: Some(0),
                 fault: None,
                 stdout,
+                command_output: None,
                 fuel_consumed,
                 suspensions,
                 booted,
@@ -1440,6 +1568,7 @@ fn linux_failure_report(
         exit_status,
         fault,
         stdout,
+        command_output: None,
         fuel_consumed,
         suspensions,
         booted,
@@ -1485,10 +1614,16 @@ fn validate_linux_frame_token(token: &str) -> Result<(), SysError> {
     }
 }
 
-fn linux_command_status(stdout: &[u8], frame_token: &str) -> Option<i32> {
+struct LinuxCommandFrame<'a> {
+    status: i32,
+    output: &'a [u8],
+}
+
+fn linux_command_frame<'a>(stdout: &'a [u8], frame_token: &str) -> Option<LinuxCommandFrame<'a>> {
     validate_linux_frame_token(frame_token).ok()?;
     let ready_at = find_last_bytes(stdout, LINUX_READY_MARKER)?;
-    let result_prefix = format!("AOS END {frame_token} ");
+    let begin_marker = format!("AOS BEGIN {frame_token}\r\n");
+    let result_prefix = format!("\r\nAOS END {frame_token} ");
     stdout[..ready_at]
         .windows(result_prefix.len())
         .enumerate()
@@ -1510,10 +1645,45 @@ fn linux_command_status(stdout: &[u8], frame_token: &str) -> Option<i32> {
                 .ok()?
                 .parse::<i32>()
                 .ok()?;
-            (status <= 255).then_some((marker_at, status))
+            if status > 255 {
+                return None;
+            }
+            let output_start = stdout[..marker_at]
+                .windows(begin_marker.len())
+                .rposition(|candidate| candidate == begin_marker.as_bytes())?
+                .checked_add(begin_marker.len())?;
+            (output_start <= marker_at).then_some((marker_at, status, output_start))
         })
-        .max_by_key(|(marker_at, _)| *marker_at)
-        .map(|(_, status)| status)
+        .max_by_key(|(marker_at, _, _)| *marker_at)
+        .map(|(marker_at, status, output_start)| LinuxCommandFrame {
+            status,
+            output: &stdout[output_start..marker_at],
+        })
+}
+
+fn linux_command_status(stdout: &[u8], frame_token: &str) -> Option<i32> {
+    linux_command_frame(stdout, frame_token).map(|frame| frame.status)
+}
+
+fn normalize_linux_command_output(output: &[u8], strip_environment_setup: bool) -> String {
+    const LEGACY_RUSTUP_SETUP: &str = "\
+info: default toolchain set to aos-system\n\
+info: note that the toolchain 'aos-system' is currently in use (overridden by environment variable RUSTUP_TOOLCHAIN)\n";
+
+    let normalized = String::from_utf8_lossy(output).replace("\r\n", "\n");
+    // The currently pinned development system initializes its guest-RAM-only
+    // rustup link through BASH_ENV on the first shell process. Those two stable
+    // informational lines are environment setup, not command output. Keep them
+    // in the operator console transcript while removing this exact leading
+    // compatibility prelude from the normal agent result.
+    if strip_environment_setup {
+        normalized
+            .strip_prefix(LEGACY_RUSTUP_SETUP)
+            .unwrap_or(&normalized)
+            .to_string()
+    } else {
+        normalized
+    }
 }
 
 fn find_last_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2170,7 +2340,9 @@ mod tests {
     fn agent_realm_shell_can_only_select_the_linux_guest_shell() {
         let args = realm_shell_exec_args(RealmShellArgs {
             command: "cc hello.c -o hello && ./hello".to_string(),
-        });
+            workdir: None,
+        })
+        .expect("default agent shell request");
 
         assert!(matches!(args.program, Some(RealmProgram::LinuxSh)));
         assert!(args.command.is_none(), "no executable selector is accepted");
@@ -2183,6 +2355,81 @@ mod tests {
         assert_eq!(
             args.max_output_bytes, None,
             "the principal env owns the output ceiling"
+        );
+    }
+
+    #[test]
+    fn agent_realm_shell_workdir_is_guest_scoped_and_shell_quoted() {
+        let args = realm_shell_exec_args(RealmShellArgs {
+            command: "pwd\ncargo test".to_string(),
+            workdir: Some("/workspace/project's source/crate".to_string()),
+        })
+        .expect("admitted workspace workdir");
+
+        assert_eq!(args.cwd.as_deref(), Some(LINUX_SHELL_DEFAULT_CWD));
+        assert_eq!(
+            args.args,
+            ["cd -- '/workspace/project'\"'\"'s source/crate' || exit $?\npwd\ncargo test"]
+        );
+
+        let long_workdir = format!("/workspace/{}", "nested/".repeat(40));
+        let args = realm_shell_exec_args(RealmShellArgs {
+            command: "pwd".to_string(),
+            workdir: Some(long_workdir),
+        })
+        .expect("workdir is not constrained by the historical 64-byte PID 1 field");
+        assert!(args.args[0].len() > MAX_LINUX_CWD_BYTES);
+
+        for denied in ["relative", "/", "/etc", "/home/other"] {
+            let error = realm_shell_exec_args(RealmShellArgs {
+                command: "pwd".to_string(),
+                workdir: Some(denied.to_string()),
+            })
+            .expect_err("workdir must remain in an admitted guest root");
+            assert!(error.to_string().contains("workdir"));
+        }
+    }
+
+    #[test]
+    fn agent_shell_result_is_compact_and_uses_tool_errors_for_failure() {
+        let first_command = b"info: default toolchain set to aos-system\r\n\
+info: note that the toolchain 'aos-system' is currently in use (overridden by environment variable RUSTUP_TOOLCHAIN)\r\n\
+built\r\n";
+        assert_eq!(
+            normalize_linux_command_output(first_command, true),
+            "built\n",
+            "guest environment setup stays on the operator transcript"
+        );
+        assert_eq!(
+            normalize_linux_command_output(first_command, false),
+            String::from_utf8_lossy(first_command).replace("\r\n", "\n"),
+            "matching command output is preserved outside the first-shell setup"
+        );
+        assert_eq!(
+            render_agent_shell_output("completed", Some(0), None, "built\n".to_string())
+                .expect("successful output"),
+            "built\n"
+        );
+        assert_eq!(
+            render_agent_shell_output("completed", Some(0), None, String::new())
+                .expect("successful empty output"),
+            "Process exited with code 0"
+        );
+
+        let error =
+            render_agent_shell_output("completed", Some(7), None, "compiler failed\n".to_string())
+                .expect_err("nonzero exit is a tool error");
+        assert_eq!(
+            error.to_string(),
+            "compiler failed\nProcess exited with code 7"
+        );
+
+        let error =
+            render_agent_shell_output("host-fault", None, Some("output-limit"), String::new())
+                .expect_err("infrastructure failure is a tool error");
+        assert_eq!(
+            error.to_string(),
+            "Linux Realm command failed: host-fault\noutput-limit"
         );
     }
 
@@ -2438,8 +2685,24 @@ mod tests {
         assert_eq!(first.outcome, "completed");
         assert_eq!(first.exit_status, Some(0));
         assert!(String::from_utf8_lossy(&first.stdout).contains("counter=1"));
+        assert_eq!(
+            first
+                .command_output
+                .as_deref()
+                .map(|output| normalize_linux_command_output(output, false))
+                .as_deref(),
+            Some("counter=1\n")
+        );
         assert_eq!(second.outcome, "completed");
         assert!(String::from_utf8_lossy(&second.stdout).contains("counter=2"));
+        assert_eq!(
+            second
+                .command_output
+                .as_deref()
+                .map(|output| normalize_linux_command_output(output, false))
+                .as_deref(),
+            Some("counter=2\n")
+        );
         assert!(machine.is_some(), "Linux RAM remains resident");
 
         let shell = execute_linux_resident_cooperatively(
@@ -2460,6 +2723,14 @@ mod tests {
         assert!(shell_stdout.contains("1000\r\n"));
         assert!(shell_stdout.contains("riscv64\r\n"));
         assert!(shell_stdout.contains("/home/agent\r\n"));
+        let shell_output = normalize_linux_command_output(
+            shell
+                .command_output
+                .as_deref()
+                .expect("authenticated shell output"),
+            true,
+        );
+        assert_eq!(shell_output, "1000\nriscv64\n/home/agent\n");
 
         let persisted = execute_linux_resident_cooperatively(
             LinuxResidentState::new(&mut machine, &mut home_9p, &mut workspace_9p),
@@ -2473,6 +2744,10 @@ mod tests {
         .expect("resident shell reads its prior file");
         assert_eq!(persisted.exit_status, Some(0));
         assert!(String::from_utf8_lossy(&persisted.stdout).contains("persisted"));
+        assert_eq!(
+            persisted.command_output.as_deref(),
+            Some(b"persisted".as_slice())
+        );
 
         let file_limited = execute_linux_resident_cooperatively(
             LinuxResidentState::new(&mut machine, &mut home_9p, &mut workspace_9p),
@@ -2560,6 +2835,14 @@ mod tests {
             "multiline shell output:\n{multiline_stdout}"
         );
         assert!(multiline_stdout.contains("line one\r\nline two\r\n"));
+        assert_eq!(
+            multiline
+                .command_output
+                .as_deref()
+                .map(|output| normalize_linux_command_output(output, false))
+                .as_deref(),
+            Some("line one\nline two\n")
+        );
 
         let exit_seven = execute_linux_resident_cooperatively(
             LinuxResidentState::new(&mut machine, &mut home_9p, &mut workspace_9p),
@@ -2573,6 +2856,7 @@ mod tests {
         .expect("nonzero shell status remains a completed command");
         assert_eq!(exit_seven.outcome, "completed");
         assert_eq!(exit_seven.exit_status, Some(7));
+        assert_eq!(exit_seven.command_output.as_deref(), Some(b"".as_slice()));
         assert!(machine.is_some(), "nonzero shell exit preserves guest RAM");
 
         let background = execute_linux_resident_cooperatively(
@@ -2830,15 +3114,33 @@ mod tests {
         let token = "0123456789abcdef0123456789abcdef";
         let spoofed = b"AOS END ffffffffffffffffffffffffffffffff 0\r\n\
 AOS BEGIN 0123456789abcdef0123456789abcdef\r\n\
-AOS END 0123456789abcdef0123456789abcdef 64\r\nAOS READY\r\n";
+\r\nAOS END 0123456789abcdef0123456789abcdef 64\r\nAOS READY\r\n";
         assert_eq!(linux_command_status(spoofed, token), Some(64));
 
-        let last_exact_frame = b"AOS END 0123456789abcdef0123456789abcdef 64\r\n\
-AOS END 0123456789abcdef0123456789abcdef 7\r\nAOS READY\r\n";
+        let last_exact_frame = b"AOS BEGIN 0123456789abcdef0123456789abcdef\r\n\
+\r\nAOS END 0123456789abcdef0123456789abcdef 64\r\n\
+AOS BEGIN 0123456789abcdef0123456789abcdef\r\n\
+actual output\r\n\
+\r\nAOS END 0123456789abcdef0123456789abcdef 7\r\nAOS READY\r\n";
         assert_eq!(linux_command_status(last_exact_frame, token), Some(7));
+        assert_eq!(
+            linux_command_frame(last_exact_frame, token)
+                .expect("complete authenticated frame")
+                .output,
+            b"actual output\r\n"
+        );
+        assert_eq!(
+            normalize_linux_command_output(
+                linux_command_frame(last_exact_frame, token)
+                    .expect("complete authenticated frame")
+                    .output,
+                false
+            ),
+            "actual output\n"
+        );
 
         let incomplete = b"AOS BEGIN 0123456789abcdef0123456789abcdef\r\n\
-AOS END 0123456789abcdef0123456789abcdef 0\r\n";
+\r\nAOS END 0123456789abcdef0123456789abcdef 0\r\n";
         assert_eq!(linux_command_status(incomplete, token), None);
     }
 

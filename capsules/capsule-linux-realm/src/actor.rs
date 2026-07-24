@@ -17,11 +17,20 @@ pub(crate) fn execute_resident(
     args: ExecArgs,
     resources: RealmResources,
 ) -> Result<String, SysError> {
+    let response = execute_response(principal, args, resources)?;
+    serde_json::to_string(&response).map_err(|error| SysError::ApiError(error.to_string()))
+}
+
+pub(super) fn execute_response(
+    principal: &str,
+    args: ExecArgs,
+    resources: RealmResources,
+) -> Result<ExecResponse, SysError> {
     RESIDENT_REALM.with(|state| {
         state
             .try_borrow_mut()
             .map_err(|_| SysError::ApiError("principal-affine Realm was re-entered".to_string()))?
-            .execute(principal, args, resources)
+            .execute_response(principal, args, resources)
     })
 }
 
@@ -90,6 +99,7 @@ struct LinuxActivity {
     last_exit_status: Option<i32>,
     active_memory_bytes: Option<u64>,
     active_vcpus: Option<u32>,
+    shell_environment_pending: bool,
 }
 
 impl LinuxActivity {
@@ -99,6 +109,7 @@ impl LinuxActivity {
         self.workspace_9p = None;
         self.active_memory_bytes = None;
         self.active_vcpus = None;
+        self.shell_environment_pending = false;
         if was_running {
             self.last_outcome = Some("resource-policy-changed");
             self.last_exit_status = None;
@@ -161,9 +172,15 @@ impl LinuxActivity {
 
         if report.booted {
             self.boot_executions = self.boot_executions.saturating_add(1);
+            self.shell_environment_pending = true;
         }
+        let strip_environment_setup =
+            action == LinuxAction::Shell && self.shell_environment_pending;
         if report.command_completed {
             self.commands_completed = self.commands_completed.saturating_add(1);
+            if action == LinuxAction::Shell {
+                self.shell_environment_pending = false;
+            }
         }
         if report.clean_shutdown {
             self.clean_shutdowns = self.clean_shutdowns.saturating_add(1);
@@ -200,6 +217,9 @@ impl LinuxActivity {
             fault: report.fault,
             stdout: String::from_utf8_lossy(&report.stdout).into_owned(),
             stderr: String::new(),
+            agent_output: report
+                .command_output
+                .map(|output| normalize_linux_command_output(&output, strip_environment_setup)),
             fuel_consumed: report.fuel_consumed,
             memory_limit_bytes: effective_memory_bytes,
             suspensions: report.suspensions,
@@ -334,12 +354,12 @@ impl ResidentRealm {
         }
     }
 
-    pub(crate) fn execute(
+    pub(crate) fn execute_response(
         &mut self,
         principal: &str,
         args: ExecArgs,
         resources: RealmResources,
-    ) -> Result<String, SysError> {
+    ) -> Result<ExecResponse, SysError> {
         self.bind_owner(principal)?;
         ensure_layout()?;
         let selected = select_program(&args)?;
@@ -359,7 +379,7 @@ impl ResidentRealm {
             next_boot_sequence,
         )?;
         response.home_generation_after = home_status()?.generation;
-        serde_json::to_string(&response).map_err(|error| SysError::ApiError(error.to_string()))
+        Ok(response)
     }
 
     pub(crate) fn status(

@@ -1326,7 +1326,7 @@ live `rustc` attempt classifies the current values as follows:
 | 16 GiB signed-worker shared memory | largest valid memory64 import produced by the pinned linker; reported by compute admission | retain as a replaceable backend capability, not a principal policy; guest RAM is the admitted value minus the worker's declared 64 MiB base and 64 MiB heap allowance |
 | 64 harts | machine protocol/static topology maximum | retain only while derived from the machine type; native workers may declare a different maximum |
 | 64 KiB captured result | seed result-envelope policy | remove in favor of principal-configured streaming or durable job logs |
-| 512 KiB script and 64-byte operator CWD | script derives from the one MiB IPC/control-transfer envelope; CWD remains a compatibility seed | retain the `sh3` script bound while IPC is one MiB; replace the operator-only CWD seed with a path-context token before exposing model-supplied CWD |
+| 512 KiB script and 64-byte operator initial CWD | script derives from the one MiB IPC/control-transfer envelope; CWD remains an old PID 1 frame field | retain the `sh3` script bound while IPC is one MiB; model `workdir` is instead canonicalized within existing guest roots and applied inside Bash, while selecting a different host attachment still requires a kernel path-context token |
 | 1,024 FIDs, 4,096 directory entries, 16,384 QIDs | fixed 9P-session memory controls | page directory state and charge live session objects to the principal; exhaustion must remain explicit |
 | eight CAS retries | fixed optimistic-contention policy | replace with bounded backoff against the admitted operation deadline and cancellation token |
 | 64 KiB/4,096-node format-0 import | one-time compatibility migration | retain and label as historical; it is not reachable after the format marker advances |
@@ -2031,12 +2031,22 @@ package. The production capsule exports one model-facing tool:
 
 - `realm_shell`: the normal agent-facing foreground shell; it always executes
   Bash inside the caller's principal-affine Linux Realm and has no host-process
-  mode, host executable selector, CWD selector, or caller-controlled budget
-  override. It starts in the kernel-stamped `/workspace`; principal env and the
-  outer profile own execution limits.
+  mode, host executable selector, or caller-controlled budget override. It
+  starts in the kernel-stamped `/workspace`. An optional guest `workdir` may
+  select a canonical path beneath that attachment, `/home/agent`, or `/tmp`,
+  but it cannot name a host path or replace the attached workspace root.
+  Principal env and the outer profile own execution limits.
+
+Each call is a foreground process, matching an ordinary process-execution tool:
+`cd` affects the current Bash process only, while a later call defaults to
+`/workspace` unless it supplies `workdir` again. Routine results contain only
+the command output, or a concise empty-success/exit failure. The full
+token-bound console transcript, resource receipt, mount context, and durable
+home generations remain available through the authenticated operator command,
+not in the model's normal result.
 
 Structured exec, lifecycle, and status operations remain on the authenticated
-`astrid capsule aos-linux-realm realm ...` operator command. They are not
+`astrid capsule run aos-linux-realm realm ...` operator command. They are not
 advertised to the model. Astrid currently derives a capsule's tool list
 statically from `#[astrid::tool]`, so an env boolean would leave a disabled
 debug tool visible. If model-callable diagnostics are ever required, ship an
@@ -2211,7 +2221,7 @@ The proof deliberately avoids Bash, Debian, networking, and a large image.
 
 ```text
 operator invokes:
-  astrid capsule aos-linux-realm realm exec --cwd /home/agent write-file notes.txt hello
+  astrid capsule run aos-linux-realm realm exec --cwd /home/agent write-file notes.txt hello
   -> outer capsule resolves kernel-stamped principal
   -> realm initializes only that principal's layout
   -> realm validates the guest CWD and exact command name
@@ -3648,9 +3658,10 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   resident Linux Bash action, and provide no native-host fallback or executable
   selector;
 - [x] reduce the production model surface to `realm_shell` alone; keep
-  structured exec/lifecycle/status on the authenticated operator CLI; and remove
-  model-controlled CWD, step, and output overrides so workspace and budgets come
-  from runtime/principal policy;
+  structured exec/lifecycle/status on the authenticated operator CLI; keep host
+  workspace selection plus step/output ceilings under runtime/principal policy;
+  and admit only an optional confined guest `workdir` within the already
+  attached workspace, principal home, or temporary filesystem;
 - [x] test malformed modules, undeclared imports, invalid pointers, unknown
   descriptors, fuel exhaustion, output exhaustion, memory admission, and forged
   principal input;
@@ -3849,7 +3860,10 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   length-validated `sh3` stream: exact multiline/heredoc bytes are base64
   framed up to 512 KiB beneath the one MiB IPC/control-transfer boundary;
 - [ ] replace the operator-only 64-byte initial CWD compatibility field with a
-  kernel-stamped path-context token before any model-facing tool may select CWD;
+  kernel-stamped path-context token before a caller may select or replace a host
+  attachment. The model-facing shell does not consume that field: its optional
+  workdir is canonicalized within already admitted guest roots and applied by
+  Bash after `/workspace` is attached;
 - [ ] page 9P directory enumeration and derive FID/QID residency from the
   principal's admitted session budget instead of fixed seed constants;
 - [ ] replace the fixed eight-attempt filesystem CAS loop with cancellation-aware

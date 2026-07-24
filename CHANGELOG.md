@@ -85,6 +85,11 @@
   pinned worker currently reports a 16 GiB shared-memory capability.
   Worker fuel joins the ordinary cross-capsule principal CPU account and rate
   limit.
+- Agent-native Linux Realm shell results. `realm_shell` now returns only
+  authenticated command output, reports nonzero exits through the tool error
+  bit, accepts an optional guest `workdir` confined to `/workspace`,
+  `/home/agent`, or `/tmp`, and keeps boot logs, protocol frames, resource
+  accounting, and mount receipts on the operator diagnostic surface.
 - Deterministic virtual SMP for Linux Realm: exact 1–64-hart FDT topology,
   per-hart architectural, timer, interrupt, reservation, and translation state,
   round-robin aggregate metering, SBI HSM/IPI/RFENCE/TIME services, an
