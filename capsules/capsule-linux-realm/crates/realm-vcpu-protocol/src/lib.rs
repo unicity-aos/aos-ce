@@ -31,7 +31,11 @@ pub const WORKER_HEAP_OVERHEAD_BYTES: usize = 64 * 1024 * 1024;
 /// Smallest shared memory accepted by the worker import.
 pub const WORKER_MIN_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// Largest shared memory accepted by the worker import.
-pub const WORKER_MAX_MEMORY_BYTES: usize = 3584 * 1024 * 1024;
+///
+/// The pinned wasm64 linker currently validates imports through 16 GiB. The
+/// runtime may admit any lower value, so this is a worker capability rather
+/// than a Linux or principal policy ceiling.
+pub const WORKER_MAX_MEMORY_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// Maximum private worker stacks admitted by the signed machine object.
 pub const MAX_WORKER_STACKS: usize = 64;
 /// Linear-memory stack bytes reserved for each possible compute worker.

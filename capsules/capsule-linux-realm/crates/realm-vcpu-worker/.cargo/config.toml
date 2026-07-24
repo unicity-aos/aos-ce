@@ -1,7 +1,7 @@
 [build]
-target = "wasm32-unknown-unknown"
+target = "wasm64-unknown-unknown"
 
-[target.wasm32-unknown-unknown]
+[target.wasm64-unknown-unknown]
 rustflags = [
     "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
     # Keep the low 64 KiB outside Rust data, stack, and heap as a guard against
@@ -15,5 +15,5 @@ rustflags = [
     "-C", "link-arg=--import-memory=astrid_compute,memory",
     "-C", "link-arg=--shared-memory",
     "-C", "link-arg=--initial-memory=67108864",
-    "-C", "link-arg=--max-memory=3758096384",
+    "-C", "link-arg=--max-memory=17179869184",
 ]

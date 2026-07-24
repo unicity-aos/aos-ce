@@ -88,7 +88,7 @@ struct LinuxActivity {
     guest_steps: u64,
     last_outcome: Option<&'static str>,
     last_exit_status: Option<i32>,
-    active_memory_bytes: Option<usize>,
+    active_memory_bytes: Option<u64>,
     active_vcpus: Option<u32>,
 }
 
@@ -142,6 +142,7 @@ impl LinuxActivity {
             &cwd,
             LinuxInvocationLimits {
                 run: limits,
+                guest_memory_bytes: resources.linux_memory_bytes,
                 max_file_bytes: resources.linux_max_file_bytes,
                 max_processes: resources.linux_max_processes,
                 max_open_files: resources.linux_max_open_files,

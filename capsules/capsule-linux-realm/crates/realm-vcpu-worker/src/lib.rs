@@ -24,29 +24,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 const ABI_VERSION: i32 = 1;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 const LINUX_KERNEL_ASSET_INDEX: i32 = 0;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 const LINUX_SYSTEM_ASSET_INDEX: i32 = 1;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 const LINUX_CHECKPOINT_ASSET_INDEX: i32 = 2;
 const LINUX_SYSTEM_BLOCK_CHANNEL: u32 = 3;
 const LINUX_SYSTEM_SECTOR_BYTES: usize = 512;
 // Keep finite admission ceilings with ample room for patch releases. The exact
 // attached objects are hash-bound and worker memory remains charged to the
 // principal by generic compute.
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(target_family = "wasm", test))]
 const MAX_LINUX_KERNEL_BYTES: usize = 512 * 1024 * 1024;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 const MAX_LINUX_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 const MAX_LINUX_SYSTEM_BYTES: usize = 2 * 1024 * 1024 * 1024;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 const MAX_ASSET_READ_BYTES: usize = 64 * 1024;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 const ASSET_OK: i32 = 0;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 #[link(wasm_import_module = "astrid_compute")]
 unsafe extern "C" {
     #[link_name = "asset_count"]
@@ -66,7 +66,7 @@ enum PendingOwner {
 enum WorkerMode {
     Deterministic(Box<Mutex<Machine>>),
     #[cfg_attr(
-        not(target_arch = "wasm32"),
+        not(target_family = "wasm"),
         allow(dead_code, reason = "constructed only by the signed Wasm worker")
     )]
     Parallel(Vec<Mutex<Machine>>),
@@ -411,7 +411,7 @@ fn prepare_parallel(bytes: &mut [u8]) -> WorkerResult {
         ));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     {
         state.mode = Some(WorkerMode::Deterministic(Box::new(Mutex::new(machine))));
         Err(machine_error(
@@ -419,7 +419,7 @@ fn prepare_parallel(bytes: &mut [u8]) -> WorkerResult {
         ))
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     {
         let mut machines = Vec::new();
         if machines.try_reserve_exact(hart_count).is_err() {
@@ -447,7 +447,7 @@ fn prepare_parallel(bytes: &mut [u8]) -> WorkerResult {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 fn load_linux_image() -> Result<Vec<u8>, (Status, String)> {
     load_asset(
         LINUX_KERNEL_ASSET_INDEX,
@@ -456,7 +456,7 @@ fn load_linux_image() -> Result<Vec<u8>, (Status, String)> {
     )
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 fn load_checkpoint() -> Result<Vec<u8>, (Status, String)> {
     load_asset(
         LINUX_CHECKPOINT_ASSET_INDEX,
@@ -465,7 +465,7 @@ fn load_checkpoint() -> Result<Vec<u8>, (Status, String)> {
     )
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 fn read_system_block(offset: u64, length: usize) -> Result<Vec<u8>, (Status, String)> {
     let system_bytes = system_asset_size()?;
     let offset =
@@ -492,7 +492,7 @@ fn read_system_block(offset: u64, length: usize) -> Result<Vec<u8>, (Status, Str
     Ok(response)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 fn system_asset_size() -> Result<usize, (Status, String)> {
     // SAFETY: the attached asset list is admitted by Astrid before this signed
     // worker starts. The index names the hash-pinned immutable system image.
@@ -507,19 +507,19 @@ fn system_asset_size() -> Result<usize, (Status, String)> {
         .ok_or_else(|| machine_error("Linux system asset size is outside the admitted range"))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn read_system_block(_offset: u64, _length: usize) -> Result<Vec<u8>, (Status, String)> {
     Err(machine_error(
         "Linux system asset reads require the signed compute worker",
     ))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn system_asset_size() -> Result<usize, (Status, String)> {
     Ok(4096)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 fn load_asset(
     asset_index: i32,
     max_asset_bytes: usize,
@@ -571,19 +571,19 @@ fn admitted_linux_kernel_size(asset_size: i64) -> Option<usize> {
     admitted_asset_size(asset_size, MAX_LINUX_KERNEL_BYTES)
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(target_family = "wasm", test))]
 fn admitted_asset_size(asset_size: i64, max_asset_bytes: usize) -> Option<usize> {
     usize::try_from(asset_size)
         .ok()
         .filter(|size| (1..=max_asset_bytes).contains(size))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn load_linux_image() -> Result<Vec<u8>, (Status, String)> {
     Ok(include_bytes!("../../../assets/linux-kernel.img").to_vec())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn load_checkpoint() -> Result<Vec<u8>, (Status, String)> {
     Ok(include_bytes!("../../../assets/linux-prewarm-1g-1h.aos-machine").to_vec())
 }
@@ -995,7 +995,7 @@ mod tests {
     use super::*;
 
     const SIGNED_WORKER_HASH: &str =
-        "blake3:894aa90f028e7f90ddfc4085420838476f60a3a1bb447c9cde2f5e0fac7576f6";
+        "blake3:c8db98e1509d5f598f154b40fa68edc8fcef910aabb3a0b1990ae5c0618c7139";
     const SIGNED_KERNEL_HASH: &str =
         "blake3:0139c1ec8d514df182fc760e623ff5850dba8b012719e7f6789081779ef65c05";
     const SIGNED_SYSTEM_HASH: &str =
@@ -1306,6 +1306,55 @@ mod tests {
     }
 
     #[test]
+    fn signed_memory64_worker_auto_admission_uses_the_principal_budget() {
+        use astrid_compute::{
+            ComputeLedger, ComputeLimits, ComputeRuntime, ExecutionMode, GroupRequest, Parallelism,
+            WorkerArtifact,
+        };
+        use astrid_core::principal::PrincipalId;
+        use std::path::Path;
+
+        const EIGHT_GIB: u64 = 8 * 1024 * 1024 * 1024;
+        const WASM_PAGE_BYTES: u64 = 65_536;
+        let capsule_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("capsule root");
+        let artifact = WorkerArtifact::from_capsule_path(
+            protocol::WORKER_ID,
+            capsule_root,
+            Path::new("assets/linux-vcpu.wasm"),
+            SIGNED_WORKER_HASH,
+        )
+        .expect("signed memory64 worker");
+        let runtime = ComputeRuntime::new(
+            ComputeLedger::default(),
+            ComputeLimits {
+                max_memory_bytes_per_principal: Some(EIGHT_GIB),
+                ..ComputeLimits::default()
+            },
+        )
+        .expect("compute runtime");
+        let group = runtime
+            .open_group(
+                &PrincipalId::new("linux-memory64-auto-admission").expect("principal"),
+                &artifact,
+                GroupRequest {
+                    mode: ExecutionMode::Deterministic,
+                    parallelism: Parallelism::Exact(1),
+                    initial_memory_pages: 1024,
+                    maximum_memory_pages: 0,
+                },
+            )
+            .expect("principal budget admits memory64 worker");
+
+        assert_eq!(
+            u64::from(group.maximum_memory_pages()) * WASM_PAGE_BYTES,
+            EIGHT_GIB
+        );
+    }
+
+    #[test]
     fn linux_kernel_asset_size_is_positive_and_finitely_bounded() {
         assert_eq!(admitted_linux_kernel_size(-1), None);
         assert_eq!(admitted_linux_kernel_size(0), None);
@@ -1404,7 +1453,7 @@ mod tests {
                     mode: ExecutionMode::Deterministic,
                     parallelism: Parallelism::Exact(1),
                     initial_memory_pages: 1024,
-                    maximum_memory_pages: 57_344,
+                    maximum_memory_pages: 18_432,
                 },
             )
             .expect("prewarm worker admission");

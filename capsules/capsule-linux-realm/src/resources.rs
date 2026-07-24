@@ -4,9 +4,8 @@ use astrid_sdk::prelude::*;
 use serde::Serialize;
 
 /// Zero delegates guest-RAM sizing to Astrid's admitted compute envelope.
-pub(crate) const DEFAULT_LINUX_MEMORY_BYTES: usize = 0;
-pub(crate) const MAX_LINUX_MEMORY_BYTES: usize = 3 * 1024 * 1024 * 1024;
-pub(crate) const MIN_LINUX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const DEFAULT_LINUX_MEMORY_BYTES: u64 = 0;
+pub(crate) const MIN_LINUX_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 /// No additional inner instruction ceiling; Astrid's principal CPU and timeout
 /// policy remains the outer enforcement boundary.
 pub(crate) const DEFAULT_LINUX_MAX_STEPS: u64 = 0;
@@ -30,7 +29,7 @@ pub(crate) const MAX_LINUX_MAX_OPEN_FILES: u32 = 1_048_576;
 /// compute worker per guest hart.
 pub(crate) const DEFAULT_LINUX_VCPUS: u32 = 0;
 pub(crate) const MAX_LINUX_VCPUS: u32 = aos_realm_machine::MAX_HARTS as u32;
-const GUEST_PAGE_BYTES: usize = 4096;
+const GUEST_PAGE_BYTES: u64 = 4096;
 
 const LINUX_MEMORY_BYTES_KEY: &str = "linux_memory_bytes";
 const LINUX_MAX_STEPS_KEY: &str = "linux_max_steps";
@@ -48,7 +47,7 @@ const LINUX_VCPUS_KEY: &str = "linux_vcpus";
 /// cannot enlarge the enclosing Wasmtime Store or escape its kernel meter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct RealmResources {
-    pub(crate) linux_memory_bytes: usize,
+    pub(crate) linux_memory_bytes: u64,
     /// Per-invocation guest step limit. Zero delegates to Astrid's outer CPU
     /// and timeout policy.
     pub(crate) linux_max_steps: u64,
@@ -80,7 +79,7 @@ impl Default for RealmResources {
 }
 
 impl RealmResources {
-    pub(crate) const fn with_linux_memory_bytes(mut self, bytes: usize) -> Self {
+    pub(crate) const fn with_linux_memory_bytes(mut self, bytes: u64) -> Self {
         self.linux_memory_bytes = bytes;
         self
     }
@@ -105,19 +104,19 @@ impl RealmResources {
     fn from_values(
         mut read: impl FnMut(&str) -> Result<Option<String>, SysError>,
     ) -> Result<Self, SysError> {
-        let linux_memory_bytes = parse_usize(
+        let linux_memory_bytes = parse_u64(
             LINUX_MEMORY_BYTES_KEY,
             read(LINUX_MEMORY_BYTES_KEY)?,
             DEFAULT_LINUX_MEMORY_BYTES,
             0,
-            MAX_LINUX_MEMORY_BYTES,
+            u64::MAX,
         )?;
         if linux_memory_bytes != 0 && linux_memory_bytes < MIN_LINUX_MEMORY_BYTES {
             return Err(invalid_integer(
                 LINUX_MEMORY_BYTES_KEY,
                 &linux_memory_bytes.to_string(),
-                u64::try_from(MIN_LINUX_MEMORY_BYTES).expect("Realm minimum fits u64"),
-                u64::try_from(MAX_LINUX_MEMORY_BYTES).expect("Realm maximum fits u64"),
+                MIN_LINUX_MEMORY_BYTES,
+                u64::MAX,
             ));
         }
         if linux_memory_bytes != 0 && !linux_memory_bytes.is_multiple_of(GUEST_PAGE_BYTES) {
@@ -306,7 +305,6 @@ mod tests {
         for values in [
             vec![(LINUX_MEMORY_BYTES_KEY, "unbounded")],
             vec![(LINUX_MEMORY_BYTES_KEY, "33554433")],
-            vec![(LINUX_MEMORY_BYTES_KEY, "4294967296")],
             vec![(LINUX_MAX_STEPS_KEY, "1000000000001")],
             vec![(LINUX_MAX_OUTPUT_BYTES_KEY, "0")],
             vec![(LINUX_MAX_FILE_BYTES_KEY, "1099511627777")],
@@ -317,5 +315,12 @@ mod tests {
         ] {
             assert!(resources(&values).is_err(), "accepted {values:?}");
         }
+    }
+
+    #[test]
+    fn explicit_memory_is_not_limited_by_the_capsules_wasm32_address_space() {
+        let selected = resources(&[(LINUX_MEMORY_BYTES_KEY, "180388626432")])
+            .expect("168 GiB principal memory request parses");
+        assert_eq!(selected.linux_memory_bytes, 168 * 1024 * 1024 * 1024);
     }
 }

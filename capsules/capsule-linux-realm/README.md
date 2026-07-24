@@ -63,8 +63,10 @@ instruction images, and the resident Linux boot image:
 - `linux-boot`, which restores the bound 1 GiB/one-hart principal-free
   checkpoint when the admitted envelope matches, otherwise cold-boots the
   hash-bound Linux 6.18.39 kernel and immutable system in the principal's
-  admitted 512 MiB–3 GiB envelope; it returns when `/init` reports `AOS READY`,
-  and calling it again while warm is a zero-step readiness check
+  admitted envelope; explicit guest RAM starts at 512 MiB, while automatic RAM
+  is derived from the caller's remaining principal/host compute admission and
+  the signed worker's reported capability. It returns when `/init` reports
+  `AOS READY`, and calling it again while warm is a zero-step readiness check
 - `linux-console`, which lazily boots if needed, sends one validated line to the
   resident `/init`, and returns one framed result while preserving Linux RAM;
   the proof commands are `ping`, `counter`, and `echo ...`
@@ -377,7 +379,7 @@ per-capsule configuration on every operation:
 
 | Config key | Default | Admitted range | Meaning |
 | --- | ---: | ---: | --- |
-| `linux_memory_bytes` | 0 | 0, or 536870912–3221225472 aligned to 4 KiB | Guest-visible RV64 RAM; zero uses current host/principal admission but caps the interpreter at its measured 1 GiB cold-boot default |
+| `linux_memory_bytes` | 0 | 0, or at least 536870912 aligned to 4 KiB | Guest-visible RV64 RAM; zero uses the admitted principal/host envelope after subtracting only the signed worker's fixed base and heap requirements. An explicit value is still bounded by that admission and the selected backend's reported addressability |
 | `linux_max_steps` | 0 | 0–1000000000000 | Guest steps admitted per invocation; zero delegates to Astrid's outer principal CPU and timeout policy |
 | `linux_max_output_bytes` | 65536 | 1–65536 | Captured Linux output per invocation |
 | `linux_max_file_bytes` | 0 | 0–1099511627776 | Guest `RLIMIT_FSIZE`; zero applies no extra inner cap and leaves Astrid's principal storage quota in force |
@@ -413,23 +415,25 @@ speedup claim.
 
 The effective boundary is the intersection of the Astrid principal profile, the
 daemon's host-wide compute pool, current aggregate reservations, the signed
-worker maximum, the capsule hard maximum, this configured envelope, and any
-lower per-command request.
+worker maximum, this configured envelope, and any lower per-command request.
 For the optional step, file-size, and process limits, zero omits only that inner
 boundary; Astrid's outer CPU, timeout, memory, and storage limits still apply. The guest cannot
 raise any boundary. When guest RAM or vCPUs are automatic, Astrid first opens a
 short-lived generic-compute admission probe. The capsule reads effective memory
 and worker parallelism, releases the probe, and retains one exact deterministic
 worker. For RAM it keeps the worker's fixed 64 MiB base, allocator headroom, and
-a 128 MiB safety reserve outside guest RAM, uses the remaining
-principal-admitted capacity, aligns down to a guest page, and never exceeds 3
-GiB when explicitly configured. Auto mode stops at the measured 1 GiB
-interpreter default so it can become ready inside the ordinary principal
-timeout. The daemon and principal profile have already bounded the process-wide
-pool before this calculation. For vCPUs auto mode selects one logical hart while
-the deterministic worker is serialized; the recorded one/two/four-hart matrix
-showed that additional harts increase Linux SMP work without adding host
-execution parallelism. An explicit
+uses all remaining principal-admitted capacity, aligned down to a guest page.
+There is no capsule-defined 3 GiB or 1 GiB policy cap. The current reproducible
+memory64 worker declares a 16 GiB shared-memory maximum because that is the
+largest import accepted by the pinned linker; after its 64 MiB fixed region and
+64 MiB heap allowance, its current maximum guest is 15.875 GiB. That value is a
+reported backend capability, not a default principal budget. A larger future
+worker can raise it without changing the capsule's configuration or public
+contract. The daemon and principal profile have already bounded the
+process-wide pool before this calculation. For vCPUs auto mode selects one
+logical hart while the deterministic worker is serialized; the recorded
+one/two/four-hart matrix showed that additional harts increase Linux SMP work
+without adding host execution parallelism. An explicit
 `linux_vcpus` value is a logical topology override and does not reserve idle
 native workers. Explicit limits remain useful for repeatable tests and managed
 tiers; insufficient outer admission fails closed.
@@ -490,6 +494,12 @@ cargo check -p aos-linux-realm --target wasm32-unknown-unknown
 astrid --principal default capsule install \
   capsules/capsule-linux-realm/dist/aos-linux-realm.capsule
 ```
+
+The signed worker uses Rust's tier-3 `wasm64-unknown-unknown` target. Rustup does
+not distribute a prebuilt standard library for that target, so the reproducible
+script intentionally uses the pinned nightly and `-Z build-std=std,panic_abort`
+with the installed `rust-src` component. The capsule controller remains
+`wasm32-unknown-unknown`.
 
 The asset-packaging step is currently mandatory. The released `astrid-build`
 path packages the executable component and WIT but does not yet copy private

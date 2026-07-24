@@ -1258,7 +1258,9 @@ that owner.
 
 The current Linux adapter is lazy and principal-resident. The affined Store owns
 one optional 1–64-hart machine with host-admitted automatic RAM and vCPU defaults,
-plus explicit 512 MiB–3 GiB RAM and 1–64-vCPU per-principal overrides. `linux-boot`, `linux-console`, or
+plus explicit page-aligned RAM from 512 MiB upward and 1–64-vCPU per-principal
+overrides. Explicit RAM remains subject to the same principal, host, and
+backend-addressability admission as automatic RAM. `linux-boot`, `linux-console`, or
 `linux-sh` creates it when cold, advances Linux in bounded 10,000,000-step slices
 until the controlled `/init` reports ready, and retains its CPU and RAM for later
 invocations. A `counter` probe reaches 1 and then 2 across separate calls, and a
@@ -1273,7 +1275,7 @@ Astrid administrator's principal profile
 ∩ daemon host-wide CPU/RAM compute pool
 ∩ live reservations across all principals
 ∩ signed worker declaration
-∩ capsule hard maximum
+∩ selected backend addressability
 ∩ invoking principal's per-capsule Realm configuration
 ∩ optional lower per-command request
 ```
@@ -1295,8 +1297,11 @@ The host-wide pool is an additional safety and scheduling boundary. It may delay
 or deny admission when physical capacity is unavailable, but it does not invent
 a smaller per-principal policy. Below that boundary, the only valid
 backend-specific ceilings are reported addressability or machine-topology
-limits. The current wasm32 worker's 3 GiB ceiling is therefore an implementation
-capability to replace, not a default Astrid budget.
+limits. The signed vCPU worker is now wasm64 and advertises its own imported
+shared-memory maximum. The pinned linker currently produces a valid 16 GiB
+worker; this is a replaceable backend capability, not a default Astrid budget.
+The wasm32 controller carries guest byte counts as `u64` and therefore does not
+reintroduce its own address-space cap.
 
 ### 7.2 Bound provenance
 
@@ -1318,7 +1323,7 @@ live `rustc` attempt classifies the current values as follows:
 | 64 KiB 9P `msize` | negotiated request/response unit in admitted guest RAM | retained; reads and writes stream across messages |
 | one TiB file address space | three 256-way radix levels and guest `RLIMIT_FSIZE` maximum | retained as format addressability, not default allocation |
 | one MiB manifest/node validation | hostile-metadata decode and current host-call bound | retain until manifests are paged; never apply it to file content |
-| three GiB guest RAM | leaves the controller and machine regions outside RV64 RAM in one wasm32 address space | retain while the worker is wasm32; native/wasm64 workers need their own derivation |
+| 16 GiB signed-worker shared memory | largest valid memory64 import produced by the pinned linker; reported by compute admission | retain as a replaceable backend capability, not a principal policy; guest RAM is the admitted value minus the worker's declared 64 MiB base and 64 MiB heap allowance |
 | 64 harts | machine protocol/static topology maximum | retain only while derived from the machine type; native workers may declare a different maximum |
 | 64 KiB captured result | seed result-envelope policy | remove in favor of principal-configured streaming or durable job logs |
 | 512 KiB script and 64-byte operator CWD | script derives from the one MiB IPC/control-transfer envelope; CWD remains a compatibility seed | retain the `sh3` script bound while IPC is one MiB; replace the operator-only CWD seed with a path-context token before exposing model-supplied CWD |
@@ -1362,22 +1367,28 @@ to resolve the largest currently admissible shared region from the signed worker
 principal quota, host pool, and live reservations. An automatic-parallelism
 probe also reports the currently useful principal/host worker intersection.
 `group.info()` returns both concrete values before machine initialization. Realm
-subtracts its worker base, allocator headroom, and safety reserve from the
-already principal-admitted region, page-aligns the remainder, and caps
-guest-visible RAM at a measured 1 GiB for interpreter auto mode. Automatic CPU
+subtracts only its signed 64 MiB worker base and 64 MiB allocator allowance from
+the already principal-admitted region, page-aligns the remainder, and uses the
+entire resulting guest-RAM envelope. The controller lives in a separately
+governed Store, so it does not invent a second shared-memory reserve. Automatic CPU
 topology currently selects the one-hart signed prewarm; it does not cold-boot a
 larger machine merely because workers are available. Explicit configuration
-retains the 3 GiB and 64-hart signed ceilings, releases the capacity probe, and
-opens an exact parallel worker reservation when more than one hart was
-requested. The canonical WIT PR remains held until Astrid 1.0.
+retains the 64-hart machine ceiling, releases the capacity probe, and opens an
+exact parallel worker reservation when more than one hart was requested. RAM
+has no capsule-defined 3 GiB ceiling: both explicit and automatic requests are
+bounded by the principal/host ledger and the current signed memory64 worker's
+reported 16 GiB shared-memory capability. The canonical WIT PR remains held
+until Astrid 1.0.
 
 The development bootstrap's measured explicit minimum is 512 MiB. That floor
 boots with roughly 398 MiB left for userspace, but it is not the recommended
 large-project allocation. On an unconstrained normal host, automatic sizing uses
-the admitted remainder up to the interpreter's measured 1 GiB cold-boot cap;
-managed installations and long-lived owner principals can explicitly set any
-page-aligned value from 512 MiB through 3 GiB. Larger automatic envelopes return
-only when an accelerated backend makes their cold-start cost honest.
+the admitted remainder. With the current worker this is at most 15.875 GiB of
+guest RAM after its declared base and heap regions; a principal or operator
+budget may make it smaller. The shipped 1 GiB/one-hart checkpoint remains a
+fast exact-envelope path. A different automatic envelope cold-boots once, then
+remains resident between metered turns; a future checkpoint set can cover
+additional common admitted sizes without changing resource policy.
 
 Every non-boot command uses a fresh 128-bit host-CSPRNG token. PID 1 disables
 console echo and emits token-bound begin/end frames; the host accepts the final
@@ -2670,6 +2681,11 @@ CE set rather than test-installed companions.
 
 ### Immutable worker-asset and clean default-boot evidence recorded on 2026-07-22
 
+This subsection records the exact artifact state on that date. Its 1 GiB
+automatic and 3 GiB explicit limits are historical evidence, not current
+resource policy; the memory64 admission evidence recorded below supersedes
+those implementation ceilings without rewriting the measurements.
+
 - Astrid core commit `0bbd8e389ef96d8b3447ce4f97b67c48523952b4`
   adds the private, pre-1.0 immutable compute-asset boundary without changing
   public WIT or the public capsule manifest Rust type. The builder and runtime
@@ -2917,6 +2933,38 @@ CE set rather than test-installed companions.
   cancellation, progress, and durable background-job handles remain release
   work; this successful acceptance does not relabel an abandoned foreground
   call as a background process.
+
+### Memory64 principal-budget admission recorded on 2026-07-24
+
+- the capsule remains a `wasm32-unknown-unknown` component, but guest RAM byte
+  counts are `u64` through its private boundary and the separately signed vCPU
+  worker is reproducibly built for `wasm64-unknown-unknown`. The controller's
+  address space therefore no longer limits the worker's imported shared memory;
+- Astrid generic compute enables Wasm memory64, inspects whether the worker's
+  imported shared memory uses 32- or 64-bit indexes, constructs the matching
+  shared memory, and relocates each private worker stack through the correct
+  mutable `i32` or `i64` stack pointer. A regression opens and executes a
+  65,537-page memory64 worker, crossing the 4 GiB boundary that the former path
+  could not represent;
+- the pinned nightly linker accepts a 16 GiB shared-memory declaration for the
+  current worker. It rejects a larger declaration, so 16 GiB is recorded as the
+  worker artifact's capability rather than a Linux or product policy. The
+  223,875-byte artifact validates with `wasm-tools` and is pinned as
+  `blake3:c8db98e1509d5f598f154b40fa68edc8fcef910aabb3a0b1990ae5c0618c7139`;
+- a zero RAM configuration now asks generic compute for the actual
+  host/operator/principal/live-reservation/worker intersection. Realm subtracts
+  exactly the worker's signed 64 MiB base and 64 MiB heap allowance and gives
+  the page-aligned remainder to the guest. It does not halve the result, clamp
+  it to a warm-checkpoint size, or retain a second unexplained safety margin;
+- explicit configuration accepts any 4 KiB-aligned `u64` value from 512 MiB
+  upward. Admission, not parsing in the wasm32 controller, rejects a request
+  beyond the current principal budget or backend capability. Tests prove an
+  explicit 168 GiB value survives configuration parsing and an automatic
+  8 GiB principal envelope is admitted by the real signed memory64 worker;
+- the 1 GiB/one-hart checkpoint remains an exact fast path, not a RAM default.
+  Other admitted envelopes cold-boot once and then remain resident between
+  metered turns. Additional sparse checkpoints may improve first use at common
+  sizes, but they must not change or silently narrow resource admission.
 
 ## 16. Ordered implementation milestones
 
@@ -3773,11 +3821,12 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   read-only compute asset; make wasm32 guest RAM demand-zero; package, install,
   boot, execute a warm shell, report effective resources, and shut down through
   a fresh default Astrid home;
-- [ ] replace the wasm32 worker's current 3 GiB implementation ceiling with a
-  backend-reported sparse paged-memory resource; admit automatic and explicit
-  Realm reservations from the sysadmin-assigned principal RAM budget, charge
-  every concurrent Realm and background lease to that shared ledger, and leave
-  only physical-host emergency admission outside principal policy;
+- [x] replace the wasm32 worker's 3 GiB implementation ceiling with a signed
+  memory64 worker and backend-reported shared-memory capability; admit automatic
+  and explicit Realm reservations from the sysadmin-assigned principal RAM
+  budget, charge every concurrent Realm and background lease to that shared
+  ledger, and leave only physical-host emergency admission outside principal
+  policy;
 - [x] build and boot the first AOS Realm development bootstrap with pinned Bash,
   Git, Python, Clang/binutils, Make, CMake, Ninja, target headers, CA roots, and
   explicit `/etc/os-release` identity;
