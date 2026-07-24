@@ -1229,7 +1229,8 @@ There are two different concurrency axes and they must not be collapsed:
 
 ```text
 across principals:  Astrid admits, isolates, meters, schedules, and evicts realms
-inside one realm:   the RV64 machine deterministically schedules one or more harts
+inside one realm:   the RV64 machine schedules admitted harts deterministically
+                    or on exact shared-memory compute workers
 ```
 
 Virtual SMP does not make a shared machine multi-tenant. A principal owns a Realm;
@@ -1302,10 +1303,10 @@ astrid quota set --agent NAME --memory SIZE --compute-workers N --cpu-fuel-per-s
 
 Principal memory is a virtual ceiling rather than an eager reservation; zero
 compute workers delegates to the host, and zero CPU fuel per second means
-unlimited. The current Linux adapter retains one deterministic compute worker
-and time-slices every admitted RV64 hart within it. Compute-worker count is real
-native schedulable capacity for all capsules; Linux vCPU count is a separate
-guest topology and currently carries no native-parallel speedup claim.
+unlimited. The Linux adapter retains one deterministic worker for a one-hart
+machine. An explicit topology above one opens an exact parallel group and maps
+one admitted native worker to each guest hart. Compute-worker count is still a
+generic native scheduling resource rather than a Linux-only quota.
 
 The outer principal profile remains authoritative for Wasmtime memory, CPU rate,
 storage, processes, and timeout. The inner configuration currently selects guest
@@ -1324,15 +1325,13 @@ principal quota, host pool, and live reservations. An automatic-parallelism
 probe also reports the currently useful principal/host worker intersection.
 `group.info()` returns both concrete values before machine initialization. Realm
 subtracts its worker base, allocator headroom, and safety reserve from the
-already principal-admitted region, page-aligns the remainder, caps guest-visible
-RAM at a measured 1 GiB for interpreter auto mode, and clamps the topology hint
-to two SMP harts because the current deterministic worker executes them on one
-native thread. Explicit configuration retains the 3 GiB and 64-hart signed
-ceilings. It then releases the
-capacity probe and opens an exact one-worker reservation for the chosen guest.
-An explicit `linux_vcpus` value changes only logical topology and does not
-reserve otherwise-idle native workers. The canonical WIT PR
-remains held until Astrid 1.0.
+already principal-admitted region, page-aligns the remainder, and caps
+guest-visible RAM at a measured 1 GiB for interpreter auto mode. Automatic CPU
+topology currently selects the one-hart signed prewarm; it does not cold-boot a
+larger machine merely because workers are available. Explicit configuration
+retains the 3 GiB and 64-hart signed ceilings, releases the capacity probe, and
+opens an exact parallel worker reservation when more than one hart was
+requested. The canonical WIT PR remains held until Astrid 1.0.
 
 The development bootstrap's measured explicit minimum is 512 MiB. That floor
 boots with roughly 398 MiB left for userspace, but it is not the recommended
@@ -1421,10 +1420,12 @@ token-bound console transport, bounded BusyBox shell, durable principal home,
 invocation workspace, and clean shutdown are now implemented. The next storage
 order is an immutable base plus durable root overlay; explicit
 disabled-vs-evicted lifecycle policy remains a separate increment.
-Deterministic SMP now interleaves harts in one host thread with a fixed
-scheduling quantum. True host-parallel harts
-remain optional because they add races to snapshots, metering, devices, and
-reproducibility without improving cross-principal isolation.
+Deterministic SMP interleaves harts in one worker with a fixed scheduling
+quantum. Explicit multi-hart configurations can now instead bind each hart to
+an exact generic-compute worker over one atomic guest-memory/device region.
+Automatic mode intentionally remains on the signed one-hart prewarm while the
+checkpoint asset set contains only that topology; selecting cold parallel boot
+implicitly would destroy the turn-time warm-start guarantee.
 
 ### 7.2 Generic parallel compute boundary — implemented, pre-1.0 contract held
 
@@ -1531,12 +1532,12 @@ parallel execution introduces host races.
 
 The versioned machine contract is:
 
-1. `linux_vcpus` is resolved for every principal invocation. Zero asks Astrid
-   for a useful value derived from the current principal/host generic-compute
-   admission; a positive value requests that exact guest topology from the
-   principal-scoped capsule configuration, subject to the signed machine hard
-   maximum. It does not claim or reserve the same number of native workers. A
-   changed active value requires a cold boot until CPU hotplug is implemented.
+1. `linux_vcpus` is resolved for every principal invocation. Zero selects the
+   currently distributed one-hart prewarm topology; a positive value requests
+   that exact guest topology from principal-scoped capsule configuration,
+   subject to the signed machine and generic-compute envelopes. Explicit values
+   above one reserve one exact native worker per hart today. A changed active
+   value requires a cold boot until CPU hotplug is implemented.
 2. The FDT contains one `/cpus/cpu@N` node and one unique CPU interrupt-controller
    phandle per admitted hart. Only hart 0 enters Linux at initial boot. This
    follows Linux's ordered RISC-V boot contract; Linux starts secondaries through
@@ -1595,9 +1596,9 @@ Implementation and proof order:
   unsupported fences, restart reset state, and hart-local interrupts;
 - [x] enable SMP in the pinned Linux build and prove two CPUs reach userspace,
   schedule work, receive interrupts, and remain within aggregate metering;
-- [x] resolve `linux_vcpus` from principal-scoped capsule configuration, derive
-  zero from generic compute admission, expose configured versus effective values,
-  and cold-restart only that principal when topology changes;
+- [x] resolve `linux_vcpus` from principal-scoped capsule configuration, map
+  zero to the currently distributed prewarm topology, expose configured versus
+  effective values, and cold-restart only that principal when topology changes;
 - [x] evolve the still-private checkpoint format 1 to encode and validate every
   admitted hart and the pending request's owner, clear derived translation
   caches, bind the exact kernel and immutable system, and reject resource
@@ -1608,44 +1609,50 @@ Implementation and proof order:
   mutable LLVM stack pointer to a disjoint slot, fail incomplete declarations
   closed, and prove two targeted Linux workers cross a real shared-memory
   barrier;
-- [ ] move harts onto the generic compute group, then benchmark one hart,
-  time-sliced SMP, and parallel SMP without conflating boot latency, warm command
-  latency, and throughput.
+- [x] move explicitly configured multi-hart machines onto exact generic-compute
+  workers with shared atomic RAM/devices and aggregate epoch accounting;
+- [ ] benchmark one hart, time-sliced SMP, and parallel SMP without conflating
+  group admission, cold boot, prewarm restore, warm command latency, and
+  throughput; then decide which multi-hart prewarm assets justify their
+  distribution cost.
 
-The unchecked item begins at a concrete code boundary, not at a configuration
-switch. The current signed vCPU worker rejects every `worker_index != 0`, stores
-the complete `Machine` behind one mutex, and opens a deterministic one-worker
-compute group. Raising the group size today would therefore either continue to
-serialize all hart work on that mutex or introduce unsound races in RAM,
-interrupt, device, allocation, and checkpoint state.
+The controller now opens a deterministic one-worker group for one hart and an
+exact parallel group for explicit topologies above one. Worker zero boots or
+restores the machine, then private operation 10 atomically replaces the
+deterministic machine with one worker-affine view per hart. Round-robin slices
+are rejected after that transition, exact-hart slices are rejected before it,
+and every descriptor must match Astrid's runtime-stamped worker identity.
+Automatic topology still selects one hart because the current fast checkpoint
+is a one-hart artifact, not because the parallel engine is serialized.
 
 The implementation cut is:
 
 1. [x] Evolve the still-private, unshipped vCPU protocol in place with
    coordinator-only operations and an exact `run-hart-slice(hart, budget)`
    operation. Do not add or merge public WIT for this.
-2. [ ] Move registers, CSRs, TLB, LR/SC reservation, timers, software interrupts,
-   and counters into independently owned hart cells. The production Wasm RAM
-   backend is now demand-zero, word-atomic, and carries overlap-local write
-   generations. LR/SC now consumes exact address/width/generation tokens, AMOs
-   and page-table A/D updates take the same overlap-local total order, and
-   checkpoint restore reconstructs settled reservations. Independent hart cells
-   remain. Keep UART, monotonic time, finisher, 9P effects, scheduler epochs,
-   and checkpoint control behind one machine coordinator.
-3. Give every admitted worker an exact hart affinity and a disjoint local-state
-   region while sharing only the declared guest-RAM/device-control region.
-   Disjoint Rust stacks and concurrent module entry are now proven; allocator
-   activity during parallel epochs and hart-state ownership remain part of the
-   machine split.
-4. Run harts concurrently only within a coordinator-issued epoch. All workers
+2. [x] Move registers, CSRs, TLB, LR/SC reservation, timers, software
+   interrupts, and counters behind worker-affine machine views. Share only
+   demand-zero atomic RAM, virtual time, console queues, monotonic host-request
+   allocation, and HSM/IPI/RFENCE mailboxes. Ordinary `Machine::clone` remains
+   a deep isolated clone for deterministic proofs and checkpoints.
+3. [x] Give every admitted worker exact hart affinity, a disjoint LLVM stack,
+   and a disjoint protocol descriptor. The signed worker's structural state is
+   protected only during initialization, reset, and the deterministic-to-parallel
+   transition; concurrent slices take separate per-hart locks rather than one
+   machine-wide execution mutex.
+4. [ ] Add early epoch closure. Harts already run concurrently inside one
+   controller-issued bounded epoch and all jobs join before the controller
+   exposes a result, but a host effect or terminal result does not yet cancel
+   sibling work that is already inside its budget. All workers must eventually
    join a barrier before device effects, RFENCE completion, cancellation,
    topology change, or checkpoint. A stalled or trapped worker fails the whole
    epoch and retires its group; it never leaves a partially reusable machine.
-5. Preserve the deterministic engine as the semantic oracle. Differential
+5. [ ] Preserve the deterministic engine as the semantic oracle. Differential
    tests replay interrupt/effect schedules and compare architectural state at
    every barrier, including conflicting AMOs, LR/SC invalidation, simultaneous
    IPIs, timer expiry, 9P suspension, cancellation, and checkpoint/restore.
-6. Expose native worker count separately from `linux_vcpus`. Automatic mode may
+6. [ ] Expose native worker count separately from `linux_vcpus`. Explicit
+   parallel mode currently maps one worker to one hart. Automatic mode may
    allocate fewer workers than harts and must report the real mapping. Only
    measured concurrent progress permits the `parallel SMP` label.
 
@@ -1653,14 +1660,14 @@ The concrete ownership split is:
 
 | State | Owner during an epoch | Cross-hart mechanism | Quiescent operation |
 | --- | --- | --- | --- |
-| integer/floating registers, CSRs, privilege, PC, cycle/instret, TLB | exact hart worker | none; no other worker receives a Rust reference | checkpoint copies after the barrier |
+| integer/floating registers, CSRs, privilege, PC, cycle/instret, TLB | exact hart worker | affinity guard prevents every other view from selecting or mutating that hart | checkpoint copies after the barrier |
 | lifecycle/start address/opaque value | target hart worker | atomic HSM mailbox with monotonic generation | coordinator validates every transition |
 | software interrupt and remote-fence request | target hart worker | atomic pending bits/fence generation | coordinator verifies all acknowledgements |
 | LR/SC reservation | exact hart worker | RAM write-version invalidation | checkpoint records only settled reservations |
 | guest RAM | machine-wide | naturally aligned 1/2/4/8-byte atomics; bounded ordered fallback for misaligned access | coordinator snapshots after every worker leaves the epoch |
-| UART input/output, finisher, guest time | machine coordinator | bounded device arbiter | drained or rejected before checkpoint |
-| 9P/immutable-block request | machine coordinator plus requesting-hart id | first request closes the epoch; later contenders observe suspension | fresh authority attaches only after the barrier |
-| halt/trap/cancellation, aggregate steps and retired instructions | machine coordinator | atomic terminal state and additive counters | whole group retires on disagreement or incomplete arrival |
+| UART input/output and guest time | shared machine region | mutex-bounded byte queues and atomic time counter; exact-hart slices leave output in one queue that worker zero drains once after every epoch job joins | drained or rejected before checkpoint |
+| finisher and per-hart 9P/immutable-block request | exact hart view plus controller registry | unique atomic request sequence and requesting-hart routing | fresh authority attaches only after all submitted jobs join |
+| halt/trap/cancellation and aggregate steps | controller | one bounded result per exact worker, merged in hart order | group is reusable only after every submitted job joins |
 
 This table rules out three tempting but invalid shortcuts. Worker-local `Machine`
 clones cannot carry independent RAM because Linux synchronization would be
@@ -1669,7 +1676,7 @@ that is a host-language data race even when the guest considers the accesses
 benign. A mutex taken for the whole `run-hart-slice` call is safe but remains the
 serialized engine and cannot be labelled parallel.
 
-Epoch admission has five mechanical invariants:
+The target epoch admission still has five mechanical invariants:
 
 1. the controller writes one request into the runtime-stamped worker's disjoint
    descriptor and targets that exact worker index;
@@ -1683,13 +1690,15 @@ Epoch admission has five mechanical invariants:
 5. missing, duplicate, stale-generation, or mismatched-hart results retire the
    compute group. They are never merged into reusable Linux state.
 
-Allocator activity is forbidden inside the concurrent instruction loop.
+Allocator-free epochs remain a hardening target rather than a current claim.
 Descriptor buffers, hart cells, mailbox slots, console fragments, and RAM chunk
-metadata are admitted before the arrival barrier. Demand-zero RAM may install a
-chunk through a single atomic once-cell; losing workers reuse the installed
-chunk rather than retaining duplicate allocations. Checkpoint, reset, console
-injection, 9P completion, and topology changes are worker-zero operations and
-are accepted only when no epoch is open.
+metadata should be admitted before the arrival barrier. Today demand-zero RAM
+may install a chunk through a single atomic once-cell, and guest console/9P
+effects may allocate bounded response storage. Checkpoint export remains
+disabled after the parallel transition. Reset, console injection, ordered
+console drain, 9P completion, and topology preparation are worker-zero control
+operations and the controller invokes them only after joining its current
+epoch.
 
 The shared-memory substrate follows the
 [ratified RISC-V A-extension](https://docs.riscv.org/reference/isa/unpriv/a-st-ext.html)
@@ -1728,16 +1737,16 @@ Astrid Compute remains the only creator and meter of native workers.
   operation 9 requires the requested hart to equal Astrid's runtime-stamped
   worker index. HSM start has a single-winner atomic mailbox; IPI bits and
   RFENCE generations coalesce at the target hart without cross-hart register or
-  TLB mutation. The deterministic oracle applies each mailbox immediately,
-  while checkpointing rejects unacknowledged control. The monolithic state
-  mutex still serializes instruction execution until the independent hart-cell
-  and shared-RAM cuts above land.
+  TLB mutation. The deterministic oracle applies each mailbox immediately.
+  Worker-affine harts poll their shared control mailbox before every next guest
+  instruction, so an IPI or RFENCE published after epoch entry cannot remain
+  hidden for the rest of a long slice.
 - Threaded Wasm builds now replace mutable byte chunks with demand-zero 2 MiB
   atomic chunks. Naturally aligned 1/2/4/8-byte stores take only the
   overlapping 64-byte write-generation lock; aligned loads observe one atomic
   word. Native tests prove that aligned 64-bit values never tear and that eight
-  disjoint granules make concurrent progress. This is live in the signed worker
-  but does not bypass the machine mutex yet.
+  disjoint granules make concurrent progress. Worker-affine views now share this
+  exact RAM object while retaining separate hart locks.
 - Reservation tests prove that disjoint 64-byte stores do not create false SC
   failures, overlapping stores do, eight contending LR/SC loops commit every
   increment, and concurrent AMOs produce one exact total order. The signed Wasm
@@ -1749,11 +1758,29 @@ Astrid Compute remains the only creator and meter of native workers.
   request with zero guest steps. It reports cold materialization and resident
   call latency separately without turning one developer-machine sample into a
   release threshold.
-- The reproducible worker is 186,902 bytes with BLAKE3
-  `15b937bd89498c576a568cb5a82394bc9239f894ba82e0fb7f908bf997919965`.
-  This proves the execution substrate needed by parallel harts. It does not yet
-  claim that the current monolithic `Machine` mutex or deterministic
-  round-robin hart scheduler runs Linux concurrently.
+- A second real-compute regression opens an exact two-worker parallel group,
+  cold-boots the signed SMP kernel, performs the private parallel-state
+  transition, submits both exact-hart slices before joining either, observes
+  nonzero work from hart 1, requires Linux to print
+  `smp: Brought up 1 node, 2 CPUs`, services immutable-block requests through
+  the runtime bulk-write path, and mounts the exact signed 318 MiB SquashFS
+  system. The same helper has an ignored 2/4/8-hart developer matrix. One M2
+  Ultra run, including worker initialization and Linux cold boot through system
+  mount but excluding compute-group construction, was:
+
+  | Harts/workers | Immutable-system mount latency | Aggregate interpreted steps |
+  | ---: | ---: | ---: |
+  | 2 | 1,956.652 ms | 24,000,000 |
+  | 4 | 4,555.553 ms | 58,000,000 |
+  | 8 | 16,171.692 ms | 161,000,000 |
+
+  This measures topology bring-up, whose guest work increases with CPU count;
+  it is not a throughput-speedup result or release threshold.
+- The reproducible worker is 209,710 bytes with BLAKE3
+  `894aa90f028e7f90ddfc4085420838476f60a3a1bb447c9cde2f5e0fac7576f6`.
+  Explicit multi-hart Linux now executes concurrently. Early effect-driven
+  epoch cancellation, parallel checkpoint export, full differential schedules,
+  and the timing matrix remain open.
 
 Normative references for this increment are the
 [Linux RISC-V boot requirements](https://docs.kernel.org/next/arch/riscv/boot.html),
@@ -3551,9 +3578,9 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   while Linux is an SDK consumer;
 - [x] implement aggregate-metered signed worker groups and prove deterministic
   and parallel modes against the same protocol; Linux now consumes the
-  deterministic one-worker mode for guest-visible time-sliced SMP, while native
-  parallel harts and checkpoints taken during truly concurrent execution remain
-  separate work;
+  deterministic one-worker mode for one-hart/prewarm operation and exact
+  parallel workers for explicit multi-hart operation. Parallel checkpoint
+  export and a topology-keyed prewarm matrix remain separate work;
 - [x] expose bounded pipe creation, signed child creation, direct-child wait, and
   direct-child signal through the private guest ABI without allowing jobs to
   escape foreground actor accounting;

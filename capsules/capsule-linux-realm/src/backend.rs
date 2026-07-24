@@ -28,7 +28,7 @@ const AUTO_REFERENCE_RAM_BYTES: usize = 512 * 1024 * 1024;
 #[cfg(any(target_arch = "wasm32", test))]
 const AUTO_INTERPRETER_RAM_BYTES: usize = 1024 * 1024 * 1024;
 #[cfg(any(target_arch = "wasm32", test))]
-const AUTO_INTERPRETER_HARTS: u32 = 1;
+const AUTO_PREWARM_HARTS: u32 = 1;
 #[cfg(any(target_arch = "wasm32", test))]
 const MAX_GUEST_RAM_BYTES: usize = 3 * 1024 * 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
@@ -402,9 +402,10 @@ impl ComputeMachine {
             shared_memory_layout(config.ram_bytes)?;
         if auto_memory || hart_count.is_none() {
             // A short-lived generic-compute probe exposes the current
-            // principal/host intersection without adding a Linux-specific
-            // host call. The retained interpreter group remains deterministic
-            // and single-worker; its guest harts are logical, time-sliced CPUs.
+            // principal/host intersection without adding a Linux-specific host
+            // call. Automatic CPU topology still selects the distributed
+            // prewarm shape; an explicit multi-hart topology reserves exact
+            // parallel workers below.
             let probe_maximum_pages = if auto_memory { 0 } else { initial_pages };
             let probe = open_compute_probe(initial_pages, probe_maximum_pages)?;
             let info = probe
@@ -425,7 +426,7 @@ impl ComputeMachine {
         let hart_count = hart_count.ok_or_else(|| {
             "Linux vCPU auto admission did not produce a logical CPU count".to_string()
         })?;
-        let group = open_compute_group(initial_pages, maximum_pages)?;
+        let group = open_compute_group(initial_pages, maximum_pages, hart_count)?;
         let machine = Self {
             group,
             control_offset,
@@ -450,6 +451,11 @@ impl ComputeMachine {
             );
             protocol::write_u32(header, field::HART_COUNT, hart_count);
         })?;
+        if hart_count > 1 {
+            machine.invoke(Operation::PrepareParallel, &[], |header| {
+                protocol::write_u32(header, field::HART_COUNT, hart_count);
+            })?;
+        }
         Ok(machine)
     }
 
@@ -481,9 +487,138 @@ impl ComputeMachine {
     }
 
     fn run_slice(&self, instruction_budget: u64) -> Result<LinuxSliceReport, String> {
+        if self.hart_count > 1 {
+            return self.run_parallel_slice(instruction_budget);
+        }
         let response = self.invoke(Operation::RunSlice, &[], |header| {
             protocol::write_u64(header, field::SLICE_BUDGET, instruction_budget);
         })?;
+        Self::decode_slice(response)
+    }
+
+    fn run_parallel_slice(&self, instruction_budget: u64) -> Result<LinuxSliceReport, String> {
+        if instruction_budget == 0 {
+            return Ok(LinuxSliceReport {
+                outcome: LinuxSliceOutcome::Yielded,
+                console: Vec::new(),
+                steps_executed: 0,
+            });
+        }
+        let worker_count = u64::from(self.hart_count).min(instruction_budget);
+        let base_budget = instruction_budget / worker_count;
+        let remainder = instruction_budget % worker_count;
+        let mut work = Vec::new();
+        work.try_reserve_exact(worker_count as usize)
+            .map_err(|_| "Linux vCPU epoch allocation was denied".to_string())?;
+
+        for hart_id in 0..worker_count {
+            let budget = base_budget + u64::from(hart_id < remainder);
+            let hart_id = u32::try_from(hart_id)
+                .map_err(|_| "Linux vCPU hart identity is too large".to_string())?;
+            let control_offset = protocol::control_offset(hart_id as usize)
+                .ok_or_else(|| "Linux vCPU hart has no control descriptor".to_string())?;
+            let request = Self::request(Operation::RunHartSlice, &[], |header| {
+                protocol::write_u32(header, field::HART_ID, hart_id);
+                protocol::write_u64(header, field::SLICE_BUDGET, budget);
+            })?;
+            self.group
+                .write(control_offset, &request)
+                .map_err(|error| format!("write Linux vCPU hart {hart_id} request: {error}"))?;
+            work.push((
+                hart_id,
+                control_offset,
+                WorkDescriptor {
+                    offset: control_offset,
+                    length: protocol::CONTROL_BYTES as u64,
+                    tag: Operation::RunHartSlice as u64,
+                    worker_index: Some(hart_id),
+                    fuel: None,
+                },
+            ));
+        }
+
+        let mut jobs = Vec::new();
+        jobs.try_reserve_exact(work.len())
+            .map_err(|_| "Linux vCPU job allocation was denied".to_string())?;
+        for (hart_id, control_offset, descriptor) in work {
+            match self.group.submit(descriptor) {
+                Ok(job) => jobs.push((hart_id, control_offset, job)),
+                Err(error) => {
+                    for (_, _, job) in jobs {
+                        let _ = job.join();
+                    }
+                    return Err(format!("submit Linux vCPU hart {hart_id}: {error}"));
+                }
+            }
+        }
+
+        let mut reports = Vec::new();
+        reports
+            .try_reserve_exact(jobs.len())
+            .map_err(|_| "Linux vCPU response allocation was denied".to_string())?;
+        let mut first_error = None;
+        for (hart_id, control_offset, job) in jobs {
+            let result = match job.join() {
+                Ok(result) => result,
+                Err(error) => {
+                    first_error
+                        .get_or_insert_with(|| format!("join Linux vCPU hart {hart_id}: {error}"));
+                    continue;
+                }
+            };
+            if result.worker_status != 0 {
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "Linux vCPU hart {hart_id} transport returned status {}",
+                        result.worker_status
+                    )
+                });
+                continue;
+            }
+            match self
+                .read_response(control_offset)
+                .and_then(Self::decode_slice)
+            {
+                Ok(report) => reports.push(report),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        let console = self
+            .invoke(Operation::DrainConsole, &[], |_| {})
+            .and_then(Self::decode_console)?;
+        let mut steps_executed = 0_u64;
+        let mut outcome = None;
+        for report in reports {
+            steps_executed = steps_executed.saturating_add(report.steps_executed);
+            debug_assert!(report.console.is_empty());
+            if outcome.is_none() && !matches!(&report.outcome, LinuxSliceOutcome::Yielded) {
+                outcome = Some(report.outcome);
+            }
+        }
+        Ok(LinuxSliceReport {
+            outcome: outcome.unwrap_or(LinuxSliceOutcome::Yielded),
+            console,
+            steps_executed,
+        })
+    }
+
+    fn decode_console(response: ComputeResponse) -> Result<Vec<u8>, String> {
+        let console_len = field_len(&response.header, field::CONSOLE_LEN)?;
+        let message_len = field_len(&response.header, field::MESSAGE_LEN)?;
+        let error_len = field_len(&response.header, field::ERROR_LEN)?;
+        if message_len != 0 || error_len != 0 || response.payload.len() != console_len {
+            return Err("Linux vCPU console drain returned an invalid payload".to_string());
+        }
+        Ok(response.payload)
+    }
+
+    fn decode_slice(response: ComputeResponse) -> Result<LinuxSliceReport, String> {
         let console_len = field_len(&response.header, field::CONSOLE_LEN)?;
         let message_len = field_len(&response.header, field::MESSAGE_LEN)?;
         let error_len = field_len(&response.header, field::ERROR_LEN)?;
@@ -528,12 +663,11 @@ impl ComputeMachine {
         })
     }
 
-    fn invoke(
-        &self,
+    fn request(
         operation: Operation,
         input: &[u8],
         configure: impl FnOnce(&mut [u8]),
-    ) -> Result<ComputeResponse, String> {
+    ) -> Result<Vec<u8>, String> {
         let request_len = protocol::HEADER_BYTES
             .checked_add(input.len())
             .ok_or_else(|| "Linux vCPU request range overflow".to_string())?;
@@ -551,22 +685,28 @@ impl ComputeMachine {
         );
         configure(&mut request[..protocol::HEADER_BYTES]);
         request[protocol::HEADER_BYTES..].copy_from_slice(input);
+        Ok(request)
+    }
+
+    fn invoke(
+        &self,
+        operation: Operation,
+        input: &[u8],
+        configure: impl FnOnce(&mut [u8]),
+    ) -> Result<ComputeResponse, String> {
+        let request = Self::request(operation, input, configure)?;
         self.group
             .write(self.control_offset, &request)
             .map_err(|error| format!("write Linux vCPU request: {error}"))?;
         let result = self
             .group
-            // The deterministic group admits exactly one worker. Leave
-            // affinity unspecified so the compute queue can accept the next
-            // operation during the tiny interval between job completion and
-            // worker-slot bookkeeping. Explicitly targeting worker zero would
-            // expose that interval as a spurious `Busy` after a successful
-            // join, without adding any state-affinity guarantee.
-            .submit(WorkDescriptor::new(
-                self.control_offset,
-                protocol::CONTROL_BYTES as u64,
-                operation as u64,
-            ))
+            .submit(WorkDescriptor {
+                offset: self.control_offset,
+                length: protocol::CONTROL_BYTES as u64,
+                tag: operation as u64,
+                worker_index: (self.hart_count > 1).then_some(0),
+                fuel: None,
+            })
             .map_err(|error| format!("submit Linux vCPU operation: {error}"))?
             .join()
             .map_err(|error| format!("join Linux vCPU operation: {error}"))?;
@@ -576,9 +716,13 @@ impl ComputeMachine {
                 result.worker_status
             ));
         }
+        self.read_response(self.control_offset)
+    }
+
+    fn read_response(&self, control_offset: u64) -> Result<ComputeResponse, String> {
         let header = self
             .group
-            .read(self.control_offset, protocol::HEADER_BYTES as u32)
+            .read(control_offset, protocol::HEADER_BYTES as u32)
             .map_err(|error| format!("read Linux vCPU response header: {error}"))?;
         if protocol::read_u32(&header, field::MAGIC) != Some(protocol::MAGIC)
             || protocol::read_u32(&header, field::VERSION) != Some(protocol::VERSION)
@@ -594,7 +738,7 @@ impl ComputeMachine {
         } else {
             self.group
                 .read(
-                    self.control_offset + protocol::HEADER_BYTES as u64,
+                    control_offset + protocol::HEADER_BYTES as u64,
                     response_len as u32,
                 )
                 .map_err(|error| format!("read Linux vCPU response payload: {error}"))?
@@ -667,6 +811,7 @@ fn decode_hex_digest(value: &str, output: &mut [u8]) -> Result<(), String> {
 fn open_compute_group(
     initial_memory_pages: u32,
     maximum_memory_pages: u32,
+    hart_count: u32,
 ) -> Result<ComputeGroup, String> {
     let request = GroupRequest::new(
         protocol::WORKER_ID,
@@ -678,7 +823,12 @@ fn open_compute_group(
     } else {
         request
     };
-    ComputeGroup::open(&request.deterministic())
+    let request = if hart_count == 1 {
+        request.deterministic()
+    } else {
+        request.parallel(Parallelism::Exact(hart_count))
+    };
+    ComputeGroup::open(&request)
         .map_err(|error| format!("admit Linux vCPU compute worker: {error}"))
 }
 
@@ -716,14 +866,10 @@ fn explicit_hart_count(configured: u32) -> Result<Option<u32>, String> {
 
 #[cfg(any(target_arch = "wasm32", test))]
 fn auto_guest_hart_count(_admitted_parallelism: u32) -> u32 {
-    // This backend has one deterministic worker today. More logical harts add
-    // Linux bring-up and scheduler work without running concurrently, so auto
-    // mode selects one hart instead of mirroring host CPU count. The host worker
-    // quota controls how many principals can execute concurrently; it is not a
-    // guest topology signal because one interpreter worker time-slices every
-    // logical hart. Explicit configuration remains available for topology
-    // testing.
-    AUTO_INTERPRETER_HARTS
+    // The current signed prewarm has one hart. Auto preserves its near-instant
+    // turn-time restore instead of silently choosing a cold parallel boot.
+    // Explicit topologies above one use exact concurrent compute workers.
+    AUTO_PREWARM_HARTS
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -885,17 +1031,17 @@ mod tests {
             (1..=MAX_HARTS as u32)
                 .contains(&reference_hart_count(0).expect("native auto topology"))
         );
-        assert_eq!(auto_guest_hart_count(0), AUTO_INTERPRETER_HARTS);
-        assert_eq!(auto_guest_hart_count(1), AUTO_INTERPRETER_HARTS);
-        assert_eq!(auto_guest_hart_count(8), AUTO_INTERPRETER_HARTS);
-        assert_eq!(auto_guest_hart_count(128), AUTO_INTERPRETER_HARTS);
+        assert_eq!(auto_guest_hart_count(0), AUTO_PREWARM_HARTS);
+        assert_eq!(auto_guest_hart_count(1), AUTO_PREWARM_HARTS);
+        assert_eq!(auto_guest_hart_count(8), AUTO_PREWARM_HARTS);
+        assert_eq!(auto_guest_hart_count(128), AUTO_PREWARM_HARTS);
     }
 
     #[test]
     fn automatic_topology_matches_the_signed_prewarm_envelope() {
         let prewarm = prewarm_spec().expect("signed prewarm metadata");
-        assert_eq!(AUTO_INTERPRETER_HARTS, 1);
-        assert_eq!(prewarm.hart_count, AUTO_INTERPRETER_HARTS);
+        assert_eq!(AUTO_PREWARM_HARTS, 1);
+        assert_eq!(prewarm.hart_count, AUTO_PREWARM_HARTS);
         assert!(prewarm.binding.iter().any(|byte| *byte != 0));
         assert!(prewarm.matches(
             MachineConfig {

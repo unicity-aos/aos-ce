@@ -19,8 +19,9 @@ use aos_realm_machine::{
 use aos_realm_vcpu_protocol::{
     self as protocol, Operation, Outcome, RequestFailure, Status, field,
 };
-use std::sync::Mutex;
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 const ABI_VERSION: i32 = 1;
 #[cfg(target_arch = "wasm32")]
@@ -56,12 +57,74 @@ unsafe extern "C" {
     fn host_asset_read(index: i32, offset: i64, destination: i64, length: i64) -> i32;
 }
 
-struct WorkerState {
-    machine: Machine,
-    pending_request: Option<HostRequestId>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingOwner {
+    Deterministic(usize),
+    Hart(usize),
 }
 
-static STATE: Mutex<Option<WorkerState>> = Mutex::new(None);
+enum WorkerMode {
+    Deterministic(Box<Mutex<Machine>>),
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        allow(dead_code, reason = "constructed only by the signed Wasm worker")
+    )]
+    Parallel(Vec<Mutex<Machine>>),
+}
+
+struct WorkerState {
+    mode: Option<WorkerMode>,
+    pending_requests: Mutex<BTreeMap<HostRequestId, PendingOwner>>,
+}
+
+impl WorkerState {
+    fn deterministic(machine: Machine) -> Self {
+        let mut pending_requests = BTreeMap::new();
+        if let Some((id, hart_id)) = machine.pending_host_request_identity() {
+            pending_requests.insert(id, PendingOwner::Deterministic(hart_id));
+        }
+        Self {
+            mode: Some(WorkerMode::Deterministic(Box::new(Mutex::new(machine)))),
+            pending_requests: Mutex::new(pending_requests),
+        }
+    }
+
+    fn register_request(&self, id: HostRequestId, owner: PendingOwner) -> WorkerResult {
+        match self
+            .pending_requests
+            .lock()
+            .expect("pending request lock")
+            .entry(id)
+        {
+            Entry::Vacant(entry) => {
+                entry.insert(owner);
+            }
+            Entry::Occupied(entry) if *entry.get() == owner => {}
+            Entry::Occupied(_) => {
+                return Err(machine_error("Linux vCPU reused a host request identity"));
+            }
+        }
+        Ok(())
+    }
+
+    fn pending_request(&self, raw: u64) -> Option<(HostRequestId, PendingOwner)> {
+        self.pending_requests
+            .lock()
+            .expect("pending request lock")
+            .iter()
+            .find(|(id, _)| id.get() == raw)
+            .map(|(id, owner)| (*id, *owner))
+    }
+
+    fn finish_request(&self, id: HostRequestId) {
+        self.pending_requests
+            .lock()
+            .expect("pending request lock")
+            .remove(&id);
+    }
+}
+
+static STATE: RwLock<Option<WorkerState>> = RwLock::new(None);
 static PARALLEL_PROBE_ARRIVALS: AtomicU64 = AtomicU64::new(0);
 
 /// Generic-compute worker ABI version.
@@ -155,12 +218,14 @@ fn dispatch_worker(worker_index: u32, bytes: &mut [u8], descriptor_tag: i64) -> 
         }
         Some(Operation::InitCold) => initialize(bytes),
         Some(Operation::InitCheckpoint) => initialize_checkpoint(bytes),
+        Some(Operation::PrepareParallel) => prepare_parallel(bytes),
+        Some(Operation::DrainConsole) => drain_console(bytes),
         Some(Operation::RunSlice) => run_slice(None, bytes),
         Some(Operation::PushConsole) => push_console(bytes),
         Some(Operation::Complete9p) => complete_9p(bytes),
         Some(Operation::Fail9p) => fail_9p(bytes),
         Some(Operation::Reset) if input(bytes).is_ok_and(<[u8]>::is_empty) => {
-            *STATE.lock().expect("worker state lock") = None;
+            *STATE.write().expect("worker state lock") = None;
             Ok(())
         }
         Some(Operation::Reset) => Err(invalid("reset does not accept an input payload")),
@@ -217,7 +282,7 @@ fn parallel_probe(worker_index: u32, bytes: &mut [u8]) -> WorkerResult {
 }
 
 fn initialize(bytes: &mut [u8]) -> WorkerResult {
-    if STATE.lock().expect("worker state lock").is_some() {
+    if STATE.read().expect("worker state lock").is_some() {
         return Err(invalid("Linux vCPU is already initialized"));
     }
     let boot_input = input(bytes)?;
@@ -260,15 +325,12 @@ fn initialize(bytes: &mut [u8]) -> WorkerResult {
     machine
         .boot_linux(&linux_image, &[], &bootargs)
         .map_err(|error| machine_error(error.to_string()))?;
-    *STATE.lock().expect("worker state lock") = Some(WorkerState {
-        machine,
-        pending_request: None,
-    });
+    *STATE.write().expect("worker state lock") = Some(WorkerState::deterministic(machine));
     Ok(())
 }
 
 fn initialize_checkpoint(bytes: &mut [u8]) -> WorkerResult {
-    if STATE.lock().expect("worker state lock").is_some() {
+    if STATE.read().expect("worker state lock").is_some() {
         return Err(invalid("Linux vCPU is already initialized"));
     }
     let checkpoint_input = input(bytes)?;
@@ -306,13 +368,83 @@ fn initialize_checkpoint(bytes: &mut [u8]) -> WorkerResult {
             "checkpoint resources do not match the admitted Linux envelope",
         ));
     }
-    let pending_request = Some(checkpoint.pending_host_request().id);
     let machine = checkpoint.into_machine();
-    *STATE.lock().expect("worker state lock") = Some(WorkerState {
-        machine,
-        pending_request,
-    });
+    *STATE.write().expect("worker state lock") = Some(WorkerState::deterministic(machine));
     Ok(())
+}
+
+fn prepare_parallel(bytes: &mut [u8]) -> WorkerResult {
+    if !input(bytes)?.is_empty() {
+        return Err(invalid(
+            "parallel preparation does not accept an input payload",
+        ));
+    }
+    let hart_count =
+        usize::try_from(protocol::read_u32(bytes, field::HART_COUNT).unwrap_or_default())
+            .map_err(|_| invalid("parallel hart count is not addressable"))?;
+    if !(2..=protocol::MAX_WORKER_STACKS).contains(&hart_count) {
+        return Err(invalid("parallel hart count must be between 2 and 64"));
+    }
+
+    let mut slot = STATE.write().expect("worker state lock");
+    let state = slot.as_mut().ok_or_else(|| {
+        (
+            Status::NotInitialized,
+            "Linux vCPU is not initialized".to_string(),
+        )
+    })?;
+    let mode = state
+        .mode
+        .take()
+        .ok_or_else(|| machine_error("Linux vCPU machine transition is unavailable"))?;
+    let WorkerMode::Deterministic(machine) = mode else {
+        state.mode = Some(mode);
+        return Err(invalid("Linux vCPU is already in parallel mode"));
+    };
+    let machine = (*machine)
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if machine.hart_count() != hart_count {
+        state.mode = Some(WorkerMode::Deterministic(Box::new(Mutex::new(machine))));
+        return Err(invalid(
+            "parallel hart count does not match the admitted machine topology",
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        state.mode = Some(WorkerMode::Deterministic(Box::new(Mutex::new(machine))));
+        Err(machine_error(
+            "parallel preparation requires the signed Wasm worker",
+        ))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut machines = Vec::new();
+        if machines.try_reserve_exact(hart_count).is_err() {
+            state.mode = Some(WorkerMode::Deterministic(Box::new(Mutex::new(machine))));
+            return Err(machine_error("parallel hart-state allocation was denied"));
+        }
+        for hart_id in 0..hart_count {
+            let view = machine
+                .share_hart_worker(hart_id)
+                .expect("validated hart identity");
+            machines.push(Mutex::new(view));
+        }
+        for owner in state
+            .pending_requests
+            .lock()
+            .expect("pending request lock")
+            .values_mut()
+        {
+            if let PendingOwner::Deterministic(hart_id) = *owner {
+                *owner = PendingOwner::Hart(hart_id);
+            }
+        }
+        state.mode = Some(WorkerMode::Parallel(machines));
+        Ok(())
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -472,24 +604,48 @@ fn run_slice(worker_index: Option<u32>, bytes: &mut [u8]) -> WorkerResult {
     if !(1..=protocol::MAX_SLICE_STEPS).contains(&budget) {
         return Err(invalid("slice budget is outside the admitted range"));
     }
-    let mut state = STATE.lock().expect("worker state lock");
-    let state = state.as_mut().ok_or_else(|| {
+    let slot = STATE.read().expect("worker state lock");
+    let state = slot.as_ref().ok_or_else(|| {
         (
             Status::NotInitialized,
             "Linux vCPU is not initialized".to_string(),
         )
     })?;
+    let mode = state
+        .mode
+        .as_ref()
+        .ok_or_else(|| machine_error("Linux vCPU machine transition is unavailable"))?;
+    let (machine, owner) = match (worker_index, mode) {
+        (None, WorkerMode::Deterministic(machine)) => {
+            (machine.as_ref(), PendingOwner::Deterministic(0))
+        }
+        (Some(worker_index), WorkerMode::Parallel(machines)) => {
+            let hart_id = worker_index as usize;
+            let machine = machines
+                .get(hart_id)
+                .ok_or_else(|| invalid("runtime worker exceeds the admitted hart topology"))?;
+            (machine, PendingOwner::Hart(hart_id))
+        }
+        (None, WorkerMode::Parallel(_)) => {
+            return Err(invalid(
+                "round-robin slices are unavailable after parallel preparation",
+            ));
+        }
+        (Some(_), WorkerMode::Deterministic(_)) => {
+            return Err(invalid("exact hart slices require parallel preparation"));
+        }
+    };
+    let mut machine = machine.lock().expect("hart machine lock");
     let mut steps_executed = 0_u64;
     let mut instructions_retired = 0_u64;
     let mut console = Vec::new();
     loop {
         let report = if let Some(worker_index) = worker_index {
-            state
-                .machine
+            machine
                 .run_hart_slice(worker_index as usize, budget - steps_executed)
                 .map_err(|error| machine_error(error.to_string()))?
         } else {
-            state.machine.run_slice(budget - steps_executed)
+            machine.run_slice(budget - steps_executed)
         };
         steps_executed = steps_executed.saturating_add(report.steps_executed);
         instructions_retired = instructions_retired.saturating_add(report.instructions_retired);
@@ -510,7 +666,7 @@ fn run_slice(worker_index: Option<u32>, bytes: &mut [u8]) -> WorkerResult {
         if let SliceOutcome::HostRequest(request) = &report.outcome
             && request.channel == LINUX_SYSTEM_BLOCK_CHANNEL
         {
-            complete_system_block_request(&mut state.machine, request)?;
+            complete_system_block_request(&mut machine, request)?;
             if steps_executed < budget {
                 continue;
             }
@@ -539,7 +695,17 @@ fn run_slice(worker_index: Option<u32>, bytes: &mut [u8]) -> WorkerResult {
                     u32::try_from(request.max_response_bytes).unwrap_or(u32::MAX),
                 );
                 message = &request.message;
-                state.pending_request = Some(request.id);
+                let owner = match owner {
+                    PendingOwner::Deterministic(_) => {
+                        let (_, hart_id) =
+                            machine.pending_host_request_identity().ok_or_else(|| {
+                                machine_error("host request lost its owning hart identity")
+                            })?;
+                        PendingOwner::Deterministic(hart_id)
+                    }
+                    PendingOwner::Hart(hart_id) => PendingOwner::Hart(hart_id),
+                };
+                state.register_request(request.id, owner)?;
             }
             SliceOutcome::Trapped(trap) => {
                 protocol::write_u32(bytes, field::OUTCOME, Outcome::Trapped as u32);
@@ -585,36 +751,73 @@ fn push_console(bytes: &mut [u8]) -> WorkerResult {
     if input.len() > protocol::MAX_CONSOLE_INPUT_BYTES {
         return Err(invalid("console input exceeds the per-descriptor limit"));
     }
-    let mut state = STATE.lock().expect("worker state lock");
-    state
-        .as_mut()
-        .ok_or_else(|| {
-            (
-                Status::NotInitialized,
-                "Linux vCPU is not initialized".to_string(),
-            )
-        })?
-        .machine
-        .push_console_input(&input);
-    Ok(())
-}
-
-fn complete_9p(bytes: &mut [u8]) -> WorkerResult {
-    let request_id = protocol::read_u64(bytes, field::REQUEST_ID).unwrap_or_default();
-    let response = input(bytes)?.to_vec();
-    let mut state = STATE.lock().expect("worker state lock");
-    let state = state.as_mut().ok_or_else(|| {
+    let slot = STATE.read().expect("worker state lock");
+    let state = slot.as_ref().ok_or_else(|| {
         (
             Status::NotInitialized,
             "Linux vCPU is not initialized".to_string(),
         )
     })?;
-    let id = pending_request(state, request_id)?;
-    state
-        .machine
-        .complete_9p_request(id, &response)
-        .map_err(|error| machine_error(error.to_string()))?;
-    state.pending_request = None;
+    let mode = state
+        .mode
+        .as_ref()
+        .ok_or_else(|| machine_error("Linux vCPU machine transition is unavailable"))?;
+    let machine = match mode {
+        WorkerMode::Deterministic(machine) => machine.as_ref(),
+        WorkerMode::Parallel(machines) => machines
+            .first()
+            .ok_or_else(|| machine_error("Linux vCPU has no hart-zero machine"))?,
+    };
+    machine
+        .lock()
+        .expect("hart machine lock")
+        .push_console_input(&input);
+    Ok(())
+}
+
+fn drain_console(bytes: &mut [u8]) -> WorkerResult {
+    if !input(bytes)?.is_empty() {
+        return Err(invalid("console drain does not accept an input payload"));
+    }
+    let slot = STATE.read().expect("worker state lock");
+    let state = slot.as_ref().ok_or_else(|| {
+        (
+            Status::NotInitialized,
+            "Linux vCPU is not initialized".to_string(),
+        )
+    })?;
+    let Some(WorkerMode::Parallel(machines)) = state.mode.as_ref() else {
+        return Err(invalid(
+            "console drain is available only after parallel preparation",
+        ));
+    };
+    let machine = machines
+        .first()
+        .ok_or_else(|| machine_error("Linux vCPU has no hart-zero machine"))?;
+    let console = machine
+        .lock()
+        .expect("hart machine lock")
+        .take_console_output();
+    encode_payload(bytes, &console, &[], &[])
+}
+
+fn complete_9p(bytes: &mut [u8]) -> WorkerResult {
+    let request_id = protocol::read_u64(bytes, field::REQUEST_ID).unwrap_or_default();
+    let response = input(bytes)?.to_vec();
+    let slot = STATE.read().expect("worker state lock");
+    let state = slot.as_ref().ok_or_else(|| {
+        (
+            Status::NotInitialized,
+            "Linux vCPU is not initialized".to_string(),
+        )
+    })?;
+    let (id, owner) = pending_request(state, request_id)?;
+    with_owner_machine(state, owner, |machine| {
+        machine
+            .complete_9p_request(id, &response)
+            .map_err(|error| machine_error(error.to_string()))
+    })?;
+    state.finish_request(id);
     Ok(())
 }
 
@@ -628,36 +831,57 @@ fn fail_9p(bytes: &mut [u8]) -> WorkerResult {
         value if value == RequestFailure::Failed as u32 => HostRequestFailure::Failed,
         _ => return Err(invalid("unknown 9P failure code")),
     };
-    let mut state = STATE.lock().expect("worker state lock");
-    let state = state.as_mut().ok_or_else(|| {
+    let slot = STATE.read().expect("worker state lock");
+    let state = slot.as_ref().ok_or_else(|| {
         (
             Status::NotInitialized,
             "Linux vCPU is not initialized".to_string(),
         )
     })?;
-    let id = pending_request(state, request_id)?;
-    state
-        .machine
-        .fail_9p_request(id, failure)
-        .map_err(|error| machine_error(error.to_string()))?;
-    state.pending_request = None;
+    let (id, owner) = pending_request(state, request_id)?;
+    with_owner_machine(state, owner, |machine| {
+        machine
+            .fail_9p_request(id, failure)
+            .map_err(|error| machine_error(error.to_string()))
+    })?;
+    state.finish_request(id);
     Ok(())
 }
 
-fn pending_request(state: &WorkerState, raw: u64) -> Result<HostRequestId, (Status, String)> {
-    let Some(id) = state.pending_request else {
+fn pending_request(
+    state: &WorkerState,
+    raw: u64,
+) -> Result<(HostRequestId, PendingOwner), (Status, String)> {
+    let Some(request) = state.pending_request(raw) else {
         return Err((
             Status::RequestMismatch,
-            "Linux vCPU has no pending 9P request".to_string(),
+            "Linux vCPU has no matching pending 9P request".to_string(),
         ));
     };
-    if id.get() != raw {
-        return Err((
-            Status::RequestMismatch,
-            "Linux vCPU 9P request identity mismatch".to_string(),
-        ));
-    }
-    Ok(id)
+    Ok(request)
+}
+
+fn with_owner_machine<T>(
+    state: &WorkerState,
+    owner: PendingOwner,
+    action: impl FnOnce(&mut Machine) -> Result<T, (Status, String)>,
+) -> Result<T, (Status, String)> {
+    let mode = state
+        .mode
+        .as_ref()
+        .ok_or_else(|| machine_error("Linux vCPU machine transition is unavailable"))?;
+    let machine = match (owner, mode) {
+        (PendingOwner::Deterministic(_), WorkerMode::Deterministic(machine)) => machine.as_ref(),
+        (PendingOwner::Hart(hart_id), WorkerMode::Parallel(machines)) => machines
+            .get(hart_id)
+            .ok_or_else(|| machine_error("pending request hart is unavailable"))?,
+        _ => {
+            return Err(machine_error(
+                "pending request owner does not match the machine execution mode",
+            ));
+        }
+    };
+    action(&mut machine.lock().expect("hart machine lock"))
 }
 
 fn input(bytes: &[u8]) -> Result<&[u8], (Status, String)> {
@@ -771,11 +995,9 @@ mod tests {
     use super::*;
 
     const SIGNED_WORKER_HASH: &str =
-        "blake3:15b937bd89498c576a568cb5a82394bc9239f894ba82e0fb7f908bf997919965";
+        "blake3:894aa90f028e7f90ddfc4085420838476f60a3a1bb447c9cde2f5e0fac7576f6";
     const SIGNED_KERNEL_HASH: &str =
         "blake3:60cc6c3c01222a3a33b108593974de5636747b32cacc10bf8c0f45c1cdd8b285";
-    const SIGNED_TEST_SYSTEM_HASH: &str =
-        "blake3:0ba0ad681b5d03178bfc8b3c308e67164c8daf3301386ca573a6838945078aad";
     const SIGNED_SYSTEM_HASH: &str =
         "blake3:c436bb2bfe0941f183f58f0e2e56df05a4bc03f01147ad1d095f48df0004afaa";
     const SIGNED_CHECKPOINT_HASH: &str =
@@ -844,7 +1066,7 @@ mod tests {
 
     #[test]
     fn malformed_and_out_of_state_descriptors_fail_closed() {
-        *STATE.lock().expect("worker state lock") = None;
+        *STATE.write().expect("worker state lock") = None;
 
         let mut bytes = request(Operation::Reset as u32, &[]);
         assert_eq!(dispatch(&mut bytes, Operation::RunSlice as i64), 0);
@@ -896,6 +1118,10 @@ mod tests {
         assert_eq!(dispatch(&mut bytes, Operation::Complete9p as i64), 0);
         assert_bounded_response(&bytes, Status::NotInitialized);
 
+        let mut bytes = request(Operation::DrainConsole as u32, &[]);
+        assert_eq!(dispatch(&mut bytes, Operation::DrainConsole as i64), 0);
+        assert_bounded_response(&bytes, Status::NotInitialized);
+
         let mut bytes = request(Operation::Fail9p as u32, b"unexpected");
         protocol::write_u32(
             &mut bytes,
@@ -929,10 +1155,20 @@ mod tests {
         assert_eq!(dispatch(&mut bytes, Operation::InitCheckpoint as i64), 0);
         assert_bounded_response(&bytes, Status::Ok);
         {
-            let state = STATE.lock().expect("worker state lock");
+            let state = STATE.read().expect("worker state lock");
             let state = state.as_ref().expect("restored worker state");
-            assert_eq!(state.machine.hart_count(), 1);
-            assert!(state.pending_request.is_some());
+            let Some(WorkerMode::Deterministic(machine)) = state.mode.as_ref() else {
+                panic!("checkpoint must restore deterministic mode");
+            };
+            assert_eq!(machine.lock().expect("machine lock").hart_count(), 1);
+            assert_eq!(
+                state
+                    .pending_requests
+                    .lock()
+                    .expect("pending request lock")
+                    .len(),
+                1
+            );
         }
         let mut bytes = request(Operation::Reset as u32, &[]);
         assert_eq!(dispatch(&mut bytes, Operation::Reset as i64), 0);
@@ -1240,34 +1476,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn signed_worker_cold_boots_two_linux_cpus_inside_the_real_compute_runtime() {
+    fn run_signed_parallel_linux(hart_count: u32) -> (std::time::Duration, u64, Vec<u64>) {
         use astrid_compute::{
             ComputeLedger, ComputeLimits, ComputeRuntime, ExecutionMode, GroupRequest, Parallelism,
             WorkDescriptor, WorkerArtifact, WorkerAssetSpec,
         };
         use astrid_core::principal::PrincipalId;
         use std::path::{Path, PathBuf};
+        use std::time::Instant;
 
         let capsule_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .expect("capsule root");
-        let test_root =
-            std::env::temp_dir().join(format!("aos-realm-worker-assets-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&test_root);
-        std::fs::create_dir_all(test_root.join("assets")).expect("test asset directory");
-        for (source, target) in [
-            ("assets/linux-vcpu.wasm", "assets/linux-vcpu.wasm"),
-            ("assets/linux-kernel.img", "assets/linux-kernel.img"),
-            ("linux/rootfs.cpio", "assets/linux-system-test.img"),
-        ] {
-            std::fs::copy(capsule_root.join(source), test_root.join(target))
-                .expect("copy signed test asset");
-        }
+        assert!((2..=8).contains(&hart_count));
         let artifact = WorkerArtifact::from_capsule_path_with_assets(
             protocol::WORKER_ID,
-            &test_root,
+            capsule_root,
             Path::new("assets/linux-vcpu.wasm"),
             SIGNED_WORKER_HASH,
             &[
@@ -1277,9 +1502,9 @@ mod tests {
                     expected_hash: SIGNED_KERNEL_HASH.to_owned(),
                 },
                 WorkerAssetSpec {
-                    id: "linux-system-test".to_owned(),
-                    relative_path: PathBuf::from("assets/linux-system-test.img"),
-                    expected_hash: SIGNED_TEST_SYSTEM_HASH.to_owned(),
+                    id: "linux-system".to_owned(),
+                    relative_path: PathBuf::from("assets/linux-system.squashfs"),
+                    expected_hash: SIGNED_SYSTEM_HASH.to_owned(),
                 },
             ],
         )
@@ -1288,27 +1513,30 @@ mod tests {
             .expect("compute runtime");
         let group = runtime
             .open_group(
-                &PrincipalId::new("linux-smp-worker-conformance").expect("principal"),
+                &PrincipalId::new(format!("linux-{hart_count}-way-smp-conformance"))
+                    .expect("principal"),
                 &artifact,
                 GroupRequest {
-                    mode: ExecutionMode::Deterministic,
-                    parallelism: Parallelism::Exact(1),
+                    mode: ExecutionMode::Parallel,
+                    parallelism: Parallelism::Exact(hart_count),
                     initial_memory_pages: 1024,
                     maximum_memory_pages: 2048,
                 },
             )
             .expect("worker admission");
-        let control_offset = protocol::control_offset(0).expect("worker zero descriptor");
+        let control_offsets = (0..hart_count)
+            .map(|hart_id| {
+                protocol::control_offset(hart_id as usize).expect("worker control descriptor")
+            })
+            .collect::<Vec<_>>();
         let descriptor = WorkDescriptor {
-            offset: control_offset,
+            offset: control_offsets[0],
             length: protocol::CONTROL_BYTES as u64,
             tag: Operation::InitCold as u64,
-            // The group has exactly one worker. Unspecified affinity exercises
-            // the production queueing path without racing targeted-slot
-            // bookkeeping immediately after `join`.
-            worker_index: None,
+            worker_index: Some(0),
             fuel: None,
         };
+        let started = Instant::now();
         let mut request = vec![0_u8; protocol::HEADER_BYTES + protocol::COLD_BOOT_INPUT_BYTES];
         protocol::write_u32(&mut request, field::MAGIC, protocol::MAGIC);
         protocol::write_u32(&mut request, field::VERSION, protocol::VERSION);
@@ -1320,69 +1548,179 @@ mod tests {
         );
         protocol::write_u64(&mut request, field::RAM_BYTES, 32 * 1024 * 1024);
         protocol::write_u64(&mut request, field::MAX_CONSOLE_BYTES, 64 * 1024);
-        protocol::write_u32(&mut request, field::HART_COUNT, 2);
+        protocol::write_u32(&mut request, field::HART_COUNT, hart_count);
         request[protocol::HEADER_BYTES..].copy_from_slice(&1_753_142_400_u64.to_le_bytes());
-        group.write(control_offset, &request).expect("write init");
+        group
+            .write(control_offsets[0], &request)
+            .expect("write init");
         group
             .submit(descriptor)
             .expect("submit init")
             .join()
             .expect("initialize two-hart Linux");
 
+        protocol::write_u32(
+            &mut request,
+            field::OPERATION,
+            Operation::PrepareParallel as u32,
+        );
+        protocol::write_u32(&mut request, field::INPUT_LEN, 0);
+        protocol::write_u32(&mut request, field::HART_COUNT, hart_count);
+        group
+            .write(control_offsets[0], &request)
+            .expect("write parallel preparation");
+        group
+            .submit(WorkDescriptor {
+                tag: Operation::PrepareParallel as u64,
+                ..descriptor
+            })
+            .expect("submit parallel preparation")
+            .join()
+            .expect("prepare shared two-hart machine");
+
         let mut console = Vec::new();
-        let total_steps = loop {
-            protocol::write_u32(&mut request, field::OPERATION, Operation::RunSlice as u32);
+        let mut total_steps = 0_u64;
+        let mut hart_steps = vec![0_u64; hart_count as usize];
+        let online = format!("smp: Brought up 1 node, {hart_count} CPUs");
+        let system_mounted = b"AOS SYSTEM dev-2026.07 buildroot-2026.05.1 bash-5.2.37";
+        loop {
+            let mut jobs = Vec::new();
+            for (hart_id, control_offset) in control_offsets.iter().copied().enumerate() {
+                protocol::write_u32(
+                    &mut request,
+                    field::OPERATION,
+                    Operation::RunHartSlice as u32,
+                );
+                protocol::write_u32(&mut request, field::INPUT_LEN, 0);
+                protocol::write_u32(&mut request, field::HART_ID, hart_id as u32);
+                protocol::write_u64(&mut request, field::SLICE_BUDGET, 1_000_000);
+                group.write(control_offset, &request).expect("write slice");
+                jobs.push(
+                    group
+                        .submit(WorkDescriptor {
+                            offset: control_offset,
+                            tag: Operation::RunHartSlice as u64,
+                            worker_index: Some(hart_id as u32),
+                            ..descriptor
+                        })
+                        .expect("submit hart slice"),
+                );
+            }
+
+            for (hart_id, (job, control_offset)) in jobs
+                .into_iter()
+                .zip(control_offsets.iter().copied())
+                .enumerate()
+            {
+                job.join().expect("run parallel Linux hart");
+                let header = group
+                    .read(control_offset, protocol::HEADER_BYTES as u32)
+                    .expect("read slice response");
+                assert_eq!(
+                    protocol::read_u32(&header, field::STATUS),
+                    Some(Status::Ok as u32)
+                );
+                let steps =
+                    protocol::read_u64(&header, field::STEPS_EXECUTED).expect("slice steps");
+                total_steps = total_steps.saturating_add(steps);
+                hart_steps[hart_id] = hart_steps[hart_id].saturating_add(steps);
+                assert_eq!(
+                    protocol::read_u32(&header, field::CONSOLE_LEN),
+                    Some(0),
+                    "parallel hart must leave serial output in the shared device"
+                );
+            }
+
+            protocol::write_u32(
+                &mut request,
+                field::OPERATION,
+                Operation::DrainConsole as u32,
+            );
             protocol::write_u32(&mut request, field::INPUT_LEN, 0);
-            protocol::write_u64(&mut request, field::SLICE_BUDGET, 1_000_000);
-            group.write(control_offset, &request).expect("write slice");
+            group
+                .write(control_offsets[0], &request)
+                .expect("write console drain");
             group
                 .submit(WorkDescriptor {
-                    tag: Operation::RunSlice as u64,
+                    tag: Operation::DrainConsole as u64,
                     ..descriptor
                 })
-                .expect("submit slice")
+                .expect("submit console drain")
                 .join()
-                .expect("run two-hart Linux");
+                .expect("drain ordered Linux console");
             let header = group
-                .read(control_offset, protocol::HEADER_BYTES as u32)
-                .expect("read slice response");
+                .read(control_offsets[0], protocol::HEADER_BYTES as u32)
+                .expect("read console drain response");
             assert_eq!(
                 protocol::read_u32(&header, field::STATUS),
                 Some(Status::Ok as u32)
             );
             let console_len =
-                protocol::read_u32(&header, field::CONSOLE_LEN).expect("console length") as u32;
+                protocol::read_u32(&header, field::CONSOLE_LEN).expect("console length");
             if console_len != 0 {
                 console.extend(
                     group
-                        .read(control_offset + protocol::HEADER_BYTES as u64, console_len)
-                        .expect("read Linux console"),
+                        .read(
+                            control_offsets[0] + protocol::HEADER_BYTES as u64,
+                            console_len,
+                        )
+                        .expect("read ordered Linux console"),
                 );
             }
-            let total_steps =
-                protocol::read_u64(&header, field::TOTAL_STEPS_EXECUTED).expect("total steps");
-            if console
-                .windows(b"smp: Brought up 1 node, 2 CPUs".len())
-                .any(|window| window == b"smp: Brought up 1 node, 2 CPUs")
+
+            if hart_steps.iter().skip(1).all(|steps| *steps != 0)
+                && console
+                    .windows(online.len())
+                    .any(|window| window == online.as_bytes())
+                && console
+                    .windows(system_mounted.len())
+                    .any(|window| window == system_mounted)
             {
-                break total_steps;
+                break;
             }
             assert!(
-                total_steps < 50_000_000,
-                "Linux did not bring both CPUs online"
+                total_steps < 250_000_000 * u64::from(hart_count),
+                "Linux did not mount its immutable system with all {hart_count} CPUs online; steps={hart_steps:?}; console={}",
+                String::from_utf8_lossy(&console)
             );
-        };
+        }
 
         let console = String::from_utf8_lossy(&console);
         assert!(console.contains("Linux version 6.18.39"), "{console}");
+        assert!(console.contains(&online), "{console}");
         assert!(
-            console.contains("smp: Brought up 1 node, 2 CPUs"),
+            console
+                .as_bytes()
+                .windows(system_mounted.len())
+                .any(|window| window == system_mounted),
             "{console}"
         );
         assert!(
-            (1..50_000_000).contains(&total_steps),
+            (1..250_000_000 * u64::from(hart_count)).contains(&total_steps),
             "unexpected Linux SMP bring-up cost: {total_steps}"
         );
-        std::fs::remove_dir_all(test_root).expect("remove test assets");
+        assert!(
+            hart_steps.iter().skip(1).all(|steps| *steps != 0),
+            "one or more secondary Linux harts never retired work"
+        );
+        let elapsed = started.elapsed();
+        eprintln!(
+            "parallel {hart_count}-hart Linux mounted the immutable system in {:.3} ms after {total_steps} aggregate steps ({hart_steps:?} by hart)",
+            elapsed.as_secs_f64() * 1_000.0
+        );
+        (elapsed, total_steps, hart_steps)
+    }
+
+    #[test]
+    fn signed_worker_runs_two_linux_cpus_concurrently_inside_the_real_compute_runtime() {
+        let _ = run_signed_parallel_linux(2);
+    }
+
+    #[test]
+    #[ignore = "developer timing matrix, not a release threshold"]
+    fn signed_worker_parallel_linux_timing_matrix() {
+        for hart_count in [2, 4, 8] {
+            let _ = run_signed_parallel_linux(hart_count);
+        }
     }
 }

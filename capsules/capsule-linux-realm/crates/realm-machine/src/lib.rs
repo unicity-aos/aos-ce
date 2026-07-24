@@ -26,7 +26,10 @@ use std::{
     collections::VecDeque,
     fmt,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, AtomicU64, Ordering},
+    },
 };
 
 /// Machine profile whose future device tree and Linux image are versioned together.
@@ -1147,6 +1150,72 @@ impl HartControl {
     }
 }
 
+#[derive(Debug)]
+struct HostRequestSequence {
+    #[cfg(not(target_arch = "wasm32"))]
+    next: u64,
+    #[cfg(target_arch = "wasm32")]
+    next: Arc<AtomicU64>,
+}
+
+impl Clone for HostRequestSequence {
+    fn clone(&self) -> Self {
+        Self::new(self.current())
+    }
+}
+
+impl HostRequestSequence {
+    fn new(next: u64) -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            next,
+            #[cfg(target_arch = "wasm32")]
+            next: Arc::new(AtomicU64::new(next)),
+        }
+    }
+
+    fn current(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.next;
+        #[cfg(target_arch = "wasm32")]
+        self.next.load(Ordering::Acquire)
+    }
+
+    fn set(&mut self, next: u64) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.next = next;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.next.store(next, Ordering::Release);
+        }
+    }
+
+    fn allocate(&mut self) -> Option<HostRequestId> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let id = self.next;
+            self.next = self.next.checked_add(1)?;
+            Some(HostRequestId(id))
+        }
+        #[cfg(target_arch = "wasm32")]
+        self.next
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                next.checked_add(1)
+            })
+            .ok()
+            .map(HostRequestId)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn share(&self) -> Self {
+        Self {
+            next: Arc::clone(&self.next),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct HartState {
@@ -1195,19 +1264,33 @@ struct SbiFirmware {
     enabled: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct GuestRam {
     #[cfg(all(not(target_arch = "wasm32"), not(test)))]
     bytes: Vec<u8>,
     #[cfg(test)]
     chunks: Vec<Option<Box<[u8]>>>,
     #[cfg(target_arch = "wasm32")]
-    atomic: AtomicGuestRam,
+    atomic: std::sync::Arc<AtomicGuestRam>,
     len: usize,
 }
 
 #[cfg(test)]
 const RAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
+impl Clone for GuestRam {
+    fn clone(&self) -> Self {
+        Self {
+            #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+            bytes: self.bytes.clone(),
+            #[cfg(test)]
+            chunks: self.chunks.clone(),
+            #[cfg(target_arch = "wasm32")]
+            atomic: Arc::new((*self.atomic).clone()),
+            len: self.len,
+        }
+    }
+}
 
 impl GuestRam {
     fn zeroed(len: usize) -> Result<Self, MachineError> {
@@ -1233,7 +1316,7 @@ impl GuestRam {
         #[cfg(target_arch = "wasm32")]
         {
             Ok(Self {
-                atomic: AtomicGuestRam::zeroed(len)?,
+                atomic: Arc::new(AtomicGuestRam::zeroed(len)?),
                 len,
             })
         }
@@ -1251,7 +1334,7 @@ impl GuestRam {
             *chunk = None;
         }
         #[cfg(target_arch = "wasm32")]
-        self.atomic.fill_zero();
+        Arc::make_mut(&mut self.atomic).fill_zero();
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1394,45 +1477,57 @@ impl GuestRam {
     fn copy_from_slice(&mut self, start: usize, source: &[u8]) -> bool {
         #[cfg(target_arch = "wasm32")]
         {
-            return self.atomic.copy_from_slice(start, source);
+            self.atomic.copy_from_slice(start, source)
         }
         #[cfg(not(target_arch = "wasm32"))]
-        let Some(end) = start
-            .checked_add(source.len())
-            .filter(|end| *end <= self.len)
-        else {
-            return false;
-        };
-        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
         {
-            self.bytes[start..end].copy_from_slice(source);
-        }
-        #[cfg(test)]
-        {
-            let mut destination = start;
-            let mut source_offset = 0;
-            while destination < end {
-                let chunk_index = destination / RAM_CHUNK_BYTES;
-                let chunk_offset = destination % RAM_CHUNK_BYTES;
-                let copy_len = (end - destination).min(RAM_CHUNK_BYTES - chunk_offset);
-                let source_slice = &source[source_offset..source_offset + copy_len];
-                if source_slice.iter().any(|byte| *byte != 0) {
-                    if !self.ensure_chunk(chunk_index) {
-                        return false;
-                    }
-                    self.chunks[chunk_index]
-                        .as_deref_mut()
-                        .expect("chunk admitted")[chunk_offset..chunk_offset + copy_len]
-                        .copy_from_slice(source_slice);
-                } else if let Some(chunk) = self.chunks[chunk_index].as_deref_mut() {
-                    chunk[chunk_offset..chunk_offset + copy_len].fill(0);
-                }
-                destination += copy_len;
-                source_offset += copy_len;
+            let Some(end) = start
+                .checked_add(source.len())
+                .filter(|end| *end <= self.len)
+            else {
+                return false;
+            };
+            #[cfg(not(test))]
+            {
+                self.bytes[start..end].copy_from_slice(source);
             }
+            #[cfg(test)]
+            {
+                let mut destination = start;
+                let mut source_offset = 0;
+                while destination < end {
+                    let chunk_index = destination / RAM_CHUNK_BYTES;
+                    let chunk_offset = destination % RAM_CHUNK_BYTES;
+                    let copy_len = (end - destination).min(RAM_CHUNK_BYTES - chunk_offset);
+                    let source_slice = &source[source_offset..source_offset + copy_len];
+                    if source_slice.iter().any(|byte| *byte != 0) {
+                        if !self.ensure_chunk(chunk_index) {
+                            return false;
+                        }
+                        self.chunks[chunk_index]
+                            .as_deref_mut()
+                            .expect("chunk admitted")[chunk_offset..chunk_offset + copy_len]
+                            .copy_from_slice(source_slice);
+                    } else if let Some(chunk) = self.chunks[chunk_index].as_deref_mut() {
+                        chunk[chunk_offset..chunk_offset + copy_len].fill(0);
+                    }
+                    destination += copy_len;
+                    source_offset += copy_len;
+                }
+            }
+            true
+        }
+    }
+
+    fn copy_from_slice_quiescent(&mut self, start: usize, source: &[u8]) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            Arc::make_mut(&mut self.atomic).copy_from_slice_quiescent(start, source)
         }
         #[cfg(not(target_arch = "wasm32"))]
-        true
+        {
+            self.copy_from_slice(start, source)
+        }
     }
 
     fn copy_to_vec(&self, range: std::ops::Range<usize>) -> Option<Vec<u8>> {
@@ -1498,7 +1593,7 @@ impl GuestRam {
         }
         index
             .checked_mul(page_bytes)
-            .is_some_and(|start| self.copy_from_slice(start, bytes))
+            .is_some_and(|start| self.copy_from_slice_quiescent(start, bytes))
     }
 
     fn nonzero_pages(&self, page_bytes: usize) -> Vec<(usize, Vec<u8>)> {
@@ -1535,15 +1630,63 @@ impl GuestRam {
             self.atomic.nonzero_pages(page_bytes)
         }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    fn share(&self) -> Self {
+        Self {
+            atomic: Arc::clone(&self.atomic),
+            len: self.len,
+        }
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Devices {
     ram: GuestRam,
+    #[cfg(not(target_arch = "wasm32"))]
     mtime: u64,
+    #[cfg(target_arch = "wasm32")]
+    mtime: Arc<AtomicU64>,
+    #[cfg(not(target_arch = "wasm32"))]
     console_input: VecDeque<u8>,
+    #[cfg(target_arch = "wasm32")]
+    console_input: Arc<std::sync::Mutex<VecDeque<u8>>>,
+    #[cfg(not(target_arch = "wasm32"))]
     console_output: Vec<u8>,
+    #[cfg(target_arch = "wasm32")]
+    console_output: Arc<std::sync::Mutex<Vec<u8>>>,
     max_console_bytes: usize,
+}
+
+impl Clone for Devices {
+    fn clone(&self) -> Self {
+        Self {
+            ram: self.ram.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            mtime: self.mtime,
+            #[cfg(target_arch = "wasm32")]
+            mtime: Arc::new(AtomicU64::new(self.mtime())),
+            #[cfg(not(target_arch = "wasm32"))]
+            console_input: self.console_input.clone(),
+            #[cfg(target_arch = "wasm32")]
+            console_input: Arc::new(std::sync::Mutex::new(
+                self.console_input
+                    .lock()
+                    .expect("console input lock")
+                    .clone(),
+            )),
+            #[cfg(not(target_arch = "wasm32"))]
+            console_output: self.console_output.clone(),
+            #[cfg(target_arch = "wasm32")]
+            console_output: Arc::new(std::sync::Mutex::new(
+                self.console_output
+                    .lock()
+                    .expect("console output lock")
+                    .clone(),
+            )),
+            max_console_bytes: self.max_console_bytes,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1661,26 +1804,54 @@ impl Devices {
     fn new(config: MachineConfig) -> Result<Self, MachineError> {
         Ok(Self {
             ram: GuestRam::zeroed(config.ram_bytes)?,
+            #[cfg(not(target_arch = "wasm32"))]
             mtime: 0,
+            #[cfg(target_arch = "wasm32")]
+            mtime: Arc::new(AtomicU64::new(0)),
+            #[cfg(not(target_arch = "wasm32"))]
             console_input: VecDeque::new(),
+            #[cfg(target_arch = "wasm32")]
+            console_input: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            #[cfg(not(target_arch = "wasm32"))]
             console_output: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
+            console_output: Arc::new(std::sync::Mutex::new(Vec::new())),
             max_console_bytes: config.max_console_bytes,
         })
     }
 
     fn reset(&mut self) {
         self.ram.fill_zero();
-        self.mtime = 0;
-        self.console_input.clear();
-        self.console_output.clear();
+        self.set_mtime(0);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.console_input.clear();
+            self.console_output.clear();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.console_input
+                .lock()
+                .expect("console input lock")
+                .clear();
+            self.console_output
+                .lock()
+                .expect("console output lock")
+                .clear();
+        }
     }
 
     fn load_program(&mut self, program: &[u8]) -> bool {
-        self.ram.copy_from_slice(0, program)
+        self.ram.copy_from_slice_quiescent(0, program)
     }
 
     fn take_new_console(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.console_output)
+        #[cfg(not(target_arch = "wasm32"))]
+        return std::mem::take(&mut self.console_output);
+        #[cfg(target_arch = "wasm32")]
+        {
+            std::mem::take(&mut *self.console_output.lock().expect("console output lock"))
+        }
     }
 
     fn read(&mut self, address: u64, bytes: u8) -> Result<u64, MachineTrap> {
@@ -1692,10 +1863,10 @@ impl Devices {
                 return Err(MachineTrap::LoadAccessFault { address, bytes });
             }
             return Ok(match offset {
-                UART_RECEIVE => self.console_input.pop_front().unwrap_or_default() as u64,
+                UART_RECEIVE => self.pop_console_input().unwrap_or_default() as u64,
                 UART_INTERRUPT_IDENTIFICATION => 1,
                 UART_LINE_STATUS => {
-                    let ready = if self.console_input.is_empty() {
+                    let ready = if self.console_input_len() == 0 {
                         0
                     } else {
                         UART_LINE_STATUS_DATA_READY
@@ -1821,38 +1992,149 @@ impl Devices {
         self.ram.copy_from_slice(range.start, bytes)
     }
 
+    fn write_ram_slice_quiescent(&mut self, address: u64, bytes: &[u8]) -> bool {
+        let Some(range) = self.ram_range_len(address, bytes.len()) else {
+            return false;
+        };
+        self.ram.copy_from_slice_quiescent(range.start, bytes)
+    }
+
     fn push_console_output(&mut self, byte: u8) -> Result<(), MachineTrap> {
-        if self.console_output.len() == self.max_console_bytes {
+        #[cfg(not(target_arch = "wasm32"))]
+        let output = &mut self.console_output;
+        #[cfg(target_arch = "wasm32")]
+        let mut output = self.console_output.lock().expect("console output lock");
+        if output.len() == self.max_console_bytes {
             return Err(MachineTrap::ConsoleLimit {
                 limit: self.max_console_bytes,
             });
         }
-        self.console_output.push(byte);
+        output.push(byte);
         Ok(())
     }
 
     fn tick(&mut self) {
-        self.mtime = self.mtime.wrapping_add(1);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.mtime = self.mtime.wrapping_add(1);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.mtime.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn mtime(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.mtime;
+        #[cfg(target_arch = "wasm32")]
+        self.mtime.load(Ordering::Acquire)
+    }
+
+    fn set_mtime(&mut self, value: u64) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.mtime = value;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.mtime.store(value, Ordering::Release);
+        }
+    }
+
+    fn push_console_input(&mut self, bytes: &[u8]) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.console_input.extend(bytes.iter().copied());
+        #[cfg(target_arch = "wasm32")]
+        self.console_input
+            .lock()
+            .expect("console input lock")
+            .extend(bytes.iter().copied());
+    }
+
+    fn pop_console_input(&mut self) -> Option<u8> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.console_input.pop_front();
+        #[cfg(target_arch = "wasm32")]
+        self.console_input
+            .lock()
+            .expect("console input lock")
+            .pop_front()
+    }
+
+    fn console_input_len(&self) -> usize {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.console_input.len();
+        #[cfg(target_arch = "wasm32")]
+        self.console_input.lock().expect("console input lock").len()
+    }
+
+    fn console_output_len(&self) -> usize {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.console_output.len();
+        #[cfg(target_arch = "wasm32")]
+        self.console_output
+            .lock()
+            .expect("console output lock")
+            .len()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn share(&self) -> Self {
+        Self {
+            ram: self.ram.share(),
+            mtime: Arc::clone(&self.mtime),
+            console_input: Arc::clone(&self.console_input),
+            console_output: Arc::clone(&self.console_output),
+            max_console_bytes: self.max_console_bytes,
+        }
     }
 }
 
 /// An admitted RV64 machine whose execution can only advance in explicit slices.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Machine {
     config: MachineConfig,
     hart_count: usize,
     active_hart_id: usize,
     harts: Vec<HartState>,
-    hart_controls: Vec<HartControl>,
+    hart_controls: Vec<Arc<HartControl>>,
+    worker_hart: Option<usize>,
     scheduler_quantum_remaining: u64,
     devices: Devices,
     state: RunState,
     steps_executed: u64,
     instructions_retired: u64,
     firmware: SbiFirmware,
-    next_host_request_id: u64,
+    next_host_request_id: HostRequestSequence,
     pending_9p_request: Option<PendingPlan9Request>,
     metrics: MachineMetrics,
+}
+
+impl Clone for Machine {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config,
+            hart_count: self.hart_count,
+            active_hart_id: self.active_hart_id,
+            harts: self.harts.clone(),
+            hart_controls: self
+                .hart_controls
+                .iter()
+                .map(|control| Arc::new((**control).clone()))
+                .collect(),
+            worker_hart: self.worker_hart,
+            scheduler_quantum_remaining: self.scheduler_quantum_remaining,
+            devices: self.devices.clone(),
+            state: self.state.clone(),
+            steps_executed: self.steps_executed,
+            instructions_retired: self.instructions_retired,
+            firmware: self.firmware,
+            next_host_request_id: self.next_host_request_id.clone(),
+            pending_9p_request: self.pending_9p_request.clone(),
+            metrics: self.metrics,
+        }
+    }
 }
 
 impl Deref for Machine {
@@ -1960,20 +2242,21 @@ impl Machine {
                 .collect(),
             hart_controls: (0..hart_count)
                 .map(|hart_id| {
-                    HartControl::new(if hart_id == 0 {
+                    Arc::new(HartControl::new(if hart_id == 0 {
                         HartLifecycle::Started
                     } else {
                         HartLifecycle::Stopped
-                    })
+                    }))
                 })
                 .collect(),
+            worker_hart: None,
             scheduler_quantum_remaining: HART_SCHEDULER_QUANTUM,
             devices: Devices::new(config)?,
             state: RunState::Runnable,
             steps_executed: 0,
             instructions_retired: 0,
             firmware: SbiFirmware::default(),
-            next_host_request_id: 1,
+            next_host_request_id: HostRequestSequence::new(1),
             pending_9p_request: None,
             metrics: MachineMetrics::default(),
         })
@@ -1990,6 +2273,16 @@ impl Machine {
     #[must_use]
     pub const fn active_hart_id(&self) -> usize {
         self.active_hart_id
+    }
+
+    /// Return the identity and owning hart of this view's suspended host
+    /// request without exposing its guest buffer bookkeeping.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending_host_request_identity(&self) -> Option<(HostRequestId, usize)> {
+        self.pending_9p_request
+            .as_ref()
+            .map(|pending| (pending.request.id, pending.hart_id))
     }
 
     fn reset_harts(&mut self) {
@@ -2014,7 +2307,7 @@ impl Machine {
         self.hart_controls = self
             .harts
             .iter()
-            .map(|hart| HartControl::new(hart.lifecycle))
+            .map(|hart| Arc::new(HartControl::new(hart.lifecycle)))
             .collect();
     }
 
@@ -2033,7 +2326,9 @@ impl Machine {
     }
 
     fn hart_lifecycle(&self, hart_id: usize) -> Option<HartLifecycle> {
-        self.hart_controls.get(hart_id).map(HartControl::lifecycle)
+        self.hart_controls
+            .get(hart_id)
+            .map(|control| control.lifecycle())
     }
 
     fn set_hart_lifecycle(&mut self, hart_id: usize, lifecycle: HartLifecycle) -> bool {
@@ -2058,6 +2353,47 @@ impl Machine {
         }
         self.active_hart_id = hart_id;
         true
+    }
+
+    fn owns_hart_control(&self, hart_id: usize) -> bool {
+        self.worker_hart.is_none_or(|owned| owned == hart_id)
+    }
+
+    /// Create one Wasm worker-affine view of this machine.
+    ///
+    /// Architectural state remains private to the selected hart while guest
+    /// RAM, virtual time, console devices, and inter-hart control mailboxes are
+    /// shared atomically. Ordinary [`Clone`] stays a deep, isolated copy for
+    /// checkpoints and deterministic verification.
+    #[cfg(target_arch = "wasm32")]
+    #[doc(hidden)]
+    pub fn share_hart_worker(&self, hart_id: usize) -> Result<Self, InvalidHartId> {
+        if hart_id >= self.hart_count {
+            return Err(InvalidHartId {
+                hart_id,
+                hart_count: self.hart_count,
+            });
+        }
+        Ok(Self {
+            config: self.config,
+            hart_count: self.hart_count,
+            active_hart_id: hart_id,
+            harts: self.harts.clone(),
+            hart_controls: self.hart_controls.clone(),
+            worker_hart: Some(hart_id),
+            scheduler_quantum_remaining: HART_SCHEDULER_QUANTUM,
+            devices: self.devices.share(),
+            state: self.state.clone(),
+            steps_executed: self.steps_executed,
+            instructions_retired: self.instructions_retired,
+            firmware: self.firmware,
+            next_host_request_id: self.next_host_request_id.share(),
+            pending_9p_request: self
+                .pending_9p_request
+                .clone()
+                .filter(|pending| pending.hart_id == hart_id),
+            metrics: self.metrics,
+        })
     }
 
     fn select_runnable_hart(&mut self) -> bool {
@@ -2159,9 +2495,12 @@ impl Machine {
 
         self.devices.reset();
         self.reset_harts();
-        if !self.devices.write_ram_slice(LINUX_KERNEL_BASE, kernel)
-            || !self.devices.write_ram_slice(LINUX_FDT_BASE, &fdt)
-            || initrd_start.is_some_and(|start| !self.devices.write_ram_slice(start, initramfs))
+        if !self
+            .devices
+            .write_ram_slice_quiescent(LINUX_KERNEL_BASE, kernel)
+            || !self.devices.write_ram_slice_quiescent(LINUX_FDT_BASE, &fdt)
+            || initrd_start
+                .is_some_and(|start| !self.devices.write_ram_slice_quiescent(start, initramfs))
         {
             return Err(MachineError::RamAllocationDenied(self.config.ram_bytes));
         }
@@ -2191,7 +2530,18 @@ impl Machine {
 
     /// Add bytes that the guest may consume from the serial receive register.
     pub fn push_console_input(&mut self, bytes: &[u8]) {
-        self.devices.console_input.extend(bytes.iter().copied());
+        self.devices.push_console_input(bytes);
+    }
+
+    /// Drain serial output accumulated by every view sharing this machine's
+    /// devices.
+    ///
+    /// Parallel hart slices intentionally leave output in the shared device so
+    /// the controller can collect one temporally ordered stream after the
+    /// entire epoch has joined.
+    #[doc(hidden)]
+    pub fn take_console_output(&mut self) -> Vec<u8> {
+        self.devices.take_new_console()
     }
 
     /// Borrow an admitted physical RAM range for image measurement, snapshots,
@@ -2291,7 +2641,7 @@ impl Machine {
             return match (offset, bytes) {
                 (CLINT_MSIP, 4) => Ok(u64::from(self.msip)),
                 (CLINT_MTIMECMP, 8) => Ok(self.mtimecmp),
-                (CLINT_MTIME, 8) => Ok(self.devices.mtime),
+                (CLINT_MTIME, 8) => Ok(self.devices.mtime()),
                 _ => Err(MachineTrap::LoadAccessFault { address, bytes }),
             };
         }
@@ -2318,7 +2668,7 @@ impl Machine {
                     Ok(None)
                 }
                 (CLINT_MTIME, 8) => {
-                    self.devices.mtime = value;
+                    self.devices.set_mtime(value);
                     Ok(None)
                 }
                 _ => Err(MachineTrap::StoreAccessFault { address, bytes }),
@@ -2361,14 +2711,14 @@ impl Machine {
         if self.pending_9p_request.is_none() {
             return Err(CheckpointError::NoPendingHostRequest);
         }
-        if !self.devices.console_input.is_empty() {
+        if self.devices.console_input_len() != 0 {
             return Err(CheckpointError::PendingConsoleInput {
-                bytes: self.devices.console_input.len(),
+                bytes: self.devices.console_input_len(),
             });
         }
-        if !self.devices.console_output.is_empty() {
+        if self.devices.console_output_len() != 0 {
             return Err(CheckpointError::UndrainedConsoleOutput {
-                bytes: self.devices.console_output.len(),
+                bytes: self.devices.console_output_len(),
             });
         }
         if let Some(hart_id) = self
@@ -2422,6 +2772,15 @@ impl Machine {
                 break;
             }
             if scheduled {
+                let applied = self.apply_hart_control(self.active_hart_id);
+                debug_assert!(applied);
+            } else {
+                // A worker-affine hart must observe HSM, IPI, and RFENCE
+                // mailboxes before every next instruction. Other workers can
+                // publish these controls while this exact slice is already
+                // running; checking only at the epoch boundary would permit a
+                // stale translation or delayed interrupt for the rest of a
+                // long slice.
                 let applied = self.apply_hart_control(self.active_hart_id);
                 debug_assert!(applied);
             }
@@ -2478,7 +2837,11 @@ impl Machine {
             total_steps_executed: self.steps_executed,
             instructions_retired: retired,
             total_instructions_retired: self.instructions_retired,
-            console: self.devices.take_new_console(),
+            console: if self.worker_hart.is_some() {
+                Vec::new()
+            } else {
+                self.devices.take_new_console()
+            },
         }
     }
 
@@ -3294,7 +3657,7 @@ impl Machine {
     fn read_csr(&self, csr: Csr) -> u64 {
         match csr {
             Csr::Cycle | Csr::Mcycle => self.cycle,
-            Csr::Time => self.devices.mtime,
+            Csr::Time => self.devices.mtime(),
             Csr::Instret | Csr::Minstret => self.instret,
             Csr::Mhartid => self.active_hart_id as u64,
             _ => self.csrs.read(csr),
@@ -3327,7 +3690,7 @@ impl Machine {
         if self.msip {
             hardware |= MIP_MSIP;
         }
-        if self.devices.mtime >= self.mtimecmp {
+        if self.devices.mtime() >= self.mtimecmp {
             hardware |= MIP_MTIP;
         }
         if self.firmware.enabled && hardware & MIP_MTIP != 0 {
@@ -3397,8 +3760,10 @@ impl Machine {
         if control.request_start(start_address, arguments[2]).is_err() {
             return (SBI_ERR_ALREADY_AVAILABLE, 0);
         }
-        let applied = self.apply_hart_control(hart_id);
-        debug_assert!(applied);
+        if self.owns_hart_control(hart_id) {
+            let applied = self.apply_hart_control(hart_id);
+            debug_assert!(applied);
+        }
         (SBI_SUCCESS, 0)
     }
 
@@ -3449,8 +3814,10 @@ impl Machine {
         };
         for hart_id in selected {
             self.hart_controls[hart_id].raise_interrupt(MIP_SSIP);
-            let applied = self.apply_hart_control(hart_id);
-            debug_assert!(applied);
+            if self.owns_hart_control(hart_id) {
+                let applied = self.apply_hart_control(hart_id);
+                debug_assert!(applied);
+            }
         }
         (SBI_SUCCESS, 0)
     }
@@ -3468,8 +3835,10 @@ impl Machine {
         }
         for hart_id in selected {
             self.hart_controls[hart_id].request_fence();
-            let applied = self.apply_hart_control(hart_id);
-            debug_assert!(applied);
+            if self.owns_hart_control(hart_id) {
+                let applied = self.apply_hart_control(hart_id);
+                debug_assert!(applied);
+            }
         }
         (SBI_SUCCESS, 0)
     }
@@ -3573,11 +3942,9 @@ impl Machine {
         {
             return Some((SBI_ERR_INVALID_ADDRESS, 0));
         }
-        let Some(next_id) = self.next_host_request_id.checked_add(1) else {
+        let Some(id) = self.next_host_request_id.allocate() else {
             return Some((SBI_ERR_FAILED, 0));
         };
-        let id = HostRequestId(self.next_host_request_id);
-        self.next_host_request_id = next_id;
         self.pending_9p_request = Some(PendingPlan9Request {
             request: Plan9Request {
                 id,
@@ -3608,7 +3975,7 @@ impl Machine {
         let remaining = self
             .devices
             .max_console_bytes
-            .saturating_sub(self.devices.console_output.len());
+            .saturating_sub(self.devices.console_output_len());
         let written = bytes.min(remaining);
         let output = self
             .devices
@@ -3631,12 +3998,11 @@ impl Machine {
         let Some(range) = self.devices.ram_range_len(arguments[1], bytes) else {
             return (SBI_ERR_INVALID_ADDRESS, 0);
         };
-        let read = bytes.min(self.devices.console_input.len());
+        let read = bytes.min(self.devices.console_input_len());
         for offset in 0..read {
             let byte = self
                 .devices
-                .console_input
-                .pop_front()
+                .pop_console_input()
                 .expect("length checked console input");
             if !self.devices.ram.set_byte(range.start + offset, byte) {
                 return (SBI_ERR_FAILED, offset as u64);

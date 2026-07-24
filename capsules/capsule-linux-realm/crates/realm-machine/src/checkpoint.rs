@@ -173,11 +173,11 @@ impl MachineCheckpoint {
             );
         }
 
-        push_u64(&mut bytes, machine.devices.mtime);
+        push_u64(&mut bytes, machine.devices.mtime());
         push_u64(&mut bytes, machine.steps_executed);
         push_u64(&mut bytes, machine.instructions_retired);
         bytes.push(u8::from(machine.firmware.enabled));
-        push_u64(&mut bytes, machine.next_host_request_id);
+        push_u64(&mut bytes, machine.next_host_request_id.current());
 
         let pending = machine
             .pending_9p_request
@@ -311,14 +311,14 @@ impl MachineCheckpoint {
         machine.rebuild_reservation_tokens();
         machine.scheduler_quantum_remaining = scheduler_quantum_remaining;
 
-        machine.devices.mtime = decoder.u64()?;
+        machine.devices.set_mtime(decoder.u64()?);
         machine.steps_executed = decoder.u64()?;
         machine.instructions_retired = decoder.u64()?;
         machine.firmware.enabled = decoder.boolean("firmware state")?;
         if !machine.firmware.enabled {
             return Err(CheckpointDecodeError::InvalidField("firmware state"));
         }
-        machine.next_host_request_id = decoder.u64()?;
+        machine.next_host_request_id.set(decoder.u64()?);
 
         let request_id = HostRequestId(decoder.u64()?);
         let channel = decoder.u32()?;
@@ -339,7 +339,7 @@ impl MachineCheckpoint {
             .ram_range_len(response_address, max_response_bytes)
             .is_none()
             || request_id.get() == 0
-            || machine.next_host_request_id <= request_id.get()
+            || machine.next_host_request_id.current() <= request_id.get()
             || request_hart_id >= hart_count
         {
             return Err(CheckpointDecodeError::InvalidField(
