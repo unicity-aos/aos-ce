@@ -56,6 +56,7 @@ const LINUX_FRAME_TOKEN_HEX_BYTES: usize = LINUX_FRAME_TOKEN_BYTES * 2;
 const MAX_LINUX_COMMAND_BYTES: usize = 1024;
 const MAX_LINUX_CWD_BYTES: usize = 64;
 const LINUX_DEFAULT_CWD: &str = "/home/agent";
+const LINUX_SHELL_DEFAULT_CWD: &str = "/workspace";
 #[cfg(target_arch = "wasm32")]
 const LINUX_COOPERATE_TOPIC: &str = "realm.v1.linux.cooperate";
 
@@ -145,12 +146,6 @@ pub struct ExecArgs {
 pub struct RealmShellArgs {
     /// Exact script to execute inside the Linux Realm.
     pub command: String,
-    /// Guest-visible CWD beneath `/home/agent` or `/workspace`.
-    pub cwd: Option<String>,
-    /// Optional lower guest-step ceiling. It cannot raise the principal limit.
-    pub max_steps: Option<u64>,
-    /// Optional lower output ceiling. It cannot raise the principal limit.
-    pub max_output_bytes: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -415,25 +410,15 @@ impl SelectedExecution {
 
 #[capsule]
 impl LinuxRealm {
-    /// Run one signed command in the caller's principal-scoped AOS Realm.
-    ///
-    /// Nested core-WASM programs can use the confined `/workspace`, durable
-    /// `/home/agent`, and ephemeral `/tmp` Astrid projections. Linux receives
-    /// the same durable principal home over one 9P channel and the current
-    /// invocation's Astrid `/workspace` over another. The response describes
-    /// the selected consumer, projection state, and home generation boundary.
-    #[astrid::tool("linux_realm_exec", mutable)]
-    pub fn exec(&self, args: ExecArgs) -> Result<String, SysError> {
-        let principal = caller_principal()?;
-        actor::execute_resident(&principal, args, RealmResources::load()?)
-    }
-
     /// Run a foreground shell command inside the caller's Linux Realm.
     ///
     /// This is the normal shell surface for agents. It never invokes a host
     /// shell and the capsule declares no `host_process` capability. Files built
-    /// in `/workspace` therefore remain data on the host and execute only in the
-    /// guest unless a separate, explicitly privileged boundary promotes them.
+    /// in the invocation workspace therefore remain data on the host and
+    /// execute only in the guest unless a separate, explicitly privileged
+    /// boundary promotes them. Its CWD and execution ceilings come from the
+    /// kernel-stamped workspace attachment and principal configuration, not
+    /// model-supplied tool arguments.
     #[astrid::tool("realm_shell", mutable)]
     pub fn shell(&self, args: RealmShellArgs) -> Result<String, SysError> {
         let principal = caller_principal()?;
@@ -444,17 +429,10 @@ impl LinuxRealm {
         )
     }
 
-    /// Discover the per-consumer CWD and mount projections without exposing
-    /// physical host paths. Call this before selecting a path for a Realm job.
-    #[astrid::tool("linux_realm_status")]
-    pub fn status(&self, args: StatusArgs) -> Result<String, SysError> {
-        let principal = caller_principal()?;
-        actor::status_resident(&principal, args, RealmResources::load()?)
-    }
-
     /// Serve the provider-scoped `astrid capsule ... realm` command without
-    /// requiring an MCP broker. The CLI remains an authenticated Astrid
-    /// uplink; this is not a host shell escape hatch.
+    /// requiring an MCP broker. Structured execution and status are diagnostics
+    /// on this operator surface rather than model-visible tools. The CLI remains
+    /// an authenticated Astrid uplink; this is not a host shell escape hatch.
     #[astrid::interceptor("cli_run_linux_realm")]
     fn cli_run(&self, request: CliRunRequest) -> Result<(), SysError> {
         if !is_valid_cli_request_id(&request.req_id) {
@@ -581,9 +559,9 @@ fn realm_shell_exec_args(args: RealmShellArgs) -> ExecArgs {
         program: Some(RealmProgram::LinuxSh),
         command: None,
         args: vec![args.command],
-        cwd: args.cwd,
-        fuel: args.max_steps,
-        max_output_bytes: args.max_output_bytes,
+        cwd: Some(LINUX_SHELL_DEFAULT_CWD.to_string()),
+        fuel: None,
+        max_output_bytes: None,
     }
 }
 
@@ -1751,7 +1729,7 @@ fn linux_effective_cwd(
     }
 
     let Some(requested) = requested_cwd else {
-        return Ok(LINUX_DEFAULT_CWD.to_string());
+        return Ok(LINUX_SHELL_DEFAULT_CWD.to_string());
     };
     if !requested.starts_with('/') {
         return Err(SysError::ApiError(format!(
@@ -2120,17 +2098,20 @@ mod tests {
     fn agent_realm_shell_can_only_select_the_linux_guest_shell() {
         let args = realm_shell_exec_args(RealmShellArgs {
             command: "cc hello.c -o hello && ./hello".to_string(),
-            cwd: Some("/workspace/project".to_string()),
-            max_steps: Some(50_000_000),
-            max_output_bytes: Some(16_384),
         });
 
         assert!(matches!(args.program, Some(RealmProgram::LinuxSh)));
         assert!(args.command.is_none(), "no executable selector is accepted");
         assert_eq!(args.args, ["cc hello.c -o hello && ./hello"]);
-        assert_eq!(args.cwd.as_deref(), Some("/workspace/project"));
-        assert_eq!(args.fuel, Some(50_000_000));
-        assert_eq!(args.max_output_bytes, Some(16_384));
+        assert_eq!(args.cwd.as_deref(), Some(LINUX_SHELL_DEFAULT_CWD));
+        assert_eq!(
+            args.fuel, None,
+            "the principal env owns the execution ceiling"
+        );
+        assert_eq!(
+            args.max_output_bytes, None,
+            "the principal env owns the output ceiling"
+        );
     }
 
     #[test]
@@ -2239,7 +2220,7 @@ mod tests {
     fn linux_cwd_admits_only_the_two_real_shell_roots() {
         assert_eq!(
             linux_effective_cwd(LinuxAction::Shell, None).expect("default Linux cwd"),
-            LINUX_DEFAULT_CWD
+            LINUX_SHELL_DEFAULT_CWD
         );
         assert_eq!(
             linux_effective_cwd(LinuxAction::Shell, Some(LINUX_DEFAULT_CWD))
@@ -3245,6 +3226,18 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
         assert_eq!(
             manifest["subscribe"]["tool.v1.execute.realm_shell"]["handler"].as_str(),
             Some("tool_execute_realm_shell")
+        );
+        let execute_topics = manifest["subscribe"]
+            .as_table()
+            .expect("subscribe is a table")
+            .keys()
+            .filter(|topic| topic.starts_with("tool.v1.execute."))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            execute_topics,
+            ["tool.v1.execute.realm_shell"],
+            "diagnostic operations must not be exposed as model tools"
         );
     }
 
