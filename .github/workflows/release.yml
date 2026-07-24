@@ -558,13 +558,17 @@ jobs:
           name: aos-community-capsules
           path: artifacts/*.capsule
 
-  github-release:
-    name: Publish signed release
+  release-candidate:
+    name: Prepare signed release candidate
     needs: [classify, build, capsules]
     runs-on: ubuntu-latest
     environment: release
+    outputs:
+      artifact-name: ${{ steps.candidate.outputs.artifact-name }}
+      existing-release: ${{ steps.candidate.outputs.existing-release }}
+      release-id: ${{ steps.candidate.outputs.release-id }}
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     steps:
@@ -590,14 +594,6 @@ jobs:
           toolchain: '1.95.0'
       - name: Install pinned BLAKE3 checksum tool
         run: cargo install b3sum --locked --version "$B3SUM_VERSION"
-      - name: Load runtime compatibility pins
-        run: |
-          python3 - <<'PY' >> "$GITHUB_ENV"
-          import tomllib
-          with open("release/runtime-compatibility.toml", "rb") as file:
-              metadata = tomllib.load(file)["runtime"]
-          print(f"RUNTIME_TAG={metadata['tag']}")
-          PY
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
@@ -730,23 +726,6 @@ jobs:
               --use-signed-timestamps \
               "$asset"
           done
-      - name: Write release notes
-        run: |
-          cat > release-notes.md <<EOF
-          Unicity AOS Community Edition ${GITHUB_REF_NAME}.
-
-          This product release bundles Astrid Runtime ${RUNTIME_TAG}. The exact runtime release identity, WIT commit, and compatibility pins are published in \`runtime-compatibility.toml\`, \`runtime-musl-compatibility.toml\`, and every archive's \`release-manifest.json\`.
-
-          The release also contains the 19 signed, installable capsule artifacts selected by Community Edition. Published \`astrid-capsule-*\` identities remain unchanged.
-
-          Install this exact release:
-
-          \`\`\`sh
-          curl --proto '=https' --tlsv1.2 -fsSL https://aos.unicity.ai/install.sh | sh -s -- --version ${GITHUB_REF_NAME}
-          \`\`\`
-
-          Moving channel installs change only after a separate protected promotion.
-          EOF
       - name: Refuse conflicting releases or authenticate a complete draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -812,8 +791,227 @@ jobs:
             echo "RECOVER_DRAFT=1"
             echo "CANDIDATE=$EXISTING_ASSETS"
           } >> "$GITHUB_ENV"
-      - name: Test signed direct install in a clean Alpine home
-        run: bash scripts/test-clean-home-musl-install.sh "$CANDIDATE"
+      - name: Revalidate the complete signed candidate
+        env:
+          EXPECTED_SOURCE: ${{ needs.classify.outputs.source-commit }}
+        run: |
+          PAYLOADS="$RUNNER_TEMP/candidate-payloads.txt"
+          python3 scripts/release_publication.py \
+            --artifacts "$CANDIDATE" \
+            --version "$GITHUB_REF_NAME" \
+            --source-commit "$EXPECTED_SOURCE" > "$PAYLOADS"
+          (
+            cd "$CANDIDATE"
+            b3sum --check BLAKE3SUMS.txt
+            sha256sum --check SHA256SUMS.txt
+          )
+          IDENTITY="https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+          while IFS= read -r asset; do
+            cosign verify-blob \
+              --bundle "$CANDIDATE/${asset}.sigstore.json" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity "$IDENTITY" \
+              --use-signed-timestamps \
+              "$CANDIDATE/$asset"
+          done < "$PAYLOADS"
+      - name: Export authenticated candidate state
+        id: candidate
+        run: |
+          ARTIFACT_NAME="signed-release-candidate-${GITHUB_RUN_ATTEMPT}"
+          mkdir signed-candidate
+          cp "$CANDIDATE"/* signed-candidate/
+          echo "artifact-name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "existing-release=$RECOVER_DRAFT" >> "$GITHUB_OUTPUT"
+          if [[ "$RECOVER_DRAFT" == 1 ]]; then
+            [[ -n "$SELECTED_RELEASE_ID" ]]
+            echo "release-id=$SELECTED_RELEASE_ID" >> "$GITHUB_OUTPUT"
+          else
+            echo "release-id=" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload immutable signed candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.candidate.outputs.artifact-name }}
+          path: signed-candidate/*
+          if-no-files-found: error
+          compression-level: 0
+
+  signed-musl-install:
+    name: Signed musl install (${{ matrix.target }})
+    needs: [classify, release-candidate]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            platform: linux/amd64
+            expected_uname: x86_64
+            cosign_asset: cosign-linux-amd64
+            image: docker.io/library/rust@sha256:e98196986adced5602f6e21c54babdbf2a8700400c7a78868324a3630e0c5d15
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            platform: linux/arm64
+            expected_uname: aarch64
+            cosign_asset: cosign-linux-arm64
+            image: docker.io/library/rust@sha256:594694ee6b07747b63b5c265be2616b62e814180b66227e2c18c6ee85e4136be
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Stage deterministic nightly version
+        if: needs.classify.outputs.nightly == 'true'
+        run: python3 scripts/nightly_version.py stage --version "$GITHUB_REF_NAME"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+      - name: Install pinned BLAKE3 checksum tool
+        run: cargo install b3sum --locked --version "$B3SUM_VERSION"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v3.1.1'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.release-candidate.outputs.artifact-name }}
+          path: candidate
+      - name: Authenticate the exact signed candidate
+        env:
+          EXPECTED_SOURCE: ${{ needs.classify.outputs.source-commit }}
+        run: |
+          PAYLOADS="$RUNNER_TEMP/candidate-payloads.txt"
+          python3 scripts/release_publication.py \
+            --artifacts candidate \
+            --version "$GITHUB_REF_NAME" \
+            --source-commit "$EXPECTED_SOURCE" > "$PAYLOADS"
+          (
+            cd candidate
+            b3sum --check BLAKE3SUMS.txt
+            sha256sum --check SHA256SUMS.txt
+          )
+          IDENTITY="https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+          while IFS= read -r asset; do
+            cosign verify-blob \
+              --bundle "candidate/${asset}.sigstore.json" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity "$IDENTITY" \
+              --use-signed-timestamps \
+              "candidate/$asset"
+          done < "$PAYLOADS"
+      - name: Exercise the signed installer on the native architecture
+        env:
+          COSIGN_ASSET: ${{ matrix.cosign_asset }}
+          EXPECTED_UNAME: ${{ matrix.expected_uname }}
+          IMAGE: ${{ matrix.image }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          bash scripts/test-clean-home-musl-install.sh \
+            candidate \
+            "$TARGET" \
+            "$PLATFORM" \
+            "$IMAGE" \
+            "$EXPECTED_UNAME" \
+            "$COSIGN_ASSET"
+
+  github-release:
+    name: Publish signed release
+    needs: [classify, release-candidate, signed-musl-install]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Require repository immutable releases
+        env:
+          GH_TOKEN: ${{ secrets.AOS_RELEASE_ADMIN_TOKEN }}
+        run: |
+          [[ -n "$GH_TOKEN" ]]
+          gh api "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            --jq 'select(.enabled == true) | true' | grep -Fx true
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Stage deterministic nightly version
+        if: needs.classify.outputs.nightly == 'true'
+        run: python3 scripts/nightly_version.py stage --version "$GITHUB_REF_NAME"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+      - name: Install pinned BLAKE3 checksum tool
+        run: cargo install b3sum --locked --version "$B3SUM_VERSION"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v3.1.1'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.release-candidate.outputs.artifact-name }}
+          path: candidate
+      - name: Load runtime compatibility pins
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import tomllib
+          with open("release/runtime-compatibility.toml", "rb") as file:
+              metadata = tomllib.load(file)["runtime"]
+          print(f"RUNTIME_TAG={metadata['tag']}")
+          PY
+      - name: Write release notes
+        run: |
+          cat > release-notes.md <<EOF
+          Unicity AOS Community Edition ${GITHUB_REF_NAME}.
+
+          This product release bundles Astrid Runtime ${RUNTIME_TAG}. The exact runtime release identity, WIT commit, and compatibility pins are published in \`runtime-compatibility.toml\`, \`runtime-musl-compatibility.toml\`, and every archive's \`release-manifest.json\`.
+
+          The release also contains the 19 signed, installable capsule artifacts selected by Community Edition. Published \`astrid-capsule-*\` identities remain unchanged.
+
+          Install this exact release:
+
+          \`\`\`sh
+          curl --proto '=https' --tlsv1.2 -fsSL https://aos.unicity.ai/install.sh | sh -s -- --version ${GITHUB_REF_NAME}
+          \`\`\`
+
+          Moving channel installs change only after a separate protected promotion.
+          EOF
+      - name: Refuse drift and select the publication draft
+        env:
+          EXPECTED_EXISTING: ${{ needs.release-candidate.outputs.existing-release }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_RELEASE_ID: ${{ needs.release-candidate.outputs.release-id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASES="$RUNNER_TEMP/releases-before-create.json"
+          MATCHING_RELEASE="$RUNNER_TEMP/matching-release-before-create.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --paginate --slurp > "$RELEASES"
+          jq --arg tag "$GITHUB_REF_NAME" \
+            '[.[][] | select(.tag_name == $tag)]' "$RELEASES" > "$MATCHING_RELEASE"
+          MATCH_COUNT=$(jq -er length "$MATCHING_RELEASE")
+          [[ "$MATCH_COUNT" -le 1 ]]
+          if [[ "$EXPECTED_EXISTING" == 1 ]]; then
+            jq -e --argjson prerelease "$EXPECTED_PRERELEASE" \
+              'length == 1 and .[0].draft == true and .[0].prerelease == $prerelease and .[0].published_at == null' \
+              "$MATCHING_RELEASE" >/dev/null
+            RELEASE_ID=$(jq -er '.[0].id' "$MATCHING_RELEASE")
+            [[ "$RELEASE_ID" == "$EXPECTED_RELEASE_ID" ]]
+            {
+              echo "RECOVER_DRAFT=1"
+              echo "SELECTED_RELEASE_ID=$RELEASE_ID"
+            } >> "$GITHUB_ENV"
+          else
+            [[ "$EXPECTED_EXISTING" == 0 ]]
+            [[ "$MATCH_COUNT" == 0 ]]
+            echo "RECOVER_DRAFT=0" >> "$GITHUB_ENV"
+          fi
       - name: Create draft release with write-once assets
         if: env.RECOVER_DRAFT != '1'
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
@@ -824,20 +1022,20 @@ jobs:
           overwrite_files: false
           fail_on_unmatched_files: true
           files: |
-            artifacts/*.tar.gz
-            artifacts/*.capsule
-            artifacts/BLAKE3SUMS.txt
-            artifacts/SHA256SUMS.txt
-            artifacts/runtime-compatibility.toml
-            artifacts/runtime-musl-compatibility.toml
-            artifacts/unicity-aos-*-release.toml
-            artifacts/*.sigstore.json
+            candidate/*.tar.gz
+            candidate/*.capsule
+            candidate/BLAKE3SUMS.txt
+            candidate/SHA256SUMS.txt
+            candidate/runtime-compatibility.toml
+            candidate/runtime-musl-compatibility.toml
+            candidate/unicity-aos-*-release.toml
+            candidate/*.sigstore.json
           body_path: release-notes.md
       - name: Bind newly created draft identity
         if: env.RECOVER_DRAFT != '1'
         env:
-          GH_TOKEN: ${{ github.token }}
           EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           RELEASES="$RUNNER_TEMP/releases-after-create.json"
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
@@ -848,9 +1046,9 @@ jobs:
           echo "SELECTED_RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
       - name: Reauthenticate and publish the exact immutable release
         env:
-          GH_TOKEN: ${{ github.token }}
           EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
           EXPECTED_SOURCE: ${{ needs.classify.outputs.source-commit }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           EXPECTED_LATEST=true
           if [[ "$EXPECTED_PRERELEASE" == true ]]; then
@@ -912,8 +1110,8 @@ jobs:
           )
           IDENTITY="https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
           while IFS= read -r asset; do
-            cmp "$CANDIDATE/$asset" "$FINAL/$asset"
-            cmp "$CANDIDATE/${asset}.sigstore.json" "$FINAL/${asset}.sigstore.json"
+            cmp "candidate/$asset" "$FINAL/$asset"
+            cmp "candidate/${asset}.sigstore.json" "$FINAL/${asset}.sigstore.json"
             cosign verify-blob \
               --bundle "$FINAL/${asset}.sigstore.json" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
