@@ -160,6 +160,19 @@ pub enum Operation {
     /// `hart-id` must equal the runtime-stamped worker index. This operation
     /// never invokes the deterministic round-robin scheduler.
     RunHartSlice = 9,
+    /// Atomically replace the deterministic machine with one worker-affine
+    /// view per admitted hart.
+    ///
+    /// Worker zero performs this transition after initialization and before
+    /// any [`RunHartSlice`](Self::RunHartSlice) submissions. `hart-count` must
+    /// equal the topology already admitted by the machine.
+    PrepareParallel = 10,
+    /// Drain the single serial stream shared by every parallel hart.
+    ///
+    /// Worker zero performs this only after every slice in the current epoch
+    /// has joined, preserving the order in which guest bytes reached the
+    /// emulated serial device.
+    DrainConsole = 11,
 }
 
 impl TryFrom<u32> for Operation {
@@ -176,6 +189,8 @@ impl TryFrom<u32> for Operation {
             7 => Ok(Self::InitCheckpoint),
             8 => Ok(Self::ParallelProbe),
             9 => Ok(Self::RunHartSlice),
+            10 => Ok(Self::PrepareParallel),
+            11 => Ok(Self::DrainConsole),
             _ => Err(()),
         }
     }
@@ -353,11 +368,13 @@ mod tests {
         assert_eq!(Operation::InitCheckpoint as u32, 7);
         assert_eq!(Operation::ParallelProbe as u32, 8);
         assert_eq!(Operation::RunHartSlice as u32, 9);
-        for value in 1..=9 {
+        assert_eq!(Operation::PrepareParallel as u32, 10);
+        assert_eq!(Operation::DrainConsole as u32, 11);
+        for value in 1..=11 {
             assert!(Operation::try_from(value).is_ok());
         }
         assert!(Operation::try_from(0).is_err());
-        assert!(Operation::try_from(10).is_err());
+        assert!(Operation::try_from(12).is_err());
     }
 
     #[test]

@@ -494,7 +494,40 @@ impl AtomicGuestRam {
             .update_value(chunk_offset, value, bytes)
     }
 
-    pub(super) fn copy_from_slice(&mut self, start: usize, source: &[u8]) -> bool {
+    pub(super) fn copy_from_slice(&self, start: usize, source: &[u8]) -> bool {
+        let Some(end) = start
+            .checked_add(source.len())
+            .filter(|end| *end <= self.len)
+        else {
+            return false;
+        };
+        let mut destination = start;
+        let mut source_offset = 0;
+        while destination < end {
+            let remaining = end - destination;
+            if destination.is_multiple_of(WORD_BYTES) && remaining >= WORD_BYTES {
+                let value = u64::from_le_bytes(
+                    source[source_offset..source_offset + WORD_BYTES]
+                        .try_into()
+                        .expect("exact atomic word"),
+                );
+                if !self.write_value(destination, value, WORD_BYTES as u8) {
+                    return false;
+                }
+                destination += WORD_BYTES;
+                source_offset += WORD_BYTES;
+            } else {
+                if !self.set_byte(destination, source[source_offset]) {
+                    return false;
+                }
+                destination += 1;
+                source_offset += 1;
+            }
+        }
+        true
+    }
+
+    pub(super) fn copy_from_slice_quiescent(&mut self, start: usize, source: &[u8]) -> bool {
         let Some(end) = start
             .checked_add(source.len())
             .filter(|end| *end <= self.len)
@@ -610,12 +643,12 @@ mod tests {
         assert!(!ram.write_value(3, 1, 4));
         assert!(!ram.write_value(ram.len, 1, 1));
 
-        assert!(ram.copy_from_slice(ATOMIC_RAM_CHUNK_BYTES - 3, &[1, 2, 3, 4, 5, 6]));
+        assert!(ram.copy_from_slice_quiescent(ATOMIC_RAM_CHUNK_BYTES - 3, &[1, 2, 3, 4, 5, 6]));
         assert_eq!(
             ram.copy_to_vec(ATOMIC_RAM_CHUNK_BYTES - 3..ATOMIC_RAM_CHUNK_BYTES + 3),
             Some(vec![1, 2, 3, 4, 5, 6])
         );
-        assert!(ram.copy_from_slice(4096, &vec![7; 4096]));
+        assert!(ram.copy_from_slice_quiescent(4096, &vec![7; 4096]));
         assert!(
             ram.nonzero_pages(4096)
                 .iter()
@@ -648,6 +681,15 @@ mod tests {
             ));
         }
         writer.join().expect("atomic RAM writer");
+    }
+
+    #[test]
+    fn live_bulk_writes_remain_visible_through_every_shared_reference() {
+        let ram = Arc::new(AtomicGuestRam::zeroed(4096).expect("atomic RAM"));
+        let peer = Arc::clone(&ram);
+        let payload = (0..257_u16).flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+        assert!(ram.copy_from_slice(3, &payload));
+        assert_eq!(peer.copy_to_vec(3..3 + payload.len()), Some(payload));
     }
 
     #[test]
