@@ -4,11 +4,11 @@ This directory contains Linux inputs for `aos-rv64-virt-v1`.
 Linux 6.18.39 boots a tiny checked-in `newc` bootstrap, runs an AOS-owned static
 `/init` as PID 1, mounts a separately hash-bound Buildroot 2026.05.1 SquashFS as
 its immutable root, and keeps one admitted 1–64-hart guest resident per
-principal Store. Automatic topology selects one logical hart for the current
-serialized interpreter. Astrid's compute-worker quota independently controls
-how many principal machines can execute concurrently; it does not reduce the
-topology inside one machine. Every guest hart is deterministically time-sliced
-inside one generic compute worker in the current implementation.
+principal Store. Automatic topology selects the one-hart warm checkpoint.
+Explicit topologies above one reserve one parallel generic-compute worker per
+guest hart. Astrid's compute-worker quota independently controls both admission
+of that exact topology and how many principal machines can execute
+concurrently.
 
 `build-userland.sh` produces the current, intentionally bounded agent
 development-workbench candidate:

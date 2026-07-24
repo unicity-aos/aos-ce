@@ -25,9 +25,9 @@ pub(crate) const MAX_LINUX_MAX_PROCESSES: u32 = 65_536;
 /// default unless this principal selects a lower or higher explicit ceiling.
 pub(crate) const DEFAULT_LINUX_MAX_OPEN_FILES: u32 = 0;
 pub(crate) const MAX_LINUX_MAX_OPEN_FILES: u32 = 1_048_576;
-/// Zero selects one logical CPU for the current serialized interpreter.
-/// Explicit 1–64-hart topologies remain available for testing and managed
-/// configurations.
+/// Zero selects the one-hart warm-checkpoint topology. Explicit 1–64-hart
+/// topologies remain available, with values above one admitted as one parallel
+/// compute worker per guest hart.
 pub(crate) const DEFAULT_LINUX_VCPUS: u32 = 0;
 pub(crate) const MAX_LINUX_VCPUS: u32 = aos_realm_machine::MAX_HARTS as u32;
 const GUEST_PAGE_BYTES: usize = 4096;
