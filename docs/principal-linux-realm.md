@@ -1722,10 +1722,14 @@ Astrid Compute remains the only creator and meter of native workers.
   than swapping active and parked CPU records. Exact-hart slices cannot rotate
   into another hart, stopped harts consume no work, and private protocol
   operation 9 requires the requested hart to equal Astrid's runtime-stamped
-  worker index. The monolithic state mutex still serializes those operations
-  until the independent hart-cell cut above lands.
-- The reproducible worker is 176,870 bytes with BLAKE3
-  `1502265de0687bff43962ea7528ea3ff2153c7422b913ea996553a5844c98378`.
+  worker index. HSM start has a single-winner atomic mailbox; IPI bits and
+  RFENCE generations coalesce at the target hart without cross-hart register or
+  TLB mutation. The deterministic oracle applies each mailbox immediately,
+  while checkpointing rejects unacknowledged control. The monolithic state
+  mutex still serializes instruction execution until the independent hart-cell
+  and shared-RAM cuts above land.
+- The reproducible worker is 179,636 bytes with BLAKE3
+  `d7273c2193e90bae1db220a3b880367716fca7854472ded92df986794b23ee98`.
   This proves the execution substrate needed by parallel harts. It does not yet
   claim that the current monolithic `Machine` mutex or deterministic
   round-robin hart scheduler runs Linux concurrently.
