@@ -13,10 +13,11 @@ AOS-controlled PID 1, accepts token-bound command frames, and remains alive
 until explicit shutdown or runtime eviction. The immutable system contains
 Bash, Git, Python, Clang/C++, Make, CMake, Ninja, Rust/Cargo/rustup, and
 `astrid-build`; mutable home and workspace bytes never enter it.
-The normal shell receives only a script. Its current directory is the
-kernel-stamped invocation workspace and its execution ceilings come from the
-caller's principal configuration; neither is model-selected. There is no host
-shell command line and the manifest requests no `host_process` capability.
+The normal shell receives a script and an optional guest-visible workdir. The
+workspace root itself is the kernel-stamped invocation CWD and its execution
+ceilings come from the caller's principal configuration; the model cannot
+select a host path or raise a budget. There is no host shell command line and
+the manifest requests no `host_process` capability.
 
 ```text
 agent -> realm tool -> signed nested WASM command -> private realm ABI
@@ -29,16 +30,27 @@ agent -> realm tool -> signed nested WASM command -> private realm ABI
 `realm_shell` is the normal agent-facing shell tool. Its `command` is executed
 by Bash as UID/GID 1000 inside the caller's resident Linux Realm, starting at
 `/workspace`. The exact command may be a multiline Bash script, including
-heredocs, up to the transport-derived 512 KiB boundary. It has no CWD,
-executable, step-limit, or output-limit selector: the authenticated
-client/runtime supplies the workspace attachment and
-`linux_max_steps`, `linux_max_output_bytes`, and the outer principal profile own
-the ceilings. It has no host execution mode and never falls back to `aos-shell`.
+heredocs, up to the transport-derived 512 KiB boundary. Optional `workdir`
+selects a guest path beneath `/workspace`, `/home/agent`, or `/tmp`; it never
+names or changes the attached host workspace. Calls are independent processes,
+so `cd` inside one command does not change a later call—pass `workdir` again,
+as with an ordinary process-execution tool. There is no executable, step-limit,
+or output-limit selector: the authenticated client/runtime supplies the
+workspace attachment and `linux_max_steps`, `linux_max_output_bytes`, and the
+outer principal profile own the ceilings. It has no host execution mode and
+never falls back to `aos-shell`.
+
+Routine results contain only normalized command output. Empty success returns
+`Process exited with code 0`; nonzero exit and infrastructure failure use the
+tool-result error bit with the command output and concise status. PID 1's
+token-bound begin/end markers, Linux boot console, resource accounting, mount
+receipt, and CAS generations remain on the authenticated operator receipt and
+do not consume the agent's normal context.
 
 The installable production capsule advertises no structured exec or status
 tools. Those operations remain available to an authenticated operator through
-`astrid capsule aos-linux-realm realm ...`; they do not enter the model's tool
-list. A runtime env switch cannot safely hide a statically described
+`astrid capsule run aos-linux-realm realm ...`; they do not enter the model's
+tool list. A runtime env switch cannot safely hide a statically described
 `#[astrid::tool]`, so a future model-callable diagnostic profile must be a
 separate, explicit artifact or gain a runtime-native conditional-discovery
 primitive rather than advertising a disabled tool.
@@ -81,9 +93,9 @@ instruction images, and the resident Linux boot image:
 - `cat`
 - `smoke-write`, the original interpreter smoke test
 
-`astrid capsule aos-linux-realm realm status` reports the guest-visible mount
-and command surface without exposing physical host paths. It also reports the
-caller's actor boot sequence,
+`astrid capsule run aos-linux-realm realm status` reports the guest-visible
+mount and command surface without exposing physical host paths. It also reports
+the caller's actor boot sequence,
 completed-command count, next process identifier, and live process/pipe resource
 accounting. Linux-specific fields state whether the admitted virtual-CPU topology
 is cold or running, the configured and effective vCPU counts, whether RAM is
@@ -509,42 +521,30 @@ copies only the five manifest-bound assets and verifies their exact bytes in
 the final archive; remove it only after the upstream builder covers and tests
 this manifest surface.
 
-The installed realm appears as two MCP tools when an Astrid MCP broker such as
-`sage-mcp` is present and `astrid --principal default mcp serve` is connected to
-an MCP client. `astrid mcp serve` is the stdio transport shim, not the broker.
-The first mutating call may elicit session-ingress consent and a capsule grant.
+The installed realm appears as the single `realm_shell` MCP tool when an Astrid
+MCP broker such as `aos-mcp` is present and `astrid --principal default mcp
+serve` is connected to an MCP client. `astrid mcp serve` is the stdio transport
+shim, not the broker. The first mutating call may elicit session-ingress consent
+and a capsule grant.
 
-Example tool arguments:
+Example agent-tool arguments:
 
 ```json
 {"command":"pwd"}
-{"command":"echo","args":["hello", "realm"]}
-{"command":"pipe-echo","args":["hello through two processes"]}
-{"command":"guest-pipe-echo","args":["the guest built this pipeline"]}
-{"command":"realm-sh","args":["echo","the shell built this job"]}
-{"command":"realm-sh","args":["echo","the shell built this pipe","|","cat"]}
-{"command":"realm-sh","args":["echo","persisted by the guest shell",">","/home/agent/note.txt"]}
-{"command":"realm-sh","args":["env","ASTRID_REALM=ready"]}
-{"command":"rv64-smoke"}
-{"command":"rv64-supervisor"}
-{"command":"linux-boot"}
-{"command":"linux-console","args":["ping"]}
-{"command":"linux-console","args":["counter"]}
-{"command":"linux-console","args":["echo","hello from Linux"]}
-{"command":"linux-sh","args":["id -u; uname -m; pwd"]}
-{"command":"linux-sh","args":["printf persisted > proof && cat proof"]}
-{"command":"linux-sh","args":["pwd; ls -la"],"cwd":"/workspace"}
-{"command":"linux-shutdown"}
-{"command":"write-file","args":["notes.txt","durable\n"],"cwd":"/home/agent"}
-{"command":"cat","args":["notes.txt"],"cwd":"/home/agent"}
-{"command":"write-file","args":["candidate.rs","..."],"cwd":"/workspace"}
+{"command":"printf 'hello from Linux\\n'; uname -m"}
+{"command":"cargo test","workdir":"/workspace/my-project"}
+{"command":"printf 'durable\\n' > note.txt","workdir":"/home/agent"}
+{"command":"cat <<'EOF' > hello.rs\nfn main() { println!(\"hello\"); }\nEOF\nrustc hello.rs\n./hello"}
 ```
 
-The outer `command` field is never a command line. For example,
-`{"command":"pwd && whoami"}` is rejected as an unknown program. `realm-sh`
-interprets only its separate structured `args` tokens according to the grammar
-above; a single argument containing `"echo hello | cat"` exits with usage status
-64 instead of being reparsed as text.
+The structured exec/status commands listed earlier are operator diagnostics.
+For example:
+
+```console
+astrid capsule run aos-linux-realm realm status
+astrid capsule run aos-linux-realm realm sh --cwd /workspace 'pwd; git status'
+astrid capsule run aos-linux-realm realm exec --cwd /home/agent write-file notes.txt hello
+```
 
 ## Benchmarking
 
