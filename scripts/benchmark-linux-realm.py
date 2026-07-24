@@ -25,7 +25,8 @@ ROOT = Path(__file__).resolve().parent.parent
 REALM = ROOT / "capsules" / "capsule-linux-realm"
 IMAGE = REALM / "assets" / "linux-kernel.img"
 SYSTEM = REALM / "assets" / "linux-system.squashfs"
-CHECKPOINT = REALM / "assets" / "linux-prewarm-1g-2h.aos-machine"
+CHECKPOINT = REALM / "assets" / "linux-prewarm-1g-1h.aos-machine"
+CHECKPOINT_HART_COUNT = 1
 INIT_MARKER = b"AOS LINUX /init"
 MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024
 
@@ -42,7 +43,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--hart-counts",
         type=positive_int,
         nargs="+",
-        default=[2],
+        default=[1],
         help="logical Linux hart counts for the serialized reference matrix",
     )
     parser.add_argument(
@@ -173,7 +174,7 @@ def metadata() -> dict[str, Any]:
             ),
             "checkpoint-to-bindable": (
                 "preloaded checkpoint; includes integrity and artifact-binding validation, "
-                "1 GiB sparse two-hart RAM materialization, and handoff at the pending "
+                "1 GiB sparse one-hart RAM materialization, and handoff at the pending "
                 "principal-home request; excludes provider completion"
             ),
             "qemu-tcg-cold-to-init": (
@@ -241,7 +242,7 @@ def run_reference(
             ):
                 raise RuntimeError("reference benchmark emitted an unknown record")
             lane.append(record)
-        expected = samples * (3 if hart_count == 2 else 2)
+        expected = samples * (3 if hart_count == CHECKPOINT_HART_COUNT else 2)
         if len(lane) != expected:
             raise RuntimeError(
                 f"{hart_count}-hart reference emitted {len(lane)} samples, expected {expected}"

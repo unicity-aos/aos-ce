@@ -448,7 +448,7 @@ fn load_linux_image() -> Result<Vec<u8>, (Status, String)> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn load_checkpoint() -> Result<Vec<u8>, (Status, String)> {
-    Ok(include_bytes!("../../../assets/linux-prewarm-1g-2h.aos-machine").to_vec())
+    Ok(include_bytes!("../../../assets/linux-prewarm-1g-1h.aos-machine").to_vec())
 }
 
 fn run_slice(worker_index: Option<u32>, bytes: &mut [u8]) -> WorkerResult {
@@ -897,6 +897,36 @@ mod tests {
         let mut bytes = request(Operation::Reset as u32, &[]);
         assert_eq!(dispatch_worker(1, &mut bytes, Operation::Reset as i64), 0);
         assert_bounded_response(&bytes, Status::Invalid);
+
+        let digest = |hex: &str| {
+            hex.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    u8::from_str_radix(std::str::from_utf8(pair).expect("digest pair"), 16)
+                        .expect("lowercase digest")
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut binding =
+            digest("60cc6c3c01222a3a33b108593974de5636747b32cacc10bf8c0f45c1cdd8b285");
+        binding.extend(digest(
+            "c436bb2bfe0941f183f58f0e2e56df05a4bc03f01147ad1d095f48df0004afaa",
+        ));
+        let mut bytes = request(Operation::InitCheckpoint as u32, &binding);
+        protocol::write_u64(&mut bytes, field::RAM_BYTES, 1024 * 1024 * 1024);
+        protocol::write_u64(&mut bytes, field::MAX_CONSOLE_BYTES, 64 * 1024);
+        protocol::write_u32(&mut bytes, field::HART_COUNT, 1);
+        assert_eq!(dispatch(&mut bytes, Operation::InitCheckpoint as i64), 0);
+        assert_bounded_response(&bytes, Status::Ok);
+        {
+            let state = STATE.lock().expect("worker state lock");
+            let state = state.as_ref().expect("restored worker state");
+            assert_eq!(state.machine.hart_count(), 1);
+            assert!(state.pending_request.is_some());
+        }
+        let mut bytes = request(Operation::Reset as u32, &[]);
+        assert_eq!(dispatch(&mut bytes, Operation::Reset as i64), 0);
+        assert_bounded_response(&bytes, Status::Ok);
     }
 
     #[test]

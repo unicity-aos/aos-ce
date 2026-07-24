@@ -28,12 +28,12 @@ const AUTO_REFERENCE_RAM_BYTES: usize = 512 * 1024 * 1024;
 #[cfg(any(target_arch = "wasm32", test))]
 const AUTO_INTERPRETER_RAM_BYTES: usize = 1024 * 1024 * 1024;
 #[cfg(any(target_arch = "wasm32", test))]
-const AUTO_INTERPRETER_HARTS: u32 = 2;
+const AUTO_INTERPRETER_HARTS: u32 = 1;
 #[cfg(any(target_arch = "wasm32", test))]
 const MAX_GUEST_RAM_BYTES: usize = 3 * 1024 * 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
 const LINUX_SYSTEM_BLOCK_CHANNEL: u32 = 3;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 const PREWARM_LOCK: &str = include_str!("../linux/PREWARM.lock");
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -372,12 +372,21 @@ struct ComputeResponse {
     payload: Vec<u8>,
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 struct PrewarmSpec {
     ram_bytes: usize,
     max_console_bytes: usize,
     hart_count: u32,
     binding: [u8; protocol::CHECKPOINT_BINDING_BYTES],
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl PrewarmSpec {
+    fn matches(&self, config: MachineConfig, hart_count: u32) -> bool {
+        self.ram_bytes == config.ram_bytes
+            && self.max_console_bytes == config.max_console_bytes
+            && self.hart_count == hart_count
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -424,10 +433,7 @@ impl ComputeMachine {
             hart_count,
         };
         let prewarm = prewarm_spec()?;
-        let (operation, input) = if prewarm.ram_bytes == config.ram_bytes
-            && prewarm.max_console_bytes == config.max_console_bytes
-            && prewarm.hart_count == hart_count
-        {
+        let (operation, input) = if prewarm.matches(config, hart_count) {
             (Operation::InitCheckpoint, prewarm.binding.to_vec())
         } else {
             (
@@ -606,7 +612,7 @@ impl ComputeMachine {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 fn prewarm_spec() -> Result<PrewarmSpec, String> {
     let value = |name: &str| {
         PREWARM_LOCK
@@ -637,7 +643,7 @@ fn prewarm_spec() -> Result<PrewarmSpec, String> {
     })
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 fn decode_hex_digest(value: &str, output: &mut [u8]) -> Result<(), String> {
     if value.len() != output.len() * 2 {
         return Err("Linux prewarm digest has the wrong length".to_string());
@@ -712,11 +718,11 @@ fn explicit_hart_count(configured: u32) -> Result<Option<u32>, String> {
 fn auto_guest_hart_count(_admitted_parallelism: u32) -> u32 {
     // This backend has one deterministic worker today. More logical harts add
     // Linux bring-up and scheduler work without running concurrently, so auto
-    // mode proves SMP with two harts instead of mirroring host CPU count. The
-    // host worker quota controls how many principals can execute concurrently;
-    // it is not a guest topology signal because one interpreter worker
-    // time-slices every logical hart. Explicit configuration remains available
-    // for topology testing.
+    // mode selects one hart instead of mirroring host CPU count. The host worker
+    // quota controls how many principals can execute concurrently; it is not a
+    // guest topology signal because one interpreter worker time-slices every
+    // logical hart. Explicit configuration remains available for topology
+    // testing.
     AUTO_INTERPRETER_HARTS
 }
 
@@ -884,6 +890,28 @@ mod tests {
         assert_eq!(auto_guest_hart_count(1), AUTO_INTERPRETER_HARTS);
         assert_eq!(auto_guest_hart_count(8), AUTO_INTERPRETER_HARTS);
         assert_eq!(auto_guest_hart_count(128), AUTO_INTERPRETER_HARTS);
+    }
+
+    #[test]
+    fn automatic_topology_matches_the_signed_prewarm_envelope() {
+        let prewarm = prewarm_spec().expect("signed prewarm metadata");
+        assert_eq!(AUTO_INTERPRETER_HARTS, 1);
+        assert_eq!(prewarm.hart_count, AUTO_INTERPRETER_HARTS);
+        assert!(prewarm.binding.iter().any(|byte| *byte != 0));
+        assert!(prewarm.matches(
+            MachineConfig {
+                ram_bytes: 1024 * 1024 * 1024,
+                max_console_bytes: 64 * 1024,
+            },
+            auto_guest_hart_count(24),
+        ));
+        assert!(!prewarm.matches(
+            MachineConfig {
+                ram_bytes: 1024 * 1024 * 1024,
+                max_console_bytes: 64 * 1024,
+            },
+            2,
+        ));
     }
 
     #[test]

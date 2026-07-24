@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::{env, fs, process::ExitCode, time::Instant};
 
 const RAM_BYTES: usize = 1024 * 1024 * 1024;
-const CHECKPOINT_HART_COUNT: usize = 2;
+const CHECKPOINT_HART_COUNT: usize = 1;
 const CONSOLE_BYTES: usize = 64 * 1024;
 const SLICE_STEPS: u64 = 10_000_000;
 const MAX_STEPS: u64 = 2_000_000_000;

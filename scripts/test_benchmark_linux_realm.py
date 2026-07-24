@@ -67,7 +67,7 @@ class BenchmarkTests(unittest.TestCase):
                 write_records.assert_called_once()
 
     def test_hart_matrix_is_explicit_and_defaults_to_checkpoint_topology(self) -> None:
-        self.assertEqual(BENCHMARK.parse_args([]).hart_counts, [2])
+        self.assertEqual(BENCHMARK.parse_args([]).hart_counts, [1])
         self.assertEqual(
             BENCHMARK.parse_args(["--hart-counts", "1", "2", "4"]).hart_counts,
             [1, 2, 4],

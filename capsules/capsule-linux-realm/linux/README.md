@@ -4,11 +4,11 @@ This directory contains Linux inputs for `aos-rv64-virt-v1`.
 Linux 6.18.39 boots a tiny checked-in `newc` bootstrap, runs an AOS-owned static
 `/init` as PID 1, mounts a separately hash-bound Buildroot 2026.05.1 SquashFS as
 its immutable root, and keeps one admitted 1–64-hart guest resident per
-principal Store. Automatic topology selects two logical harts for the current
-interpreter. Astrid's compute-worker quota independently controls how many
-principal machines can execute concurrently; it does not reduce the topology
-inside one machine. Every guest hart is deterministically time-sliced inside
-one generic compute worker in the current implementation.
+principal Store. Automatic topology selects one logical hart for the current
+serialized interpreter. Astrid's compute-worker quota independently controls
+how many principal machines can execute concurrently; it does not reduce the
+topology inside one machine. Every guest hart is deterministically time-sliced
+inside one generic compute worker in the current implementation.
 
 `build-userland.sh` produces the current, intentionally bounded agent
 development-workbench candidate:
@@ -140,11 +140,12 @@ checkpoint occurs after the immutable SquashFS is mounted but before the first
 principal-home response. It therefore retains kernel state and only the system
 pages Linux actually touched during boot, not a decompressed compiler
 initramfs. The codec binds every hart and scheduler field to the exact kernel
-and system digests. The accepted 1 GiB/two-hart artifact is 22,773,044 bytes and
-restores to the principal-bind boundary in a 21.57 ms native median versus
-907.93 ms from cold boot, while removing all 46,431,093 pre-principal guest
-steps. The outer signed-component and CLI path remains a separately measured
-boundary.
+and system digests. The current 1 GiB/one-hart artifact is 22,505,847 bytes and
+removes all 35,932,587 pre-principal guest steps. It replaces the measured
+two-hart artifact because the serialized topology matrix found that a second
+logical hart added 33.3% to cold principal-bind latency without adding host
+execution parallelism. The outer signed-component and CLI path remains a
+separately measured boundary.
 
 The active Buildroot output directory must be on a Linux filesystem. GNU
 package configure probes create path patterns that macOS file-sharing mounts do
