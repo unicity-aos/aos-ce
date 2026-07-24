@@ -3257,6 +3257,50 @@ native machine/checkpoint measurement, not an MCP-visible shell latency claim.
 Provider completion, signed outer-Wasm execution, broker/client transport, and
 the first useful shell command are outside the boundary.
 
+### 18.5 Streamed shell bootstrap refresh, 2026-07-24
+
+Commit `0ebf62d` replaces the one-line 1,024-byte PID 1 shell transport with the
+backward-compatible `sh3` stream while retaining `sh` and `sh2`. The controller
+selects `sh3` only for multiline or larger scripts, sends exact script length
+plus canonical RFC 4648 base64, and rejects NUL or input above the 512 KiB
+transport-derived ceiling. The optimized native regression booted the new
+kernel and passed a 28 KiB fragmented heredoc through the live guest before
+verifying exact output, workspace cleanup, legacy commands, descendant reaping,
+shutdown, and durable-home restart.
+
+The static RISC-V PID 1 was compiled inside the admitted AOS Realm with the
+recorded Clang 22.1.7 toolchain. It is 483,192 bytes with SHA-256
+`53e2b6dd7bf64598790575b16b77d731c8f01ebd1e63dfbfbb9e9e525b943e61`.
+The deterministic 484,864-byte `newc` bootstrap has SHA-256
+`9053302f6af6a55700aaf41cfa6ab988d66c10aded09893b7531a9d62e60cf40`.
+The pinned Ubuntu/Clang 18.1.3 kernel builder produced the 3,792,232-byte Image
+with SHA-256
+`b65cfa26b84fc5fcb04edf624a6a45d0b3ca8aad95a4e80199813a977fd425da`.
+The resulting 22,526,347-byte principal-free checkpoint records 35,978,939
+charged steps, SHA-256
+`2339619c53a7d33faf03bcd1e0570f171c878662e06ea651b7680df46b1c5a7f`,
+and BLAKE3
+`15fe4d8789182917fc90b3f939ffadac0d65ab38304edfa49506007e87a4ab43`.
+
+The exact 30-sample run after three discarded warmups is
+`benchmarks/linux-realm/2026-07-24-m2-ultra-0ebf62d-sh3-prewarm.jsonl`;
+its BLAKE3 is
+`fecedf27a1d6bed70503182cab4da3aee41aeaf792b9eb6b38a94db0c611629b`.
+
+| One-hart boundary | Median | p95 |
+| --- | ---: | ---: |
+| Cold to PID 1 | 719.950 ms | 727.294 ms |
+| Cold to principal bind | 763.704 ms | 771.438 ms |
+| Checkpoint to pending principal bind | 21.079 ms | 22.483 ms |
+
+Checkpoint admission is 36.2 times faster than the corresponding cold bind and
+executes no restored guest instructions before fresh authority attachment. It
+is paid on first activation after Store creation/eviction, daemon restart, or
+image replacement—not for every call while the principal's machine remains
+resident. This is still a native machine/checkpoint result; guest command work,
+fresh provider completion, signed outer-Wasm execution, and broker/client
+transport remain outside the measured boundary.
+
 ## 19. AOS Realm distribution and image policy
 
 The project should own the image recipe, package selection, signatures, and update

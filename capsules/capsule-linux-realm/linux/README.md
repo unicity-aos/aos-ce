@@ -174,8 +174,8 @@ removes all 35,978,939 pre-principal guest steps. It replaces the measured
 two-hart artifact because the serialized topology matrix found that a second
 logical hart added 33.3% to cold principal-bind latency without adding host
 execution parallelism. A 30-sample post-build run after three discarded warmups
-on the recorded M2 Ultra restored it to the pending principal bind in a 20.886
-ms median (p95 21.697 ms), 37.0 times faster than the matching 772.132 ms
+on the recorded M2 Ultra restored it to the pending principal bind in a 21.079
+ms median (p95 22.483 ms), 36.2 times faster than the matching 763.704 ms
 one-hart cold bind. The outer signed-component and CLI path remains a separately
 measured boundary.
 
