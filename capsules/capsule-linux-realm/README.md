@@ -48,7 +48,7 @@ images, and the first resident Linux boot image:
   mode with `mret`, delegates a Supervisor `ecall` through `stvec`, returns with
   `sret`, writes `STR\n`, and halts from Supervisor mode. It charges 31 bounded
   steps while retiring 30 instructions because `ecall` does not retire
-- `linux-boot`, which restores the bound 1 GiB/two-hart principal-free
+- `linux-boot`, which restores the bound 1 GiB/one-hart principal-free
   checkpoint when the admitted envelope matches, otherwise cold-boots the
   hash-bound Linux 6.18.39 kernel and immutable system in the principal's
   admitted 512 MiB–3 GiB envelope; it returns when `/init` reports `AOS READY`,
@@ -398,9 +398,10 @@ principal-admitted capacity, aligns down to a guest page, and never exceeds 3
 GiB when explicitly configured. Auto mode stops at the measured 1 GiB
 interpreter default so it can become ready inside the ordinary principal
 timeout. The daemon and principal profile have already bounded the process-wide
-pool before this calculation. For vCPUs auto mode clamps the parallelism hint
-to two logical harts because one deterministic worker cannot run them in
-parallel. An explicit
+pool before this calculation. For vCPUs auto mode selects one logical hart while
+the deterministic worker is serialized; the recorded one/two/four-hart matrix
+showed that additional harts increase Linux SMP work without adding host
+execution parallelism. An explicit
 `linux_vcpus` value is a logical topology override and does not reserve idle
 native workers. Explicit limits remain useful for repeatable tests and managed
 tiers; insufficient outer admission fails closed.
@@ -434,7 +435,7 @@ records for the current Store residency. Durable root storage remains an
 independent block-overlay problem rather than a promise made by resident RAM.
 The pinned Buildroot 2026.05.1 userland is a separately hash-bound read-only
 SquashFS. The kernel and immutable system are restored from a principal-free
-post-mount checkpoint when the exact 1 GiB/two-hart envelope matches; durable
+post-mount checkpoint when the exact 1 GiB/one-hart envelope matches; durable
 principal home and invocation-scoped workspace capabilities are attached only
 after restore.
 
@@ -512,7 +513,7 @@ records three current boundaries:
 - `cold-to-init`: allocate the admitted envelope, load the image, and execute
   through PID 1's `AOS LINUX /init` marker;
 - `cold-to-principal-bind`: continue through the first principal-home 9P request.
-- `checkpoint-to-bindable`: validate and restore the principal-free two-hart
+- `checkpoint-to-bindable`: validate and restore the principal-free one-hart
   checkpoint at that same pending home request, before any principal authority
   is attached.
 

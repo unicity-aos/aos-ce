@@ -1,10 +1,10 @@
 use aos_realm_machine::{
-    CheckpointBinding, CheckpointDigest, Machine, MachineConfig, SliceOutcome,
+    CheckpointBinding, CheckpointDigest, MAX_HARTS, Machine, MachineConfig, SliceOutcome,
 };
 use std::{env, fs, process::ExitCode, time::Instant};
 
 const RAM_BYTES: usize = 1024 * 1024 * 1024;
-const HART_COUNT: usize = 2;
+const DEFAULT_HART_COUNT: usize = 1;
 const CONSOLE_BYTES: usize = 64 * 1024;
 const SLICE_STEPS: u64 = 10_000_000;
 const MAX_STEPS: u64 = 2_000_000_000;
@@ -24,17 +24,16 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let mut args = env::args_os().skip(1);
-    let image_path = args
+    let image_path = args.next().ok_or_else(usage)?;
+    let system_path = args.next().ok_or_else(usage)?;
+    let output_path = args.next().ok_or_else(usage)?;
+    let hart_count = args
         .next()
-        .ok_or_else(|| "usage: build_prewarm IMAGE SYSTEM_SQUASHFS OUTPUT".to_string())?;
-    let system_path = args
-        .next()
-        .ok_or_else(|| "usage: build_prewarm IMAGE SYSTEM_SQUASHFS OUTPUT".to_string())?;
-    let output_path = args
-        .next()
-        .ok_or_else(|| "usage: build_prewarm IMAGE SYSTEM_SQUASHFS OUTPUT".to_string())?;
+        .map(|value| parse_hart_count(&value))
+        .transpose()?
+        .unwrap_or(DEFAULT_HART_COUNT);
     if args.next().is_some() {
-        return Err("usage: build_prewarm IMAGE SYSTEM_SQUASHFS OUTPUT".to_string());
+        return Err(usage());
     }
 
     let image = fs::read(&image_path)
@@ -53,7 +52,7 @@ fn run() -> Result<(), String> {
             ram_bytes: RAM_BYTES,
             max_console_bytes: CONSOLE_BYTES,
         },
-        HART_COUNT,
+        hart_count,
     )
     .map_err(|error| format!("could not admit prewarm machine: {error}"))?;
     let bootargs = format!(
@@ -124,13 +123,31 @@ fn run() -> Result<(), String> {
     fs::write(&output_path, &encoded)
         .map_err(|error| format!("could not write checkpoint {output_path:?}: {error}"))?;
     eprintln!(
-        "AOS prewarm checkpoint: {total_steps} steps in {:.3}s, {} bytes, image={}, distribution={}",
+        "AOS prewarm checkpoint: {total_steps} steps in {:.3}s, {} bytes, harts={hart_count}, image={}, distribution={}",
         started.elapsed().as_secs_f64(),
         encoded.len(),
         hex(binding.linux_image().as_bytes()),
         hex(binding.distribution().as_bytes())
     );
     Ok(())
+}
+
+fn usage() -> String {
+    "usage: build_prewarm IMAGE SYSTEM_SQUASHFS OUTPUT [HART_COUNT]".to_string()
+}
+
+fn parse_hart_count(value: &std::ffi::OsStr) -> Result<usize, String> {
+    let count = value
+        .to_str()
+        .ok_or_else(|| "HART_COUNT must be UTF-8".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid HART_COUNT: {error}"))?;
+    if !(1..=MAX_HARTS).contains(&count) {
+        return Err(format!(
+            "HART_COUNT must be between 1 and {MAX_HARTS}, got {count}"
+        ));
+    }
+    Ok(count)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -141,4 +158,28 @@ fn hex(bytes: &[u8]) -> String {
         text.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prewarm_topology_is_bounded_before_machine_allocation() {
+        assert_eq!(DEFAULT_HART_COUNT, 1);
+        assert_eq!(parse_hart_count(std::ffi::OsStr::new("1")), Ok(1));
+        assert_eq!(
+            parse_hart_count(std::ffi::OsStr::new("0")),
+            Err(format!(
+                "HART_COUNT must be between 1 and {MAX_HARTS}, got 0"
+            ))
+        );
+        let excessive = (MAX_HARTS + 1).to_string();
+        assert_eq!(
+            parse_hart_count(std::ffi::OsStr::new(&excessive)),
+            Err(format!(
+                "HART_COUNT must be between 1 and {MAX_HARTS}, got {excessive}"
+            ))
+        );
+    }
 }

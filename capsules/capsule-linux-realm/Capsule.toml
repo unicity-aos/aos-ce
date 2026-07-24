@@ -37,8 +37,8 @@ hash = "blake3:c436bb2bfe0941f183f58f0e2e56df05a4bc03f01147ad1d095f48df0004afaa"
 
 [[component.asset]]
 id = "linux-checkpoint"
-file = "assets/linux-prewarm-1g-2h.aos-machine"
-hash = "blake3:c5434f61273eed03cba7eb5db724a134373446a0e9819b12a53c4682347c2b33"
+file = "assets/linux-prewarm-1g-1h.aos-machine"
+hash = "blake3:59c7a2cb08f4fec01d6bd0ba1351a9c7d4b3fa3eecff7578ed9bbfc6229835fd"
 
 # The realm sees only the invocation CWD, its private subtree of the caller's
 # principal home, and its principal-scoped tmp subtree. It has no host_process.
@@ -57,7 +57,7 @@ linux_max_output_bytes = { type = "integer", default = "65536", request = "Maxim
 linux_max_file_bytes = { type = "integer", default = "0", request = "Maximum bytes per Linux-created file (0 uses only Astrid's outer principal storage quota; otherwise 1 to 1099511627776)" }
 linux_max_processes = { type = "integer", default = "0", request = "Maximum Linux processes and threads for the agent UID (0 uses the inherited Linux limit and Astrid's outer principal envelope; otherwise 1 to 65536)" }
 linux_max_open_files = { type = "integer", default = "0", request = "Maximum open Linux file descriptors per process (0 preserves the inherited Linux operator limit; otherwise 1 to 1048576)" }
-linux_vcpus = { type = "integer", default = "0", request = "Logical Linux CPUs (0 = auto up to 2 for the current single-worker interpreter; explicit range 1 to 64)" }
+linux_vcpus = { type = "integer", default = "0", request = "Logical Linux CPUs (0 = one CPU for the current serialized interpreter; explicit range 1 to 64)" }
 
 [publish]
 "tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }

@@ -287,7 +287,7 @@ supply only one 512-byte-aligned offset and bounded read length; it cannot name
 an asset, path, provider, or principal. Asset index 1 is selected by the signed
 manifest and admitted by the generic compute runtime. Channels 1 and 2 continue
 outward to the principal-affine controller for home and invocation workspace.
-The production auto envelope is 1 GiB RAM, two logical harts, and a 64 KiB
+The production auto envelope is 1 GiB RAM, one logical hart, and a 64 KiB
 console so it can select the reusable checkpoint. Every other admitted topology
 performs an honest cold boot.
 
@@ -3056,7 +3056,7 @@ confirms the architecture diagnosis: increasing logical topology before
 splitting the worker's machine mutex spends more guest work without admitting
 more host compute.
 
-The current two-hart checkpoint validates and materializes to the pending
+The recorded two-hart checkpoint validates and materializes to the pending
 principal bind in a median 21.319 ms (p95 21.838 ms), 51.0 times faster than the
 two-hart cold-bind median. Fresh provider completion, signed outer-Wasm
 execution, broker transport, and first useful shell completion remain outside
@@ -3486,7 +3486,7 @@ clean shutdown and eviction to restartable `cold`; a future operator-disabled
   accelerated backend for a principal;
 - [x] define a principal-free host-suspension checkpoint, add the sparse bound
   codec and reproducible builder, prove the historical 32 MiB seed, then replace
-  it with the current 1 GiB/two-hart post-system-mount artifact; every restore
+  it with the current 1 GiB/one-hart post-system-mount artifact; every restore
   attaches fresh home/workspace providers before ready;
 - [x] move the Linux kernel out of the worker into a separately hash-bound,
   read-only compute asset; make wasm32 guest RAM demand-zero; package, install,
