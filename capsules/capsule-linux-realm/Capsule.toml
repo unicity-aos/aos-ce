@@ -57,7 +57,7 @@ linux_max_output_bytes = { type = "integer", default = "65536", request = "Maxim
 linux_max_file_bytes = { type = "integer", default = "0", request = "Maximum bytes per Linux-created file (0 uses only Astrid's outer principal storage quota; otherwise 1 to 1099511627776)" }
 linux_max_processes = { type = "integer", default = "0", request = "Maximum Linux processes and threads for the agent UID (0 uses the inherited Linux limit and Astrid's outer principal envelope; otherwise 1 to 65536)" }
 linux_max_open_files = { type = "integer", default = "0", request = "Maximum open Linux file descriptors per process (0 preserves the inherited Linux operator limit; otherwise 1 to 1048576)" }
-linux_vcpus = { type = "integer", default = "0", request = "Logical Linux CPUs (0 = one CPU for the current serialized interpreter; explicit range 1 to 64)" }
+linux_vcpus = { type = "integer", default = "0", request = "Logical Linux CPUs (0 = one CPU matching the warm checkpoint; explicit 1 to 64, with values above one admitted as parallel workers)" }
 
 [publish]
 "tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }
