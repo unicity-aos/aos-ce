@@ -25,7 +25,7 @@ use aos_realm_runtime::{
 use aos_realm_vfs::FsStatus;
 use astrid_sdk::prelude::*;
 use astrid_sdk::schemars;
-use backend::{DEFAULT_LINUX_BACKEND_ID, LinuxMachine, LinuxSliceOutcome};
+use backend::{DEFAULT_LINUX_BACKEND_ID, LinuxMachine, LinuxMachineConfig, LinuxSliceOutcome};
 #[cfg(test)]
 use host::NativeTestWorkspace9p;
 #[cfg(not(test))]
@@ -171,7 +171,7 @@ struct ExecResponse {
     stdout: String,
     stderr: String,
     fuel_consumed: u64,
-    memory_limit_bytes: usize,
+    memory_limit_bytes: u64,
     suspensions: u64,
     processes: usize,
     realm_boot_sequence: u64,
@@ -263,7 +263,7 @@ struct StatusResponse {
     linux_state: &'static str,
     linux_residency: &'static str,
     linux_vcpus: u32,
-    linux_ram_bytes: Option<usize>,
+    linux_ram_bytes: Option<u64>,
     linux_ram_persistent: bool,
     linux_ram_durability: &'static str,
     linux_storage_persistent: bool,
@@ -312,7 +312,7 @@ struct LinuxSnapshot {
     last_outcome: Option<&'static str>,
     last_exit_status: Option<i32>,
     commands_completed: u64,
-    ram_bytes: Option<usize>,
+    ram_bytes: Option<u64>,
     vcpus: Option<u32>,
 }
 
@@ -388,9 +388,12 @@ impl SelectedExecution {
         }
     }
 
-    const fn memory_bytes(self, resources: RealmResources) -> usize {
+    fn memory_bytes(self, _resources: RealmResources) -> usize {
         match self {
-            Self::Linux(_) => resources.linux_memory_bytes,
+            // Linux execution consumes the separate u64 guest-memory field in
+            // `LinuxInvocationLimits`. The nested runtime retains usize-sized
+            // limits because it executes inside the capsule's wasm32 Store.
+            Self::Linux(_) => HARD_MEMORY_BYTES,
             _ => HARD_MEMORY_BYTES,
         }
     }
@@ -691,7 +694,8 @@ fn run_command_in_machine(
         stdout: String::from_utf8_lossy(&report.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&report.stderr).into_owned(),
         fuel_consumed: report.fuel_consumed,
-        memory_limit_bytes: report.memory_limit_bytes,
+        memory_limit_bytes: u64::try_from(report.memory_limit_bytes)
+            .expect("nested Realm memory limit fits u64"),
         suspensions: report.suspensions,
         processes: process_ids.len(),
         realm_boot_sequence: boot_sequence,
@@ -905,6 +909,7 @@ fn execute_linux_resident(
 
 struct LinuxInvocationLimits {
     run: RunLimits,
+    guest_memory_bytes: u64,
     max_file_bytes: u64,
     max_processes: u32,
     max_open_files: u32,
@@ -914,6 +919,8 @@ struct LinuxInvocationLimits {
 impl From<RunLimits> for LinuxInvocationLimits {
     fn from(run: RunLimits) -> Self {
         Self {
+            guest_memory_bytes: u64::try_from(run.memory_bytes)
+                .expect("native test memory limit fits u64"),
             run,
             max_file_bytes: resources::DEFAULT_LINUX_MAX_FILE_BYTES,
             max_processes: resources::DEFAULT_LINUX_MAX_PROCESSES,
@@ -961,6 +968,7 @@ fn execute_linux_resident_cooperatively(
 ) -> Result<LinuxInvocationReport, SysError> {
     let LinuxInvocationLimits {
         run: limits,
+        guest_memory_bytes,
         max_file_bytes,
         max_processes,
         max_open_files,
@@ -1003,8 +1011,8 @@ fn execute_linux_resident_cooperatively(
     if booted {
         *workspace_9p = None;
         let resident = LinuxMachine::new(
-            Rv64MachineConfig {
-                ram_bytes: limits.memory_bytes,
+            LinuxMachineConfig {
+                ram_bytes: guest_memory_bytes,
                 // Console chunks are drained after every scheduling slice. The
                 // invocation-wide output ceiling is enforced below.
                 max_console_bytes: HARD_MAX_OUTPUT_BYTES,
@@ -2338,7 +2346,10 @@ mod tests {
         assert_eq!(response.exit_status, Some(0));
         assert_eq!(response.stdout, "AOS RV64\n");
         assert_eq!(response.fuel_consumed, 23);
-        assert_eq!(response.memory_limit_bytes, HARD_MEMORY_BYTES);
+        assert_eq!(
+            response.memory_limit_bytes,
+            u64::try_from(HARD_MEMORY_BYTES).expect("test limit fits u64")
+        );
         assert_eq!(response.processes, 0);
         assert!(response.process_ids.is_empty());
     }
@@ -2361,7 +2372,10 @@ mod tests {
         assert_eq!(response.exit_status, Some(0));
         assert_eq!(response.stdout, "STR\n");
         assert_eq!(response.fuel_consumed, 31);
-        assert_eq!(response.memory_limit_bytes, HARD_MEMORY_BYTES);
+        assert_eq!(
+            response.memory_limit_bytes,
+            u64::try_from(HARD_MEMORY_BYTES).expect("test limit fits u64")
+        );
         assert_eq!(response.processes, 0);
         assert!(response.process_ids.is_empty());
     }
@@ -2370,7 +2384,7 @@ mod tests {
     fn linux_boot_and_console_preserve_userspace_across_invocations() {
         let limits = RunLimits {
             fuel: RealmResources::default().effective_max_steps(),
-            memory_bytes: DEFAULT_LINUX_MEMORY_BYTES,
+            memory_bytes: 0,
             output_bytes: HARD_MAX_OUTPUT_BYTES,
         };
         let mut machine = None;
@@ -2468,6 +2482,7 @@ mod tests {
             Some("2a2a4455667788990011aabbccddeeff"),
             LinuxInvocationLimits {
                 run: limits,
+                guest_memory_bytes: DEFAULT_LINUX_MEMORY_BYTES,
                 max_file_bytes: 4,
                 max_processes: 0,
                 max_open_files: 0,
@@ -2764,7 +2779,7 @@ mod tests {
             None,
             RunLimits {
                 fuel: LINUX_SLICE_STEPS * 2,
-                memory_bytes: DEFAULT_LINUX_MEMORY_BYTES,
+                memory_bytes: 0,
                 output_bytes: HARD_MAX_OUTPUT_BYTES,
             },
             || {
@@ -2794,7 +2809,7 @@ mod tests {
             None,
             RunLimits {
                 fuel: RealmResources::default().effective_max_steps(),
-                memory_bytes: DEFAULT_LINUX_MEMORY_BYTES,
+                memory_bytes: 0,
                 output_bytes: HARD_MAX_OUTPUT_BYTES,
             },
             || Ok(()),
@@ -2840,7 +2855,7 @@ AOS END 0123456789abcdef0123456789abcdef 0\r\n";
             None,
             RunLimits {
                 fuel: RealmResources::default().effective_max_steps(),
-                memory_bytes: DEFAULT_LINUX_MEMORY_BYTES,
+                memory_bytes: 0,
                 output_bytes: HARD_MAX_OUTPUT_BYTES,
             },
             || Err(SysError::ApiError("cooperation failed".to_string())),

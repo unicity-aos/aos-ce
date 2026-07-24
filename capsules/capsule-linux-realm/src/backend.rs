@@ -5,7 +5,9 @@
 //! signed Astrid compute worker, leaving 9P and every other host effect in the
 //! principal-affine controller component.
 
-use aos_realm_machine::{HostRequestFailure, MAX_HARTS, MachineConfig};
+#[cfg(any(not(target_arch = "wasm32"), test))]
+use aos_realm_machine::MachineConfig;
+use aos_realm_machine::{HostRequestFailure, MAX_HARTS};
 #[cfg(any(target_arch = "wasm32", test))]
 use aos_realm_vcpu_protocol as protocol;
 
@@ -22,15 +24,12 @@ use astrid_sdk::compute::{ComputeGroup, GroupRequest, Parallelism, WorkDescripto
 /// Compute changes where the interpreter executes, not the machine semantics
 /// exposed to tools, traces, checkpoints, or differential tests.
 pub(crate) const DEFAULT_LINUX_BACKEND_ID: &str = "aos-rv64-interpreter";
-#[cfg(any(target_arch = "wasm32", test))]
-const AUTO_GUEST_RESERVE_BYTES: usize = 128 * 1024 * 1024;
-const AUTO_REFERENCE_RAM_BYTES: usize = 512 * 1024 * 1024;
-#[cfg(any(target_arch = "wasm32", test))]
-const AUTO_INTERPRETER_RAM_BYTES: usize = 1024 * 1024 * 1024;
+/// Smallest measured RAM envelope that boots the development guest.
+///
+/// This is a machine viability floor, not an automatic default or policy cap.
+const MIN_BOOT_RAM_BYTES: u64 = 512 * 1024 * 1024;
 #[cfg(any(target_arch = "wasm32", test))]
 const AUTO_PREWARM_HARTS: u32 = 1;
-#[cfg(any(target_arch = "wasm32", test))]
-const MAX_GUEST_RAM_BYTES: usize = 3 * 1024 * 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
 const LINUX_SYSTEM_BLOCK_CHANNEL: u32 = 3;
 #[cfg(any(target_arch = "wasm32", test))]
@@ -95,6 +94,16 @@ pub(crate) enum LinuxMachine {
     Compute(ComputeMachine),
 }
 
+/// Guest resources selected by the principal and admitted by Astrid.
+///
+/// This lives in the wasm32 controller, so guest RAM is deliberately u64:
+/// the controller's own address space must not cap a memory64 compute worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LinuxMachineConfig {
+    pub(crate) ram_bytes: u64,
+    pub(crate) max_console_bytes: usize,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub(crate) struct ReferenceMachine {
@@ -102,13 +111,16 @@ pub(crate) struct ReferenceMachine {
     pending_request: Option<HostRequestId>,
     system: Vec<u8>,
     shell_v2: bool,
-    ram_bytes: usize,
+    ram_bytes: u64,
     hart_count: u32,
 }
 
 impl LinuxMachine {
     /// Admit and initialize the production backend for this build target.
-    pub(crate) fn new(config: MachineConfig, configured_hart_count: u32) -> Result<Self, String> {
+    pub(crate) fn new(
+        config: LinuxMachineConfig,
+        configured_hart_count: u32,
+    ) -> Result<Self, String> {
         let wall_time_seconds = wall_time_seconds()?;
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -118,9 +130,14 @@ impl LinuxMachine {
                 // Native execution is the conformance/reference lane and has
                 // no Astrid compute admission query. Production wasm resolves
                 // auto sizing from its admitted group.
-                config.ram_bytes = AUTO_REFERENCE_RAM_BYTES;
+                config.ram_bytes = MIN_BOOT_RAM_BYTES;
             }
-            let mut machine = Machine::new_with_harts(config, hart_count as usize)
+            let machine_config = MachineConfig {
+                ram_bytes: usize::try_from(config.ram_bytes)
+                    .map_err(|_| "Linux guest RAM exceeds the reference host address space")?,
+                max_console_bytes: config.max_console_bytes,
+            };
+            let mut machine = Machine::new_with_harts(machine_config, hart_count as usize)
                 .map_err(|error| error.to_string())?;
             let (system, shell_v2) = std::fs::read(LINUX_SYSTEM_PATH)
                 .map(|system| (system, true))
@@ -148,6 +165,7 @@ impl LinuxMachine {
 
     #[cfg(test)]
     pub(crate) fn new_reference(config: MachineConfig) -> Result<Self, String> {
+        let ram_bytes = u64::try_from(config.ram_bytes).map_err(|_| "reference RAM exceeds u64")?;
         Machine::new(config)
             .map(|machine| {
                 Self::Reference(ReferenceMachine {
@@ -155,7 +173,7 @@ impl LinuxMachine {
                     pending_request: None,
                     system: Vec::new(),
                     shell_v2: false,
-                    ram_bytes: config.ram_bytes,
+                    ram_bytes,
                     hart_count: 1,
                 })
             })
@@ -171,6 +189,7 @@ impl LinuxMachine {
     ) -> Result<Self, String> {
         let hart_count = reference_hart_count(hart_count)?;
         let wall_time_seconds = wall_time_seconds()?;
+        let ram_bytes = u64::try_from(config.ram_bytes).map_err(|_| "reference RAM exceeds u64")?;
         let mut machine = Machine::new_with_harts(config, hart_count as usize)
             .map_err(|error| error.to_string())?;
         machine
@@ -181,7 +200,7 @@ impl LinuxMachine {
             pending_request: None,
             system: system.to_vec(),
             shell_v2: !system.is_empty(),
-            ram_bytes: config.ram_bytes,
+            ram_bytes,
             hart_count,
         }))
     }
@@ -190,7 +209,7 @@ impl LinuxMachine {
         DEFAULT_LINUX_BACKEND_ID
     }
 
-    pub(crate) const fn ram_bytes(&self) -> usize {
+    pub(crate) const fn ram_bytes(&self) -> u64 {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
             Self::Reference(reference) => reference.ram_bytes,
@@ -361,7 +380,7 @@ impl ReferenceMachine {
 pub(crate) struct ComputeMachine {
     group: ComputeGroup,
     control_offset: u64,
-    ram_bytes: usize,
+    ram_bytes: u64,
     hart_count: u32,
 }
 
@@ -374,7 +393,7 @@ struct ComputeResponse {
 
 #[cfg(any(target_arch = "wasm32", test))]
 struct PrewarmSpec {
-    ram_bytes: usize,
+    ram_bytes: u64,
     max_console_bytes: usize,
     hart_count: u32,
     binding: [u8; protocol::CHECKPOINT_BINDING_BYTES],
@@ -382,7 +401,7 @@ struct PrewarmSpec {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl PrewarmSpec {
-    fn matches(&self, config: MachineConfig, hart_count: u32) -> bool {
+    fn matches(&self, config: LinuxMachineConfig, hart_count: u32) -> bool {
         self.ram_bytes == config.ram_bytes
             && self.max_console_bytes == config.max_console_bytes
             && self.hart_count == hart_count
@@ -392,7 +411,7 @@ impl PrewarmSpec {
 #[cfg(target_arch = "wasm32")]
 impl ComputeMachine {
     fn new(
-        mut config: MachineConfig,
+        mut config: LinuxMachineConfig,
         configured_hart_count: u32,
         wall_time_seconds: u64,
     ) -> Result<Self, String> {
@@ -443,7 +462,7 @@ impl ComputeMachine {
             )
         };
         machine.invoke(operation, &input, |header| {
-            protocol::write_u64(header, field::RAM_BYTES, config.ram_bytes as u64);
+            protocol::write_u64(header, field::RAM_BYTES, config.ram_bytes);
             protocol::write_u64(
                 header,
                 field::MAX_CONSOLE_BYTES,
@@ -768,7 +787,7 @@ fn prewarm_spec() -> Result<PrewarmSpec, String> {
             .ok_or_else(|| format!("Linux prewarm lock is missing {name}"))
     };
     let ram_bytes = value("ram_bytes")?
-        .parse::<usize>()
+        .parse::<u64>()
         .map_err(|error| format!("Linux prewarm RAM is invalid: {error}"))?;
     let max_console_bytes = value("max_console_bytes")?
         .parse::<usize>()
@@ -884,32 +903,44 @@ fn reference_hart_count(configured: u32) -> Result<u32, String> {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-fn shared_memory_layout(ram_bytes: usize) -> Result<(u32, u32, u64), String> {
+fn shared_memory_layout(ram_bytes: u64) -> Result<(u32, u32, u64), String> {
     // Rust's wasm allocator acquires heap segments with `memory.grow`; it does
     // not adopt unused bytes from the imported memory's initial extent. Keep
     // the signed worker's code/data and descriptor in the fixed 64-MiB base,
     // then reserve guest RAM plus bounded allocator headroom as the maximum.
     // Astrid reserves that maximum before the worker can grow itself.
-    let maximum_required = protocol::WORKER_MIN_MEMORY_BYTES
+    let worker_minimum =
+        u64::try_from(protocol::WORKER_MIN_MEMORY_BYTES).expect("worker minimum fits u64");
+    let worker_heap =
+        u64::try_from(protocol::WORKER_HEAP_OVERHEAD_BYTES).expect("worker heap overhead fits u64");
+    let wasm_page = u64::try_from(protocol::WASM_PAGE_BYTES).expect("Wasm page size fits u64");
+    let maximum_required = worker_minimum
         .checked_add(ram_bytes)
-        .and_then(|value| value.checked_add(protocol::WORKER_HEAP_OVERHEAD_BYTES))
+        .and_then(|value| value.checked_add(worker_heap))
         .ok_or_else(|| "Linux vCPU shared-memory size overflow".to_string())?
-        .max(protocol::WORKER_MIN_MEMORY_BYTES);
+        .max(worker_minimum);
     let maximum_pages = if ram_bytes == 0 {
         // Zero is the held compute-contract sentinel for host admission. The
         // effective value is read back from `group.info()` before VM init.
         0
     } else {
         maximum_required
-            .checked_add(protocol::WASM_PAGE_BYTES - 1)
+            .checked_add(wasm_page - 1)
             .ok_or_else(|| "Linux vCPU shared-memory rounding overflow".to_string())?
-            / protocol::WASM_PAGE_BYTES
+            / wasm_page
     };
     let maximum_bytes = maximum_pages
-        .checked_mul(protocol::WASM_PAGE_BYTES)
+        .checked_mul(wasm_page)
         .ok_or_else(|| "Linux vCPU shared-memory size overflow".to_string())?;
     if maximum_bytes > protocol::WORKER_MAX_MEMORY_BYTES {
-        return Err("Linux vCPU shared memory exceeds the worker's signed maximum".to_string());
+        let maximum_guest_bytes = protocol::WORKER_MAX_MEMORY_BYTES
+            .checked_sub(worker_minimum)
+            .and_then(|bytes| bytes.checked_sub(worker_heap))
+            .expect("signed worker maximum covers its declared regions");
+        return Err(format!(
+            "Linux guest RAM request is {ram_bytes} bytes, but the signed backend currently supports at most {maximum_guest_bytes} guest bytes ({maximum_bytes} required shared bytes, {} supported); lower this principal's `linux_memory_bytes` or install a wider signed worker",
+            protocol::WORKER_MAX_MEMORY_BYTES
+        ));
     }
     let initial_pages = protocol::WORKER_MIN_MEMORY_BYTES / protocol::WASM_PAGE_BYTES;
     let control_offset = protocol::control_offset(0)
@@ -924,31 +955,29 @@ fn shared_memory_layout(ram_bytes: usize) -> Result<(u32, u32, u64), String> {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-fn auto_guest_ram_bytes(maximum_memory_pages: u32) -> Result<usize, String> {
-    const GUEST_PAGE_BYTES: usize = 4096;
-    let admitted = usize::try_from(maximum_memory_pages)
-        .ok()
-        .and_then(|pages| pages.checked_mul(protocol::WASM_PAGE_BYTES))
+fn auto_guest_ram_bytes(maximum_memory_pages: u32) -> Result<u64, String> {
+    const GUEST_PAGE_BYTES: u64 = 4096;
+    let wasm_page = u64::try_from(protocol::WASM_PAGE_BYTES).expect("Wasm page size fits u64");
+    let worker_minimum =
+        u64::try_from(protocol::WORKER_MIN_MEMORY_BYTES).expect("worker minimum fits u64");
+    let worker_heap =
+        u64::try_from(protocol::WORKER_HEAP_OVERHEAD_BYTES).expect("worker heap overhead fits u64");
+    let admitted = u64::from(maximum_memory_pages)
+        .checked_mul(wasm_page)
         .ok_or_else(|| "admitted Linux vCPU memory exceeds this platform".to_string())?;
     let available = admitted
-        .checked_sub(protocol::WORKER_MIN_MEMORY_BYTES)
-        .and_then(|bytes| bytes.checked_sub(AUTO_GUEST_RESERVE_BYTES))
+        .checked_sub(worker_minimum)
+        .and_then(|bytes| bytes.checked_sub(worker_heap))
         .ok_or_else(|| "admitted Linux vCPU memory leaves no guest RAM".to_string())?;
-    // The admitted group is already the intersection of host capacity,
-    // operator policy, and the invoking principal's profile. The pure RV64
-    // interpreter also has a measured cold-boot cost proportional to guest
-    // memory: 3 GiB exceeds the ordinary five-minute principal timeout on the
-    // M2 Ultra reference host. Auto mode therefore remains host-aware below
-    // 1 GiB but does not silently select a machine that cannot become ready in
-    // the default budget. Explicit configuration retains the signed 3-GiB
-    // ceiling for longer-lived principals and future accelerated backends.
-    let selected = available
-        .clamp(AUTO_REFERENCE_RAM_BYTES, MAX_GUEST_RAM_BYTES)
-        .min(AUTO_INTERPRETER_RAM_BYTES);
-    let aligned = selected - (selected % GUEST_PAGE_BYTES);
-    if aligned < AUTO_REFERENCE_RAM_BYTES {
+    // This group maximum is already the intersection of the signed worker's
+    // memory64 capability, remaining host capacity, operator policy, and the
+    // invoking principal's budget. Guest RAM consumes that admitted envelope
+    // minus only the worker's signed base and heap requirements. The controller
+    // lives in its own governed Store and is not charged to this shared region.
+    let aligned = available - (available % GUEST_PAGE_BYTES);
+    if aligned < MIN_BOOT_RAM_BYTES {
         return Err(format!(
-            "admitted Linux vCPU memory leaves {aligned} guest bytes; at least {AUTO_REFERENCE_RAM_BYTES} are required"
+            "admitted Linux vCPU memory leaves {aligned} guest bytes; at least {MIN_BOOT_RAM_BYTES} are required"
         ));
     }
     Ok(aligned)
@@ -998,14 +1027,14 @@ mod tests {
         assert_eq!(control_offset, (56 * 1024 * 1024) as u64);
 
         let (initial_pages, maximum_pages, control_offset) =
-            shared_memory_layout(3 * 1024 * 1024 * 1024).expect("largest Realm layout");
+            shared_memory_layout(8 * 1024 * 1024 * 1024).expect("memory64 Realm layout");
         assert_eq!(initial_pages, 1024);
-        assert_eq!(maximum_pages, 51_200);
+        assert_eq!(maximum_pages, 133_120);
         assert_eq!(control_offset, (56 * 1024 * 1024) as u64);
     }
 
     #[test]
-    fn auto_memory_scales_without_monopolizing_the_admitted_group() {
+    fn auto_memory_uses_the_admitted_group_without_a_hidden_policy_cap() {
         let (initial_pages, maximum_pages, _) =
             shared_memory_layout(0).expect("auto layout request");
         assert_eq!(initial_pages, 1024);
@@ -1013,13 +1042,21 @@ mod tests {
 
         assert_eq!(
             auto_guest_ram_bytes(16_384).expect("one GiB group"),
-            832 * 1024 * 1024
+            896 * 1024 * 1024
         );
         assert_eq!(
-            auto_guest_ram_bytes(57_344).expect("signed worker maximum"),
-            AUTO_INTERPRETER_RAM_BYTES
+            auto_guest_ram_bytes(262_144).expect("signed memory64 worker maximum"),
+            15 * 1024 * 1024 * 1024 + 896 * 1024 * 1024
         );
         assert!(auto_guest_ram_bytes(2048).is_err());
+    }
+
+    #[test]
+    fn explicit_memory_beyond_the_signed_worker_fails_with_capability_provenance() {
+        let error = shared_memory_layout(168 * 1024 * 1024 * 1024)
+            .expect_err("current signed worker cannot address 168 GiB");
+        assert!(error.contains("signed backend currently supports at most"));
+        assert!(error.contains("install a wider signed worker"));
     }
 
     #[test]
@@ -1044,14 +1081,14 @@ mod tests {
         assert_eq!(prewarm.hart_count, AUTO_PREWARM_HARTS);
         assert!(prewarm.binding.iter().any(|byte| *byte != 0));
         assert!(prewarm.matches(
-            MachineConfig {
+            LinuxMachineConfig {
                 ram_bytes: 1024 * 1024 * 1024,
                 max_console_bytes: 64 * 1024,
             },
             auto_guest_hart_count(24),
         ));
         assert!(!prewarm.matches(
-            MachineConfig {
+            LinuxMachineConfig {
                 ram_bytes: 1024 * 1024 * 1024,
                 max_console_bytes: 64 * 1024,
             },
@@ -1062,7 +1099,7 @@ mod tests {
     #[test]
     fn multi_hart_machine_uses_the_explicit_topology() {
         let machine = LinuxMachine::new(
-            MachineConfig {
+            LinuxMachineConfig {
                 ram_bytes: 32 * 1024 * 1024,
                 max_console_bytes: 64 * 1024,
             },

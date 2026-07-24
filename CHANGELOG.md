@@ -77,9 +77,12 @@
   ceilings derive from host CPU parallelism and physical RAM with a safety
   reserve, then intersect a process-wide pool, the invoking principal's memory
   and compute-worker quotas, existing reservations, and the signed worker
-  maximum. Realm probes the admitted envelope, defaults guest RAM to half of
-  its usable capacity so one Realm does not monopolize the pool, then reopens
-  an exact reservation. RAM may still be fixed per principal through 3 GiB.
+  maximum. Realm probes the admitted envelope, subtracts only the signed
+  worker's concrete base and heap requirements, then reopens an exact
+  reservation for all remaining page-aligned guest RAM. The signed vCPU worker
+  now uses shared memory64, so neither the wasm32 controller nor a capsule-level
+  3 GiB constant silently limits an operator-assigned principal budget. The
+  pinned worker currently reports a 16 GiB shared-memory capability.
   Worker fuel joins the ordinary cross-capsule principal CPU account and rate
   limit.
 - Deterministic virtual SMP for Linux Realm: exact 1–64-hart FDT topology,

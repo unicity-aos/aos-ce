@@ -8,13 +8,13 @@
 //! guest CPU state, admitted RAM, and virtual hardware. The outer Realm owns
 //! scheduling, authority, image admission, persistence, and all host effects.
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(target_family = "wasm", test))]
 mod atomic_ram;
 mod checkpoint;
 mod fdt;
 mod floating;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 use atomic_ram::{AtomicGuestRam, AtomicReservation};
 pub use checkpoint::{CheckpointBinding, CheckpointDecodeError, CheckpointDigest};
 use fdt::{LinuxFdtConfig, build_linux_fdt};
@@ -69,7 +69,13 @@ const UART_LINE_STATUS: u64 = 5;
 const UART_LINE_STATUS_DATA_READY: u8 = 1;
 const UART_LINE_STATUS_TRANSMIT_EMPTY: u8 = (1 << 5) | (1 << 6);
 const MIN_RAM_BYTES: usize = 4096;
-const MAX_RAM_BYTES: usize = 3 * 1024 * 1024 * 1024;
+// Checkpoints encode sparse 4-KiB page indices as u32. That format boundary,
+// intersected with the build target's address space, is the machine's actual
+// RAM capability; resource policy is enforced outside the interpreter.
+#[cfg(target_pointer_width = "64")]
+const MAX_RAM_BYTES: usize = u32::MAX as usize * MIN_RAM_BYTES;
+#[cfg(target_pointer_width = "32")]
+const MAX_RAM_BYTES: usize = usize::MAX - (usize::MAX % MIN_RAM_BYTES);
 const MAX_CONSOLE_BYTES: usize = 16 * 1024 * 1024;
 const MIN_LINUX_RAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BOOTARGS_BYTES: usize = 4096;
@@ -1152,9 +1158,9 @@ impl HartControl {
 
 #[derive(Debug)]
 struct HostRequestSequence {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     next: u64,
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     next: Arc<AtomicU64>,
 }
 
@@ -1167,39 +1173,39 @@ impl Clone for HostRequestSequence {
 impl HostRequestSequence {
     fn new(next: u64) -> Self {
         Self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             next,
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             next: Arc::new(AtomicU64::new(next)),
         }
     }
 
     fn current(&self) -> u64 {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         return self.next;
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         self.next.load(Ordering::Acquire)
     }
 
     fn set(&mut self, next: u64) {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             self.next = next;
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             self.next.store(next, Ordering::Release);
         }
     }
 
     fn allocate(&mut self) -> Option<HostRequestId> {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             let id = self.next;
             self.next = self.next.checked_add(1)?;
             Some(HostRequestId(id))
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         self.next
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
                 next.checked_add(1)
@@ -1208,7 +1214,7 @@ impl HostRequestSequence {
             .map(HostRequestId)
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn share(&self) -> Self {
         Self {
             next: Arc::clone(&self.next),
@@ -1226,7 +1232,7 @@ pub struct HartState {
     cycle: u64,
     instret: u64,
     reservation: Option<(u64, u8)>,
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     reservation_token: Option<AtomicReservation>,
     mtimecmp: u64,
     msip: bool,
@@ -1243,7 +1249,7 @@ impl HartState {
             cycle: 0,
             instret: 0,
             reservation: None,
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             reservation_token: None,
             mtimecmp: u64::MAX,
             msip: false,
@@ -1266,11 +1272,11 @@ struct SbiFirmware {
 
 #[derive(Debug)]
 struct GuestRam {
-    #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+    #[cfg(all(not(target_family = "wasm"), not(test)))]
     bytes: Vec<u8>,
     #[cfg(test)]
     chunks: Vec<Option<Box<[u8]>>>,
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     atomic: std::sync::Arc<AtomicGuestRam>,
     len: usize,
 }
@@ -1281,11 +1287,11 @@ const RAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 impl Clone for GuestRam {
     fn clone(&self) -> Self {
         Self {
-            #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+            #[cfg(all(not(target_family = "wasm"), not(test)))]
             bytes: self.bytes.clone(),
             #[cfg(test)]
             chunks: self.chunks.clone(),
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             atomic: Arc::new((*self.atomic).clone()),
             len: self.len,
         }
@@ -1294,7 +1300,7 @@ impl Clone for GuestRam {
 
 impl GuestRam {
     fn zeroed(len: usize) -> Result<Self, MachineError> {
-        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        #[cfg(all(not(target_family = "wasm"), not(test)))]
         {
             let mut bytes = Vec::new();
             bytes
@@ -1313,7 +1319,7 @@ impl GuestRam {
             chunks.resize_with(chunk_count, || None);
             Ok(Self { chunks, len })
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             Ok(Self {
                 atomic: Arc::new(AtomicGuestRam::zeroed(len)?),
@@ -1327,22 +1333,22 @@ impl GuestRam {
     }
 
     fn fill_zero(&mut self) {
-        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        #[cfg(all(not(target_family = "wasm"), not(test)))]
         self.bytes.fill(0);
         #[cfg(test)]
         for chunk in &mut self.chunks {
             *chunk = None;
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         Arc::make_mut(&mut self.atomic).fill_zero();
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     fn byte(&self, index: usize) -> Option<u8> {
         if index >= self.len {
             return None;
         }
-        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        #[cfg(all(not(target_family = "wasm"), not(test)))]
         return self.bytes.get(index).copied();
         #[cfg(test)]
         {
@@ -1352,7 +1358,7 @@ impl GuestRam {
                     .map_or(0, |bytes| bytes[index % RAM_CHUNK_BYTES])
             })
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         self.atomic.byte(index)
     }
 
@@ -1362,9 +1368,9 @@ impl GuestRam {
         if byte_count == 0 || byte_count > size_of::<u64>() || end > self.len {
             return None;
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         return self.atomic.read_value(index, bytes);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             let mut value = 0_u64;
             for shift in 0..byte_count {
@@ -1386,9 +1392,9 @@ impl GuestRam {
         {
             return false;
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         return self.atomic.write_value(index, value, bytes);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             for shift in 0..byte_count {
                 if !self.set_byte(index + shift, (value >> (shift * 8)) as u8) {
@@ -1399,12 +1405,12 @@ impl GuestRam {
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn load_reserved(&self, index: usize, bytes: u8) -> Option<(u64, AtomicReservation)> {
         self.atomic.load_reserved(index, bytes)
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn store_conditional(
         &self,
         reservation: AtomicReservation,
@@ -1416,7 +1422,7 @@ impl GuestRam {
             .store_conditional(reservation, index, value, bytes)
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn update_value(&self, index: usize, bytes: u8, value: impl FnOnce(u64) -> u64) -> Option<u64> {
         self.atomic.update_value(index, bytes, value)
     }
@@ -1444,7 +1450,7 @@ impl GuestRam {
         if index >= self.len {
             return false;
         }
-        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        #[cfg(all(not(target_family = "wasm"), not(test)))]
         {
             self.bytes.get_mut(index).is_some_and(|slot| {
                 *slot = value;
@@ -1468,18 +1474,18 @@ impl GuestRam {
                     true
                 })
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             self.atomic.set_byte(index, value)
         }
     }
 
     fn copy_from_slice(&mut self, start: usize, source: &[u8]) -> bool {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             self.atomic.copy_from_slice(start, source)
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             let Some(end) = start
                 .checked_add(source.len())
@@ -1520,11 +1526,11 @@ impl GuestRam {
     }
 
     fn copy_from_slice_quiescent(&mut self, start: usize, source: &[u8]) -> bool {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             Arc::make_mut(&mut self.atomic).copy_from_slice_quiescent(start, source)
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             self.copy_from_slice(start, source)
         }
@@ -1534,7 +1540,7 @@ impl GuestRam {
         if range.start > range.end || range.end > self.len {
             return None;
         }
-        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        #[cfg(all(not(target_family = "wasm"), not(test)))]
         return Some(self.bytes[range].to_vec());
         #[cfg(test)]
         {
@@ -1556,7 +1562,7 @@ impl GuestRam {
             }
             Some(bytes)
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             self.atomic.copy_to_vec(range)
         }
@@ -1569,7 +1575,7 @@ impl GuestRam {
         if range.is_empty() {
             return Some(&[]);
         }
-        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        #[cfg(all(not(target_family = "wasm"), not(test)))]
         return self.bytes.get(range);
         #[cfg(test)]
         {
@@ -1581,7 +1587,7 @@ impl GuestRam {
                 .and_then(Option::as_deref)
                 .and_then(|chunk| chunk.get(chunk_offset..chunk_offset.checked_add(length)?))
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             None
         }
@@ -1599,7 +1605,7 @@ impl GuestRam {
     fn nonzero_pages(&self, page_bytes: usize) -> Vec<(usize, Vec<u8>)> {
         debug_assert!(page_bytes > 0);
         debug_assert_eq!(self.len % page_bytes, 0);
-        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        #[cfg(all(not(target_family = "wasm"), not(test)))]
         return self
             .bytes
             .chunks_exact(page_bytes)
@@ -1625,13 +1631,13 @@ impl GuestRam {
             }
             pages
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             self.atomic.nonzero_pages(page_bytes)
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn share(&self) -> Self {
         Self {
             atomic: Arc::clone(&self.atomic),
@@ -1643,17 +1649,17 @@ impl GuestRam {
 #[derive(Debug)]
 struct Devices {
     ram: GuestRam,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     mtime: u64,
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     mtime: Arc<AtomicU64>,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     console_input: VecDeque<u8>,
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     console_input: Arc<std::sync::Mutex<VecDeque<u8>>>,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     console_output: Vec<u8>,
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     console_output: Arc<std::sync::Mutex<Vec<u8>>>,
     max_console_bytes: usize,
 }
@@ -1662,22 +1668,22 @@ impl Clone for Devices {
     fn clone(&self) -> Self {
         Self {
             ram: self.ram.clone(),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             mtime: self.mtime,
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             mtime: Arc::new(AtomicU64::new(self.mtime())),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             console_input: self.console_input.clone(),
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             console_input: Arc::new(std::sync::Mutex::new(
                 self.console_input
                     .lock()
                     .expect("console input lock")
                     .clone(),
             )),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             console_output: self.console_output.clone(),
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             console_output: Arc::new(std::sync::Mutex::new(
                 self.console_output
                     .lock()
@@ -1804,17 +1810,17 @@ impl Devices {
     fn new(config: MachineConfig) -> Result<Self, MachineError> {
         Ok(Self {
             ram: GuestRam::zeroed(config.ram_bytes)?,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             mtime: 0,
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             mtime: Arc::new(AtomicU64::new(0)),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             console_input: VecDeque::new(),
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             console_input: Arc::new(std::sync::Mutex::new(VecDeque::new())),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             console_output: Vec::new(),
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             console_output: Arc::new(std::sync::Mutex::new(Vec::new())),
             max_console_bytes: config.max_console_bytes,
         })
@@ -1823,12 +1829,12 @@ impl Devices {
     fn reset(&mut self) {
         self.ram.fill_zero();
         self.set_mtime(0);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             self.console_input.clear();
             self.console_output.clear();
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             self.console_input
                 .lock()
@@ -1846,9 +1852,9 @@ impl Devices {
     }
 
     fn take_new_console(&mut self) -> Vec<u8> {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         return std::mem::take(&mut self.console_output);
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             std::mem::take(&mut *self.console_output.lock().expect("console output lock"))
         }
@@ -1943,7 +1949,7 @@ impl Devices {
         self.ram.read_value(range.start, bytes)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     fn write_ram(&mut self, address: u64, value: u64, bytes: u8) -> bool {
         let Some(range) = self.ram_range(address, bytes) else {
             return false;
@@ -1951,13 +1957,13 @@ impl Devices {
         self.ram.write_value(range.start, value, bytes)
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn load_reserved_ram(&self, address: u64, bytes: u8) -> Option<(u64, AtomicReservation)> {
         let range = self.ram_range(address, bytes)?;
         self.ram.load_reserved(range.start, bytes)
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn store_conditional_ram(
         &self,
         reservation: AtomicReservation,
@@ -1972,7 +1978,7 @@ impl Devices {
             .store_conditional(reservation, range.start, value, bytes)
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn update_ram(&self, address: u64, bytes: u8, value: impl FnOnce(u64) -> u64) -> Option<u64> {
         let range = self.ram_range(address, bytes)?;
         self.ram.update_value(range.start, bytes, value)
@@ -2000,9 +2006,9 @@ impl Devices {
     }
 
     fn push_console_output(&mut self, byte: u8) -> Result<(), MachineTrap> {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let output = &mut self.console_output;
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         let mut output = self.console_output.lock().expect("console output lock");
         if output.len() == self.max_console_bytes {
             return Err(MachineTrap::ConsoleLimit {
@@ -2014,38 +2020,38 @@ impl Devices {
     }
 
     fn tick(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             self.mtime = self.mtime.wrapping_add(1);
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             self.mtime.fetch_add(1, Ordering::AcqRel);
         }
     }
 
     fn mtime(&self) -> u64 {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         return self.mtime;
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         self.mtime.load(Ordering::Acquire)
     }
 
     fn set_mtime(&mut self, value: u64) {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             self.mtime = value;
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             self.mtime.store(value, Ordering::Release);
         }
     }
 
     fn push_console_input(&mut self, bytes: &[u8]) {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         self.console_input.extend(bytes.iter().copied());
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         self.console_input
             .lock()
             .expect("console input lock")
@@ -2053,9 +2059,9 @@ impl Devices {
     }
 
     fn pop_console_input(&mut self) -> Option<u8> {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         return self.console_input.pop_front();
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         self.console_input
             .lock()
             .expect("console input lock")
@@ -2063,23 +2069,23 @@ impl Devices {
     }
 
     fn console_input_len(&self) -> usize {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         return self.console_input.len();
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         self.console_input.lock().expect("console input lock").len()
     }
 
     fn console_output_len(&self) -> usize {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         return self.console_output.len();
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         self.console_output
             .lock()
             .expect("console output lock")
             .len()
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     fn share(&self) -> Self {
         Self {
             ram: self.ram.share(),
@@ -2312,7 +2318,7 @@ impl Machine {
     }
 
     fn rebuild_reservation_tokens(&mut self) {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             let devices = &self.devices;
             for hart in &mut self.harts {
@@ -2365,7 +2371,7 @@ impl Machine {
     /// RAM, virtual time, console devices, and inter-hart control mailboxes are
     /// shared atomically. Ordinary [`Clone`] stays a deep, isolated copy for
     /// checkpoints and deterministic verification.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     #[doc(hidden)]
     pub fn share_hart_worker(&self, hart_id: usize) -> Result<Self, InvalidHartId> {
         if hart_id >= self.hart_count {
@@ -3416,7 +3422,7 @@ impl Machine {
             if pte & required_ad != required_ad {
                 self.metrics.page_table_entries_written =
                     self.metrics.page_table_entries_written.saturating_add(1);
-                #[cfg(target_arch = "wasm32")]
+                #[cfg(target_family = "wasm")]
                 if self
                     .devices
                     .update_ram(pte_address, 8, |value| value | required_ad)
@@ -3424,7 +3430,7 @@ impl Machine {
                 {
                     return Err(access.access_fault(address, 8));
                 }
-                #[cfg(not(target_arch = "wasm32"))]
+                #[cfg(not(target_family = "wasm"))]
                 {
                     if !self.devices.write_ram(pte_address, pte | required_ad, 8) {
                         return Err(access.access_fault(address, 8));
@@ -3489,7 +3495,7 @@ impl Machine {
             }
             ensure_aligned(virtual_address, bytes, false)?;
             let physical = self.translate(virtual_address, AccessType::Load)?;
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             let (value, reservation_token) = self
                 .devices
                 .load_reserved_ram(physical, bytes)
@@ -3497,7 +3503,7 @@ impl Machine {
                     address: virtual_address,
                     bytes,
                 })?;
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             let value =
                 self.read_device(physical, bytes)
                     .map_err(|_| MachineTrap::LoadAccessFault {
@@ -3505,7 +3511,7 @@ impl Machine {
                         bytes,
                     })?;
             self.reservation = Some((physical, bytes));
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             {
                 self.reservation_token = Some(reservation_token);
             }
@@ -3526,34 +3532,34 @@ impl Machine {
             let address_matches = self.reservation == Some((physical, bytes));
             self.reservation = None;
             let value = self.cpu.read(rs2);
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             let succeeds = self.reservation_token.take().is_some_and(|reservation| {
                 address_matches
                     && self
                         .devices
                         .store_conditional_ram(reservation, physical, value, bytes)
             });
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             let succeeds = address_matches;
             if !succeeds {
                 self.cpu.write(rd, 1);
                 return Ok(None);
             }
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             let halt = self
                 .write_device(physical, value, bytes)
                 .map_err(|trap| map_store_fault(trap, virtual_address, bytes))?;
             self.cpu.write(rd, 0);
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             return Ok(None);
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             return Ok(halt);
         }
 
         let rhs = self.cpu.read(rs2);
         atomic_result(operation, 0, rhs, bytes).ok_or_else(|| illegal(pc, instruction))?;
         self.invalidate_reservation(physical, bytes);
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         let old = self
             .devices
             .update_ram(physical, bytes, |old| {
@@ -3563,16 +3569,16 @@ impl Machine {
                 address: virtual_address,
                 bytes,
             })?;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let old = self
             .read_device(physical, bytes)
             .map_err(|_| MachineTrap::StoreAccessFault {
                 address: virtual_address,
                 bytes,
             })?;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let value = atomic_result(operation, old, rhs, bytes).expect("atomic operation validated");
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let halt = self
             .write_device(physical, value, bytes)
             .map_err(|trap| map_store_fault(trap, virtual_address, bytes))?;
@@ -3584,9 +3590,9 @@ impl Machine {
                 old
             },
         );
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         return Ok(None);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         Ok(halt)
     }
 
@@ -3601,7 +3607,7 @@ impl Machine {
         for hart in &mut self.harts {
             if overlaps(hart.reservation) {
                 hart.reservation = None;
-                #[cfg(target_arch = "wasm32")]
+                #[cfg(target_family = "wasm")]
                 {
                     hart.reservation_token = None;
                 }
@@ -3723,7 +3729,7 @@ impl Machine {
             hart.cycle = 0;
             hart.instret = 0;
             hart.reservation = None;
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             {
                 hart.reservation_token = None;
             }
@@ -4048,7 +4054,7 @@ impl Machine {
         let origin = self.cpu.privilege;
         let pc = self.cpu.pc;
         self.reservation = None;
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             self.reservation_token = None;
         }
@@ -4089,7 +4095,7 @@ impl Machine {
     fn take_exception(&mut self, cause: u64, value: u64, pc: u64) {
         let origin = self.cpu.privilege;
         self.reservation = None;
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             self.reservation_token = None;
         }

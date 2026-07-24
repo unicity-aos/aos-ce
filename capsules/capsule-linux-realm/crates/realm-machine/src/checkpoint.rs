@@ -284,7 +284,7 @@ impl MachineCheckpoint {
                 cycle: hart.cycle,
                 instret: hart.instret,
                 reservation: hart.reservation,
-                #[cfg(target_arch = "wasm32")]
+                #[cfg(target_family = "wasm")]
                 reservation_token: None,
                 mtimecmp: hart.mtimecmp,
                 msip: hart.msip,
@@ -299,7 +299,7 @@ impl MachineCheckpoint {
             cycle: active.cycle,
             instret: active.instret,
             reservation: active.reservation,
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(target_family = "wasm")]
             reservation_token: None,
             mtimecmp: active.mtimecmp,
             msip: active.msip,
