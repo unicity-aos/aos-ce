@@ -248,7 +248,8 @@ fn append(record: &TraceRecord) -> Result<(), SysError> {
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str(&serde_json::to_string(record).map_err(|e| SysError::ApiError(e.to_string()))?);
+    content
+        .push_str(&serde_json::to_string(record).map_err(|e| SysError::ApiError(e.to_string()))?);
     content.push('\n');
 
     fs::write(&path, content.as_bytes())?;

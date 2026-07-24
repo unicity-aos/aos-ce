@@ -277,6 +277,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aos-trace"
+version = "0.1.0"
+dependencies = [
+ "astrid-sdk",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "aos-users"
 version = "0.1.0"
 dependencies = [
