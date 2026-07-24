@@ -22,6 +22,7 @@ use std::{
     collections::VecDeque,
     fmt,
     ops::{Deref, DerefMut},
+    sync::atomic::{AtomicU8, AtomicU64, Ordering},
 };
 
 /// Machine profile whose future device tree and Linux image are versioned together.
@@ -341,6 +342,8 @@ pub enum CheckpointError {
     PendingConsoleInput { bytes: usize },
     /// Console bytes must be drained into the checkpoint build receipt first.
     UndrainedConsoleOutput { bytes: usize },
+    /// Cross-hart control mailboxes must be acknowledged at an epoch barrier.
+    PendingHartControl { hart_id: usize },
 }
 
 impl fmt::Display for CheckpointError {
@@ -357,6 +360,10 @@ impl fmt::Display for CheckpointError {
             Self::UndrainedConsoleOutput { bytes } => write!(
                 f,
                 "prewarm checkpoint contains {bytes} bytes of undrained console output"
+            ),
+            Self::PendingHartControl { hart_id } => write!(
+                f,
+                "prewarm checkpoint contains unacknowledged control for hart {hart_id}"
             ),
         }
     }
@@ -1008,6 +1015,134 @@ enum HartLifecycle {
     Stopped,
 }
 
+const HART_CONTROL_STOPPED: u8 = 0;
+const HART_CONTROL_START_CLAIMED: u8 = 1;
+const HART_CONTROL_START_PENDING: u8 = 2;
+const HART_CONTROL_STARTED: u8 = 3;
+
+#[derive(Debug)]
+struct HartControl {
+    lifecycle: AtomicU8,
+    start_address: AtomicU64,
+    start_opaque: AtomicU64,
+    start_generation: AtomicU64,
+    start_acknowledged: AtomicU64,
+    pending_interrupts: AtomicU64,
+    fence_generation: AtomicU64,
+    fence_acknowledged: AtomicU64,
+}
+
+impl Clone for HartControl {
+    fn clone(&self) -> Self {
+        Self {
+            lifecycle: AtomicU8::new(self.lifecycle.load(Ordering::Acquire)),
+            start_address: AtomicU64::new(self.start_address.load(Ordering::Acquire)),
+            start_opaque: AtomicU64::new(self.start_opaque.load(Ordering::Acquire)),
+            start_generation: AtomicU64::new(self.start_generation.load(Ordering::Acquire)),
+            start_acknowledged: AtomicU64::new(self.start_acknowledged.load(Ordering::Acquire)),
+            pending_interrupts: AtomicU64::new(self.pending_interrupts.load(Ordering::Acquire)),
+            fence_generation: AtomicU64::new(self.fence_generation.load(Ordering::Acquire)),
+            fence_acknowledged: AtomicU64::new(self.fence_acknowledged.load(Ordering::Acquire)),
+        }
+    }
+}
+
+impl HartControl {
+    fn new(lifecycle: HartLifecycle) -> Self {
+        Self {
+            lifecycle: AtomicU8::new(match lifecycle {
+                HartLifecycle::Started => HART_CONTROL_STARTED,
+                HartLifecycle::Stopped => HART_CONTROL_STOPPED,
+            }),
+            start_address: AtomicU64::new(0),
+            start_opaque: AtomicU64::new(0),
+            start_generation: AtomicU64::new(0),
+            start_acknowledged: AtomicU64::new(0),
+            pending_interrupts: AtomicU64::new(0),
+            fence_generation: AtomicU64::new(0),
+            fence_acknowledged: AtomicU64::new(0),
+        }
+    }
+
+    fn lifecycle(&self) -> HartLifecycle {
+        match self.lifecycle.load(Ordering::Acquire) {
+            HART_CONTROL_STARTED => HartLifecycle::Started,
+            _ => HartLifecycle::Stopped,
+        }
+    }
+
+    fn request_start(&self, address: u64, opaque: u64) -> Result<u64, ()> {
+        self.lifecycle
+            .compare_exchange(
+                HART_CONTROL_STOPPED,
+                HART_CONTROL_START_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| ())?;
+        self.start_address.store(address, Ordering::Relaxed);
+        self.start_opaque.store(opaque, Ordering::Relaxed);
+        let generation = self.start_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.lifecycle
+            .store(HART_CONTROL_START_PENDING, Ordering::Release);
+        Ok(generation)
+    }
+
+    fn pending_start(&self) -> Option<(u64, u64, u64)> {
+        (self.lifecycle.load(Ordering::Acquire) == HART_CONTROL_START_PENDING).then(|| {
+            (
+                self.start_address.load(Ordering::Relaxed),
+                self.start_opaque.load(Ordering::Relaxed),
+                self.start_generation.load(Ordering::Acquire),
+            )
+        })
+    }
+
+    fn acknowledge_start(&self, generation: u64) {
+        self.start_acknowledged.store(generation, Ordering::Release);
+        self.lifecycle
+            .store(HART_CONTROL_STARTED, Ordering::Release);
+    }
+
+    fn stop(&self) {
+        self.lifecycle
+            .store(HART_CONTROL_STOPPED, Ordering::Release);
+    }
+
+    fn raise_interrupt(&self, interrupt: u64) {
+        self.pending_interrupts
+            .fetch_or(interrupt, Ordering::AcqRel);
+    }
+
+    fn take_interrupts(&self) -> u64 {
+        self.pending_interrupts.swap(0, Ordering::AcqRel)
+    }
+
+    fn request_fence(&self) -> u64 {
+        self.fence_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn pending_fence(&self) -> Option<u64> {
+        let requested = self.fence_generation.load(Ordering::Acquire);
+        let acknowledged = self.fence_acknowledged.load(Ordering::Acquire);
+        (requested != acknowledged).then_some(requested)
+    }
+
+    fn acknowledge_fence(&self, generation: u64) {
+        self.fence_acknowledged.store(generation, Ordering::Release);
+    }
+
+    fn is_quiescent(&self) -> bool {
+        let lifecycle = self.lifecycle.load(Ordering::Acquire);
+        !matches!(
+            lifecycle,
+            HART_CONTROL_START_CLAIMED | HART_CONTROL_START_PENDING
+        ) && self.pending_interrupts.load(Ordering::Acquire) == 0
+            && self.fence_generation.load(Ordering::Acquire)
+                == self.fence_acknowledged.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct HartState {
@@ -1579,6 +1714,7 @@ pub struct Machine {
     hart_count: usize,
     active_hart_id: usize,
     harts: Vec<HartState>,
+    hart_controls: Vec<HartControl>,
     scheduler_quantum_remaining: u64,
     devices: Devices,
     state: RunState,
@@ -1693,6 +1829,15 @@ impl Machine {
                     )
                 })
                 .collect(),
+            hart_controls: (0..hart_count)
+                .map(|hart_id| {
+                    HartControl::new(if hart_id == 0 {
+                        HartLifecycle::Started
+                    } else {
+                        HartLifecycle::Stopped
+                    })
+                })
+                .collect(),
             scheduler_quantum_remaining: HART_SCHEDULER_QUANTUM,
             devices: Devices::new(config)?,
             state: RunState::Runnable,
@@ -1732,11 +1877,36 @@ impl Machine {
                 )
             })
             .collect();
+        self.rebuild_hart_controls();
         self.scheduler_quantum_remaining = HART_SCHEDULER_QUANTUM;
     }
 
+    fn rebuild_hart_controls(&mut self) {
+        self.hart_controls = self
+            .harts
+            .iter()
+            .map(|hart| HartControl::new(hart.lifecycle))
+            .collect();
+    }
+
     fn hart_lifecycle(&self, hart_id: usize) -> Option<HartLifecycle> {
-        self.harts.get(hart_id).map(|hart| hart.lifecycle)
+        self.hart_controls.get(hart_id).map(HartControl::lifecycle)
+    }
+
+    fn set_hart_lifecycle(&mut self, hart_id: usize, lifecycle: HartLifecycle) -> bool {
+        let (Some(hart), Some(control)) =
+            (self.harts.get_mut(hart_id), self.hart_controls.get(hart_id))
+        else {
+            return false;
+        };
+        hart.lifecycle = lifecycle;
+        match lifecycle {
+            HartLifecycle::Started => control
+                .lifecycle
+                .store(HART_CONTROL_STARTED, Ordering::Release),
+            HartLifecycle::Stopped => control.stop(),
+        }
+        true
     }
 
     fn switch_active_hart(&mut self, hart_id: usize) -> bool {
@@ -2058,6 +2228,13 @@ impl Machine {
                 bytes: self.devices.console_output.len(),
             });
         }
+        if let Some(hart_id) = self
+            .hart_controls
+            .iter()
+            .position(|control| !control.is_quiescent())
+        {
+            return Err(CheckpointError::PendingHartControl { hart_id });
+        }
 
         let mut machine = self.clone();
         machine.translation_cache.clear();
@@ -2093,12 +2270,17 @@ impl Machine {
     fn run_slice_inner(&mut self, instruction_budget: u64, scheduled: bool) -> SliceReport {
         let mut steps = 0_u64;
         let mut retired = 0_u64;
+        let _ = self.apply_hart_control(self.active_hart_id);
         while steps < instruction_budget
             && matches!(self.state, RunState::Runnable)
             && self.pending_9p_request.is_none()
         {
             if scheduled && !self.select_runnable_hart() {
                 break;
+            }
+            if scheduled {
+                let applied = self.apply_hart_control(self.active_hart_id);
+                debug_assert!(applied);
             }
             if !scheduled && self.lifecycle != HartLifecycle::Started {
                 break;
@@ -2956,6 +3138,44 @@ impl Machine {
         self.csrs.mip = (self.csrs.mip & !hardware_mask) | hardware;
     }
 
+    fn apply_hart_control(&mut self, hart_id: usize) -> bool {
+        let Some(control) = self.hart_controls.get(hart_id) else {
+            return false;
+        };
+        let pending_start = control.pending_start();
+        let pending_interrupts = control.take_interrupts();
+        let pending_fence = control.pending_fence();
+
+        let hart = &mut self.harts[hart_id];
+        if let Some((start_address, opaque, generation)) = pending_start {
+            hart.lifecycle = HartLifecycle::Started;
+            hart.cpu.reset();
+            hart.cpu.pc = start_address;
+            hart.cpu.privilege = Privilege::Supervisor;
+            hart.cpu.write(10, hart_id as u64);
+            hart.cpu.write(11, opaque);
+            hart.csrs.reset();
+            hart.csrs.medeleg = MEDELEG_SUPPORTED;
+            hart.csrs.mideleg = MIDELEG_SUPPORTED;
+            hart.csrs.mcounteren = 0b111;
+            hart.cycle = 0;
+            hart.instret = 0;
+            hart.reservation = None;
+            hart.mtimecmp = u64::MAX;
+            hart.msip = false;
+            hart.translation_cache.clear();
+            control.acknowledge_start(generation);
+        }
+        hart.csrs.mip |= pending_interrupts;
+        if let Some(generation) = pending_fence {
+            hart.translation_cache.clear();
+            self.metrics.translation_cache_flushes =
+                self.metrics.translation_cache_flushes.saturating_add(1);
+            control.acknowledge_fence(generation);
+        }
+        true
+    }
+
     fn sbi_hart_start(&mut self, arguments: [u64; 6]) -> (u64, u64) {
         let Ok(hart_id) = usize::try_from(arguments[0]) else {
             return (SBI_ERR_INVALID_PARAM, 0);
@@ -2970,23 +3190,12 @@ impl Machine {
         if start_address & 1 != 0 || self.devices.ram_range(start_address, 2).is_none() {
             return (SBI_ERR_INVALID_ADDRESS, 0);
         }
-        let hart = &mut self.harts[hart_id];
-        hart.lifecycle = HartLifecycle::Started;
-        hart.cpu.reset();
-        hart.cpu.pc = start_address;
-        hart.cpu.privilege = Privilege::Supervisor;
-        hart.cpu.write(10, hart_id as u64);
-        hart.cpu.write(11, arguments[2]);
-        hart.csrs.reset();
-        hart.csrs.medeleg = MEDELEG_SUPPORTED;
-        hart.csrs.mideleg = MIDELEG_SUPPORTED;
-        hart.csrs.mcounteren = 0b111;
-        hart.cycle = 0;
-        hart.instret = 0;
-        hart.reservation = None;
-        hart.mtimecmp = u64::MAX;
-        hart.msip = false;
-        hart.translation_cache.clear();
+        let control = &self.hart_controls[hart_id];
+        if control.request_start(start_address, arguments[2]).is_err() {
+            return (SBI_ERR_ALREADY_AVAILABLE, 0);
+        }
+        let applied = self.apply_hart_control(hart_id);
+        debug_assert!(applied);
         (SBI_SUCCESS, 0)
     }
 
@@ -3036,7 +3245,9 @@ impl Machine {
             Err(error) => return (error, 0),
         };
         for hart_id in selected {
-            self.harts[hart_id].csrs.mip |= MIP_SSIP;
+            self.hart_controls[hart_id].raise_interrupt(MIP_SSIP);
+            let applied = self.apply_hart_control(hart_id);
+            debug_assert!(applied);
         }
         (SBI_SUCCESS, 0)
     }
@@ -3053,9 +3264,9 @@ impl Machine {
             return (SBI_SUCCESS, 0);
         }
         for hart_id in selected {
-            self.harts[hart_id].translation_cache.clear();
-            self.metrics.translation_cache_flushes =
-                self.metrics.translation_cache_flushes.saturating_add(1);
+            self.hart_controls[hart_id].request_fence();
+            let applied = self.apply_hart_control(hart_id);
+            debug_assert!(applied);
         }
         (SBI_SUCCESS, 0)
     }
@@ -3100,7 +3311,8 @@ impl Machine {
             (SBI_EXT_RFENCE, function) => Some(self.sbi_remote_fence(function, arguments)),
             (SBI_EXT_HSM, 0) => Some(self.sbi_hart_start(arguments)),
             (SBI_EXT_HSM, 1) => {
-                self.lifecycle = HartLifecycle::Stopped;
+                let stopped = self.set_hart_lifecycle(self.active_hart_id, HartLifecycle::Stopped);
+                debug_assert!(stopped);
                 None
             }
             (SBI_EXT_HSM, 2) => Some(self.sbi_hart_status(arguments[0])),
@@ -4489,7 +4701,7 @@ mod tests {
                 encode_addi(6, 5, 10),
             ]))
             .expect("load shared hart probe");
-        machine.harts[1].lifecycle = HartLifecycle::Started;
+        assert!(machine.set_hart_lifecycle(1, HartLifecycle::Started));
 
         machine.scheduler_quantum_remaining = 1;
         assert_eq!(machine.run_slice(1).instructions_retired, 1);
@@ -4526,6 +4738,78 @@ mod tests {
     }
 
     #[test]
+    fn hart_start_mailbox_has_one_winner_and_publishes_one_payload() {
+        let control = std::sync::Arc::new(HartControl::new(HartLifecycle::Stopped));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8_u64)
+            .map(|worker| {
+                let control = std::sync::Arc::clone(&control);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (
+                        worker,
+                        control.request_start(DRAM_BASE + worker * 2, worker),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("start claimant"))
+            .collect::<Vec<_>>();
+        let (winner, generation) = results
+            .iter()
+            .find_map(|(worker, result)| {
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|generation| (*worker, *generation))
+            })
+            .expect("one start claimant");
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(
+            control.pending_start(),
+            Some((DRAM_BASE + winner * 2, winner, generation))
+        );
+        control.acknowledge_start(generation);
+        assert_eq!(control.lifecycle(), HartLifecycle::Started);
+        assert!(control.is_quiescent());
+    }
+
+    #[test]
+    fn hart_interrupt_and_fence_mailboxes_coalesce_without_loss() {
+        let control = std::sync::Arc::new(HartControl::new(HartLifecycle::Started));
+        let handles = (0..8_u32)
+            .map(|worker| {
+                let control = std::sync::Arc::clone(&control);
+                std::thread::spawn(move || {
+                    control.raise_interrupt(1_u64 << worker);
+                    control.request_fence()
+                })
+            })
+            .collect::<Vec<_>>();
+        let generations = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("control publisher"))
+            .collect::<Vec<_>>();
+        assert_eq!(control.take_interrupts(), 0xff);
+        assert_eq!(control.pending_fence(), Some(8));
+        assert_eq!(
+            generations
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            (1..=8).collect()
+        );
+        assert!(!control.is_quiescent());
+        control.acknowledge_fence(8);
+        assert!(control.is_quiescent());
+    }
+
+    #[test]
     fn exact_hart_slice_never_runs_or_rotates_to_another_hart() {
         let mut machine = Machine::new_with_harts(
             MachineConfig {
@@ -4548,7 +4832,7 @@ mod tests {
         assert_eq!(machine.active_hart_id(), 1);
         assert_eq!(machine.register(5), Some(0));
 
-        machine.harts[1].lifecycle = HartLifecycle::Started;
+        assert!(machine.set_hart_lifecycle(1, HartLifecycle::Started));
         let secondary = machine.run_hart_slice(1, 2).expect("started hart");
         assert_eq!(secondary.steps_executed, 2);
         assert_eq!(secondary.instructions_retired, 2);
@@ -5745,6 +6029,12 @@ mod tests {
             Err(CheckpointError::UndrainedConsoleOutput { bytes: 1 })
         ));
         assert_eq!(machine.devices.take_new_console(), b"X");
+        machine.hart_controls[0].raise_interrupt(MIP_SSIP);
+        assert!(matches!(
+            machine.checkpoint_host_suspension(),
+            Err(CheckpointError::PendingHartControl { hart_id: 0 })
+        ));
+        assert!(machine.apply_hart_control(0));
 
         assert_eq!(
             machine.complete_9p_request(HostRequestId(host_request.id.get() + 1), &response),
@@ -5825,7 +6115,7 @@ mod tests {
             2,
         )
         .expect("admit two harts");
-        machine.harts[1].lifecycle = HartLifecycle::Started;
+        assert!(machine.set_hart_lifecycle(1, HartLifecycle::Started));
         assert!(machine.switch_active_hart(1));
         let request_address = DRAM_BASE + 0x100;
         let response_address = DRAM_BASE + 0x200;

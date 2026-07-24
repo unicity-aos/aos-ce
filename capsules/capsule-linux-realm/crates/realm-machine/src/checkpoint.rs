@@ -303,6 +303,7 @@ impl MachineCheckpoint {
         };
         machine.active_hart_id = active_hart_id;
         machine.harts = harts;
+        machine.rebuild_hart_controls();
         machine.scheduler_quantum_remaining = scheduler_quantum_remaining;
 
         machine.devices.mtime = decoder.u64()?;
