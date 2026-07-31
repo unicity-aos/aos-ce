@@ -120,3 +120,9 @@ The `aos` CLI can deliberately copy compatible state from a standalone runtime
 installation without changing the source. See
 [Importing standalone runtime state](docs/runtime-migration.md) for the exact
 allowlist, integrity checks, recovery behavior, and command.
+
+## License
+
+Except where otherwise noted, AOS Community Edition is dual-licensed under the
+[MIT License](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE), at your
+option.
