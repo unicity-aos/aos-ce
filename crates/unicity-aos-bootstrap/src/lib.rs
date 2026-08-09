@@ -1203,7 +1203,8 @@ mod tests {
         let encoded = materialize_manifest(&capsule_dir).expect("materialize manifest");
         let decoded: toml::Value = encoded.parse().expect("parse materialized TOML");
         let capsules = decoded["capsule"].as_array().expect("capsule array");
-        assert_eq!(capsules.len(), 21);
+        let expected = capsule_assets_from_manifest().expect("embedded capsule assets");
+        assert_eq!(capsules.len(), expected.len());
         assert!(capsules.iter().all(|capsule| {
             PathBuf::from(capsule["source"].as_str().expect("absolute source")).parent()
                 == Some(capsule_dir.as_path())

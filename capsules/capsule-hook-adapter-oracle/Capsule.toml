@@ -1,0 +1,25 @@
+[package]
+name = "aos-hook-adapter-oracle"
+version = "0.1.0"
+description = "Authenticated Codex, Claude, and Grok hook adapter for the canonical AOS hook bus"
+authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
+astrid-version = ">=0.10.1"
+
+[[component]]
+id = "hook-adapter-oracle"
+file = "aos_hook_adapter_oracle.wasm"
+type = "executable"
+
+[publish]
+"hook.v1.event.*" = { wit = "@unicity-astrid/wit/hook/hook-event-request" }
+"oracle.v1.hook.response.*" = { wit = "opaque" }
+
+[subscribe]
+# Exactly one adapter owns each authenticated frontend topic. No priority is
+# set: these are protocol ingress points, not a middleware chain.
+"oracle.v1.hook.validated.codex" = { wit = "opaque", handler = "on_codex_hook" }
+"oracle.v1.hook.validated.claude" = { wit = "opaque", handler = "on_claude_hook" }
+"oracle.v1.hook.validated.grok" = { wit = "opaque", handler = "on_grok_hook" }
+
+# Dynamic, correlation-scoped response collection for prompt-context hooks.
+"hook.v1.response.message_received.*" = { wit = "opaque" }

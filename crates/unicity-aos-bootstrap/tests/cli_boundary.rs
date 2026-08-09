@@ -601,7 +601,16 @@ fn offline_init_keeps_the_runtime_offline_flag_and_uses_only_local_capsules() {
         .parse()
         .expect("parse materialized manifest");
     let capsules = manifest["capsule"].as_array().expect("capsule entries");
-    assert_eq!(capsules.len(), 21);
+    let embedded: toml::Value = include_str!("../../../distros/community/unicity-ce/Distro.toml")
+        .parse()
+        .expect("parse embedded distro fixture");
+    assert_eq!(
+        capsules.len(),
+        embedded["capsule"]
+            .as_array()
+            .expect("embedded capsule entries")
+            .len()
+    );
     let expected_root = fixture
         .home
         .join("releases")

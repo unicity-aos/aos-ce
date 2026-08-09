@@ -8,6 +8,7 @@ members = [
     "capsules/capsule-forge",
     "capsules/capsule-fs",
     "capsules/capsule-hook-bridge",
+    "capsules/capsule-hook-adapter-oracle",
     "capsules/capsule-meta-harness",
     "capsules/capsule-http",
     "capsules/capsule-identity",

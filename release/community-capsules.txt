@@ -14,6 +14,7 @@ capsule-router
 capsule-prompt-builder
 capsule-context-engine
 capsule-hook-bridge
+capsule-hook-adapter-oracle
 capsule-meta-harness
 capsule-shell
 capsule-http
