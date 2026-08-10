@@ -44,7 +44,18 @@ Every mapping declares one response class.
 
 The adapter publishes without a correlation ID. Subscribers may observe but
 cannot affect the frontend operation. Session, post-tool, compaction, sub-agent,
-and shutdown events use this class.
+completed-response, and shutdown events use this class. Frontend adapters must
+not conflate a per-turn response event with session termination:
+
+- Codex and Claude `stop` map to `message_sent` and retain
+  `last_assistant_message` in the nested frontend payload;
+- Claude `message_display` maps to `message_displayed` and retains its streamed
+  `delta`; and
+- only `session_end` maps to canonical `session_end`.
+
+These hooks expose the submitted user prompt and rendered assistant text, not
+the frontend's complete provider-bound prompt with hidden system, developer,
+tool, or harness context.
 
 `pre_tool_use` and `permission_request` are also observations on the current
 Oracle relay because its outer response schema can return context only. Binding

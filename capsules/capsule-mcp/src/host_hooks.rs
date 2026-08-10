@@ -165,7 +165,7 @@ pub(crate) fn relay_response(payload: serde_json::Value) -> Result<(), SysError>
         &response,
     )?;
 
-    if matches!(response.event.as_deref(), Some("stop" | "session_end"))
+    if response.event.as_deref().is_some_and(retires_session_route)
         && let Err(error) = kv::delete(&token_key)
     {
         log::warn(format!(
@@ -194,6 +194,10 @@ fn authenticate_token(key: &str, request: &HostHookRequest) -> Result<bool, SysE
 
 fn can_register(event: &str) -> bool {
     matches!(event, "session_start" | "user_prompt_submit")
+}
+
+fn retires_session_route(event: &str) -> bool {
+    event == "session_end"
 }
 
 fn token_key(host: &str, session: &str) -> String {
@@ -466,6 +470,13 @@ mod tests {
         assert!(can_register("user_prompt_submit"));
         assert!(!can_register("pre_tool_use"));
         assert!(!can_register("stop"));
+    }
+
+    #[test]
+    fn only_real_session_end_retires_the_authenticated_route() {
+        assert!(retires_session_route("session_end"));
+        assert!(!retires_session_route("stop"));
+        assert!(!retires_session_route("message_display"));
     }
 
     #[test]
