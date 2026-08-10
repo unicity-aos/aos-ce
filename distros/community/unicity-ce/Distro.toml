@@ -108,6 +108,11 @@ source = "capsules/aos-hook-bridge.capsule"
 version = "0.2.0"
 
 [[capsule]]
+name = "aos-hook-adapter-oracle"
+source = "capsules/aos-hook-adapter-oracle.capsule"
+version = "0.1.0"
+
+[[capsule]]
 name = "aos-meta-harness"
 source = "capsules/aos-meta-harness.capsule"
 version = "0.1.0"

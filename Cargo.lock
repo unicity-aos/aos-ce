@@ -114,6 +114,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aos-hook-adapter-oracle"
+version = "0.1.0"
+dependencies = [
+ "astrid-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aos-hook-bridge"
 version = "0.2.0"
 dependencies = [

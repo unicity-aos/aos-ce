@@ -1,0 +1,14 @@
+[package]
+name = "aos-hook-adapter-oracle"
+version = "0.1.0"
+edition = "2024"
+description = "Authenticated Oracle frontend hooks to canonical AOS hook events"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+astrid-sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
