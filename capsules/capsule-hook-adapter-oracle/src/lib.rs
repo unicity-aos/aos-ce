@@ -144,6 +144,9 @@ struct OracleHookResponse<'a> {
     principal_id: &'a str,
     host: &'a str,
     session_id: &'a str,
+    /// Canonical lifecycle/observation classification selected by this
+    /// frontend adapter. The source frontend event remains in `event`.
+    canonical_hook: &'a str,
     event: &'a str,
     correlation_id: &'a str,
     route_id: &'a str,
@@ -392,6 +395,7 @@ fn handle_oracle_hook(expected: Frontend, payload: serde_json::Value) -> Result<
             principal_id: &event.principal_id,
             host: &event.host,
             session_id: &event.session_id,
+            canonical_hook: mapping.hook,
             event: &event.event,
             correlation_id: &event.correlation_id,
             route_id: &event.route_id,
@@ -487,6 +491,11 @@ mod tests {
             Frontend::Claude.mapping("session_end"),
             Some(observe("session_end"))
         );
+    }
+
+    #[test]
+    fn grok_stop_remains_an_explicit_session_termination_exception() {
+        assert_eq!(Frontend::Grok.mapping("stop"), Some(observe("session_end")));
     }
 
     #[test]
