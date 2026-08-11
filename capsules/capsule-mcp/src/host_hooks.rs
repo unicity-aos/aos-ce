@@ -263,6 +263,9 @@ fn validate_response_shape(response: &HostHookResponse) -> Result<(), &'static s
     if !is_host(&response.host) {
         return Err("unsupported_host");
     }
+    if response.event.is_none() && response.canonical_hook.is_none() {
+        return Err("missing_event_classification");
+    }
     if response
         .event
         .as_deref()
@@ -448,6 +451,18 @@ mod tests {
         let mut value = response(&request);
         value.event = None;
         assert!(validate_response_shape(&value).is_ok());
+    }
+
+    #[test]
+    fn response_requires_a_source_or_canonical_event_classification() {
+        let request = request();
+        let mut value = response(&request);
+        value.event = None;
+        value.canonical_hook = None;
+        assert_eq!(
+            validate_response_shape(&value),
+            Err("missing_event_classification")
+        );
     }
 
     #[test]
