@@ -44,7 +44,27 @@ Every mapping declares one response class.
 
 The adapter publishes without a correlation ID. Subscribers may observe but
 cannot affect the frontend operation. Session, post-tool, compaction, sub-agent,
-and shutdown events use this class.
+completed-response, and shutdown events use this class. Frontend adapters must
+not conflate a per-turn response event with session termination:
+
+- Codex and Claude `stop` map to `message_sent` and retain
+  `last_assistant_message` in the nested frontend payload;
+- Claude `message_display` maps to `message_displayed` and retains its streamed
+  `delta`;
+- Codex and Claude map only their explicit `session_end` event to canonical
+  `session_end`; and
+- Grok currently maps `stop` to canonical `session_end` because its installed
+  hook contract does not expose a distinct verified termination event.
+
+Adapter responses preserve both names: `event` is the source frontend event,
+while `canonical_hook` is the semantic classification used by authenticated
+route lifecycle handling. `capsule-mcp` retires a route only when
+`canonical_hook` is `session_end`; during a staggered upgrade, a legacy response
+without `canonical_hook` retires only on an explicit source `session_end`.
+
+These hooks expose the submitted user prompt and rendered assistant text, not
+the frontend's complete provider-bound prompt with hidden system, developer,
+tool, or harness context.
 
 `pre_tool_use` and `permission_request` are also observations on the current
 Oracle relay because its outer response schema can return context only. Binding

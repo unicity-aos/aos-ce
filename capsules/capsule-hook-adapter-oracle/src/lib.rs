@@ -79,6 +79,7 @@ const fn context(hook: &'static str) -> HookMapping {
 fn common_mapping(event: &str) -> Option<HookMapping> {
     match event {
         "session_start" => Some(observe("session_start")),
+        "session_end" => Some(observe("session_end")),
         "user_prompt_submit" => Some(context("message_received")),
         // This relay's outer response schema carries context only. These are
         // observations here; binding native-tool decisions use astrid-gate.
@@ -88,21 +89,36 @@ fn common_mapping(event: &str) -> Option<HookMapping> {
         "post_compact" => Some(observe("on_compaction_completed")),
         "subagent_start" => Some(observe("subagent_start")),
         "subagent_stop" => Some(observe("subagent_stop")),
-        "stop" | "session_end" => Some(observe("session_end")),
         _ => None,
     }
 }
 
 fn codex_mapping(event: &str) -> Option<HookMapping> {
-    common_mapping(event)
+    match event {
+        // Codex Stop is per-turn and carries `last_assistant_message`.
+        "stop" => Some(observe("message_sent")),
+        _ => common_mapping(event),
+    }
 }
 
 fn claude_mapping(event: &str) -> Option<HookMapping> {
-    common_mapping(event)
+    match event {
+        // Claude Stop is per-turn and carries `last_assistant_message`.
+        "stop" => Some(observe("message_sent")),
+        // Claude MessageDisplay carries response text in `delta` while it is
+        // rendered. It is observation-only on this relay.
+        "message_display" => Some(observe("message_displayed")),
+        _ => common_mapping(event),
+    }
 }
 
 fn grok_mapping(event: &str) -> Option<HookMapping> {
-    common_mapping(event)
+    match event {
+        // Preserve the existing Grok interpretation until its upstream hook
+        // contract supplies a distinct, verified per-turn response event.
+        "stop" => Some(observe("session_end")),
+        _ => common_mapping(event),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +144,9 @@ struct OracleHookResponse<'a> {
     principal_id: &'a str,
     host: &'a str,
     session_id: &'a str,
+    /// Canonical lifecycle/observation classification selected by this
+    /// frontend adapter. The source frontend event remains in `event`.
+    canonical_hook: &'a str,
     event: &'a str,
     correlation_id: &'a str,
     route_id: &'a str,
@@ -376,6 +395,7 @@ fn handle_oracle_hook(expected: Frontend, payload: serde_json::Value) -> Result<
             principal_id: &event.principal_id,
             host: &event.host,
             session_id: &event.session_id,
+            canonical_hook: mapping.hook,
             event: &event.event,
             correlation_id: &event.correlation_id,
             route_id: &event.route_id,
@@ -451,6 +471,87 @@ mod tests {
             Frontend::Claude.mapping("pre_tool_use"),
             Some(observe("before_tool_call"))
         );
+    }
+
+    #[test]
+    fn codex_and_claude_stop_are_response_events_not_session_termination() {
+        assert_eq!(
+            Frontend::Codex.mapping("stop"),
+            Some(observe("message_sent"))
+        );
+        assert_eq!(
+            Frontend::Claude.mapping("stop"),
+            Some(observe("message_sent"))
+        );
+        assert_eq!(
+            Frontend::Codex.mapping("session_end"),
+            Some(observe("session_end"))
+        );
+        assert_eq!(
+            Frontend::Claude.mapping("session_end"),
+            Some(observe("session_end"))
+        );
+    }
+
+    #[test]
+    fn grok_stop_remains_an_explicit_session_termination_exception() {
+        assert_eq!(Frontend::Grok.mapping("stop"), Some(observe("session_end")));
+    }
+
+    #[test]
+    fn claude_message_display_is_response_egress_only() {
+        assert_eq!(
+            Frontend::Claude.mapping("message_display"),
+            Some(observe("message_displayed"))
+        );
+        assert_eq!(Frontend::Codex.mapping("message_display"), None);
+    }
+
+    #[test]
+    fn canonical_events_retain_user_prompt_and_assistant_response_text() {
+        let mut prompt = host_event("codex");
+        prompt.payload = serde_json::json!({"prompt": "inspect this input"});
+        let request = canonical_request(
+            &prompt,
+            Frontend::Codex.mapping("user_prompt_submit").unwrap(),
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&request.payload).unwrap();
+        assert_eq!(payload["source_event"], "user_prompt_submit");
+        assert_eq!(payload["payload"]["prompt"], "inspect this input");
+
+        let mut response = host_event("codex");
+        response.event = "stop".to_owned();
+        response.payload = serde_json::json!({
+            "last_assistant_message": "the final assistant response"
+        });
+        let request =
+            canonical_request(&response, Frontend::Codex.mapping("stop").unwrap()).unwrap();
+        assert_eq!(request.hook, "message_sent");
+        let payload: serde_json::Value = serde_json::from_str(&request.payload).unwrap();
+        assert_eq!(payload["source_event"], "stop");
+        assert_eq!(
+            payload["payload"]["last_assistant_message"],
+            "the final assistant response"
+        );
+    }
+
+    #[test]
+    fn canonical_claude_display_event_retains_streamed_delta() {
+        let mut event = host_event("claude");
+        event.event = "message_display".to_owned();
+        event.payload = serde_json::json!({
+            "message_id": "message-one",
+            "index": 0,
+            "final": true,
+            "delta": "rendered assistant response"
+        });
+        let request =
+            canonical_request(&event, Frontend::Claude.mapping("message_display").unwrap())
+                .unwrap();
+        assert_eq!(request.hook, "message_displayed");
+        let payload: serde_json::Value = serde_json::from_str(&request.payload).unwrap();
+        assert_eq!(payload["payload"]["delta"], "rendered assistant response");
     }
 
     #[test]

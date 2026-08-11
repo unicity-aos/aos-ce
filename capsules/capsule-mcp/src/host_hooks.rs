@@ -51,6 +51,8 @@ struct HostHookResponse {
     host: String,
     session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_hook: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     event: Option<String>,
     correlation_id: String,
     route_id: String,
@@ -165,7 +167,7 @@ pub(crate) fn relay_response(payload: serde_json::Value) -> Result<(), SysError>
         &response,
     )?;
 
-    if matches!(response.event.as_deref(), Some("stop" | "session_end"))
+    if retires_session_route(&response)
         && let Err(error) = kv::delete(&token_key)
     {
         log::warn(format!(
@@ -194,6 +196,15 @@ fn authenticate_token(key: &str, request: &HostHookRequest) -> Result<bool, SysE
 
 fn can_register(event: &str) -> bool {
     matches!(event, "session_start" | "user_prompt_submit")
+}
+
+fn retires_session_route(response: &HostHookResponse) -> bool {
+    match response.canonical_hook.as_deref() {
+        Some(canonical_hook) => canonical_hook == "session_end",
+        // Staggered upgrades may receive a response from an older adapter.
+        // Only its explicit source session_end is safe to treat as terminal.
+        None => response.event.as_deref() == Some("session_end"),
+    }
 }
 
 fn token_key(host: &str, session: &str) -> String {
@@ -252,12 +263,19 @@ fn validate_response_shape(response: &HostHookResponse) -> Result<(), &'static s
     if !is_host(&response.host) {
         return Err("unsupported_host");
     }
+    if response.event.is_none() && response.canonical_hook.is_none() {
+        return Err("missing_event_classification");
+    }
     if response
         .event
         .as_deref()
         .is_some_and(|event| !is_segment(event, 128))
+        || response
+            .canonical_hook
+            .as_deref()
+            .is_some_and(|hook| !is_segment(hook, 128))
     {
-        return Err("invalid_event");
+        return Err("invalid_event_classification");
     }
     validate_delivery_fields(
         &response.session_id,
@@ -397,6 +415,7 @@ mod tests {
             principal_id: request.principal_id.clone(),
             host: request.host.clone(),
             session_id: request.session_id.clone(),
+            canonical_hook: Some("message_received".to_owned()),
             event: Some(request.event.clone()),
             correlation_id: request.correlation_id.clone(),
             route_id: request.route_id.clone(),
@@ -435,6 +454,18 @@ mod tests {
     }
 
     #[test]
+    fn response_requires_a_source_or_canonical_event_classification() {
+        let request = request();
+        let mut value = response(&request);
+        value.event = None;
+        value.canonical_hook = None;
+        assert_eq!(
+            validate_response_shape(&value),
+            Err("missing_event_classification")
+        );
+    }
+
+    #[test]
     fn response_accepts_future_additive_fields() {
         let request = request();
         let mut value = serde_json::to_value(response(&request)).expect("serialize response");
@@ -466,6 +497,27 @@ mod tests {
         assert!(can_register("user_prompt_submit"));
         assert!(!can_register("pre_tool_use"));
         assert!(!can_register("stop"));
+    }
+
+    #[test]
+    fn only_real_session_end_retires_the_authenticated_route() {
+        let request = request();
+        let mut value = response(&request);
+
+        value.event = Some("stop".to_owned());
+        value.canonical_hook = Some("message_sent".to_owned());
+        assert!(!retires_session_route(&value));
+
+        // Grok currently classifies its source `stop` as session termination.
+        value.canonical_hook = Some("session_end".to_owned());
+        assert!(retires_session_route(&value));
+
+        // Old adapters did not emit canonical_hook. Preserve only the
+        // unambiguous explicit session_end compatibility path.
+        value.canonical_hook = None;
+        assert!(!retires_session_route(&value));
+        value.event = Some("session_end".to_owned());
+        assert!(retires_session_route(&value));
     }
 
     #[test]
