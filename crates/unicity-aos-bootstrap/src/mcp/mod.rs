@@ -69,11 +69,7 @@ pub(crate) fn handle_serve(principal: Option<String>, args: ServeArgs) -> ExitCo
     }
 }
 
-async fn serve(
-    home: &AosHome,
-    principal: Option<&str>,
-    args: ServeArgs,
-) -> Result<(), String> {
+async fn serve(home: &AosHome, principal: Option<&str>, args: ServeArgs) -> Result<(), String> {
     let mode = args.interaction;
     let mut runtime_args = Vec::<OsString>::new();
     if let Some(principal) = principal {
