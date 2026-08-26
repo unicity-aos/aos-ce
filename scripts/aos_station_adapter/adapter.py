@@ -1,4 +1,4 @@
-"""Fail-closed AOS Station v2 preparation and deterministic local output."""
+"""Fail-closed AOS Station v1 publication preparation and deterministic local output."""
 
 from __future__ import annotations
 
@@ -278,7 +278,7 @@ def _verify_worktree_tree(station_tools: Path, expected: dict[str, tuple[str, in
 
 
 def check_station_tools_pin(station_tools: Path) -> dict[str, str]:
-    """Require the exact reviewed local v2 interface and immutable tree."""
+    """Require the exact reviewed publication interface and immutable tree."""
     if not station_tools.is_dir() or station_tools.is_symlink():
         raise AdapterError(f"station-tools checkout is not a directory: {station_tools}")
     head = _run(
@@ -291,7 +291,7 @@ def check_station_tools_pin(station_tools: Path) -> dict[str, str]:
     ).stdout.strip()
     if head != policy.STATION_TOOLS_COMMIT or tree != policy.STATION_TOOLS_TREE:
         raise AdapterError(
-            "station-tools checkout is not the reviewed v2 interface "
+            "station-tools checkout is not the reviewed publication interface "
             f"(head={head!r}, tree={tree!r})"
         )
     _index_flags(station_tools)
@@ -372,8 +372,8 @@ def emit_submission_skeleton(root: Path, verification: dict[str, Any]) -> dict[s
     _write_regular(
         submission / "README.md",
         (
-            "# AOS CE Station v2 proposal\n\n"
-            "This local tree is a readiness fixture. It contains sealed v2 "
+            "# AOS CE Station v1 publication proposal\n\n"
+            "This local tree is a readiness fixture. It contains sealed publication "
             "publication records produced by the reviewed `prepare_v2` API, "
             "but readiness remains false: fixture publisher material is not a "
             "namespace owner or live signing authority. This adapter cannot "
@@ -476,7 +476,7 @@ def _freeze_export(export: Path) -> None:
 def _bridge_manifest(station_tools: Path, cargo: str) -> Path:
     """Build only from a verified Git export, never from the operator checkout."""
     if not BRIDGE_SOURCE.is_file() or BRIDGE_SOURCE.is_symlink():
-        raise AdapterError(f"v2 bridge source is missing: {BRIDGE_SOURCE}")
+        raise AdapterError(f"publication bridge source is missing: {BRIDGE_SOURCE}")
     # Re-check at the build boundary so direct callers cannot bypass the
     # worktree and index validation performed by prepare_v2_records.
     check_station_tools_pin(station_tools)
@@ -494,7 +494,7 @@ def _bridge_manifest(station_tools: Path, cargo: str) -> Path:
     manifest = export / "Cargo.toml"
     _run(
         [cargo, "fetch", "--manifest-path", str(manifest), "--locked"],
-        context="station v2 locked dependency fetch",
+        context="Station publication locked dependency fetch",
         env=build_env,
     )
     _run(
@@ -511,12 +511,12 @@ def _bridge_manifest(station_tools: Path, cargo: str) -> Path:
             "--bin",
             "aos-station-v2-bridge",
         ],
-        context="station v2 bridge build",
+        context="Station publication bridge build",
         env=build_env,
     )
     binary = export / "target" / "debug" / "aos-station-v2-bridge"
     if not binary.is_file() or binary.is_symlink():
-        raise AdapterError("station v2 bridge build did not produce an executable")
+        raise AdapterError("Station publication bridge build did not produce an executable")
     return binary
 
 

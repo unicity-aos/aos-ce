@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Prepare an inert, deterministic AOS CE 2026.1.3 Station v2 submission.
+"""Prepare an inert, deterministic AOS CE 2026.1.3 Station v1 submission.
 
 The default command is deliberately fail-closed.  An explicit ``--dry-run``
 executes the reviewed ``astrid-station-publish::prepare_v2`` API with a
-non-admitting fixture identity, emits 19 sealed v2 records and artifacts, and
+non-admitting fixture identity, emits 19 sealed publication records and artifacts, and
 round-trips them through the Station protocol. It never signs, pushes, or
 publishes anything.
 """
@@ -55,7 +55,7 @@ def parser() -> argparse.ArgumentParser:
         "--station-tools",
         type=Path,
         required=True,
-        help=f"station-tools checkout at reviewed local v2 interface {policy.STATION_TOOLS_COMMIT}",
+        help=f"station-tools checkout at reviewed publication interface {policy.STATION_TOOLS_COMMIT}",
     )
     root.add_argument("--output", type=Path, required=True, help="fresh local output tree")
     root.add_argument("--b3sum", default="b3sum", help="pinned b3sum executable")
@@ -68,7 +68,7 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument(
         "--dry-run",
         action="store_true",
-        help="emit a deterministic local v2 fixture; readiness and live authority remain false",
+        help="emit a deterministic local publication fixture; readiness and live authority remain false",
     )
     root.add_argument(
         "--publish",
@@ -232,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(
             f"proposal-incomplete: verified {report['verification']['seed_count']} capsules; "
-            f"prepared {report['publication']['record_count']} station-v2 records with a non-admitting fixture; "
+            f"prepared {report['publication']['record_count']} Station publication records with a non-admitting fixture; "
             "network publication disabled"
         )
     return 0

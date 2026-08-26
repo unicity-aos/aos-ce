@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-# This is the reviewed local v2 interface supplied to the adapter.  It is not
+# This is the reviewed publication interface supplied to the adapter.  It is not
 # a public Station repository/configuration pin; publication remains disabled.
 STATION_TOOLS_COMMIT = "fd233f91b40d00c5f721ba99436ce30eca9036ba"
 STATION_TOOLS_TREE = "0bf775f225bfb9177d5788ec8c32d5453f75c660"

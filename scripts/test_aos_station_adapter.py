@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adversarial and fail-closed tests for the Station v2 adapter."""
+"""Adversarial and fail-closed tests for the Station v1 publication adapter."""
 
 from __future__ import annotations
 

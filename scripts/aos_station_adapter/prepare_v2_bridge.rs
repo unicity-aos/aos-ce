@@ -1,4 +1,4 @@
-//! Tiny, generated-at-runtime bridge to the reviewed Station v2 publisher.
+//! Tiny, generated-at-runtime bridge to the reviewed Station publication interface.
 //!
 //! This source intentionally lives in the AOS adapter rather than in the
 //! Station repository.  The adapter exports and freezes the exact reviewed Git

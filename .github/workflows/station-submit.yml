@@ -1,4 +1,4 @@
-name: Station v2 adapter contract
+name: Station v1 adapter contract
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   station-v2-contract:
-    name: Fail-closed Station v2 contract
+    name: Fail-closed Station v1 contract
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -56,7 +56,7 @@ jobs:
           test -f "$evidence/unicity-aos-2026.1.3-release.toml"
           test -f "$evidence/BLAKE3SUMS.txt"
           printf 'AOS_CE_EVIDENCE_ASSETS=%s\n' "$evidence" >> "$GITHUB_ENV"
-      - name: Checkout reviewed station-tools v2 interface
+      - name: Checkout reviewed Station publication interface
         id: station_tools_checkout
         continue-on-error: true
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -69,7 +69,7 @@ jobs:
       - name: Report unavailable station-tools pin and fail closed
         if: steps.station_tools_checkout.outcome != 'success'
         run: |
-          echo "::error::station-tools v2 pin fd233f91b40d00c5f721ba99436ce30eca9036ba was not fetchable; need-a-ruling"
+          echo "::error::station-tools publication pin fd233f91b40d00c5f721ba99436ce30eca9036ba was not fetchable; need-a-ruling"
           exit 1
       - name: Verify and stage station-tools input path
         shell: bash
