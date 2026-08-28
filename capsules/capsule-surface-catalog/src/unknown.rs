@@ -81,7 +81,7 @@ pub fn validate_unknown_component(
     if !valid_identifier(&document.identifier) {
         return Err(UnknownComponentError::Identifier);
     }
-    if Primitive::from_id(document.identifier.rsplit(':').next().unwrap_or("")).is_some() {
+    if Primitive::from_id(&document.identifier).is_some() {
         return Err(UnknownComponentError::KnownPrimitive);
     }
     if !document
@@ -194,10 +194,9 @@ mod tests {
             validate_unknown_component(&document("evil")),
             Err(UnknownComponentError::Identifier)
         );
-        assert_eq!(
-            validate_unknown_component(&document("example:Button")),
-            Err(UnknownComponentError::KnownPrimitive)
-        );
+        let namespaced_known_word = validate_unknown_component(&document("example:Button"))
+            .expect("a namespaced extension is not the unnamespaced catalog primitive");
+        assert_eq!(namespaced_known_word.identifier, "example:Button");
         let hostile_action = UnknownComponentDocument {
             accepted_actions: ["capability.grant".to_owned()].into_iter().collect(),
             ..document("example:Widget")

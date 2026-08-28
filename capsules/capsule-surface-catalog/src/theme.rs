@@ -8,6 +8,10 @@ use std::fmt;
 pub const THEME_SCHEMA: &str = "aos.theme/1";
 /// Number of complete themes shipped by this tranche.
 pub const BUILT_IN_THEME_COUNT: usize = 2;
+/// Canonical dark-first built-in theme identity.
+pub const FIELDGLASS_THEME_ID: &str = "aos.builtin.fieldglass";
+/// Canonical light-first built-in theme identity.
+pub const PAPER_SIGNAL_THEME_ID: &str = "aos.builtin.paper-signal";
 
 const SUPPORTED_TEXT_SCALES: [u8; 4] = [90, 100, 118, 200];
 const APPROVED_LENGTHS: [u16; 14] = [0, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192];
@@ -302,7 +306,7 @@ impl Default for ThemeRegistry {
 impl ThemeRegistry {
     /// Construct and validate the two built-in packs.
     pub fn new() -> Self {
-        let packs = [ThemePack::aurora(), ThemePack::daylight()];
+        let packs = [ThemePack::fieldglass(), ThemePack::paper_signal()];
         for pack in &packs {
             pack.validate()
                 .expect("built-in theme packs are valid by construction");
@@ -371,10 +375,7 @@ impl ThemeRegistry {
         density: Density,
         role: &str,
     ) -> Option<ResolvedToken> {
-        let id = match environment {
-            ColorEnvironment::Light | ColorEnvironment::HighContrastLight => "daylight",
-            ColorEnvironment::Dark | ColorEnvironment::HighContrastDark => "aurora",
-        };
+        let id = FIELDGLASS_THEME_ID;
         let pack = self.packs().iter().find(|pack| pack.id == id)?;
         pack.resolved_token(environment, density, role)
             .map(|value| ResolvedToken {
@@ -570,13 +571,13 @@ struct Palette {
 
 impl ThemePack {
     /// Complete dark-first built-in theme.
-    pub fn aurora() -> Self {
-        Self::pack("aurora", false)
+    pub fn fieldglass() -> Self {
+        Self::pack(FIELDGLASS_THEME_ID, false)
     }
 
     /// Complete light-first built-in theme.
-    pub fn daylight() -> Self {
-        Self::pack("daylight", true)
+    pub fn paper_signal() -> Self {
+        Self::pack(PAPER_SIGNAL_THEME_ID, true)
     }
 
     fn pack(id: &str, light: bool) -> Self {
@@ -894,7 +895,7 @@ fn semantic_tokens(id: &str, environment: ColorEnvironment) -> BTreeMap<String, 
 
 fn palette(id: &str, dark: bool, high_contrast: bool) -> Palette {
     let transparent_black = [0, 0, 0, 64];
-    if id == "aurora" {
+    if id == FIELDGLASS_THEME_ID {
         if dark && high_contrast {
             return Palette {
                 background: [0, 0, 0, 255],
@@ -1140,18 +1141,25 @@ fn validate_token(role: &str, value: TokenValue) -> Result<(), ThemeError> {
 }
 
 fn valid_theme_id(value: &str) -> bool {
-    let mut characters = value.chars();
-    if !characters
-        .next()
-        .is_some_and(|character| character.is_ascii_lowercase())
+    if value.is_empty()
         || value.len() > 64
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || value.contains("..")
         || !value.chars().all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '-' | '.')
         })
     {
         return false;
     }
-    !value.ends_with('-') && !value.contains("--")
+    value.split('.').all(|segment| {
+        !segment.is_empty()
+            && !segment.starts_with('-')
+            && !segment.ends_with('-')
+            && !segment.contains("--")
+    })
 }
 
 fn valid_role(role: &str) -> bool {
@@ -1220,7 +1228,11 @@ mod tests {
 
     #[test]
     fn ships_two_complete_themes() {
-        for pack in [ThemePack::aurora(), ThemePack::daylight()] {
+        assert_eq!(
+            [FIELDGLASS_THEME_ID, PAPER_SIGNAL_THEME_ID],
+            ["aos.builtin.fieldglass", "aos.builtin.paper-signal"]
+        );
+        for pack in [ThemePack::fieldglass(), ThemePack::paper_signal()] {
             pack.validate().expect("theme is complete");
             for environment in [
                 ColorEnvironment::Light,
@@ -1242,12 +1254,12 @@ mod tests {
 
     #[test]
     fn hostile_tokens_fail_closed() {
-        let mut pack = ThemePack::daylight();
+        let mut pack = ThemePack::paper_signal();
         pack.aliases
             .insert("aos.color.accent".to_owned(), "aos.color.text".to_owned());
         assert!(pack.validate().is_ok());
 
-        let mut transparent_required_color = ThemePack::daylight();
+        let mut transparent_required_color = ThemePack::paper_signal();
         transparent_required_color
             .semantic_tokens
             .get_mut(&ColorEnvironment::Light)
@@ -1261,7 +1273,7 @@ mod tests {
             Err(ThemeError::TokenValue)
         ));
 
-        let mut infinite = ThemePack::daylight();
+        let mut infinite = ThemePack::paper_signal();
         infinite
             .density_tokens
             .get_mut(&Density::Cozy)
@@ -1286,9 +1298,27 @@ mod tests {
     #[test]
     fn missing_token_falls_back_through_stages() {
         let registry = ThemeRegistry::new();
+        for environment in [
+            ColorEnvironment::Light,
+            ColorEnvironment::Dark,
+            ColorEnvironment::HighContrastLight,
+            ColorEnvironment::HighContrastDark,
+        ] {
+            let fallback = registry
+                .resolve(
+                    "absent",
+                    "1.0.0",
+                    environment,
+                    Density::Cozy,
+                    "aos.color.text",
+                )
+                .expect("built-in contrast fallback");
+            assert_eq!(fallback.stage, FallbackStage::BuiltInContrast);
+            assert_eq!(fallback.theme_id, FIELDGLASS_THEME_ID);
+        }
         let exact = registry
             .resolve(
-                "daylight",
+                FIELDGLASS_THEME_ID,
                 "1.0.0",
                 ColorEnvironment::Light,
                 Density::Cozy,
@@ -1298,7 +1328,7 @@ mod tests {
         assert_eq!(exact.stage, FallbackStage::ExactTheme);
         let compatible = registry
             .resolve(
-                "daylight",
+                FIELDGLASS_THEME_ID,
                 "1.4.0",
                 ColorEnvironment::Light,
                 Density::Cozy,

@@ -18,13 +18,14 @@ pub use catalog::{
     PrimitiveRecord, State,
 };
 pub use lab::{
-    Breakpoint, InputModality, LabDimension, LabError, LabInstance, RecipeFixture, Scenario,
-    ThemeLab, instantiate, scenario_count, scenarios, verification_lab,
+    Breakpoint, COMPACT_BREAKPOINT_REM, DESKTOP_BREAKPOINT_REM, InputModality, LabDimension,
+    LabError, LabInstance, RecipeFixture, Scenario, ThemeLab, instantiate, scenario_count,
+    scenarios, verification_lab,
 };
 pub use theme::{
-    BUILT_IN_THEME_COUNT, ColorEnvironment, Density, EnvironmentSpec, FallbackStage, Material,
-    NeutralFallback, Preferences, ResolvedToken, SafeArea, ThemeError, ThemePack, ThemeRegistry,
-    TokenValue, required_theme_roles,
+    BUILT_IN_THEME_COUNT, ColorEnvironment, Density, EnvironmentSpec, FIELDGLASS_THEME_ID,
+    FallbackStage, Material, NeutralFallback, PAPER_SIGNAL_THEME_ID, Preferences, ResolvedToken,
+    SafeArea, ThemeError, ThemePack, ThemeRegistry, TokenValue, required_theme_roles,
 };
 pub use unknown::{
     UnknownComponent, UnknownComponentDocument, UnknownComponentError, UnknownFallback,

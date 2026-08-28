@@ -851,7 +851,7 @@ impl PrimitiveRecord {
             Primitive::Card => slots(&["header", "content", "footer"]),
             Primitive::Collapse => slots(&["summary", "content"]),
             Primitive::Repeater => slots(&["template"]),
-            Primitive::Button => slots(&["icon", "label"]),
+            Primitive::Button => slots(&["leading-icon", "label", "trailing-icon"]),
             Primitive::Dialog => slots(&["header", "content", "footer"]),
             Primitive::Tabs => slots(&["tab", "panel"]),
             Primitive::Breadcrumb => children("crumb", 1, 16),
@@ -1013,6 +1013,54 @@ mod tests {
             ));
             assert!(!record.states.is_empty());
         }
+        let families = [
+            (PrimitiveFamily::Layout, "layout"),
+            (PrimitiveFamily::Content, "content"),
+            (PrimitiveFamily::Input, "input"),
+            (PrimitiveFamily::Data, "data"),
+            (PrimitiveFamily::Navigation, "navigation"),
+            (PrimitiveFamily::Feedback, "feedback"),
+            (PrimitiveFamily::Permission, "permission"),
+            (PrimitiveFamily::Media, "media"),
+            (PrimitiveFamily::Canvas, "canvas"),
+            (PrimitiveFamily::Terminal, "terminal"),
+            (PrimitiveFamily::NativePortal, "native-portal"),
+        ];
+        for (family, expected_name) in families {
+            assert_eq!(
+                serde_json::to_value(family).unwrap(),
+                serde_json::json!(expected_name)
+            );
+        }
+        let button = catalog.record(Primitive::Button).unwrap();
+        assert_eq!(
+            button.children,
+            ChildrenPolicy::ClosedSlots {
+                slots: ["leading-icon", "label", "trailing-icon",]
+                    .iter()
+                    .map(|slot| (*slot).to_owned())
+                    .collect()
+            }
+        );
+        for kind in [
+            Primitive::CapabilityCard,
+            Primitive::ConsentForm,
+            Primitive::SecurePrompt,
+            Primitive::FilePicker,
+        ] {
+            let record = catalog.record(kind).unwrap();
+            assert!(record.native_mapping.contains("policy"));
+            assert!(!record.native_mapping.contains("grant"));
+        }
+        let terminal = catalog.record(Primitive::TerminalView).unwrap();
+        assert!(
+            terminal
+                .focus_keyboard_contract
+                .contains("no command entry")
+        );
+        let native_portal = catalog.record(Primitive::NativePortal).unwrap();
+        assert!(native_portal.native_mapping.contains("portal state only"));
+        assert!(native_portal.fallback_rendering.contains("unavailable"));
     }
 
     #[test]

@@ -5,14 +5,34 @@ use crate::theme::{ColorEnvironment, Density, ThemePack};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Exclusive upper bound of the phone breakpoint, in rem.
+pub const COMPACT_BREAKPOINT_REM: f64 = 45.0;
+/// Exclusive lower bound of the desktop breakpoint, in rem.
+pub const DESKTOP_BREAKPOINT_REM: f64 = 72.0;
+
 /// Lab breakpoint.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Breakpoint {
     /// Compact phone viewport.
     Phone,
+    /// Intermediate compact breakpoint.
+    Compact,
     /// Desktop viewport.
     Desktop,
+}
+
+impl Breakpoint {
+    /// Resolve the contract breakpoint from a viewport width in rem.
+    pub const fn from_viewport_rem(width_rem: f64) -> Self {
+        if width_rem < COMPACT_BREAKPOINT_REM {
+            Self::Phone
+        } else if width_rem < DESKTOP_BREAKPOINT_REM {
+            Self::Compact
+        } else {
+            Self::Desktop
+        }
+    }
 }
 
 /// Lab input modality.
@@ -148,7 +168,7 @@ impl ThemeLab {
             },
             LabDimension {
                 name: "breakpoint".to_owned(),
-                values: ["phone", "desktop"]
+                values: ["phone", "compact", "desktop"]
                     .iter()
                     .map(|value| (*value).to_owned())
                     .collect(),
@@ -205,13 +225,13 @@ pub fn canonical_recipe_fixture() -> RecipeFixture {
         recipe_id: "fixture/workspace-recipe".to_owned(),
         revision: 1,
         semantic_digest: "fixture-semantic-content".to_owned(),
-        theme_id: "aurora@1.0.0".to_owned(),
+        theme_id: "aos.builtin.fieldglass@1.0.0".to_owned(),
     }
 }
 
 /// Number of complete documented scenarios.
 pub const fn scenario_count() -> usize {
-    4 * 3 * 2 * 2 * 4 * 2
+    4 * 3 * 3 * 2 * 4 * 2
 }
 
 /// Enumerate every documented scenario.
@@ -233,7 +253,7 @@ pub fn scenario(index: usize) -> Option<Scenario> {
         ColorEnvironment::HighContrastDark,
     ];
     let densities = [Density::Compact, Density::Cozy, Density::Spacious];
-    let breakpoints = [Breakpoint::Phone, Breakpoint::Desktop];
+    let breakpoints = [Breakpoint::Phone, Breakpoint::Compact, Breakpoint::Desktop];
     let modalities = [InputModality::Pointer, InputModality::Keyboard];
     let scales = [90, 100, 118, 200];
     let mut remaining = index;
@@ -296,12 +316,13 @@ fn scenario_supported(scenario: &Scenario) -> bool {
     ) && matches!(
         scenario.density,
         Density::Compact | Density::Cozy | Density::Spacious
-    ) && matches!(scenario.breakpoint, Breakpoint::Phone | Breakpoint::Desktop)
-        && matches!(
-            scenario.modality,
-            InputModality::Pointer | InputModality::Keyboard
-        )
-        && matches!(scenario.text_scale_percent, 90 | 100 | 118 | 200)
+    ) && matches!(
+        scenario.breakpoint,
+        Breakpoint::Phone | Breakpoint::Compact | Breakpoint::Desktop
+    ) && matches!(
+        scenario.modality,
+        InputModality::Pointer | InputModality::Keyboard
+    ) && matches!(scenario.text_scale_percent, 90 | 100 | 118 | 200)
 }
 
 fn token_role(id: Primitive, state: State) -> &'static str {
@@ -342,17 +363,27 @@ mod tests {
         let lab = ThemeLab::new();
         assert_eq!(lab.catalog.records.len(), 62);
         assert_eq!(lab.themes.len(), BUILT_IN_THEME_COUNT);
-        assert_eq!(scenario_count(), 384);
-        assert_eq!(scenarios().len(), 384);
+        assert_eq!(scenario_count(), 576);
+        assert_eq!(scenarios().len(), 576);
         assert_eq!(
             lab.dimensions()
                 .into_iter()
                 .map(|dimension| dimension.values.len())
                 .product::<usize>(),
-            384
+            576
         );
-        assert!(scenario(383).is_some());
+        assert!(scenario(575).is_some());
         assert!(scenario(768).is_none());
+        assert_eq!(
+            Breakpoint::from_viewport_rem(44.999_999_999_999),
+            Breakpoint::Phone
+        );
+        assert_eq!(Breakpoint::from_viewport_rem(45.0), Breakpoint::Compact);
+        assert_eq!(
+            Breakpoint::from_viewport_rem(71.999_999_999_999),
+            Breakpoint::Compact
+        );
+        assert_eq!(Breakpoint::from_viewport_rem(72.0), Breakpoint::Desktop);
     }
 
     #[test]
