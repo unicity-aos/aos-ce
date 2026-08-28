@@ -25,6 +25,7 @@ members = [
     "capsules/capsule-session",
     "capsules/capsule-shell",
     "capsules/capsule-skills",
+    "capsules/capsule-surface-catalog",
     "capsules/capsule-surface-model",
     "capsules/capsule-workspace-recipes",
     "capsules/capsule-system",
