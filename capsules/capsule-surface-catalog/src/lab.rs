@@ -1,6 +1,6 @@
 //! Catalog-owned Theme Lab verification corpus.
 
-use crate::catalog::{Catalog, Primitive, PrimitiveRecord, State};
+use crate::catalog::{Catalog, CatalogPrimitive, Primitive, PrimitiveRecord, State};
 use crate::theme::{ColorEnvironment, Density, ThemePack};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -336,7 +336,7 @@ fn token_role(id: Primitive, state: State) -> &'static str {
         State::FocusVisible => "aos.color.focus",
         State::Selected => "aos.color.selected",
         State::Loading | State::Empty => "aos.color.text-muted",
-        _ => match id.family() {
+        _ => match id.catalog_family() {
             crate::catalog::PrimitiveFamily::Layout => "aos.color.surface",
             crate::catalog::PrimitiveFamily::Content => "aos.color.text",
             crate::catalog::PrimitiveFamily::Input => "aos.color.accent",

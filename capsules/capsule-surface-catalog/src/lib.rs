@@ -14,8 +14,8 @@ pub mod unknown;
 
 pub use a2ui::{A2uiImportError, DeclaredLossMapping, map_a2ui_component};
 pub use catalog::{
-    CATALOG_SCHEMA, Catalog, CatalogError, ChildrenPolicy, Primitive, PrimitiveFamily,
-    PrimitiveRecord, State,
+    CATALOG_SCHEMA, Catalog, CatalogError, CatalogPrimitive, ChildrenPolicy, Primitive,
+    PrimitiveFamily, PrimitiveRecord, State,
 };
 pub use lab::{
     Breakpoint, COMPACT_BREAKPOINT_REM, DESKTOP_BREAKPOINT_REM, InputModality, LabDimension,

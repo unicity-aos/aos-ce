@@ -1,5 +1,6 @@
 //! The finite `aos.catalog/1` primitive inventory and record validator.
 
+use capsule_surface_model::ComponentKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -10,281 +11,133 @@ pub const CATALOG_SCHEMA: &str = "aos.catalog/1";
 const MAX_TEXT_BYTES: usize = 320;
 const MAX_SLOTS: usize = 8;
 
-/// Every v1 primitive in the exact stable order owned by this capsule.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum Primitive {
-    /// A named semantic region.
-    Region,
-    /// An ordered vertical or horizontal stack.
-    Stack,
-    /// A grid of semantic children.
-    Grid,
-    /// A resizable split.
-    Split,
-    /// Navigation sidebar.
-    Sidebar,
-    /// A row of semantic actions.
-    ActionBar,
-    /// Framed content card.
-    Card,
-    /// Preference or content group.
-    Group,
-    /// Collapsible content.
-    Collapse,
-    /// Repeated bounded children.
-    Repeater,
-    /// Scrollable semantic region.
-    ScrollRegion,
-    /// A semantic divider.
-    Divider,
-    /// A heading.
-    Heading,
-    /// Body or inline text.
-    Text,
-    /// Inline rich content.
-    InlineContent,
-    /// Source or code text.
-    CodeBlock,
-    /// Compact label.
-    Badge,
-    /// Prominent numeric fact.
-    KeyFigure,
-    /// Empty-result explanation.
-    EmptyState,
-    /// A named icon.
-    Icon,
-    /// An action control; icon-only controls use the icon slot.
-    Button,
-    /// Single-line text entry.
-    TextField,
-    /// Multi-line text entry.
-    TextArea,
-    /// Numeric entry.
-    NumberField,
-    /// Single selection.
-    Select,
-    /// Multiple selection.
-    MultiSelect,
-    /// Boolean switch.
-    Switch,
-    /// Boolean checkbox.
-    Checkbox,
-    /// Bounded range input.
-    Slider,
-    /// Date or time entry.
-    DateTimeField,
-    /// Tabular data.
-    Table,
-    /// Concise record summary.
-    RecordSummary,
-    /// Data chart with a textual equivalent.
-    DatasetChart,
-    /// Ordered events.
-    Timeline,
-    /// Before-and-after difference.
-    Difference,
-    /// Progress indicator.
-    Progress,
-    /// Tab navigation.
-    Tabs,
-    /// Hierarchical navigation.
-    Breadcrumb,
-    /// Context menu.
-    Menu,
-    /// Page navigation.
-    Pager,
-    /// A semantic link.
-    Link,
-    /// Important non-blocking alert.
-    Alert,
-    /// Temporary notification.
-    Toast,
-    /// Inline feedback.
-    InlineMessage,
-    /// Loading placeholder.
-    Skeleton,
-    /// Busy indicator.
-    Spinner,
-    /// Small status indicator.
-    StatusDot,
-    /// Modal dialog.
-    Dialog,
-    /// Capability description, never a grant.
-    CapabilityCard,
-    /// Consent request, never consent itself.
-    ConsentForm,
-    /// Deliberate secure-input prompt.
-    SecurePrompt,
-    /// Governed file-selection request.
-    FilePicker,
-    /// Image media.
-    ImageView,
-    /// Audio media.
-    AudioPlayer,
-    /// Video media.
-    VideoPlayer,
-    /// File metadata.
-    FileDetails,
-    /// Typed principal-scoped media reference.
-    MediaEmbed,
-    /// Free-form drawing stage.
-    CanvasStage,
-    /// Diagram surface.
-    DiagramView,
-    /// Annotation layer.
-    AnnotationLayer,
-    /// Presentation of a bound terminal session.
-    TerminalView,
-    /// Presentation of external portal state.
-    NativePortal,
-}
+/// The canonical v1 primitive identity is owned by `capsule-surface-model`.
+pub use capsule_surface_model::ComponentKind as Primitive;
 
-impl Primitive {
-    /// Every primitive in stable contract order.
-    pub const ALL: [Self; 62] = [
-        Self::Region,
-        Self::Stack,
-        Self::Grid,
-        Self::Split,
-        Self::Sidebar,
-        Self::ActionBar,
-        Self::Card,
-        Self::Group,
-        Self::Collapse,
-        Self::Repeater,
-        Self::ScrollRegion,
-        Self::Divider,
-        Self::Heading,
-        Self::Text,
-        Self::InlineContent,
-        Self::CodeBlock,
-        Self::Badge,
-        Self::KeyFigure,
-        Self::EmptyState,
-        Self::Icon,
-        Self::Button,
-        Self::TextField,
-        Self::TextArea,
-        Self::NumberField,
-        Self::Select,
-        Self::MultiSelect,
-        Self::Switch,
-        Self::Checkbox,
-        Self::Slider,
-        Self::DateTimeField,
-        Self::Table,
-        Self::RecordSummary,
-        Self::DatasetChart,
-        Self::Timeline,
-        Self::Difference,
-        Self::Progress,
-        Self::Tabs,
-        Self::Breadcrumb,
-        Self::Menu,
-        Self::Pager,
-        Self::Link,
-        Self::Alert,
-        Self::Toast,
-        Self::InlineMessage,
-        Self::Skeleton,
-        Self::Spinner,
-        Self::StatusDot,
-        Self::Dialog,
-        Self::CapabilityCard,
-        Self::ConsentForm,
-        Self::SecurePrompt,
-        Self::FilePicker,
-        Self::ImageView,
-        Self::AudioPlayer,
-        Self::VideoPlayer,
-        Self::FileDetails,
-        Self::MediaEmbed,
-        Self::CanvasStage,
-        Self::DiagramView,
-        Self::AnnotationLayer,
-        Self::TerminalView,
-        Self::NativePortal,
-    ];
-
-    /// Stable string identity.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Region => "Region",
-            Self::Stack => "Stack",
-            Self::Grid => "Grid",
-            Self::Split => "Split",
-            Self::Sidebar => "Sidebar",
-            Self::ActionBar => "ActionBar",
-            Self::Card => "Card",
-            Self::Group => "Group",
-            Self::Collapse => "Collapse",
-            Self::Repeater => "Repeater",
-            Self::ScrollRegion => "ScrollRegion",
-            Self::Divider => "Divider",
-            Self::Heading => "Heading",
-            Self::Text => "Text",
-            Self::InlineContent => "InlineContent",
-            Self::CodeBlock => "CodeBlock",
-            Self::Badge => "Badge",
-            Self::KeyFigure => "KeyFigure",
-            Self::EmptyState => "EmptyState",
-            Self::Icon => "Icon",
-            Self::Button => "Button",
-            Self::TextField => "TextField",
-            Self::TextArea => "TextArea",
-            Self::NumberField => "NumberField",
-            Self::Select => "Select",
-            Self::MultiSelect => "MultiSelect",
-            Self::Switch => "Switch",
-            Self::Checkbox => "Checkbox",
-            Self::Slider => "Slider",
-            Self::DateTimeField => "DateTimeField",
-            Self::Table => "Table",
-            Self::RecordSummary => "RecordSummary",
-            Self::DatasetChart => "DatasetChart",
-            Self::Timeline => "Timeline",
-            Self::Difference => "Difference",
-            Self::Progress => "Progress",
-            Self::Tabs => "Tabs",
-            Self::Breadcrumb => "Breadcrumb",
-            Self::Menu => "Menu",
-            Self::Pager => "Pager",
-            Self::Link => "Link",
-            Self::Alert => "Alert",
-            Self::Toast => "Toast",
-            Self::InlineMessage => "InlineMessage",
-            Self::Skeleton => "Skeleton",
-            Self::Spinner => "Spinner",
-            Self::StatusDot => "StatusDot",
-            Self::Dialog => "Dialog",
-            Self::CapabilityCard => "CapabilityCard",
-            Self::ConsentForm => "ConsentForm",
-            Self::SecurePrompt => "SecurePrompt",
-            Self::FilePicker => "FilePicker",
-            Self::ImageView => "ImageView",
-            Self::AudioPlayer => "AudioPlayer",
-            Self::VideoPlayer => "VideoPlayer",
-            Self::FileDetails => "FileDetails",
-            Self::MediaEmbed => "MediaEmbed",
-            Self::CanvasStage => "CanvasStage",
-            Self::DiagramView => "DiagramView",
-            Self::AnnotationLayer => "AnnotationLayer",
-            Self::TerminalView => "TerminalView",
-            Self::NativePortal => "NativePortal",
-        }
-    }
-
-    /// Parse the stable string identity without accepting extensions.
-    pub fn from_id(value: &str) -> Option<Self> {
-        Self::ALL
+/// Catalog-owned behavior layered on the canonical component identity.
+pub trait CatalogPrimitive: Copy + Eq + Into<ComponentKind> + From<ComponentKind> {
+    /// Parse an unnamespaced canonical identity; extensions are rejected.
+    fn from_id(value: &str) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        ComponentKind::ALL
             .iter()
             .copied()
-            .find(|kind| kind.as_str() == value)
+            .find(|kind| {
+                serde_json::to_string(kind)
+                    .is_ok_and(|serialized| serialized.trim_matches('"') == value)
+            })
+            .map(Self::from)
     }
 
-    /// Coarse semantic family.
-    pub const fn family(self) -> PrimitiveFamily {
+    /// Public issue-family name mapped by this catalog.
+    fn catalog_family(self) -> PrimitiveFamily;
+
+    /// Whether presentation can create authority.
+    fn mints_capability(self) -> bool {
+        false
+    }
+
+    /// States that a complete record and Lab corpus must document.
+    fn required_states(self) -> Vec<State> {
+        let interaction = vec![
+            State::Default,
+            State::Hover,
+            State::Pressed,
+            State::FocusVisible,
+            State::Disabled,
+        ];
+        let kind: ComponentKind = self.into();
+        match kind.catalog_family() {
+            PrimitiveFamily::Layout => {
+                if kind == ComponentKind::Repeater {
+                    vec![
+                        State::Default,
+                        State::FocusVisible,
+                        State::Disabled,
+                        State::Loading,
+                        State::Empty,
+                    ]
+                } else if matches!(kind, ComponentKind::ActionBar | ComponentKind::Collapse) {
+                    vec![State::Default, State::FocusVisible, State::Disabled]
+                } else {
+                    vec![State::Default]
+                }
+            }
+            PrimitiveFamily::Content => {
+                if matches!(
+                    kind,
+                    ComponentKind::Badge | ComponentKind::KeyFigure | ComponentKind::EmptyState
+                ) {
+                    vec![State::Default, State::FocusVisible, State::Disabled]
+                } else {
+                    vec![State::Default]
+                }
+            }
+            PrimitiveFamily::Input => interaction,
+            PrimitiveFamily::Data => {
+                let mut states = vec![State::Default, State::FocusVisible, State::Disabled];
+                if matches!(
+                    kind,
+                    ComponentKind::EmptyState
+                        | ComponentKind::Table
+                        | ComponentKind::DatasetChart
+                        | ComponentKind::Progress
+                ) {
+                    states.extend([State::Loading, State::Empty]);
+                }
+                states
+            }
+            PrimitiveFamily::Navigation => {
+                vec![State::Default, State::FocusVisible, State::Disabled]
+            }
+            PrimitiveFamily::Feedback => {
+                if matches!(
+                    kind,
+                    ComponentKind::Skeleton | ComponentKind::Spinner | ComponentKind::StatusDot
+                ) {
+                    vec![State::Default, State::Loading]
+                } else {
+                    vec![
+                        State::Default,
+                        State::FocusVisible,
+                        State::Disabled,
+                        State::Success,
+                        State::Warning,
+                        State::Danger,
+                    ]
+                }
+            }
+            PrimitiveFamily::Permission => vec![
+                State::Default,
+                State::FocusVisible,
+                State::Disabled,
+                State::Loading,
+                State::Error,
+            ],
+            PrimitiveFamily::Media | PrimitiveFamily::Canvas => vec![
+                State::Default,
+                State::FocusVisible,
+                State::Loading,
+                State::Empty,
+                State::Error,
+            ],
+            PrimitiveFamily::Terminal => vec![
+                State::Default,
+                State::FocusVisible,
+                State::Loading,
+                State::Error,
+            ],
+            PrimitiveFamily::NativePortal => {
+                vec![State::Default, State::Loading, State::Empty, State::Error]
+            }
+        }
+    }
+}
+
+impl CatalogPrimitive for ComponentKind {
+    fn catalog_family(self) -> PrimitiveFamily {
         match self {
             Self::Region
             | Self::Stack
@@ -346,124 +199,6 @@ impl Primitive {
             Self::TerminalView => PrimitiveFamily::Terminal,
             Self::NativePortal => PrimitiveFamily::NativePortal,
         }
-    }
-
-    /// Whether presentation of this primitive can create authority.
-    pub const fn mints_capability(self) -> bool {
-        false
-    }
-
-    /// States that a complete record and Lab corpus must document.
-    pub fn required_states(self) -> Vec<State> {
-        let interaction = [
-            State::Default,
-            State::Hover,
-            State::Pressed,
-            State::FocusVisible,
-            State::Disabled,
-        ];
-        let status = [State::Default, State::Loading, State::Empty, State::Error];
-        match self {
-            Self::Region
-            | Self::Stack
-            | Self::Grid
-            | Self::Split
-            | Self::Sidebar
-            | Self::Card
-            | Self::Group
-            | Self::ScrollRegion
-            | Self::Heading
-            | Self::Text
-            | Self::InlineContent
-            | Self::CodeBlock
-            | Self::Icon => vec![State::Default],
-            Self::ActionBar
-            | Self::Collapse
-            | Self::Repeater
-            | Self::Divider
-            | Self::Badge
-            | Self::KeyFigure
-            | Self::EmptyState
-            | Self::Table
-            | Self::RecordSummary
-            | Self::DatasetChart
-            | Self::Timeline
-            | Self::Difference
-            | Self::Progress
-            | Self::Tabs
-            | Self::Breadcrumb
-            | Self::Menu
-            | Self::Pager
-            | Self::Link => {
-                let mut states = vec![State::Default, State::FocusVisible, State::Disabled];
-                if matches!(
-                    self,
-                    Self::Repeater
-                        | Self::EmptyState
-                        | Self::Table
-                        | Self::DatasetChart
-                        | Self::Progress
-                ) {
-                    states.extend([State::Loading, State::Empty]);
-                }
-                states
-            }
-            Self::Button
-            | Self::TextField
-            | Self::TextArea
-            | Self::NumberField
-            | Self::Select
-            | Self::MultiSelect
-            | Self::Switch
-            | Self::Checkbox
-            | Self::Slider
-            | Self::DateTimeField => interaction.to_vec(),
-            Self::Alert | Self::Toast | Self::InlineMessage | Self::Dialog => vec![
-                State::Default,
-                State::FocusVisible,
-                State::Disabled,
-                State::Success,
-                State::Warning,
-                State::Danger,
-            ],
-            Self::Skeleton | Self::Spinner | Self::StatusDot => {
-                vec![State::Default, State::Loading]
-            }
-            Self::CapabilityCard | Self::ConsentForm | Self::SecurePrompt | Self::FilePicker => {
-                vec![
-                    State::Default,
-                    State::FocusVisible,
-                    State::Disabled,
-                    State::Loading,
-                    State::Error,
-                ]
-            }
-            Self::ImageView
-            | Self::AudioPlayer
-            | Self::VideoPlayer
-            | Self::FileDetails
-            | Self::MediaEmbed
-            | Self::CanvasStage
-            | Self::DiagramView
-            | Self::AnnotationLayer => {
-                let mut states = vec![State::Default, State::FocusVisible];
-                states.extend(status[1..].iter().copied());
-                states
-            }
-            Self::TerminalView => vec![
-                State::Default,
-                State::FocusVisible,
-                State::Loading,
-                State::Error,
-            ],
-            Self::NativePortal => vec![State::Default, State::Loading, State::Empty, State::Error],
-        }
-    }
-}
-
-impl fmt::Display for Primitive {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
     }
 }
 
@@ -622,7 +357,7 @@ impl Catalog {
     pub fn v1() -> Self {
         Self {
             schema: CATALOG_SCHEMA.to_owned(),
-            records: Primitive::ALL
+            records: ComponentKind::ALL
                 .into_iter()
                 .map(PrimitiveRecord::for_primitive)
                 .collect(),
@@ -637,7 +372,7 @@ impl Catalog {
         if self.records.len() != 62 {
             return Err(CatalogError::PrimitiveCount);
         }
-        let expected: Vec<_> = Primitive::ALL.into_iter().collect();
+        let expected: Vec<_> = ComponentKind::ALL.into_iter().collect();
         let actual: Vec<_> = self.records.iter().map(|record| record.id).collect();
         if actual != expected {
             return Err(CatalogError::PrimitiveOrder);
@@ -657,7 +392,7 @@ impl Catalog {
 impl PrimitiveRecord {
     /// Build the normative record for a v1 primitive.
     pub fn for_primitive(id: Primitive) -> Self {
-        let family = id.family();
+        let family = id.catalog_family();
         let (semantic_role, accessibility, focus, native, motion, fallback) = match family {
             PrimitiveFamily::Layout => (
                 "layout container",
@@ -926,79 +661,15 @@ fn bounded_text(value: &str) -> bool {
 mod tests {
     use super::*;
 
-    const EXPECTED: [Primitive; 62] = Primitive::ALL;
-
     #[test]
-    fn owns_the_exact_v1_inventory() {
-        let expected_names = [
-            "Region",
-            "Stack",
-            "Grid",
-            "Split",
-            "Sidebar",
-            "ActionBar",
-            "Card",
-            "Group",
-            "Collapse",
-            "Repeater",
-            "ScrollRegion",
-            "Divider",
-            "Heading",
-            "Text",
-            "InlineContent",
-            "CodeBlock",
-            "Badge",
-            "KeyFigure",
-            "EmptyState",
-            "Icon",
-            "Button",
-            "TextField",
-            "TextArea",
-            "NumberField",
-            "Select",
-            "MultiSelect",
-            "Switch",
-            "Checkbox",
-            "Slider",
-            "DateTimeField",
-            "Table",
-            "RecordSummary",
-            "DatasetChart",
-            "Timeline",
-            "Difference",
-            "Progress",
-            "Tabs",
-            "Breadcrumb",
-            "Menu",
-            "Pager",
-            "Link",
-            "Alert",
-            "Toast",
-            "InlineMessage",
-            "Skeleton",
-            "Spinner",
-            "StatusDot",
-            "Dialog",
-            "CapabilityCard",
-            "ConsentForm",
-            "SecurePrompt",
-            "FilePicker",
-            "ImageView",
-            "AudioPlayer",
-            "VideoPlayer",
-            "FileDetails",
-            "MediaEmbed",
-            "CanvasStage",
-            "DiagramView",
-            "AnnotationLayer",
-            "TerminalView",
-            "NativePortal",
-        ];
-        assert_eq!(EXPECTED.len(), 62);
-        assert_eq!(expected_names.len(), 62);
-        for (primitive, name) in Primitive::ALL.into_iter().zip(expected_names) {
-            assert_eq!(primitive.as_str(), name);
-        }
+    fn consumes_component_kind_all_exactly_once() {
+        let catalog = Catalog::v1();
+        let actual: Vec<ComponentKind> = catalog.records.iter().map(|record| record.id).collect();
+        assert_eq!(actual, ComponentKind::ALL.to_vec());
+        assert_eq!(
+            actual.iter().collect::<BTreeSet<_>>().len(),
+            ComponentKind::ALL.len()
+        );
     }
 
     #[test]

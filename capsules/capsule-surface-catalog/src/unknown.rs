@@ -1,6 +1,6 @@
 //! Safe namespaced-extension boundary and neutral fallback.
 
-use crate::catalog::Primitive;
+use crate::catalog::{CatalogPrimitive, Primitive};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
