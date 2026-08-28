@@ -576,6 +576,11 @@ fn hostile_owner_extension_and_surface_documents_fail_closed() {
     surface.surface_id = "../../home/surface".to_owned();
     let surface_json = canonical_string(&surface).expect("serialize constructed surface");
     assert!(parse_canonical::<Surface>(surface_json.as_bytes()).is_err());
+
+    let mut path_recipe = Surface::from_recipe(&fixture_recipe(), "surface-1", 1).unwrap();
+    path_recipe.recipe_id = "../../home/recipe".to_owned();
+    let path_recipe_json = canonical_string(&path_recipe).expect("serialize path recipe_id");
+    assert!(parse_canonical::<Surface>(path_recipe_json.as_bytes()).is_err());
 }
 
 #[test]

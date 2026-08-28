@@ -6,7 +6,7 @@ use crate::components::{SceneError, SemanticNode};
 use crate::recipe::{Recipe, RecipeValidationError, SURFACE_SCHEMA};
 use serde::{Deserialize, Serialize};
 
-fn valid_surface_id(value: &str) -> bool {
+fn valid_document_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
         && !value.contains("..")
@@ -36,7 +36,7 @@ impl Surface {
         incarnation: u64,
     ) -> Result<Self, RecipeValidationError> {
         let surface_id = surface_id.into();
-        if !valid_surface_id(&surface_id)
+        if !valid_document_id(&surface_id)
             || incarnation == 0
             || !valid_blake3_digest(&recipe.digest)
         {
@@ -57,8 +57,8 @@ impl Surface {
 
     pub fn validate(&self) -> Result<(), SceneError> {
         if self.schema != SURFACE_SCHEMA
-            || !valid_surface_id(&self.surface_id)
-            || self.recipe_id.is_empty()
+            || !valid_document_id(&self.surface_id)
+            || !valid_document_id(&self.recipe_id)
             || self.recipe_revision == 0
             || self.incarnation == 0
             || !valid_blake3_digest(&self.recipe_digest)
