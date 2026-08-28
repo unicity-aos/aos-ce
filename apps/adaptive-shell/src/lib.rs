@@ -11,6 +11,7 @@
 #![warn(missing_docs)]
 
 pub mod activity;
+pub mod atlas;
 pub mod components;
 pub mod fixtures;
 pub mod input;
@@ -22,6 +23,11 @@ pub mod theme;
 pub use activity::{
     Activity, ActivityRegistry, OpaqueOwnerRef, Patch, PatchError, PatchOp, PatchOutcome, Recipe,
     RecipeStore, Surface, SurfaceId,
+};
+pub use atlas::{
+    AtlasActivityId, AtlasEntry, AtlasError, AtlasInvocation, AtlasLayout, AtlasLayoutPolicy,
+    AtlasState, AtlasTile, PlacementCommit, PlacementIntent, PlacementOrigin, PlacementTarget,
+    PreviewKind, RecipeStatus,
 };
 pub use components::{ComponentKind, NodeId, SemanticNode, StateSet};
 pub use fixtures::{Fixture, FixtureKind, Snapshot};

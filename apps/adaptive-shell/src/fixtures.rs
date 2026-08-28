@@ -3,6 +3,9 @@
 use crate::activity::{
     Activity, OpaqueOwnerRef, Patch, PatchOutcome, Recipe, RecipeStore, SurfaceId,
 };
+use crate::atlas::{
+    AtlasActivityId, AtlasEntry, AtlasError, AtlasLayoutPolicy, PreviewKind, RecipeStatus,
+};
 use crate::components::NodeId;
 use crate::components::{ComponentKind, PropValue, SemanticNode, StateSet};
 use crate::input::{Command, ShellState};
@@ -35,7 +38,6 @@ impl FixtureKind {
             _ => None,
         }
     }
-
     /// Stable display name.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -114,6 +116,8 @@ pub struct Fixture {
     pub clock: DeterministicClock,
     /// Keyed retained graph.
     pub reconciler: Reconciler,
+    /// Shell-owned Atlas fixture entries.
+    pub atlas_entries: Vec<AtlasEntry>,
     recipes: RecipeStore,
 }
 
@@ -164,12 +168,19 @@ impl Fixture {
         recipes
             .insert(recipe.clone())
             .map_err(FixtureError::Patch)?;
+        let selected =
+            AtlasActivityId::new(activity.activity_id.clone()).map_err(FixtureError::Atlas)?;
+        let atlas_entries = atlas_entries().map_err(FixtureError::Atlas)?;
         Ok(Self {
             kind,
             viewport,
             state: ShellState {
                 activity_id: activity.activity_id.clone(),
                 theme: config,
+                atlas: crate::atlas::AtlasState {
+                    selected_activity: Some(selected),
+                    ..crate::atlas::AtlasState::default()
+                },
                 ..ShellState::default()
             },
             activity,
@@ -178,13 +189,67 @@ impl Fixture {
             theme,
             clock: DeterministicClock::new(1_724_847_360_000),
             reconciler,
+            atlas_entries,
             recipes,
         })
     }
 
     /// Apply a command and rematerialize the surface if its semantic state changed.
     pub fn apply(&mut self, command: Command) -> Result<bool, FixtureError> {
-        let changed = self.state.apply(command);
+        let atlas_activity_ids = self.atlas_activity_ids();
+        let commit_geometry = if matches!(command, Command::CommitAtlasPlacement)
+            && self.state.atlas.placement.is_some()
+        {
+            let selected_index = self
+                .state
+                .atlas
+                .selected_activity
+                .as_ref()
+                .and_then(|selected| {
+                    self.atlas_entries
+                        .iter()
+                        .position(|entry| entry.activity_id == *selected)
+                });
+            let target = self
+                .state
+                .atlas
+                .placement
+                .as_ref()
+                .map(|choice| choice.target);
+            let before_layout = AtlasLayoutPolicy::resolve(
+                self.viewport,
+                self.atlas_entries.len(),
+                selected_index,
+                target.map(|target| (target, true)),
+            );
+            let source_rect = if before_layout.phone {
+                before_layout.tiles.first().map(|tile| tile.rect)
+            } else {
+                selected_index
+                    .and_then(|index| before_layout.tiles.get(index))
+                    .map(|tile| tile.rect)
+            };
+            let destination_rect = target.and_then(|target| {
+                before_layout
+                    .placements
+                    .iter()
+                    .find(|tile| tile.target == target)
+                    .map(|tile| tile.rect)
+            });
+            Some((source_rect, destination_rect))
+        } else {
+            None
+        };
+        let changed =
+            self.state
+                .apply_with_context(command, self.viewport.is_phone(), &atlas_activity_ids);
+        if changed
+            && let Some((source_rect, destination_rect)) = commit_geometry
+            && let Some(commit) = self.state.atlas.last_commit.as_mut()
+        {
+            commit.source_rect = source_rect;
+            commit.destination_rect = destination_rect;
+        }
         self.theme = Theme::resolve(self.state.theme);
         if changed {
             self.reconciler
@@ -250,7 +315,7 @@ impl Fixture {
 
     /// Produce a backend-neutral display list.
     pub fn display_list(&self) -> DisplayList {
-        if self.kind == FixtureKind::ThemeLab {
+        let list = if self.kind == FixtureKind::ThemeLab {
             theme_lab_display(self.viewport, &self.theme, &self.surface.root)
         } else {
             activity_display(
@@ -260,6 +325,11 @@ impl Fixture {
                 &self.layout(),
                 &self.surface.root,
             )
+        };
+        if self.state.atlas.open {
+            atlas_display(self.viewport, &self.theme, &self.state, &self.atlas_entries)
+        } else {
+            list
         }
     }
 
@@ -295,6 +365,19 @@ impl Fixture {
     /// Return the recipe store used by the fixture.
     pub fn recipe_store(&self) -> &RecipeStore {
         &self.recipes
+    }
+
+    /// Stable Atlas fixtures in display order.
+    pub fn atlas_entries(&self) -> &[AtlasEntry] {
+        &self.atlas_entries
+    }
+
+    /// Stable Atlas identities in display order.
+    pub fn atlas_activity_ids(&self) -> Vec<String> {
+        self.atlas_entries
+            .iter()
+            .map(|entry| entry.activity_id.as_str().to_owned())
+            .collect()
     }
 }
 
@@ -342,6 +425,8 @@ pub enum FixtureError {
     Recipe(crate::activity::RecipeValidationError),
     /// Surface incarnation exhausted u64.
     IncarnationOverflow,
+    /// Atlas fixture construction failed.
+    Atlas(AtlasError),
 }
 
 impl fmt::Display for FixtureError {
@@ -351,6 +436,7 @@ impl fmt::Display for FixtureError {
             Self::Patch(error) => error.fmt(f),
             Self::Recipe(error) => error.fmt(f),
             Self::IncarnationOverflow => write!(f, "surface incarnation overflow"),
+            Self::Atlas(error) => error.fmt(f),
         }
     }
 }
@@ -367,6 +453,92 @@ fn prop(node: &mut SemanticNode, key: &str, value: PropValue) {
 
 fn child(parent: &mut SemanticNode, node: SemanticNode) {
     parent.push(node).expect("fixture child bound");
+}
+
+fn atlas_entries() -> Result<Vec<AtlasEntry>, AtlasError> {
+    let owner = OpaqueOwnerRef::Principal("fixture-principal".to_owned());
+    let principal = crate::activity::OpaquePrincipalRef::Agent("fixture-agent".to_owned());
+    let mut entries = Vec::new();
+    let mut push = |id: &'static str,
+                    title: &'static str,
+                    context: &'static str,
+                    recipe: &'static str,
+                    revision: u64,
+                    status: RecipeStatus,
+                    edits: u16,
+                    preview: PreviewKind| {
+        entries.push(AtlasEntry::new(
+            id,
+            title,
+            context,
+            owner.clone(),
+            principal.clone(),
+            recipe,
+            revision,
+            status,
+            edits,
+            preview,
+        )?);
+        Ok::<(), AtlasError>(())
+    };
+    push(
+        "cats",
+        "Cat break",
+        "2 hours ago",
+        "cat-break",
+        1,
+        RecipeStatus::Restored,
+        0,
+        PreviewKind::Video,
+    )?;
+    push(
+        "build",
+        "Build",
+        "Yesterday",
+        "build-recipe",
+        2,
+        RecipeStatus::Changed,
+        4,
+        PreviewKind::Editor,
+    )?;
+    push(
+        "sound",
+        "Listening",
+        "Today",
+        "sound-recipe",
+        1,
+        RecipeStatus::Restored,
+        0,
+        PreviewKind::Audio,
+    )?;
+    push(
+        "make",
+        "Poster",
+        "Today",
+        "poster-recipe",
+        3,
+        RecipeStatus::Proposal,
+        0,
+        PreviewKind::Plan,
+    )?;
+    push(
+        "native",
+        "Native application",
+        "Unavailable",
+        "native-recipe",
+        1,
+        RecipeStatus::Restored,
+        0,
+        PreviewKind::NativeUnavailable,
+    )?;
+    let identities = entries
+        .iter()
+        .map(|entry| entry.activity_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if identities.len() != entries.len() {
+        return Err(AtlasError::DuplicateActivity);
+    }
+    Ok(entries)
 }
 
 fn activity_root() -> SemanticNode {
@@ -605,6 +777,326 @@ fn token_px(theme: &Theme, role: &str, fallback: u16) -> u16 {
         _ => fallback,
     }
 }
+
+fn atlas_display(
+    viewport: Viewport,
+    theme: &Theme,
+    state: &ShellState,
+    entries: &[AtlasEntry],
+) -> DisplayList {
+    let canvas = token_color(theme, "aos.color.canvas", [12, 14, 17, 255]);
+    let fieldglass = token_color(theme, "aos.color.fieldglass", [27, 29, 35, 246]);
+    let layer = token_color(theme, "aos.color.layer.2", [31, 33, 40, 255]);
+    let text = token_color(theme, "aos.color.text", [244, 242, 247, 255]);
+    let soft = token_color(theme, "aos.color.text-soft", [194, 193, 204, 255]);
+    let dim = token_color(theme, "aos.color.text-dim", [131, 130, 143, 255]);
+    let line = token_color(theme, "aos.color.line", [61, 62, 71, 255]);
+    let line_strong = token_color(theme, "aos.color.line-strong", [85, 86, 99, 255]);
+    let accent = token_color(theme, "aos.color.accent", [157, 122, 255, 255]);
+    let focus = token_color(theme, "aos.color.focus", [111, 180, 255, 255]);
+    let success = token_color(theme, "aos.color.success", [76, 208, 149, 255]);
+    let warning = token_color(theme, "aos.color.warning", [242, 181, 89, 255]);
+    let radius_detail = token_px(theme, "aos.radius.detail", 6);
+    let radius_control = token_px(theme, "aos.radius.control", 9);
+    let radius_window = token_px(theme, "aos.radius.window", 15);
+    let selected_index = state.atlas.selected_activity.as_ref().and_then(|selected| {
+        entries
+            .iter()
+            .position(|entry| entry.activity_id == *selected)
+    });
+    let placement = state
+        .atlas
+        .placement
+        .as_ref()
+        .map(|choice| (choice.target, true));
+    let atlas_layout =
+        AtlasLayoutPolicy::resolve(viewport, entries.len(), selected_index, placement);
+    let visible_entries = if atlas_layout.phone {
+        selected_index
+            .and_then(|index| entries.get(index))
+            .map(std::slice::from_ref)
+            .unwrap_or(entries)
+    } else {
+        entries
+    };
+    let mut list = DisplayList::new((viewport.width, viewport.height));
+    list.push(DrawCommand::FillRoundRect {
+        rect: Rect {
+            x: 0,
+            y: 0,
+            width: viewport.width,
+            height: viewport.height,
+        },
+        radius: 0,
+        color: canvas,
+    });
+    list.push(DrawCommand::Text {
+        rect: Rect {
+            x: 24,
+            y: 18,
+            width: 280,
+            height: 34,
+        },
+        content: "Activities".to_owned(),
+        role: "title".to_owned(),
+        color: text,
+    });
+    list.push(DrawCommand::Text {
+        rect: Rect {
+            x: viewport.width.saturating_sub(300),
+            y: 22,
+            width: 276,
+            height: 26,
+        },
+        content: "Escape closes · Return restores".to_owned(),
+        role: "caption".to_owned(),
+        color: soft,
+    });
+
+    for (index, (tile, entry)) in atlas_layout.tiles.iter().zip(visible_entries).enumerate() {
+        frame(&mut list, tile.rect, radius_window, fieldglass, line);
+        let preview_rect = Rect {
+            x: tile.rect.x + 14,
+            y: tile.rect.y + 58,
+            width: tile.rect.width.saturating_sub(28),
+            height: tile.rect.height.saturating_sub(122),
+        };
+        let preview_color = match entry.preview {
+            PreviewKind::Video => [224, 191, 165, 255],
+            PreviewKind::Editor => [167, 195, 222, 255],
+            PreviewKind::Audio => accent,
+            PreviewKind::Plan => success,
+            PreviewKind::NativeUnavailable => warning,
+        };
+        list.push(DrawCommand::FillRoundRect {
+            rect: preview_rect,
+            radius: radius_control,
+            color: layer,
+        });
+        list.push(DrawCommand::Placeholder {
+            rect: Rect {
+                x: preview_rect.x + 18,
+                y: preview_rect.y + 18,
+                width: preview_rect.width.saturating_sub(36),
+                height: preview_rect.height.saturating_sub(64),
+            },
+            label: entry.preview.label().to_owned(),
+            color: preview_color,
+        });
+        let progress = u32::try_from((state.atlas.preview_ms % 4_000) / 40).unwrap_or(0);
+        let progress_width = preview_rect.width.saturating_sub(36).min(progress.max(1));
+        list.push(DrawCommand::Line {
+            from: (
+                preview_rect.x + 18,
+                preview_rect.y + preview_rect.height.saturating_sub(30),
+            ),
+            to: (
+                preview_rect.x + 18 + progress_width,
+                preview_rect.y + preview_rect.height.saturating_sub(30),
+            ),
+            color: focus,
+            width: 2,
+        });
+        list.push(DrawCommand::Text {
+            rect: Rect {
+                x: tile.rect.x + 14,
+                y: tile.rect.y + 12,
+                width: tile.rect.width.saturating_sub(28),
+                height: 28,
+            },
+            content: entry.title.clone(),
+            role: "atlas-tile".to_owned(),
+            color: text,
+        });
+        list.push(DrawCommand::Text {
+            rect: Rect {
+                x: tile.rect.x + 14,
+                y: tile.rect.y + 38,
+                width: tile.rect.width.saturating_sub(28),
+                height: 20,
+            },
+            content: entry.temporal_context.clone(),
+            role: "caption".to_owned(),
+            color: dim,
+        });
+        list.push(DrawCommand::Text {
+            rect: Rect {
+                x: tile.rect.x + 14,
+                y: tile.rect.y + tile.rect.height.saturating_sub(52),
+                width: tile.rect.width.saturating_sub(130),
+                height: 20,
+            },
+            content: entry.status_line(),
+            role: "caption".to_owned(),
+            color: soft,
+        });
+        let action = Rect {
+            x: tile.rect.x + tile.rect.width.saturating_sub(108),
+            y: tile.rect.y + tile.rect.height.saturating_sub(54),
+            width: 94,
+            height: 40,
+        };
+        list.push(DrawCommand::StrokeRoundRect {
+            rect: action,
+            radius: radius_detail,
+            color: if state.atlas.details_activity.as_ref() == Some(&entry.activity_id) {
+                accent
+            } else {
+                line_strong
+            },
+            width: 1,
+        });
+        list.push(DrawCommand::Text {
+            rect: action,
+            content: "Details".to_owned(),
+            role: "atlas-details".to_owned(),
+            color: text,
+        });
+        if tile.selected {
+            list.push(DrawCommand::StrokeRoundRect {
+                rect: tile.rect,
+                radius: radius_window,
+                color: focus,
+                width: 2,
+            });
+        }
+        if index >= MAX_DISPLAY_TILES {
+            break;
+        }
+    }
+
+    for placement_tile in &atlas_layout.placements {
+        frame(
+            &mut list,
+            placement_tile.rect,
+            radius_control,
+            fieldglass,
+            line_strong,
+        );
+        if placement_tile.active {
+            list.push(DrawCommand::FillRoundRect {
+                rect: Rect {
+                    x: placement_tile.rect.x + 12,
+                    y: placement_tile.rect.y + 12,
+                    width: placement_tile.rect.width.saturating_sub(24),
+                    height: placement_tile.rect.height.saturating_sub(52),
+                },
+                radius: radius_detail,
+                color: layer,
+            });
+            list.push(DrawCommand::StrokeRoundRect {
+                rect: placement_tile.rect,
+                radius: radius_control,
+                color: accent,
+                width: 2,
+            });
+        }
+        list.push(DrawCommand::Text {
+            rect: Rect {
+                x: placement_tile.rect.x + 12,
+                y: placement_tile.rect.y + placement_tile.rect.height.saturating_sub(32),
+                width: placement_tile.rect.width.saturating_sub(24),
+                height: 22,
+            },
+            content: placement_tile.target.label().to_owned(),
+            role: "atlas-placement".to_owned(),
+            color: if placement_tile.active { text } else { soft },
+        });
+    }
+
+    if let Some(commit) = &state.atlas.last_commit {
+        if let (Some(source), Some(destination)) = (commit.source_rect, commit.destination_rect) {
+            if !commit.reduced_motion {
+                list.push(DrawCommand::Line {
+                    from: (source.x + source.width / 2, source.y + source.height / 2),
+                    to: (
+                        destination.x + destination.width / 2,
+                        destination.y + destination.height / 2,
+                    ),
+                    color: accent,
+                    width: 1,
+                });
+                list.push(DrawCommand::StrokeRoundRect {
+                    rect: source,
+                    radius: radius_control,
+                    color: line_strong,
+                    width: 1,
+                });
+            }
+            list.push(DrawCommand::StrokeRoundRect {
+                rect: destination,
+                radius: radius_control,
+                color: focus,
+                width: 2,
+            });
+        }
+        list.push(DrawCommand::Text {
+            rect: Rect {
+                x: 24,
+                y: if atlas_layout.phone {
+                    atlas_layout
+                        .strip
+                        .map_or(viewport.height.saturating_sub(44), |strip| {
+                            strip.y.saturating_sub(34)
+                        })
+                } else {
+                    viewport.height.saturating_sub(44)
+                },
+                width: viewport.width.saturating_sub(48),
+                height: 24,
+            },
+            content: format!(
+                "{} · identity preserved · {}",
+                commit.activity_id,
+                if commit.reduced_motion {
+                    "destination state applied immediately"
+                } else {
+                    "connected destination transition"
+                }
+            ),
+            role: "atlas-identity".to_owned(),
+            color: soft,
+        });
+    }
+
+    if atlas_layout.phone
+        && let Some(strip) = atlas_layout.strip
+    {
+        list.push(DrawCommand::FillRoundRect {
+            rect: strip,
+            radius: 0,
+            color: fieldglass,
+        });
+        list.push(DrawCommand::Line {
+            from: (0, strip.y),
+            to: (strip.width, strip.y),
+            color: line_strong,
+            width: 1,
+        });
+        let width = strip.width / entries.len().max(1) as u32;
+        for (index, entry) in entries.iter().enumerate() {
+            list.push(DrawCommand::Text {
+                rect: Rect {
+                    x: index as u32 * width,
+                    y: strip.y + 12,
+                    width,
+                    height: 44,
+                },
+                content: entry.title.clone(),
+                role: "atlas-strip".to_owned(),
+                color: if selected_index == Some(index) {
+                    text
+                } else {
+                    dim
+                },
+            });
+        }
+    }
+
+    list
+}
+
+const MAX_DISPLAY_TILES: usize = 64;
 
 fn activity_display(
     viewport: Viewport,
@@ -994,6 +1486,7 @@ pub fn replay_digest(kind: FixtureKind, config: ThemeConfig) -> Result<bool, Fix
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atlas::{PlacementOrigin, PlacementTarget};
     use crate::theme::ThemeConfig;
 
     fn reviewed_patch(
@@ -1160,6 +1653,261 @@ mod tests {
                 !later_opaque_fill,
                 "{kind} has an opaque fill after the semantic root sample pixel"
             );
+        }
+    }
+
+    #[test]
+    fn atlas_opens_from_pointer_and_both_platform_shortcuts() {
+        for invocation in [
+            crate::atlas::AtlasInvocation::Pointer,
+            crate::atlas::AtlasInvocation::CommandSpace,
+            crate::atlas::AtlasInvocation::SuperSpace,
+        ] {
+            let mut fixture =
+                Fixture::new(FixtureKind::Desktop, ThemeConfig::default()).expect("fixture");
+            assert!(
+                fixture
+                    .apply(Command::ToggleAtlas(invocation))
+                    .expect("apply")
+            );
+            assert!(fixture.state.atlas.open);
+            assert!(fixture
+                .display_list()
+                .commands
+                .iter()
+                .any(|command| matches!(command, DrawCommand::Text { content, .. } if content == "Activities")));
+        }
+    }
+
+    #[test]
+    fn drag_and_keyboard_placement_commit_the_same_identity() {
+        let run = |origin| {
+            let mut fixture =
+                Fixture::new(FixtureKind::Desktop, ThemeConfig::default()).expect("fixture");
+            fixture
+                .apply(Command::ToggleAtlas(
+                    crate::atlas::AtlasInvocation::SuperSpace,
+                ))
+                .expect("apply");
+            fixture
+                .apply(Command::BeginAtlasPlacement {
+                    activity_id: "cats".to_owned(),
+                    origin,
+                })
+                .expect("apply");
+            fixture
+                .apply(Command::HoverAtlasPlacement(PlacementTarget::Float))
+                .expect("apply");
+            fixture.apply(Command::CommitAtlasPlacement).expect("apply");
+            let commit = fixture.state.atlas.last_commit.clone().expect("commit");
+            assert_eq!(commit.activity_id.as_str(), "cats");
+            assert_eq!(commit.target, PlacementTarget::Float);
+            assert_eq!(commit.intent, crate::atlas::PlacementIntent::FloatingRegion);
+            assert_eq!(fixture.recipe.revision, 1);
+            assert_eq!(fixture.recipe.digest, fixture.recipe.computed_digest());
+            assert_eq!(fixture.surface.incarnation, 1);
+            commit
+        };
+        assert_eq!(run(PlacementOrigin::Drag), run(PlacementOrigin::Keyboard));
+    }
+
+    #[test]
+    fn connected_transition_has_backend_neutral_geometry() {
+        let mut fixture =
+            Fixture::new(FixtureKind::Desktop, ThemeConfig::default()).expect("fixture");
+        fixture
+            .apply(Command::ToggleAtlas(crate::atlas::AtlasInvocation::Pointer))
+            .expect("apply");
+        fixture
+            .apply(Command::BeginAtlasPlacement {
+                activity_id: "cats".to_owned(),
+                origin: PlacementOrigin::Drag,
+            })
+            .expect("apply");
+        fixture
+            .apply(Command::HoverAtlasPlacement(PlacementTarget::Float))
+            .expect("apply");
+        fixture.apply(Command::CommitAtlasPlacement).expect("apply");
+        let commit = fixture.state.atlas.last_commit.as_ref().expect("commit");
+        let source = commit.source_rect.expect("source geometry");
+        let destination = commit.destination_rect.expect("destination geometry");
+        assert_eq!(commit.activity_id.as_str(), "cats");
+        assert_eq!(commit.target, PlacementTarget::Float);
+        assert!(source.width > 100 && source.height > 100);
+        assert!(destination.width > 100 && destination.height > 40);
+        assert_eq!(fixture.recipe.revision, 1);
+        assert_eq!(fixture.surface.incarnation, 1);
+        let list = fixture.display_list();
+        assert!(list.commands.iter().any(|command| matches!(
+            command,
+            DrawCommand::Line { color, width, .. }
+                if *color == token_color(&fixture.theme, "aos.color.accent", [0; 4]) && *width == 1,
+        )));
+        assert!(list.commands.iter().any(|command| matches!(
+            command,
+            DrawCommand::StrokeRoundRect { rect, color, width, .. }
+                if *rect == destination
+                    && *color == token_color(&fixture.theme, "aos.color.focus", [0; 4])
+                    && *width == 2,
+        )));
+    }
+
+    #[test]
+    fn phone_strip_remains_persistent_after_placement_commit() {
+        let mut fixture = Fixture::new(
+            FixtureKind::Phone,
+            ThemeConfig {
+                reduced_motion: true,
+                ..ThemeConfig::default()
+            },
+        )
+        .expect("fixture");
+        fixture
+            .apply(Command::ToggleAtlas(crate::atlas::AtlasInvocation::Pointer))
+            .expect("apply");
+        fixture
+            .apply(Command::BeginAtlasPlacement {
+                activity_id: "cats".to_owned(),
+                origin: PlacementOrigin::Keyboard,
+            })
+            .expect("apply");
+        fixture
+            .apply(Command::HoverAtlasPlacement(PlacementTarget::NewActivity))
+            .expect("apply");
+        fixture.apply(Command::CommitAtlasPlacement).expect("apply");
+        assert!(
+            fixture
+                .state
+                .atlas
+                .last_commit
+                .as_ref()
+                .expect("commit")
+                .source_rect
+                .is_some()
+        );
+        let list = fixture.display_list();
+        assert_eq!(
+            list.commands
+                .iter()
+                .filter(|command| matches!(command, DrawCommand::Text { role, .. } if role == "atlas-strip"))
+                .count(),
+            5
+        );
+    }
+
+    #[test]
+    fn atlas_details_do_not_restore_or_authorize() {
+        let mut fixture =
+            Fixture::new(FixtureKind::Desktop, ThemeConfig::default()).expect("fixture");
+        fixture
+            .apply(Command::ToggleAtlas(crate::atlas::AtlasInvocation::Pointer))
+            .expect("apply");
+        fixture
+            .apply(Command::ShowAtlasDetails("make".to_owned()))
+            .expect("apply");
+        assert_eq!(
+            fixture
+                .state
+                .atlas
+                .details_activity
+                .as_ref()
+                .map(AtlasActivityId::as_str),
+            Some("make")
+        );
+        assert_eq!(fixture.state.activity_id, "cats");
+        assert!(fixture.state.atlas.open);
+    }
+
+    #[test]
+    fn deterministic_preview_tick_changes_the_snapshot() {
+        let mut fixture =
+            Fixture::new(FixtureKind::Desktop, ThemeConfig::default()).expect("fixture");
+        fixture
+            .apply(Command::ToggleAtlas(crate::atlas::AtlasInvocation::Pointer))
+            .expect("apply");
+        let before = fixture.snapshot();
+        assert!(
+            fixture
+                .apply(Command::AdvanceLivePreviews(240))
+                .expect("apply")
+        );
+        let after = fixture.snapshot();
+        assert_ne!(before.semantic_digest, after.semantic_digest);
+        assert_ne!(before.display.digest, after.display.digest);
+    }
+
+    #[test]
+    fn atlas_snapshots_preserve_phone_and_portal_claims() {
+        let mut fixture =
+            Fixture::new(FixtureKind::Phone, ThemeConfig::default()).expect("fixture");
+        fixture
+            .apply(Command::ToggleAtlas(
+                crate::atlas::AtlasInvocation::CommandSpace,
+            ))
+            .expect("apply");
+        fixture
+            .apply(Command::BeginAtlasPlacement {
+                activity_id: "cats".to_owned(),
+                origin: PlacementOrigin::Keyboard,
+            })
+            .expect("apply");
+        fixture
+            .apply(Command::FocusAtlasTile("native".to_owned()))
+            .expect("apply");
+        let list = fixture.display_list();
+        assert_eq!(
+            list.commands
+                .iter()
+                .filter(
+                    |command| matches!(command, DrawCommand::Text { role, .. } if role == "atlas-tile"),
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            list.commands
+                .iter()
+                .filter(|command| matches!(command, DrawCommand::Text { role, .. } if role == "atlas-placement"))
+                .count(),
+            1
+        );
+        assert_eq!(fixture.snapshot().visible_surface_count, 1);
+        assert_eq!(
+            fixture.snapshot().native_portal,
+            NativePortalState::Unavailable
+        );
+        let _rendered = list
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Text { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(list.commands.iter().any(|command| matches!(
+            command,
+            DrawCommand::Placeholder { label, .. } if label == "native unavailable"
+        )));
+    }
+
+    #[test]
+    fn desktop_atlas_exposes_all_subordinate_recipe_statuses() {
+        let mut fixture =
+            Fixture::new(FixtureKind::Desktop, ThemeConfig::default()).expect("fixture");
+        fixture
+            .apply(Command::ToggleAtlas(crate::atlas::AtlasInvocation::Pointer))
+            .expect("apply");
+        let display = fixture.display_list();
+        let rendered = display
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Text { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for expected in ["Restored", "Changed", "Proposal"] {
+            assert!(rendered.iter().any(|text| text.contains(expected)));
         }
     }
 }
