@@ -21,6 +21,12 @@ pub(crate) struct ServeArgs {
     /// Choose where constrained approval forms are presented.
     #[arg(long, value_enum, default_value_t = InteractionMode::Auto)]
     interaction: InteractionMode,
+    /// Project directory the host plugin attached this session to.
+    #[arg(long, value_name = "PATH")]
+    workspace: Option<std::path::PathBuf>,
+    /// Host-plugin compatibility flag forwarded to the runtime shim.
+    #[arg(long = "request-timeout", value_name = "DURATION")]
+    request_timeout: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -54,7 +60,7 @@ pub(crate) fn handle_serve(principal: Option<String>, args: ServeArgs) -> ExitCo
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(serve(&home, principal.as_deref(), args.interaction)) {
+    match runtime.block_on(serve(&home, principal.as_deref(), args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("aos mcp serve: {error}");
@@ -63,17 +69,22 @@ pub(crate) fn handle_serve(principal: Option<String>, args: ServeArgs) -> ExitCo
     }
 }
 
-async fn serve(
-    home: &AosHome,
-    principal: Option<&str>,
-    mode: InteractionMode,
-) -> Result<(), String> {
+async fn serve(home: &AosHome, principal: Option<&str>, args: ServeArgs) -> Result<(), String> {
+    let mode = args.interaction;
     let mut runtime_args = Vec::<OsString>::new();
     if let Some(principal) = principal {
         runtime_args.push(OsString::from("--principal"));
         runtime_args.push(OsString::from(principal));
     }
     runtime_args.extend([OsString::from("mcp"), OsString::from("serve")]);
+    if let Some(workspace) = args.workspace.as_ref() {
+        runtime_args.push(OsString::from("--workspace"));
+        runtime_args.push(workspace.as_os_str().to_os_string());
+    }
+    if let Some(timeout) = args.request_timeout.as_ref() {
+        runtime_args.push(OsString::from("--request-timeout"));
+        runtime_args.push(OsString::from(timeout));
+    }
 
     let mut standard_command = home
         .runtime_command_with_args(&runtime_args)
