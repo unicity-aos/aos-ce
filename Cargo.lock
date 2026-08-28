@@ -627,6 +627,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "capsule-workspace-recipes"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "capsule-surface-model",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.67"
 source = "registry+https://github.com/rust-lang/crates.io-index"

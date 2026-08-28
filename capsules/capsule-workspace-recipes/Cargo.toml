@@ -6,8 +6,6 @@ description = "Fixture adapter for adaptive workspace recipe persistence and rec
 license = "MIT OR Apache-2.0"
 publish = false
 
-[workspace]
-
 [lib]
 name = "capsule_workspace_recipes"
 path = "src/lib.rs"
