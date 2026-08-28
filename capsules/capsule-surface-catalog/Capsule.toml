@@ -1,0 +1,15 @@
+[package]
+name = "capsule-surface-catalog"
+version = "0.1.0"
+description = "Finite AOS semantic component catalog, theme packs, and validators"
+authors = ["Joshua J. Bouw <jjb@unicity-labs.com>"]
+astrid-version = ">=0.7.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# This unpublished library contract is not installed, activated, granted,
+# packaged as WASM, or exposed through adaptive-shell in this tranche.
+[[component]]
+id = "surface-catalog"
+file = "capsule_surface_catalog.wasm"
+type = "library"

@@ -4,6 +4,10 @@
 
 ### Added
 
+- An unpublished native Rust semantic catalog capsule that owns the finite v1
+  component inventory, complete primitive records, two complete theme packs,
+  hostile-value validation, fail-closed token fallback, safe unknown-component
+  fallback, A2UI declared-loss fixtures, and a catalog-owned Theme Lab matrix.
 - A bounded `aos-rhai` capsule with profile-scoped Rhai evaluation, strict
   resource ceilings, cooperative cancellation, and no script-visible host
   effects.

@@ -1,0 +1,15 @@
+[package]
+name = "capsule-surface-catalog"
+version = "0.1.0"
+edition = "2024"
+description = "Finite AOS semantic component catalog, theme packs, and validators"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "capsule_surface_catalog"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
