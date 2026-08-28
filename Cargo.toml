@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "apps/adaptive-shell",
     "crates/unicity-aos-bootstrap",
     "crates/aos-mcp-broker",
     "capsules/capsule-agents",

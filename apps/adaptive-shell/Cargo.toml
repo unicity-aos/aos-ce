@@ -1,0 +1,20 @@
+[package]
+name = "adaptive-shell"
+version = "0.1.0"
+edition = "2024"
+description = "Native Rust reference shell for the AOS Adaptive Workspace"
+publish = false
+license.workspace = true
+
+[lib]
+name = "adaptive_shell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "adaptive-shell"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
