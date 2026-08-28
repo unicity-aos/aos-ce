@@ -1,0 +1,15 @@
+[package]
+name = "capsule-surface-model"
+version = "0.1.0"
+description = "Canonical surface-model validator and document library"
+authors = ["Joshua J. Bouw <jjb@unicity-labs.com>"]
+astrid-version = ">=0.7.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The library contract is represented by a future library component. This
+# tranche is not installed, built as WASM, granted, or activated.
+[[component]]
+id = "surface-model"
+file = "capsule_surface_model.wasm"
+type = "library"
