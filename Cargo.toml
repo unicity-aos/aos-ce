@@ -19,6 +19,7 @@ members = [
     "capsules/capsule-prompt-builder",
     "capsules/capsule-react",
     "capsules/capsule-registry",
+    "capsules/capsule-rhai",
     "capsules/capsule-router",
     "capsules/capsule-session",
     "capsules/capsule-shell",

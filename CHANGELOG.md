@@ -4,6 +4,9 @@
 
 ### Added
 
+- A bounded `aos-rhai` capsule with profile-scoped Rhai evaluation, strict
+  resource ceilings, cooperative cancellation, and no script-visible host
+  effects.
 - A product-owned `aos daemon foreground` supervisor path that runs the
   persistent bundled daemon under the enforced CE distro, private runtime home,
   `.aos` workspace layout, and stderr logging environment. On Unix the daemon

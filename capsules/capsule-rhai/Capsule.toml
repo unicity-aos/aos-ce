@@ -1,0 +1,26 @@
+[package]
+name = "aos-rhai"
+version = "0.1.0"
+description = "Bounded Rhai script runtime with no script-visible host effects for Unicity AOS"
+authors = ["Unicity Labs <info@unicity-labs.com>"]
+astrid-version = ">=0.7.0"
+
+[[component]]
+id = "rhai-runtime"
+file = "aos_rhai.wasm"
+type = "executable"
+
+# This component intentionally has no [capabilities] section.  Its generated
+# entry points import Astrid IPC/sys plumbing, but scripts receive no
+# filesystem, network, process, clock, IPC, or credential primitives.  All
+# host effects remain unavailable unless a future, separately reviewed
+# capability-bearing adapter is composed around this runtime.
+
+[publish]
+"tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }
+"tool.v1.response.describe.*" = { wit = "@unicity-astrid/wit/tool/describe-response" }
+
+[subscribe]
+"tool.v1.execute.evaluate_script" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_evaluate_script" }
+"tool.v1.execute.list_script_profiles" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_list_script_profiles" }
+"tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }
