@@ -1,0 +1,21 @@
+[package]
+name = "capsule-surface-model"
+version = "0.1.0"
+edition = "2024"
+description = "Canonical AOS activity, recipe, surface, and patch model"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# This contract library is intentionally outside the parent workspace while its
+# storage and release boundaries are reviewed. The empty table detaches it from
+# workspace inheritance without changing the repository manifest.
+[workspace]
+
+[lib]
+name = "capsule_surface_model"
+path = "src/lib.rs"
+
+[dependencies]
+blake3 = "=1.8.5"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
