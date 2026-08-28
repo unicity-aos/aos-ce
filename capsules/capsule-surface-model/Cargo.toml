@@ -6,11 +6,6 @@ description = "Canonical AOS activity, recipe, surface, and patch model"
 license = "MIT OR Apache-2.0"
 publish = false
 
-# This contract library is intentionally outside the parent workspace while its
-# storage and release boundaries are reviewed. The empty table detaches it from
-# workspace inheritance without changing the repository manifest.
-[workspace]
-
 [lib]
 name = "capsule_surface_model"
 path = "src/lib.rs"
