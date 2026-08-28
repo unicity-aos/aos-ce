@@ -141,6 +141,6 @@ impl Options {
 
 fn print_help() {
     println!(
-        "AOS Adaptive Workspace native Rust runner\n\nUsage: adaptive-shell --headless [options]\n\nOptions:\n  --fixture desktop|phone|theme-lab\n  --theme dark|light|contrast\n  --density tight|cozy|open\n  --scale 90|100|118|200\n  --reduced-motion\n  --json\n  --help\n\nThe current tranche is headless by design; no browser, daemon, network, or native portal is assumed."
+        "AOS Adaptive Workspace native Rust runner\n\nUsage: adaptive-shell --headless [options]\n\nOptions:\n  --fixture desktop|phone|theme-lab\n  --theme dark|light|contrast\n  --density tight|cozy|open\n  --scale 90|100|118|200\n  --reduced-motion\n  --json\n  --help\n\nThe current tranche is headless by design; no browser, daemon, network, or native portal is assumed. Native compositor adapters must bind canonical Super-Space to the same Atlas action as Command-Space."
     );
 }

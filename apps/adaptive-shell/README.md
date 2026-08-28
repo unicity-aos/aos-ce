@@ -13,7 +13,10 @@ The current tranche is intentionally headless. It provides:
 - Fieldglass dark, light, and high-contrast themes with density, text scale,
   and reduced-motion settings;
 - a backend-neutral display list and deterministic snapshot runner;
-- an honest `NativePortal::Unavailable` fixture state.
+- an honest `NativePortal::Unavailable` fixture state;
+- the shell-chrome Activity Atlas with live deterministic previews, direct
+  Master/Stack/Tab/Float/New-activity placement, keyboard equivalents,
+  identity-preserving fixture transitions, and one-card phone presentation.
 
 No browser, DOM, WebView, JavaScript, daemon, network, LLM, process, or
 authority integration is present. A future winit/GPU adapter can consume the
@@ -24,3 +27,8 @@ cargo run -p adaptive-shell -- --headless --fixture desktop
 cargo run -p adaptive-shell -- --headless --fixture phone --theme light --json
 cargo run -p adaptive-shell -- --headless --fixture theme-lab --density open
 ```
+
+Atlas pointer, Command-Space, and Super-Space invocations reduce to the same
+shell action in tests.  A native compositor adapter must translate the platform's
+canonical Super-Space event to `Command::ToggleAtlas(AtlasInvocation::SuperSpace)`;
+the headless fixture does not attach a window backend.

@@ -1,0 +1,31 @@
+{
+  "fixture": "desktop",
+  "viewport": {
+    "width": 1440,
+    "height": 1000
+  },
+  "theme": "dark",
+  "density": "cozy",
+  "scale_percent": 100,
+  "reduced_motion": false,
+  "activity_id": "cats",
+  "recipe_revision": 1,
+  "semantic_digest": "a6eded3ad8577b6f0bd050a5cdf8e889b454cb9d26bc29d95b35884c18069551",
+  "display": {
+    "viewport": [
+      1440,
+      1000
+    ],
+    "commands": 43,
+    "fills": 6,
+    "strokes": 17,
+    "text": 18,
+    "icons": 2,
+    "placeholders": 0,
+    "digest": "08e3c974e2a6725b59c19262423eb3954ae3d5a71cf018a067541699f166df78"
+  },
+  "surface_count": 3,
+  "visible_surface_count": 3,
+  "native_portal": "unavailable",
+  "clock_ms": 1724847360000
+}
