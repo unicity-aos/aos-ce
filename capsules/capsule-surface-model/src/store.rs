@@ -46,6 +46,10 @@ pub enum PatchOp {
     SetRhai {
         reference: RhaiReference,
     },
+    RestoreRevision {
+        target_revision: u64,
+        target_digest: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -103,6 +107,7 @@ impl TryFrom<PatchInput> for Patch {
 }
 
 impl Patch {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         owner_ref: OpaqueOwnerRef,
         acting_principal: OpaquePrincipalRef,
@@ -201,6 +206,17 @@ impl Patch {
                     root.validate().map_err(PatchError::Scene)?;
                 }
                 PatchOp::ClearRoot => {}
+                PatchOp::RestoreRevision {
+                    target_revision,
+                    target_digest,
+                } => {
+                    if self.operations.len() != 1
+                        || *target_revision == 0
+                        || !valid_blake3_digest(target_digest)
+                    {
+                        return Err(PatchError::InvalidRestore);
+                    }
+                }
             }
         }
         Ok(())
@@ -236,6 +252,7 @@ pub struct ConflictCandidate {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RollbackRequest {
+    pub owner_ref: OpaqueOwnerRef,
     pub recipe_id: String,
     pub target_revision: u64,
     pub acting_principal: OpaquePrincipalRef,
@@ -316,7 +333,8 @@ impl RecipeStore {
         let recipe = self
             .current
             .get(&patch.recipe_id)
-            .ok_or(PatchError::UnknownRecipe)?;
+            .ok_or(PatchError::UnknownRecipe)?
+            .clone();
         if recipe.owner_ref != patch.owner_ref {
             return Err(PatchError::OwnerMismatch);
         }
@@ -329,8 +347,25 @@ impl RecipeStore {
 
         let mut candidate = recipe.clone();
         let mut visual_changed = false;
-        for operation in &patch.operations {
-            apply_operation(&mut candidate, operation, &mut visual_changed)?;
+        if let [
+            PatchOp::RestoreRevision {
+                target_revision,
+                target_digest,
+            },
+        ] = patch.operations.as_slice()
+        {
+            restore_revision(
+                &mut candidate,
+                self.history
+                    .get(&(patch.recipe_id.clone(), *target_revision))
+                    .ok_or(PatchError::UnknownRecipeRevision)?,
+                target_digest,
+                &mut visual_changed,
+            )?;
+        } else {
+            for operation in &patch.operations {
+                apply_operation(&mut candidate, operation, &mut visual_changed)?;
+            }
         }
         let parent_revision = recipe.revision;
         let parent_digest = recipe.digest.clone();
@@ -415,46 +450,48 @@ impl RecipeStore {
         request: RollbackRequest,
         patch_id: impl Into<String>,
     ) -> Result<Recipe, PatchError> {
-        if request.acting_principal == request.reviewer {
-            return Err(PatchError::SelfApproved);
-        }
-        request.acting_principal.validate()?;
-        request.reviewer.validate()?;
+        let patch_id = patch_id.into();
         let current = self
             .current
             .get(&request.recipe_id)
             .ok_or(PatchError::UnknownRecipe)?
             .clone();
-        if request.receipt.is_empty() || request.receipt.len() > 256 {
-            return Err(PatchError::MetadataTooLarge);
+        if current.owner_ref != request.owner_ref {
+            return Err(PatchError::OwnerMismatch);
         }
-        let target = self
+        if let Some(existing) = self
+            .applied_patch_by_revision
+            .values()
+            .find(|patch| patch.patch_id == patch_id)
+        {
+            return existing_restore_outcome(existing, &request, current);
+        }
+        let target_digest = self
             .history
             .get(&(request.recipe_id.clone(), request.target_revision))
             .ok_or(PatchError::UnknownRecipeRevision)?
+            .digest
             .clone();
-        let mut candidate = target;
-        candidate.bindings = current.bindings.clone();
-        candidate.revision = current.revision;
-        candidate
-            .finish_revision(current.revision, current.digest.clone())
-            .map_err(PatchError::Recipe)?;
-        self.history.insert(
-            (candidate.recipe_id.clone(), candidate.revision),
-            candidate.clone(),
-        );
-        self.current
-            .insert(candidate.recipe_id.clone(), candidate.clone());
-        let intent = digest_parts(&(
-            &candidate.owner_ref,
-            &candidate.recipe_id,
+        let patch = Patch::new(
+            request.owner_ref,
+            request.acting_principal,
+            request.reviewer,
+            request.receipt,
+            patch_id,
+            request.recipe_id,
             current.revision,
-            &current.digest,
-            &candidate.parent_revision,
-        ))
-        .map_err(|_| PatchError::Serialization)?;
-        self.applied_patches.insert(patch_id.into(), intent);
-        Ok(candidate)
+            current.digest,
+            format!("rollback to revision {}", request.target_revision),
+            vec![PatchOp::RestoreRevision {
+                target_revision: request.target_revision,
+                target_digest,
+            }],
+        )?;
+        match self.apply_patch(&patch)? {
+            PatchOutcome::Applied { recipe, .. } | PatchOutcome::AlreadyApplied(recipe) => {
+                Ok(recipe)
+            }
+        }
     }
 
     pub fn replay(recipe_json: &[u8], patches: &[Patch]) -> Result<Recipe, PatchError> {
@@ -525,7 +562,50 @@ fn apply_operation(
         }
         PatchOp::SetBinding { binding } => recipe.bindings.binding = Some(binding.clone()),
         PatchOp::SetRhai { reference } => recipe.bindings.rhai = Some(reference.clone()),
+        PatchOp::RestoreRevision { .. } => return Err(PatchError::InvalidRestore),
     }
+    Ok(())
+}
+
+fn existing_restore_outcome(
+    existing: &Patch,
+    request: &RollbackRequest,
+    current: Recipe,
+) -> Result<Recipe, PatchError> {
+    match existing.operations.as_slice() {
+        [
+            PatchOp::RestoreRevision {
+                target_revision, ..
+            },
+        ] if existing.owner_ref == request.owner_ref
+            && existing.recipe_id == request.recipe_id
+            && *target_revision == request.target_revision =>
+        {
+            Ok(current)
+        }
+        _ => Err(PatchError::PatchIdConflict {
+            patch_id: existing.patch_id.clone(),
+        }),
+    }
+}
+
+fn restore_revision(
+    recipe: &mut Recipe,
+    target: &Recipe,
+    expected_digest: &str,
+    visual_changed: &mut bool,
+) -> Result<(), PatchError> {
+    if target.digest != expected_digest {
+        return Err(PatchError::InvalidRestore);
+    }
+    if target.owner_ref != recipe.owner_ref || target.recipe_id != recipe.recipe_id {
+        return Err(PatchError::OwnerMismatch);
+    }
+    *visual_changed = recipe.root != target.root || recipe.theme_id != target.theme_id;
+    recipe.root = target.root.clone();
+    recipe.theme_id = target.theme_id.clone();
+    recipe.metadata = target.metadata.clone();
+    recipe.bindings = target.bindings.clone();
     Ok(())
 }
 
@@ -614,6 +694,7 @@ pub enum PatchError {
     ReplayUnexpectedlyIdempotent,
     DisjointFieldMergeRejected,
     NotConflicted,
+    InvalidRestore,
 }
 
 impl fmt::Display for PatchError {
@@ -658,6 +739,7 @@ impl fmt::Display for PatchError {
                 f.write_str("conflicting fields are not narrowly disjoint")
             }
             Self::NotConflicted => f.write_str("input is not in conflict"),
+            Self::InvalidRestore => f.write_str("restore patch is invalid"),
         }
     }
 }

@@ -24,8 +24,8 @@ fn valid_mime(value: &str) -> bool {
     let (kind, parameters) = value.split_once(';').unwrap_or((value, ""));
     if !bounded(value, 128)
         || parameters.contains(char::is_control)
-        || parameters.contains("path=")
-        || parameters.contains("home=")
+        || parameters.to_ascii_lowercase().contains("path=")
+        || parameters.to_ascii_lowercase().contains("home=")
     {
         return false;
     }
@@ -224,6 +224,9 @@ impl BindingSet {
     pub fn validate(&self) -> Result<(), DocumentError> {
         self.binding.as_ref().map_or(Ok(()), Binding::validate)?;
         self.rhai.as_ref().map_or(Ok(()), RhaiReference::validate)?;
+        self.extensions
+            .validate()
+            .map_err(|_| DocumentError::Invalid("extensions"))?;
         Ok(())
     }
 

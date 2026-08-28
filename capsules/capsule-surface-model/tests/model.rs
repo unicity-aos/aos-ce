@@ -4,7 +4,7 @@ use capsule_surface_model::a2ui::{
     export_projection,
 };
 use capsule_surface_model::activity::OpaqueOwnerRef;
-use capsule_surface_model::canonical::{CanonicalJson, parse_canonical};
+use capsule_surface_model::canonical::{CanonicalJson, canonical_string, parse_canonical};
 use capsule_surface_model::components::{ComponentKind, PropValue, SemanticNode, StateSet};
 use capsule_surface_model::error::{ExtensionError, Extensions};
 use capsule_surface_model::fixtures::{
@@ -148,23 +148,28 @@ fn rollback_appends_pointer_and_keeps_history() {
             },
         ))
         .expect("two");
+    let request = RollbackRequest {
+        owner_ref: owner(),
+        recipe_id: recipe.recipe_id.clone(),
+        target_revision: 1,
+        acting_principal: actor(),
+        reviewer: reviewer(),
+        receipt: "rollback-review".to_owned(),
+    };
     let rolled = store
-        .rollback(
-            RollbackRequest {
-                recipe_id: recipe.recipe_id.clone(),
-                target_revision: 1,
-                acting_principal: actor(),
-                reviewer: reviewer(),
-                receipt: "rollback-review".to_owned(),
-            },
-            "rollback-1",
-        )
+        .rollback(request.clone(), "rollback-1")
         .expect("rollback");
     assert_eq!(rolled.revision, 4);
     assert_eq!(rolled.parent_revision, Some(3));
     assert_eq!(rolled.root, recipe.root);
+    assert_eq!(rolled.theme_id, recipe.theme_id);
     assert!(store.revision(recipe.recipe_id.as_str(), 2).is_some());
     assert!(store.revision(recipe.recipe_id.as_str(), 1).is_some());
+    let replayed = store
+        .rollback(request, "rollback-1")
+        .expect("idempotent rollback");
+    assert_eq!(replayed.revision, 4);
+    assert_eq!(replayed.digest, rolled.digest);
 }
 
 #[test]
@@ -519,4 +524,198 @@ fn activity_and_surface_docs_validate() {
     let surface = Surface::from_recipe(&recipe, "surface-1", 1).unwrap();
     surface.validate().unwrap();
     assert_eq!(surface.schema, "aos.surface@1");
+}
+
+#[test]
+fn hostile_owner_extension_and_surface_documents_fail_closed() {
+    assert!(
+        Activity::new(
+            "activity",
+            OpaqueOwnerRef::Principal("../../home/owner".to_owned()),
+            "title",
+            "recipe",
+        )
+        .is_err()
+    );
+    let path_owner = r#"{"activity_id":"activity","owner_ref":{"id":"../../home/owner","kind":"principal"},"recipe_id":"recipe","schema":"aos.activity@1","title":"title"}"#;
+    assert!(parse_canonical::<Activity>(path_owner.as_bytes()).is_err());
+
+    assert!(
+        Extensions::new(vec![(
+            "../../home".to_owned(),
+            CanonicalJson::String("path".to_owned()),
+        )])
+        .is_err()
+    );
+    assert!(
+        Extensions::new(vec![(
+            "vendor.example/oversize".to_owned(),
+            CanonicalJson::String("x".repeat(4097)),
+        )])
+        .is_err()
+    );
+
+    let mut recipe = fixture_recipe();
+    recipe.bindings.extensions = Extensions(vec![
+        (
+            "../../home".to_owned(),
+            CanonicalJson::String("path".to_owned()),
+        ),
+        (
+            "vendor.example/oversize".to_owned(),
+            CanonicalJson::String("x".repeat(4097)),
+        ),
+    ]);
+    assert_eq!(recipe.validate(), Err(RecipeValidationError::Identity));
+    let hostile_extensions = canonical_string(&recipe).expect("serialize constructed recipe");
+    assert!(parse_canonical::<Recipe>(hostile_extensions.as_bytes()).is_err());
+
+    assert!(Surface::from_recipe(&fixture_recipe(), "../../home/surface", 1).is_err());
+    let mut surface = Surface::from_recipe(&fixture_recipe(), "surface-1", 1).unwrap();
+    surface.schema = "aos.surface@evil".to_owned();
+    surface.surface_id = "../../home/surface".to_owned();
+    let surface_json = canonical_string(&surface).expect("serialize constructed surface");
+    assert!(parse_canonical::<Surface>(surface_json.as_bytes()).is_err());
+}
+
+#[test]
+fn recipe_parent_link_requires_contiguous_blake3_digest() {
+    let mut recipe = fixture_recipe();
+    recipe.revision = 10;
+    recipe.parent_revision = Some(8);
+    recipe.parent_digest = "not-a-digest".to_owned();
+    assert_eq!(recipe.validate(), Err(RecipeValidationError::ParentLink));
+    assert!(recipe.refresh_after_declared_change().is_err());
+    let json = canonical_string(&recipe).expect("serialize constructed recipe");
+    assert!(parse_canonical::<Recipe>(json.as_bytes()).is_err());
+}
+
+#[test]
+fn a2ui_export_projects_button_action_and_declares_unprojected_loss() {
+    let mut root = fixture_root();
+    let mut button = SemanticNode::new("button", ComponentKind::Button, "Save");
+    button.props = BTreeMap::from([
+        ("label".to_owned(), PropValue::Text("Save".to_owned())),
+        ("action".to_owned(), PropValue::Token("save".to_owned())),
+    ])
+    .try_into()
+    .expect("button props");
+    root.push(button.clone()).expect("button child");
+    let recipe = Recipe::new(owner(), "button-recipe", "theme", root).unwrap();
+    let projection = export_projection(
+        &recipe,
+        "surface",
+        A2uiVersion::V1_0,
+        &ExportCatalog::minimal(),
+    )
+    .expect("projection");
+    assert!(!projection.lossy);
+    assert_eq!(projection.degraded_nodes, 0);
+    let json = canonical_string(&projection).expect("projection serializes");
+    assert!(json.contains("save"));
+
+    let mut lossy_root = fixture_root();
+    let mut extra = button;
+    extra.props = extra
+        .props
+        .with("status".to_owned(), PropValue::Text("ready".to_owned()))
+        .expect("extra prop");
+    lossy_root.push(extra).expect("lossy button");
+    let lossy_recipe = Recipe::new(owner(), "button-lossy", "theme", lossy_root).unwrap();
+    let lossy = export_projection(
+        &lossy_recipe,
+        "surface",
+        A2uiVersion::V0_9,
+        &ExportCatalog::minimal(),
+    )
+    .expect("lossy projection");
+    assert!(lossy.lossy);
+    assert!(lossy.degraded_nodes >= 1);
+}
+
+#[test]
+fn rollback_restore_patch_replays_and_rejects_cross_owner() {
+    let recipe = fixture_recipe();
+    let mut store = RecipeStore::new();
+    store.insert(recipe.clone()).expect("insert");
+    let first = reviewed_patch(&recipe, "one", PatchOp::ClearRoot);
+    store.apply_patch(&first).expect("one");
+    let after_one = store.get(recipe.recipe_id.as_str()).unwrap().clone();
+    let second = reviewed_patch(
+        &after_one,
+        "two",
+        PatchOp::SetTheme {
+            theme_id: "second-theme".to_owned(),
+        },
+    );
+    store.apply_patch(&second).expect("two");
+    let head = store.get(recipe.recipe_id.as_str()).unwrap().clone();
+    let restore = Patch::new(
+        owner(),
+        actor(),
+        reviewer(),
+        "rollback-review",
+        "rollback-1",
+        recipe.recipe_id.clone(),
+        head.revision,
+        head.digest.clone(),
+        "rollback to revision 1",
+        vec![PatchOp::RestoreRevision {
+            target_revision: 1,
+            target_digest: recipe.digest.clone(),
+        }],
+    )
+    .expect("restore patch");
+    let applied = store.apply_patch(&restore).expect("restore applied");
+    assert!(matches!(
+        applied,
+        capsule_surface_model::store::PatchOutcome::Applied { .. }
+    ));
+    let replayed = store.apply_patch(&restore).expect("restore idempotent");
+    assert!(matches!(
+        replayed,
+        capsule_surface_model::store::PatchOutcome::AlreadyApplied(_)
+    ));
+    let live = store.get(recipe.recipe_id.as_str()).unwrap().clone();
+    assert_eq!(live.revision, 4);
+    assert_eq!(live.root, recipe.root);
+    assert_eq!(live.theme_id, recipe.theme_id);
+
+    let recipe_json =
+        capsule_surface_model::canonical::canonical_bytes(&recipe).expect("canonical");
+    let replay =
+        RecipeStore::replay(&recipe_json, &[first, second, restore.clone()]).expect("replay");
+    assert_eq!(replay, live);
+
+    let foreign = Patch::new(
+        OpaqueOwnerRef::User("uid:user:other".to_owned()),
+        actor(),
+        reviewer(),
+        "receipt",
+        "foreign-rollback",
+        recipe.recipe_id.clone(),
+        live.revision,
+        live.digest.clone(),
+        "cross owner restore",
+        vec![PatchOp::RestoreRevision {
+            target_revision: 1,
+            target_digest: recipe.digest.clone(),
+        }],
+    )
+    .expect("foreign restore shape");
+    assert_eq!(store.apply_patch(&foreign), Err(PatchError::OwnerMismatch));
+    assert_eq!(
+        store.rollback(
+            RollbackRequest {
+                owner_ref: OpaqueOwnerRef::User("uid:user:other".to_owned()),
+                recipe_id: recipe.recipe_id.clone(),
+                target_revision: 1,
+                acting_principal: actor(),
+                reviewer: reviewer(),
+                receipt: "foreign-helper".to_owned(),
+            },
+            "foreign-helper",
+        ),
+        Err(PatchError::OwnerMismatch)
+    );
 }

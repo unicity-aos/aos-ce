@@ -2,7 +2,7 @@
 
 use crate::activity::OpaqueOwnerRef;
 use crate::bindings::BindingSet;
-use crate::canonical::digest_parts;
+use crate::canonical::{digest_parts, valid_blake3_digest};
 use crate::components::{MAX_SEMANTIC_TEXT_BYTES, PropValue, SceneError, SemanticNode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -18,6 +18,14 @@ pub const MAX_RECIPE_METADATA_BYTES: usize = 2048;
 
 fn bounded_nonempty(value: &str, maximum: usize) -> bool {
     !value.is_empty() && value.len() <= maximum
+}
+
+fn valid_document_id(value: &str) -> bool {
+    bounded_nonempty(value, MAX_ID_BYTES)
+        && !value.contains("..")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
 }
 
 pub(crate) fn value_text_len(value: &PropValue) -> usize {
@@ -68,21 +76,20 @@ impl Activity {
 
     pub fn validate(&self) -> Result<(), RecipeValidationError> {
         if self.schema != ACTIVITY_SCHEMA
-            || !bounded_nonempty(&self.activity_id, MAX_ID_BYTES)
-            || self.owner_ref.id().len() > MAX_ID_BYTES
-            || self.owner_ref.id().is_empty()
+            || !valid_document_id(&self.activity_id)
+            || !self.owner_ref.is_valid()
             || !bounded_nonempty(&self.title, MAX_SEMANTIC_TEXT_BYTES)
-            || !bounded_nonempty(&self.recipe_id, MAX_ID_BYTES)
+            || !valid_document_id(&self.recipe_id)
         {
             return Err(RecipeValidationError::Identity);
         }
         self.bindings
             .validate()
             .map_err(|_| RecipeValidationError::Identity)?;
-        if let Some(surface) = &self.current_surface {
-            if surface.incarnation == 0 || !bounded_nonempty(&surface.surface_id, MAX_ID_BYTES) {
-                return Err(RecipeValidationError::Identity);
-            }
+        if let Some(surface) = &self.current_surface
+            && (surface.incarnation == 0 || !valid_document_id(&surface.surface_id))
+        {
+            return Err(RecipeValidationError::Identity);
         }
         Ok(())
     }
@@ -237,23 +244,22 @@ impl Recipe {
         if self.schema != RECIPE_SCHEMA {
             return Err(RecipeValidationError::Schema);
         }
-        if !bounded_nonempty(self.owner_ref.id(), MAX_ID_BYTES)
-            || !self.owner_ref.is_valid()
-            || !bounded_nonempty(&self.recipe_id, MAX_ID_BYTES)
+        if !self.owner_ref.is_valid()
+            || !valid_document_id(&self.recipe_id)
             || !bounded_nonempty(&self.theme_id, 128)
             || self.revision == 0
         {
             return Err(RecipeValidationError::Identity);
         }
-        let has_parent = !self.parent_digest.is_empty() || self.parent_revision.is_some();
-        if has_parent != (self.revision > 1) {
-            return Err(RecipeValidationError::ParentLink);
-        }
-        if self.parent_revision.is_some() != has_parent
-            || (has_parent && self.parent_digest.is_empty())
-            || (has_parent && self.parent_revision.unwrap() == 0)
-        {
-            return Err(RecipeValidationError::ParentLink);
+        match (
+            self.revision,
+            self.parent_revision.as_ref(),
+            self.parent_digest.as_str(),
+        ) {
+            (1, None, "") => {}
+            (revision, Some(parent), digest)
+                if *parent >= 1 && *parent + 1 == revision && valid_blake3_digest(digest) => {}
+            _ => return Err(RecipeValidationError::ParentLink),
         }
         if self.metadata.len() > MAX_RECIPE_METADATA {
             return Err(RecipeValidationError::MetadataTooLarge);

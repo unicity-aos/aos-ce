@@ -7,10 +7,16 @@ use crate::recipe::{Recipe, RecipeValidationError, SURFACE_SCHEMA};
 use serde::{Deserialize, Serialize};
 
 fn valid_surface_id(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 256
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.contains("..")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "SurfaceInput")]
 pub struct Surface {
     pub schema: String,
     pub surface_id: String,
@@ -56,10 +62,43 @@ impl Surface {
             || self.recipe_revision == 0
             || self.incarnation == 0
             || !valid_blake3_digest(&self.recipe_digest)
-            || !self.bindings.validate().is_ok()
+            || self.bindings.validate().is_err()
         {
             return Err(SceneError::InvalidSurfaceId);
         }
         self.root.validate().map(|_| ())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SurfaceInput {
+    schema: String,
+    surface_id: String,
+    recipe_id: String,
+    recipe_revision: u64,
+    recipe_digest: String,
+    incarnation: u64,
+    #[serde(flatten)]
+    bindings: BindingSet,
+    root: SemanticNode,
+}
+
+impl TryFrom<SurfaceInput> for Surface {
+    type Error = SceneError;
+
+    fn try_from(input: SurfaceInput) -> Result<Self, Self::Error> {
+        let value = Self {
+            schema: input.schema,
+            surface_id: input.surface_id,
+            recipe_id: input.recipe_id,
+            recipe_revision: input.recipe_revision,
+            recipe_digest: input.recipe_digest,
+            incarnation: input.incarnation,
+            bindings: input.bindings,
+            root: input.root,
+        };
+        value.validate()?;
+        Ok(value)
     }
 }

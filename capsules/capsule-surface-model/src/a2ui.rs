@@ -90,6 +90,7 @@ pub enum StorageImport {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "message", rename_all = "kebab-case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum NonStorageCall {
     Renderer {
         frame: CanonicalJson,
@@ -101,6 +102,7 @@ pub enum NonStorageCall {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ImportedDocument {
     Recipe(Recipe),
     Patch(Patch),
@@ -401,13 +403,41 @@ fn project_node(
         return Ok(CanonicalJson::Object(object));
     }
     let mut object = BTreeMap::new();
+    let mut projected = BTreeSet::new();
     object.insert(
         "kind".to_owned(),
         CanonicalJson::String(component_label(node.kind)),
     );
-    if let Some(accessible_name) = node.props.get("label").or(node.props.get("text")) {
-        if let Some(text) = prop_text(accessible_name) {
-            object.insert("text".to_owned(), CanonicalJson::String(text));
+    if let Some(accessible_name) = node.props.get("label").or(node.props.get("text"))
+        && let Some(text) = prop_text(accessible_name)
+    {
+        object.insert("text".to_owned(), CanonicalJson::String(text));
+        if node.props.get("label").is_some() {
+            projected.insert("label");
+        } else {
+            projected.insert("text");
+        }
+    }
+    match node.props.get("action") {
+        Some(value) => {
+            projected.insert("action");
+            match prop_text(value) {
+                Some(text) => {
+                    object.insert("action".to_owned(), CanonicalJson::String(text));
+                }
+                None => {
+                    *degraded = degraded.saturating_add(1);
+                }
+            }
+        }
+        None if node.kind == ComponentKind::Button => {
+            *degraded = degraded.saturating_add(1);
+        }
+        None => {}
+    }
+    for (key, _) in node.props.iter() {
+        if !projected.contains(key.as_str()) {
+            *degraded = degraded.saturating_add(1);
         }
     }
     let children = node

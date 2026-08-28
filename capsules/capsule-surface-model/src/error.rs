@@ -1,10 +1,21 @@
 //! Document validation and extension fallback errors.
 
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
 /// An extension is namespaced, bounded, and stored verbatim.
-#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct Extensions(pub Vec<(String, crate::canonical::CanonicalJson)>);
+
+impl<'de> Deserialize<'de> for Extensions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let values = Vec::<(String, crate::canonical::CanonicalJson)>::deserialize(deserializer)?;
+        Self::new(values).map_err(serde::de::Error::custom)
+    }
+}
 
 impl Extensions {
     /// Store extensions after checking that every key has a declared namespace.
@@ -13,7 +24,7 @@ impl Extensions {
     ) -> Result<Self, ExtensionError> {
         let mut seen = std::collections::BTreeSet::new();
         for (key, value) in &values {
-            Self::validate_key(&key)?;
+            Self::validate_key(key)?;
             let canonical = value.len_bytes();
             if canonical > MAX_EXTENSION_VALUE_BYTES {
                 return Err(ExtensionError::TooLarge(key.to_string()));
@@ -39,6 +50,10 @@ impl Extensions {
             return Err(ExtensionError::InvalidKey(key.to_owned()));
         }
         Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), ExtensionError> {
+        Self::new(self.0.clone()).map(|_| ())
     }
 
     /// Read an extension or return the explicit fallback error.

@@ -39,9 +39,7 @@ impl Serialize for CanonicalJson {
             Self::Number(value) => value.serialize(serializer),
             Self::String(value) => serializer.serialize_str(value),
             Self::Array(values) => values.serialize(serializer),
-            Self::Object(values) => {
-                serializer.collect_map(values.iter().map(|(key, value)| (key, value)))
-            }
+            Self::Object(values) => serializer.collect_map(values.iter()),
         }
     }
 }

@@ -42,12 +42,15 @@ impl<'de> Deserialize<'de> for OpaqueOwnerRef {
             Principal(String),
             Fleet(String),
         }
-        let valid = |value: &str| !value.is_empty() && value.len() <= MAX_ID_BYTES;
-        match Raw::deserialize(deserializer)? {
-            Raw::User(value) if valid(&value) => Ok(Self::User(value)),
-            Raw::Principal(value) if valid(&value) => Ok(Self::Principal(value)),
-            Raw::Fleet(value) if valid(&value) => Ok(Self::Fleet(value)),
-            _ => Err(serde::de::Error::custom("invalid opaque owner reference")),
+        let parsed = match Raw::deserialize(deserializer)? {
+            Raw::User(value) => Self::User(value),
+            Raw::Principal(value) => Self::Principal(value),
+            Raw::Fleet(value) => Self::Fleet(value),
+        };
+        if parsed.is_valid() {
+            Ok(parsed)
+        } else {
+            Err(serde::de::Error::custom("invalid opaque owner reference"))
         }
     }
 }
@@ -99,12 +102,15 @@ impl<'de> Deserialize<'de> for OpaquePrincipalRef {
             Agent(String),
             Service(String),
         }
-        let valid = |value: &str| !value.is_empty() && value.len() <= MAX_ID_BYTES;
-        match Raw::deserialize(deserializer)? {
-            Raw::User(value) if valid(&value) => Ok(Self::User(value)),
-            Raw::Agent(value) if valid(&value) => Ok(Self::Agent(value)),
-            Raw::Service(value) if valid(&value) => Ok(Self::Service(value)),
-            _ => Err(serde::de::Error::custom("invalid opaque principal")),
+        let parsed = match Raw::deserialize(deserializer)? {
+            Raw::User(value) => Self::User(value),
+            Raw::Agent(value) => Self::Agent(value),
+            Raw::Service(value) => Self::Service(value),
+        };
+        if parsed.is_valid() {
+            Ok(parsed)
+        } else {
+            Err(serde::de::Error::custom("invalid opaque principal"))
         }
     }
 }
