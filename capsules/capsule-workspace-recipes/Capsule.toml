@@ -1,0 +1,11 @@
+[package]
+name = "capsule-workspace-recipes"
+version = "0.1.0"
+description = "Adaptive workspace recipe persistence fixture adapter"
+authors = ["Joshua J. Bouw <jjb@unicity-labs.com>"]
+astrid-version = ">=0.7.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# This detached artifact is not installed, activated, granted, or published.
+# The persistence proof uses the private fixture adapter and host tests.
