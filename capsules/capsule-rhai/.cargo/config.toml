@@ -1,0 +1,9 @@
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+# The host supplies random bytes to OS-less WASM capsules through its custom
+# random-source interface.  Rhai itself does not request randomness, but the
+# SDK's generated tool plumbing does.
+rustflags = ["--cfg=getrandom_backend=\"custom\""]
+

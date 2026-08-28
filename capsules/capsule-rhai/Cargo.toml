@@ -1,0 +1,22 @@
+[package]
+name = "aos-rhai"
+version = "0.1.0"
+edition = "2024"
+description = "Bounded Rhai script runtime with no script-visible host effects for Unicity AOS"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+astrid-sdk = { workspace = true }
+# Rhai 1.26 enables ahash's compile-time-rng feature unconditionally.  Enable
+# ahash's runtime-rng feature as well so production engines use fresh host
+# entropy for hash-table keys while the release WASM remains independent of
+# compile-time random bytes.  The direct dependency exists solely to unify the
+# feature set of Rhai's transitive ahash dependency.
+ahash = { version = "0.8.12", default-features = false, features = ["runtime-rng"] }
+rhai = { version = "1.26.0", default-features = false, features = ["std", "serde", "no_time", "no_module"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
