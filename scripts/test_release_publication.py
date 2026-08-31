@@ -113,7 +113,7 @@ class ReleasePublicationTests(unittest.TestCase):
             artifacts, compatibility = self.fixture(Path(temp))
             payloads = self.validate(artifacts, compatibility)
             self.assertIn(f"unicity-aos-{VERSION}-release.toml", payloads)
-            self.assertEqual(len([name for name in payloads if name.endswith(".capsule")]), 22)
+            self.assertEqual(len([name for name in payloads if name.endswith(".capsule")]), 23)
 
     def test_rejects_missing_asset(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

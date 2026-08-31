@@ -1,0 +1,15 @@
+[package]
+name = "aos-orcarouter"
+version = "0.1.0"
+edition = "2024"
+description = "OrcaRouter LLM provider capsule for Unicity AOS"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+astrid-sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

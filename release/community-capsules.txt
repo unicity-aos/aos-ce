@@ -6,6 +6,7 @@ capsule-cli
 capsule-mcp
 capsule-registry
 capsule-openai-compat
+capsule-orcarouter
 capsule-react
 capsule-session
 capsule-identity

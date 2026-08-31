@@ -234,6 +234,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aos-orcarouter"
+version = "0.1.0"
+dependencies = [
+ "astrid-sdk",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "aos-prompt-builder"
 version = "0.2.0"
 dependencies = [
