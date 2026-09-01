@@ -181,7 +181,8 @@ while read -r expected_digest expected_filename; do
     [[ -n "$expected_digest" ]] || continue
     expected_base=${expected_filename%_arm64.deb}
     expected_package=${expected_base%%_*}
-    expected_package_version=${expected_base#*_}
+    expected_package_version=$(printf '%s\n' "${package_specs[@]}" |
+        awk -F= -v package="$expected_package" '$1 == package { print substr($0, index($0, "=") + 1); exit }')
     actual_digest=$(awk -F'\t' -v package="$expected_package" -v version="$expected_package_version" '
         $1 == package && $2 == version { digest = $4 }
         END { print digest }
