@@ -35,12 +35,25 @@ if [[ "$builder_oci" != "$expected_builder_oci" ]]; then
     echo "SOURCES.lock has an unexpected builder: $builder_oci" >&2
     exit 66
 fi
-if [[ "$(make --version | sed -n '1s/^GNU Make \([^ ]*\).*$/\1/p')" != 4.3 ]] ||
-    [[ "$(gcc -dumpfullversion)" != 13.2.0 ]] ||
-    ! clang-18 --version | grep -qF '18.1.3'; then
-    echo "origin A requires the pinned Ubuntu make/gcc/clang-18 host tools" >&2
-    exit 69
-fi
+dpkg_version() {
+    dpkg-query -W -f='${Version}' "$1"
+}
+
+for package_version in \
+    'make=4.3-4.1build2' \
+    'gcc=4:13.2.0-7ubuntu1' \
+    'clang-18=1:18.1.3-1ubuntu1' \
+    'llvm-18=1:18.1.3-1ubuntu1' \
+    'lld-18=1:18.1.3-1ubuntu1'
+do
+    package=${package_version%%=*}
+    expected=${package_version#*=}
+    actual=$(dpkg_version "$package")
+    if [[ "$actual" != "$expected" ]]; then
+        echo "origin A host package $package is $actual; expected $expected" >&2
+        exit 69
+    fi
+done
 
 [[ -e "$work" ]] && { echo "origin A work directory must not exist: $work" >&2; exit 65; }
 mkdir -p "$work/downloads" "$output"
