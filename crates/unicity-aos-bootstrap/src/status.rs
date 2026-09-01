@@ -14,6 +14,14 @@ use crate::AosHome;
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_COMPATIBILITY: &str = include_str!("../../../release/runtime-compatibility.toml");
+const COORDINATION_MARKERS: [&str; 6] = [
+    "system.sock",
+    "system.pid",
+    "system.ready",
+    "system.token",
+    "mcp-gateway.sock",
+    "mcp-gateway.ready",
+];
 
 /// Product status derived from the typed runtime status response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -109,13 +117,10 @@ pub async fn read_for_principal(
 /// every transient marker is gone and the runtime lock can be acquired.
 pub fn confirm_stopped(home: &AosHome) -> Result<AosStatus, String> {
     let run_dir = home.runtime_home().join("run");
-    for marker in ["system.sock", "system.pid", "system.ready", "system.token"] {
+    let mut present = Vec::new();
+    for marker in COORDINATION_MARKERS {
         match fs::symlink_metadata(run_dir.join(marker)) {
-            Ok(_) => {
-                return Err(format!(
-                    "runtime coordination marker {marker} is still present"
-                ));
-            }
+            Ok(_) => present.push(marker),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(format!(
@@ -123,6 +128,12 @@ pub fn confirm_stopped(home: &AosHome) -> Result<AosStatus, String> {
                 ));
             }
         }
+    }
+    if !present.is_empty() {
+        return Err(format!(
+            "runtime coordination marker(s) still present: {}",
+            present.join(", ")
+        ));
     }
 
     let lock_path = run_dir.join("system.lock");
@@ -246,5 +257,39 @@ mod tests {
 
         fs2::FileExt::unlock(&lock).expect("release runtime lock");
         fs::remove_dir_all(root).expect("remove running status fixture");
+    }
+
+    #[test]
+    fn refuses_to_report_stopped_while_any_coordination_marker_remains() {
+        for marker in super::COORDINATION_MARKERS {
+            let root = temporary_status_home(marker);
+            let home = AosHome::from_root(&root);
+            let run_dir = home.runtime_home().join("run");
+            fs::create_dir_all(&run_dir).expect("create runtime run dir");
+            fs::write(run_dir.join(marker), []).expect("create coordination marker");
+
+            let error = confirm_stopped(&home).expect_err("marker must prevent stopped status");
+            assert!(error.contains(marker), "{marker} was not named in: {error}");
+
+            fs::remove_dir_all(root).expect("remove marker fixture");
+        }
+    }
+
+    #[test]
+    fn reports_every_remaining_system_and_gateway_marker() {
+        let root = temporary_status_home("combined-markers");
+        let home = AosHome::from_root(&root);
+        let run_dir = home.runtime_home().join("run");
+        fs::create_dir_all(&run_dir).expect("create runtime run dir");
+        for marker in super::COORDINATION_MARKERS {
+            fs::write(run_dir.join(marker), []).expect("create coordination marker");
+        }
+
+        let error = confirm_stopped(&home).expect_err("markers must prevent stopped status");
+        for marker in super::COORDINATION_MARKERS {
+            assert!(error.contains(marker), "{marker} was not named in: {error}");
+        }
+
+        fs::remove_dir_all(root).expect("remove combined marker fixture");
     }
 }
