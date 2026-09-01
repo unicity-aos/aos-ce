@@ -130,6 +130,27 @@ package_specs=(
     'cpp-13-aarch64-linux-gnu=13.2.0-23ubuntu4'
     'libgcc-13-dev=13.2.0-23ubuntu4'
     'libstdc++-13-dev=13.2.0-23ubuntu4'
+    # Match snapshot-era runtime dependencies rather than the newer builder
+    # base image; the container is disposable and installation is explicit.
+    'bzip2=1.0.8-5.1'
+    'libbz2-1.0=1.0.8-5.1'
+    'gcc-14-base=14-20240412-0ubuntu1'
+    'libasan8=14-20240412-0ubuntu1'
+    'libatomic1=14-20240412-0ubuntu1'
+    'libcc1-0=14-20240412-0ubuntu1'
+    'libgomp1=14-20240412-0ubuntu1'
+    'libhwasan0=14-20240412-0ubuntu1'
+    'libitm1=14-20240412-0ubuntu1'
+    'liblsan0=14-20240412-0ubuntu1'
+    'libobjc4=14-20240412-0ubuntu1'
+    'libtsan2=14-20240412-0ubuntu1'
+    'libubsan1=14-20240412-0ubuntu1'
+    'libc6=2.39-0ubuntu8.2'
+    'libc6-dev=2.39-0ubuntu8.2'
+    'libc-dev-bin=2.39-0ubuntu8.2'
+    'perl=5.38.2-3.2build2'
+    'perl-base=5.38.2-3.2build2'
+    'perl-modules-5.38=5.38.2-3.2build2'
 )
 
 find /var/cache/apt/archives -maxdepth 1 -type f -name '*.deb' -delete
