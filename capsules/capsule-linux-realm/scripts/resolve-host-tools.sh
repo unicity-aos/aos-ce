@@ -170,6 +170,7 @@ package_specs=(
     'libncurses-dev=6.4+20240113-1ubuntu2'
     'zstd=1.5.5+dfsg2-2build1'
     'findutils=4.9.0-5build1'
+    'wget=1.21.4-1ubuntu4.1'
 )
 
 find /var/cache/apt/archives -maxdepth 1 -type f -name '*.deb' -delete
