@@ -499,7 +499,7 @@ cargo clippy -p aos-realm-abi -p aos-realm-core -p aos-realm-machine -p aos-real
 cargo check -p aos-linux-realm --target wasm32-unknown-unknown
 (
   cd capsules/capsule-linux-realm
-  aos capsule build
+  aos capsule build --output build-output
   ./scripts/package-capsule-assets.sh
   ./scripts/package-capsule-assets.sh --check
 )
@@ -513,13 +513,14 @@ script intentionally uses the pinned nightly and `-Z build-std=std,panic_abort`
 with the installed `rust-src` component. The capsule controller remains
 `wasm32-unknown-unknown`.
 
-The asset-packaging step is currently mandatory. The released `astrid-build`
-path packages the executable component and WIT but does not yet copy private
-`compute-worker` assets declared by `[[component.asset]]`. Installing that thin
-archive fails closed because `assets/linux-vcpu.wasm` is absent. The script
-copies only the five manifest-bound assets and verifies their exact bytes in
-the final archive; remove it only after the upstream builder covers and tests
-this manifest surface.
+The private packaging step canonicalizes the archive emitted by pinned
+`astrid-build`. That builder emits the private compute assets and capsule WIT,
+but its archive metadata is platform-dependent. The Linux Realm script replaces
+that metadata with zeroed time and owner fields, stable modes, sorted regular
+members, and no filesystem-specific attributes. It also records the source
+commit and every member digest in a private lineage manifest. The companion
+validator rejects a missing, stale, or extra member and does not use the public
+community-capsule allowlist validator.
 
 The installed realm appears as the single `realm_shell` MCP tool when an Astrid
 MCP broker such as `aos-mcp` is present and `astrid --principal default mcp
