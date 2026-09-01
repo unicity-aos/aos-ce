@@ -179,14 +179,16 @@ missing=false
 expected_deb_manifest="$realm_root/linux/host-tools-snapshot.debs.sha256"
 while read -r expected_digest expected_filename; do
     [[ -n "$expected_digest" ]] || continue
-    if ! awk -F'  ' -v digest="$expected_digest" -v filename="$expected_filename" '
-        $1 == digest && $2 == filename { found = 1 }
-        END { exit !found }
-    ' "$hash_manifest"; then
+    expected_base=${expected_filename%_arm64.deb}
+    expected_package=${expected_base%%_*}
+    expected_package_version=${expected_base#*_}
+    actual_digest=$(awk -F'\t' -v package="$expected_package" -v version="$expected_package_version" '
+        $1 == package && $2 == version { digest = $4 }
+        END { print digest }
+    ' "$package_manifest")
+    if [[ "$actual_digest" != "$expected_digest" ]]; then
         echo "snapshot .deb mismatch: $expected_filename expected $expected_digest" >&2
-        awk -F'\t' -v filename="$expected_filename" '
-            $3 == filename { printf "snapshot .deb actual: %s %s\n", $3, $4 }
-        ' "$package_manifest" >&2
+        echo "snapshot .deb actual: $expected_package=$expected_package_version ${actual_digest:-missing}" >&2
         missing=true
     fi
 done < "$expected_deb_manifest"
