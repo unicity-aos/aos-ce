@@ -153,6 +153,23 @@ package_specs=(
     'perl=5.38.2-3.2build2'
     'perl-base=5.38.2-3.2build2'
     'perl-modules-5.38=5.38.2-3.2build2'
+    'bison=2:3.8.2+dfsg-1build2'
+    'flex=2.6.4-8.2build1'
+    'curl=8.5.0-2ubuntu10.1'
+    'libcurl4t64=8.5.0-2ubuntu10.1'
+    'ca-certificates=20240203'
+    'xz-utils=5.6.1+really5.4.5-1'
+    'cpio=2.15+dfsg-1ubuntu2'
+    'unzip=6.0-28ubuntu4'
+    'file=1:5.45-3build1'
+    'patch=2.7.6-7build3'
+    'python3=3.12.3-0ubuntu1'
+    'bc=1.07.1-3ubuntu4'
+    'git=1:2.43.0-1ubuntu7'
+    'rsync=3.2.7-1ubuntu1'
+    'libncurses-dev=6.4+20240113-1ubuntu2'
+    'zstd=1.5.5+dfsg2-2build1'
+    'findutils=4.9.0-5build1'
 )
 
 find /var/cache/apt/archives -maxdepth 1 -type f -name '*.deb' -delete
