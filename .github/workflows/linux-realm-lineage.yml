@@ -42,6 +42,7 @@ jobs:
           persist-credentials: false
       - name: Install locked tools from the pinned builder image
         run: |
+          apt-get update
           apt-get install -y --no-install-recommends \
             build-essential=12.10ubuntu1 \
             make=4.3-4.1build2 \
