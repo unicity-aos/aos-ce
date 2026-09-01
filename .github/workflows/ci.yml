@@ -67,6 +67,7 @@ jobs:
       - name: Execute x86_64 GNU artifact on glibc 2.34
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         env:
+          TARGET: ${{ matrix.target }}
           GLIBC_RUNTIME_IMAGE: oraclelinux:9
         run: |
           docker run --rm --pull=always \
