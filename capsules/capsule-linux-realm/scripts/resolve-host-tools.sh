@@ -184,6 +184,9 @@ while read -r expected_digest expected_filename; do
         END { exit !found }
     ' "$hash_manifest"; then
         echo "snapshot .deb mismatch: $expected_filename expected $expected_digest" >&2
+        awk -F'\t' -v filename="$expected_filename" '
+            $3 == filename { printf "snapshot .deb actual: %s %s\n", $3, $4 }
+        ' "$package_manifest" >&2
         missing=true
     fi
 done < "$expected_deb_manifest"
