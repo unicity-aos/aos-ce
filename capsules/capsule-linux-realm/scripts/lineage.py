@@ -79,10 +79,27 @@ def locked_builder_metadata() -> dict:
         )
     return {
         "oci": builder_oci,
+        "host_tools_snapshot": {
+            "id": value("host_tools_snapshot_id"),
+            "uri": value("host_tools_snapshot_uri"),
+            "suites": value("host_tools_suites"),
+            "components": value("host_tools_components"),
+            "archive_key_fingerprint": value("host_tools_archive_key_fingerprint"),
+        },
         "toolchain_pins": {
             "buildroot": value("buildroot_version"),
             "make": value("make"),
             "gcc": value("gcc"),
+            "gpp": value("gpp"),
+            "cpp13": value("cpp13"),
+            "gcc13": value("gcc13"),
+            "gpp13": value("gpp13"),
+            "gcc13_base": value("gcc13_base"),
+            "gcc13_aarch64": value("gcc13_aarch64"),
+            "gpp13_aarch64": value("gpp13_aarch64"),
+            "cpp13_aarch64": value("cpp13_aarch64"),
+            "libgcc13_dev": value("libgcc13_dev"),
+            "libstdcpp13_dev": value("libstdcpp13_dev"),
             "llvm": value("llvm"),
             "clang": value("clang"),
             "lld": value("lld"),

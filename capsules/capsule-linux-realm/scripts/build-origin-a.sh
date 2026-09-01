@@ -32,6 +32,8 @@ done
 builder_oci=$(lock_value builder_oci)
 expected_builder_oci=ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
 declared_builder_oci=${AOS_BUILDER_OCI:-}
+snapshot_id=$(lock_value host_tools_snapshot_id)
+declared_snapshot_id=${AOS_HOST_TOOLS_SNAPSHOT_ID:-}
 if [[ "$builder_oci" != "$expected_builder_oci" ]]; then
     echo "SOURCES.lock has an unexpected builder: $builder_oci" >&2
     exit 66
@@ -40,16 +42,28 @@ if [[ "$declared_builder_oci" != "$expected_builder_oci" ]]; then
     echo "AOS_BUILDER_OCI must declare $expected_builder_oci" >&2
     exit 66
 fi
+if [[ "$declared_snapshot_id" != "$snapshot_id" ]]; then
+    echo "AOS_HOST_TOOLS_SNAPSHOT_ID must declare $snapshot_id" >&2
+    exit 66
+fi
 dpkg_version() {
     dpkg-query -W -f='${Version}' "$1"
 }
 
 for package_version in \
+    'build-essential=12.10ubuntu1' \
     'make=4.3-4.1build2' \
     'gcc=4:13.2.0-7ubuntu1' \
+    'g++=4:13.2.0-7ubuntu1' \
     'cpp-13=13.2.0-23ubuntu4' \
     'gcc-13=13.2.0-23ubuntu4' \
     'g++-13=13.2.0-23ubuntu4' \
+    'gcc-13-base=13.2.0-23ubuntu4' \
+    'gcc-13-aarch64-linux-gnu=13.2.0-23ubuntu4' \
+    'g++-13-aarch64-linux-gnu=13.2.0-23ubuntu4' \
+    'cpp-13-aarch64-linux-gnu=13.2.0-23ubuntu4' \
+    'libgcc-13-dev=13.2.0-23ubuntu4' \
+    'libstdc++-13-dev=13.2.0-23ubuntu4' \
     'clang-18=1:18.1.3-1ubuntu1' \
     'llvm-18=1:18.1.3-1ubuntu1' \
     'lld-18=1:18.1.3-1ubuntu1'
