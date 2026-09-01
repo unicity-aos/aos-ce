@@ -27,7 +27,7 @@ jobs:
     timeout-minutes: 30
     container:
       image: ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
-      options: --security-opt=no-new-privileges
+      options: --security-opt=no-new-privileges --user 0:0
     permissions:
       contents: read
     steps:
@@ -49,6 +49,9 @@ jobs:
     name: Rebuild origin A member (${{ matrix.member }})
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
+    container:
+      image: ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+      options: --security-opt=no-new-privileges --user 0:0
     permissions:
       contents: read
     strategy:
