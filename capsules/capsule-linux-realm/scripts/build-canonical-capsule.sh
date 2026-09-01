@@ -18,7 +18,12 @@ fi
 export COPYFILE_DISABLE=1
 export SOURCE_DATE_EPOCH=0
 
+validator_args=()
+if [[ -n "${AOS_SOURCE_SHA:-}" ]]; then
+  validator_args=(--source-sha "$AOS_SOURCE_SHA")
+fi
+
 python3 "$realm_root/scripts/canonical_package.py" \
   --builder "$builder" \
   --output "$output"
-python3 "$realm_root/scripts/validate_capsule.py" "$output"
+python3 "$realm_root/scripts/validate_capsule.py" "$output" "${validator_args[@]}"

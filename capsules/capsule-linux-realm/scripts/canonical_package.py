@@ -32,6 +32,14 @@ from lineage import (
 
 
 def source_sha() -> str:
+    override = os.environ.get("AOS_SOURCE_SHA")
+    if override is not None:
+        if (
+            len(override) != 40
+            or any(character not in "0123456789abcdef" for character in override)
+        ):
+            raise LineageError("AOS_SOURCE_SHA is not a lowercase commit SHA")
+        return override
     try:
         return subprocess.run(
             ["git", "rev-parse", "HEAD"],

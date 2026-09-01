@@ -42,6 +42,9 @@ dpkg_version() {
 for package_version in \
     'make=4.3-4.1build2' \
     'gcc=4:13.2.0-7ubuntu1' \
+    'cpp-13=13.2.0-23ubuntu4' \
+    'gcc-13=13.2.0-23ubuntu4' \
+    'g++-13=13.2.0-23ubuntu4' \
     'clang-18=1:18.1.3-1ubuntu1' \
     'llvm-18=1:18.1.3-1ubuntu1' \
     'lld-18=1:18.1.3-1ubuntu1'
@@ -54,6 +57,11 @@ do
         exit 69
     fi
 done
+if [[ "$(gcc -dumpfullversion)" != 13.2.0 ]] ||
+    [[ "$(g++ -dumpfullversion)" != 13.2.0 ]]; then
+    echo "origin A selected compiler is not GCC 13.2.0" >&2
+    exit 69
+fi
 
 [[ -e "$work" ]] && { echo "origin A work directory must not exist: $work" >&2; exit 65; }
 mkdir -p "$work/downloads" "$output"
