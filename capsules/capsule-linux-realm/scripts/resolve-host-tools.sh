@@ -213,12 +213,16 @@ done < "$expected_deb_manifest"
 for spec in "${package_specs[@]}"; do
     package=${spec%%=*}
     version=${spec#*=}
-    if ! awk -F'\t' -v package="$package" -v version="$version" '
+    downloaded=$(awk -F'\t' -v package="$package" -v version="$version" '
         $1 == package && $2 == version { found = 1 }
-        END { exit !found }
-    ' "$package_manifest"; then
-        echo "snapshot resolution did not download $package=$version" >&2
-        missing=true
+        END { print found }
+    ' "$package_manifest")
+    if [[ "$downloaded" != 1 ]]; then
+        installed_version=$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null || true)
+        if [[ "$installed_version" != "$version" ]]; then
+            echo "snapshot resolution did not download or install $package=$version" >&2
+            missing=true
+        fi
     fi
 done
 if [[ "$missing" == true ]]; then
