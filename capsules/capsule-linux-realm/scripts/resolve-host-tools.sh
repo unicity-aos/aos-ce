@@ -157,7 +157,7 @@ package_specs=(
 
 find /var/cache/apt/archives -maxdepth 1 -type f -name '*.deb' -delete
 DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTIONS[@]}" \
-    --allow-downgrades --no-install-recommends --download-only install "${package_specs[@]}"
+    --yes --allow-downgrades --no-install-recommends --download-only install "${package_specs[@]}"
 
 package_manifest="$resolution_dir/packages.tsv"
 hash_manifest="$resolution_dir/packages.sha256"
@@ -204,7 +204,7 @@ fi
 
 if [[ "$install_mode" == true ]]; then
     DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTIONS[@]}" \
-        --allow-downgrades --no-download --no-install-recommends install "${package_specs[@]}"
+        --yes --allow-downgrades --no-download --no-install-recommends install "${package_specs[@]}"
 fi
 
 {
