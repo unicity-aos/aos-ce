@@ -20,6 +20,14 @@ from lineage import (
     blake3_file,
     blake3_bytes,
     declared_members,
+    read_source_sha_section,
+)
+
+FORBIDDEN_CONTROLLER_PATHS = (
+    b"/Users/",
+    b"/home/runner/",
+    b"/opt/hostedtoolcache/",
+    b"/root/.cargo/",
 )
 
 
@@ -124,6 +132,19 @@ def validate(
         raise LineageError("embedded Capsule.toml differs from source manifest")
     if members[LOCK_PATH.relative_to(ROOT).as_posix()] != LOCK_PATH.read_bytes():
         raise LineageError("embedded linux-vcpu.lock differs from source lock")
+    controller = members["aos_linux_realm.wasm"]
+    embedded_source_sha = read_source_sha_section(controller)
+    if embedded_source_sha != expected_source_sha:
+        raise LineageError(
+            "controller source mismatch: "
+            f"expected {expected_source_sha}, got {embedded_source_sha}"
+        )
+    leaked_path = next(
+        (marker.decode("ascii") for marker in FORBIDDEN_CONTROLLER_PATHS if marker in controller),
+        None,
+    )
+    if leaked_path is not None:
+        raise LineageError(f"controller retains host-absolute path prefix {leaked_path}")
 
     spec = tomllib.loads(members["Capsule.toml"].decode("utf-8"))
     for path in declared_members(spec):

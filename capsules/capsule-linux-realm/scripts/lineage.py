@@ -11,10 +11,56 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = ROOT / "Capsule.toml"
 LOCK_PATH = ROOT / "assets/linux-vcpu.lock"
+SOURCE_SHA_SECTION_NAME = b"aos_source_sha"
 
 
 class LineageError(RuntimeError):
     pass
+
+
+def _read_unsigned_leb128(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while offset < len(data):
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7f) << shift
+        if not byte & 0x80:
+            return value, offset
+        shift += 7
+        if shift >= 64:
+            break
+    raise LineageError("truncated WebAssembly LEB128 value")
+
+
+def read_source_sha_section(wasm: bytes) -> str:
+    if len(wasm) < 8 or wasm[:4] != b"\0asm":
+        raise LineageError("controller artifact is not WebAssembly")
+    if wasm[8] != 0:
+        raise LineageError("controller source-SHA custom section is missing")
+    section_size, offset = _read_unsigned_leb128(wasm, 9)
+    section_end = offset + section_size
+    if section_end > len(wasm):
+        raise LineageError("controller source-SHA custom section is truncated")
+    payload = wasm[offset:section_end]
+    name_size, payload_offset = _read_unsigned_leb128(payload, 0)
+    name_end = payload_offset + name_size
+    if name_end > len(payload):
+        raise LineageError("controller source-SHA custom section name is truncated")
+    if payload[payload_offset:name_end] != SOURCE_SHA_SECTION_NAME:
+        raise LineageError("first controller custom section is not aos_source_sha")
+    source = payload[name_end:].decode("ascii")
+    if len(source) != 40 or any(character not in "0123456789abcdef" for character in source):
+        raise LineageError("controller source-SHA custom section is malformed")
+    return source
+
+
+def source_sha_custom_section(source: str) -> bytes:
+    if len(source) != 40 or any(character not in "0123456789abcdef" for character in source):
+        raise LineageError("source SHA is not a lowercase commit SHA")
+    name_length = len(SOURCE_SHA_SECTION_NAME)
+    payload = bytes([name_length]) + SOURCE_SHA_SECTION_NAME + source.encode("ascii")
+    return b"\x00" + bytes([len(payload)]) + payload
 
 
 def blake3_file(path: Path) -> str:

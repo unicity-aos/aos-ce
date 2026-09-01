@@ -24,6 +24,7 @@ from lineage import (
     declared_members,
     expected_builder_members,
     manifest,
+    source_sha_custom_section,
     sha256_bytes,
     sha256_file,
     validate_declared_hashes,
@@ -41,6 +42,13 @@ def source_sha() -> str:
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError) as error:
         raise LineageError(f"unable to identify source commit: {error}") from error
+
+
+def embed_source_sha(wasm: bytes, expected_source_sha: str) -> bytes:
+    if len(wasm) < 8 or wasm[:4] != b"\0asm":
+        raise LineageError("controller artifact is not WebAssembly")
+    section = source_sha_custom_section(expected_source_sha)
+    return wasm[:8] + section + wasm[8:]
 
 
 def package(builder_path: Path, output_path: Path) -> dict:
@@ -67,7 +75,7 @@ def package(builder_path: Path, output_path: Path) -> dict:
         if name == "Capsule.toml":
             content[name] = MANIFEST_PATH.read_bytes()
         elif name == "aos_linux_realm.wasm":
-            content[name] = builder[name][1]
+            content[name] = embed_source_sha(builder[name][1], source_sha())
         elif name == LOCK_PATH.relative_to(ROOT).as_posix():
             content[name] = LOCK_PATH.read_bytes()
         elif name.startswith("wit/"):
