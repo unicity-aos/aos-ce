@@ -35,6 +35,7 @@ suites=$(lock_value host_tools_suites)
 components=$(lock_value host_tools_components)
 expected_fingerprint=$(lock_value host_tools_archive_key_fingerprint)
 expected_keyring_sha=$(lock_value host_tools_keyring_sha256)
+expected_tls_ca_sha=$(lock_value host_tools_tls_ca_sha256)
 expected_builder_oci=$(lock_value builder_oci)
 declared_builder_oci=${AOS_BUILDER_OCI:-}
 declared_snapshot_id=${AOS_HOST_TOOLS_SNAPSHOT_ID:-}
@@ -52,6 +53,17 @@ keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
 if [[ ! -r "$keyring" ]]; then
     echo "missing Ubuntu archive keyring: $keyring" >&2
     exit 69
+fi
+
+tls_ca="$realm_root/linux/snapshot-tls-isrg-root-x1.pem"
+if [[ ! -r "$tls_ca" ]]; then
+    echo "missing pinned snapshot TLS CA: $tls_ca" >&2
+    exit 69
+fi
+actual_tls_ca_sha=$(sha256sum "$tls_ca" | awk '{print $1}')
+if [[ "$actual_tls_ca_sha" != "$expected_tls_ca_sha" ]]; then
+    echo "snapshot TLS CA SHA-256 mismatch: expected $expected_tls_ca_sha, got $actual_tls_ca_sha" >&2
+    exit 70
 fi
 actual_keyring_sha=$(sha256sum "$keyring" | awk '{print $1}')
 if [[ "$actual_keyring_sha" != "$expected_keyring_sha" ]]; then
@@ -77,6 +89,7 @@ APT_OPTIONS=(
     -o Dir::Etc::sourceparts=-
     -o Acquire::Languages=none
     -o Acquire::Retries=3
+    -o Acquire::https::snapshot.ubuntu.com::CaInfo="$tls_ca"
 )
 
 apt-get "${APT_OPTIONS[@]}" update
@@ -177,6 +190,7 @@ fi
     echo "suites=$suites"
     echo "components=$components"
     echo "archive_key_fingerprint=$expected_fingerprint"
+    echo "snapshot_tls_ca_sha256=$expected_tls_ca_sha"
     echo "builder_oci=$expected_builder_oci"
     echo "install_mode=$install_mode"
 } > "$resolution_dir/provenance.txt"
