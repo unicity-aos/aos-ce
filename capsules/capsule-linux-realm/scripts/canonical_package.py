@@ -24,6 +24,7 @@ from lineage import (
     declared_members,
     expected_builder_members,
     manifest,
+    locked_builder_metadata,
     source_sha_custom_section,
     sha256_bytes,
     sha256_file,
@@ -142,6 +143,7 @@ def package(builder_path: Path, output_path: Path) -> dict:
     return {
         "format": "aos-linux-realm-private-lineage-1",
         "source_sha": source_sha(),
+        "builder": locked_builder_metadata(),
         "builder_archive": {
             "blake3": blake3_file(builder_path),
             "sha256": sha256_file(builder_path),

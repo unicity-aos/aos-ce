@@ -17,12 +17,16 @@ concurrency:
 env:
   B3SUM_VERSION: '1.8.5'
   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  AOS_BUILDER_OCI: 'ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b'
 
 jobs:
   origin-a-member:
     name: Rebuild origin A member (${{ matrix.member }})
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
+    container:
+      image: ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+      options: --security-opt=no-new-privileges
     permissions:
       contents: read
     strategy:
@@ -32,17 +36,13 @@ jobs:
           - one
           - two
     steps:
-      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
-        with:
-          egress-policy: audit
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ env.HEAD_SHA }}
           persist-credentials: false
-      - name: Install pinned Buildroot host tools
+      - name: Install locked tools from the pinned builder image
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          apt-get install -y --no-install-recommends \
             build-essential=12.10ubuntu1 \
             make=4.3-4.1build2 \
             gcc=4:13.2.0-7ubuntu1 \
@@ -74,6 +74,7 @@ jobs:
       - name: Rebuild origin A in a clean native Linux tree
         env:
           AOS_BUILD_JOBS: '2'
+          AOS_BUILDER_OCI: ${{ env.AOS_BUILDER_OCI }}
         run: |
           member_root="$RUNNER_TEMP/origin-a-${{ matrix.member }}"
           output_root="$RUNNER_TEMP/origin-a-output-${{ matrix.member }}"

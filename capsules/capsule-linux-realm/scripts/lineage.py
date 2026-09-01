@@ -11,7 +11,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = ROOT / "Capsule.toml"
 LOCK_PATH = ROOT / "assets/linux-vcpu.lock"
+LINUX_SOURCES_LOCK_PATH = ROOT / "linux/SOURCES.lock"
 SOURCE_SHA_SECTION_NAME = b"aos_source_sha"
+EXPECTED_BUILDER_OCI = "ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b"
 
 
 class LineageError(RuntimeError):
@@ -61,6 +63,34 @@ def source_sha_custom_section(source: str) -> bytes:
     name_length = len(SOURCE_SHA_SECTION_NAME)
     payload = bytes([name_length]) + SOURCE_SHA_SECTION_NAME + source.encode("ascii")
     return b"\x00" + bytes([len(payload)]) + payload
+
+
+def locked_builder_metadata() -> dict:
+    def value(name: str) -> str:
+        for line in LINUX_SOURCES_LOCK_PATH.read_text(encoding="utf-8").splitlines():
+            if line.startswith(f"{name}="):
+                return line.removeprefix(f"{name}=")
+        raise LineageError(f"{LINUX_SOURCES_LOCK_PATH} is missing {name}")
+
+    builder_oci = value("builder_oci")
+    if builder_oci != EXPECTED_BUILDER_OCI:
+        raise LineageError(
+            f"builder OCI mismatch: expected {EXPECTED_BUILDER_OCI}, got {builder_oci}"
+        )
+    return {
+        "oci": builder_oci,
+        "toolchain_pins": {
+            "buildroot": value("buildroot_version"),
+            "make": value("make"),
+            "gcc": value("gcc"),
+            "llvm": value("llvm"),
+            "clang": value("clang"),
+            "lld": value("lld"),
+            "guest_rust": value("realm_rust"),
+            "guest_rust_host": value("realm_rust_host"),
+            "astrid_build": value("realm_astrid_build"),
+        },
+    }
 
 
 def blake3_file(path: Path) -> str:

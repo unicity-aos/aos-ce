@@ -31,8 +31,13 @@ done
 
 builder_oci=$(lock_value builder_oci)
 expected_builder_oci=ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+declared_builder_oci=${AOS_BUILDER_OCI:-}
 if [[ "$builder_oci" != "$expected_builder_oci" ]]; then
     echo "SOURCES.lock has an unexpected builder: $builder_oci" >&2
+    exit 66
+fi
+if [[ "$declared_builder_oci" != "$expected_builder_oci" ]]; then
+    echo "AOS_BUILDER_OCI must declare $expected_builder_oci" >&2
     exit 66
 fi
 dpkg_version() {

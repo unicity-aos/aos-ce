@@ -20,6 +20,7 @@ from lineage import (
     blake3_file,
     blake3_bytes,
     declared_members,
+    locked_builder_metadata,
     read_source_sha_section,
 )
 
@@ -102,6 +103,8 @@ def validate(
             f"lineage source mismatch: expected {expected_source_sha}, "
             f"got {lineage.get('source_sha')}"
         )
+    if lineage.get("builder") != locked_builder_metadata():
+        raise LineageError("lineage builder OCI or toolchain pins differ from source locks")
 
     recorded = lineage.get("capsule", {})
     actual_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
