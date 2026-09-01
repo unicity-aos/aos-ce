@@ -51,6 +51,13 @@ https://github.com/unicity-aos/aos-ce/.github/workflows/promote-channel.yml@refs
 Product versions use `YYYY.MINOR.PATCH`: the year is calendar-based, while
 minor and patch are canonical SemVer numbers rather than months.
 
+That published rule is still in force for `2026.1.3` and any other currently
+tagged release. A later product line named `2026.9.0` is intended to become
+the first year-month-patch CalVer identity, with Astrid remaining SemVer for
+that release. `2026.9.0` is not tagged, not published, and not an installer
+target. Until a signed release exists, channel pointers and exact-version
+installs continue to use the published `YYYY.MINOR.PATCH` rule above.
+
 Stable and dev point only to canonical `YYYY.MINOR.PATCH` releases. Nightly is
 a deterministic prerelease of the reviewed product version:
 

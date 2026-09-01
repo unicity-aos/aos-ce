@@ -19,8 +19,10 @@ The current tranche is intentionally headless. It provides:
   identity-preserving fixture transitions, and one-card phone presentation.
 
 No browser, DOM, WebView, JavaScript, daemon, network, LLM, process, or
-authority integration is present. A future winit/GPU adapter can consume the
-display list without entering the semantic model.
+authority integration is present. The semantic catalog and layout rules are
+independent of CPU architecture and of Linux Realm; they do not assume a
+guest ISA. A future winit/GPU adapter can consume the display list without
+entering the semantic model.
 
 ```text
 cargo run -p adaptive-shell -- --headless --fixture desktop
