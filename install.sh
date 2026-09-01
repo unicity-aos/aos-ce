@@ -817,7 +817,20 @@ fi
 release_dir="$AOS_HOME/releases/$staged_version"
 release_stage="$AOS_HOME/releases/.${staged_version}.new.$$"
 release_backup="$AOS_HOME/releases/.${staged_version}.rollback.$$"
-for managed in "$AOS_HOME" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases" "$release_dir" "$release_dir/capsules" "$AOS_HOME/update" "$AOS_HOME/update/channels"; do
+for managed in \
+  "$AOS_HOME" \
+  "$AOS_HOME/libexec" \
+  "$AOS_HOME/runtime" \
+  "$AOS_HOME/runtime/bin" \
+  "$AOS_HOME/releases" \
+  "$release_dir" \
+  "$release_dir/bin" \
+  "$release_dir/libexec" \
+  "$release_dir/runtime" \
+  "$release_dir/runtime/bin" \
+  "$release_dir/capsules" \
+  "$AOS_HOME/update" \
+  "$AOS_HOME/update/channels"; do
   [ ! -L "$managed" ] || { echo "refusing symlinked managed path: $managed" >&2; exit 1; }
 done
 if [ -e "$release_dir" ] && [ ! -d "$release_dir" ]; then
@@ -960,15 +973,25 @@ restore() {
 }
 
 installation_started=1
-if ! install_one "$bundle/bin/aos" "$AOS_BIN_DIR/aos" aos 755; then exit 1; fi
-if ! install_one "$bundle/libexec/install.sh" "$AOS_HOME/libexec/install.sh" installer 600; then exit 1; fi
-for name in astrid astrid-daemon astrid-build astrid-emit; do
-  if ! install_one "$bundle/runtime/bin/$name" "$AOS_HOME/runtime/bin/$name" "$name" 755; then exit 1; fi
-done
 mkdir "$release_stage"
 chmod 700 "$release_stage"
-mkdir "$release_stage/capsules"
-chmod 700 "$release_stage/capsules"
+mkdir \
+  "$release_stage/bin" \
+  "$release_stage/libexec" \
+  "$release_stage/runtime" \
+  "$release_stage/runtime/bin" \
+  "$release_stage/capsules"
+chmod 700 \
+  "$release_stage/bin" \
+  "$release_stage/libexec" \
+  "$release_stage/runtime" \
+  "$release_stage/runtime/bin" \
+  "$release_stage/capsules"
+install -m 0700 "$bundle/bin/aos" "$release_stage/bin/aos"
+install -m 0600 "$bundle/libexec/install.sh" "$release_stage/libexec/install.sh"
+for name in astrid astrid-daemon astrid-build astrid-emit; do
+  install -m 0700 "$bundle/runtime/bin/$name" "$release_stage/runtime/bin/$name"
+done
 install -m 0600 "$bundle/release-manifest.json" "$release_stage/release-manifest.json"
 install -m 0600 "$bundle/Distro.toml" "$release_stage/Distro.toml"
 install -m 0600 "$bundle/capsule-assets.txt" "$release_stage/capsule-assets.txt"
@@ -983,6 +1006,15 @@ if ! mv "$release_stage" "$release_dir"; then
   exit 1
 fi
 release_committed=1
+if ! install_one "$release_dir/bin/aos" "$AOS_BIN_DIR/aos" aos 755; then exit 1; fi
+if ! install_one "$release_dir/libexec/install.sh" "$AOS_HOME/libexec/install.sh" installer 600; then exit 1; fi
+# Released 2026.1.x migration reads the bundled executables from this legacy
+# location while constructing its replacement tree. Keep those compatibility
+# copies until the authenticated single-volume migrator replaces that contract;
+# the AOS launcher executes only the immutable release-tree copies above.
+for name in astrid astrid-daemon astrid-build astrid-emit; do
+  if ! install_one "$release_dir/runtime/bin/$name" "$AOS_HOME/runtime/bin/$name" "$name" 755; then exit 1; fi
+done
 stage_channel_receipt
 installation_started=0
 rm -rf "$release_backup"

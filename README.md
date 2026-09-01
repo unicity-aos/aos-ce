@@ -38,6 +38,20 @@ be true before a tag can publish. The latter is approved only after the exact
 candidate preserves a frozen standalone-home clone and boots with freshly
 generated runtime coordination state.
 
+Installed host executables and capsule assets are retained together beneath
+`~/.aos/releases/<version>/`. The public `~/.aos/bin/aos` launcher executes the
+Astrid CLI and daemon from that exact release tree; it never launches the
+mutable compatibility copies under `~/.aos/runtime/bin` that the released
+2026.1.x state importer still requires. Those compatibility copies are removed
+by the authenticated single-volume cutover, not by the packaging transaction.
+
+`~/.aos/run` is reserved for process-only sockets, tokens, PID files, readiness
+markers, and scratch data. The currently pinned Astrid release still derives
+those paths as `ASTRID_HOME/run`, so AOS does not redirect them with a symlink or
+an unrecognized environment variable. Completing that relocation requires an
+explicit Astrid transient-root contract before the single-volume layout can be
+claimed.
+
 ## Command boundary
 
 AOS owns its product roots, including `init`, `status`, `migrate`, `update`,

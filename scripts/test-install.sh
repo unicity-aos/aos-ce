@@ -248,6 +248,18 @@ sh "$repo_root/install.sh" --yes --no-migrate-prompt
 test -x "$work/home/.aos/bin/aos"
 test -x "$work/home/.aos/runtime/bin/astrid-daemon"
 release_dir="$work/home/.aos/releases/2026.1.3"
+test -x "$release_dir/bin/aos"
+test -f "$release_dir/libexec/install.sh"
+for binary in astrid astrid-daemon astrid-build astrid-emit; do
+  test -x "$release_dir/runtime/bin/$binary"
+  cmp "$release_dir/runtime/bin/$binary" "$work/home/.aos/runtime/bin/$binary"
+done
+printf '#!/bin/sh\necho mutable-runtime-copy-used\nexit 91\n' \
+  > "$work/home/.aos/runtime/bin/astrid"
+chmod 755 "$work/home/.aos/runtime/bin/astrid"
+test "$(HOME="$work/home" "$work/home/.aos/bin/aos" doctor)" = astrid
+cp "$release_dir/runtime/bin/astrid" "$work/home/.aos/runtime/bin/astrid"
+chmod 755 "$work/home/.aos/runtime/bin/astrid"
 test -f "$release_dir/release-manifest.json"
 test -f "$release_dir/Distro.toml"
 test -f "$release_dir/capsule-assets.txt"
@@ -264,6 +276,7 @@ test ! -e "$fixture/path-cosign-called"
 test "$(stat -c '%a' "$work/home/.aos" 2>/dev/null || stat -f '%Lp' "$work/home/.aos")" = 700
 test "$(stat -c '%a' "$release_dir/release-manifest.json" 2>/dev/null || stat -f '%Lp' "$release_dir/release-manifest.json")" = 600
 test "$(stat -c '%a' "$release_dir/capsules" 2>/dev/null || stat -f '%Lp' "$release_dir/capsules")" = 700
+test "$(stat -c '%a' "$release_dir/runtime/bin/astrid" 2>/dev/null || stat -f '%Lp' "$release_dir/runtime/bin/astrid")" = 700
 
 python=${PYTHON3:-python3}
 "$python" "$repo_root/scripts/release_metadata.py" render-channel \
@@ -573,6 +586,10 @@ for binary in aos astrid astrid-daemon astrid-build astrid-emit; do
   chmod 755 "$destination"
 done
 printf 'old-release-manifest\n' > "$release_dir/release-manifest.json"
+for binary in astrid astrid-daemon astrid-build astrid-emit; do
+  printf '#!/bin/sh\necho old-release-%s\n' "$binary" > "$release_dir/runtime/bin/$binary"
+  chmod 700 "$release_dir/runtime/bin/$binary"
+done
 
 fail_bin="$work/fail-bin"
 mkdir "$fail_bin"
@@ -595,7 +612,7 @@ if PATH="$fail_bin:$fake_bin:$PATH" \
   AOS_VERSION=2026.1.3 \
   REAL_MV="$real_mv" \
   MV_FAILED="$work/mv-failed" \
-  MV_FAIL_DESTINATION="$release_dir" \
+  MV_FAIL_DESTINATION="$work/home/.aos/bin/aos" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer ignored a mid-install failure" >&2
   exit 1
@@ -608,6 +625,9 @@ for binary in aos astrid astrid-daemon astrid-build astrid-emit; do
   test "$("$destination")" = "old-$binary"
 done
 test "$(cat "$release_dir/release-manifest.json")" = old-release-manifest
+for binary in astrid astrid-daemon astrid-build astrid-emit; do
+  test "$("$release_dir/runtime/bin/$binary")" = "old-release-$binary"
+done
 test "$(find "$release_dir/capsules" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 22
 while IFS= read -r capsule; do
   cmp "$work/capsules/$capsule" "$release_dir/capsules/$capsule"

@@ -91,6 +91,11 @@ manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 product_version, runtime_version, runtime_identity = sys.argv[2:]
 assert manifest["schema_version"] == 2
 assert manifest["product"]["version"] == product_version
+assert manifest["layout"] == {
+    "release_directory": f"releases/{product_version}",
+    "runtime_executables": "runtime/bin",
+    "capsule_assets": "capsules",
+}
 assert manifest["runtime"]["version"] == runtime_version
 assert manifest["runtime"]["digest"] == "blake3:" + "0" * 64
 assert "sha256" not in manifest["runtime"]

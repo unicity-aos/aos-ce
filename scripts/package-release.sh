@@ -115,6 +115,11 @@ manifest = {
     "schema_version": 2,
     "product": {"name": "Unicity AOS Community Edition", "version": product},
     "target": target,
+    "layout": {
+        "release_directory": f"releases/{product}",
+        "runtime_executables": "runtime/bin",
+        "capsule_assets": "capsules",
+    },
     "runtime": {
         "repository": runtime_repo,
         "version": runtime,
