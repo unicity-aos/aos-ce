@@ -457,14 +457,8 @@ install -m 0644 "$repo_root/README.md" "$work/$root/README.md"
 
 distro_signing=no
 if [[ -n "${AOS_DISTRO_ED25519_SEED:-}" ]]; then
-  distro_signing=yes
-  SIGNING_WORK="$work/signing"
-  signing_seed="$work/aos-distro-seed"
-  mkdir -p "$SIGNING_WORK"
-  decode_distro_seed "$signing_seed"
-  sign_staged_distro "$work/$root" "$signing_seed"
-  destroy_distro_seed "$signing_seed"
-  signing_seed=
+  echo "release composer cannot sign Distro without an explicit native sealer; use --sign-release-archive" >&2
+  exit 1
 fi
 
 release_inventory="$work/release-files.tsv"

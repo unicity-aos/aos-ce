@@ -58,21 +58,81 @@ grep -Fq -- 'name: aos-x86_64-unknown-linux-gnu' "$repo_root/.github/workflows/r
 grep -Fq -- '--extract-release-sealer' "$repo_root/.github/workflows/release.yml"
 grep -Fq -- 'stable Distro sealing requires Astrid 2026.9.0+' "$repo_root/.github/workflows/release.yml"
 
+write_tar_listing() {
+  local archive=$1
+  local listing=$2
+  tar -tzf "$archive" > "$listing"
+}
+
 assert_signed_product_archives() {
   local artifacts_dir=$1
   local signed_archives=0
   local -a assets
+  local asset listing
 
   shopt -s nullglob
   assets=("$artifacts_dir"/unicity-aos-*.tar.gz)
   (( ${#assets[@]} > 0 )) || return 1
   for asset in "${assets[@]}"; do
-    if tar -tzf "$asset" 2>/dev/null | grep -q '/Distro.sig$'; then
-      signed_archives=$((signed_archives + 1))
+    listing=$(mktemp "$work/tar-listing.XXXXXX")
+    if write_tar_listing "$asset" "$listing" 2>/dev/null; then
+      if grep -q '/Distro.sig$' "$listing"; then
+        signed_archives=$((signed_archives + 1))
+      fi
     fi
+    rm -f "$listing"
   done
   (( signed_archives > 0 ))
 }
+
+gnu_tar_work="$work/gnu-tar-regression"
+mkdir -p "$gnu_tar_work/bin"
+gnu_tar_archive="$gnu_tar_work/archive.tar.gz"
+python3 - "$gnu_tar_archive" <<'PY'
+import sys
+import tarfile
+
+archive_path = sys.argv[1]
+with tarfile.open(archive_path, "w:gz") as archive:
+    for name in ("bundle/Distro.lock", "bundle/Distro.sig"):
+        archive.addfile(tarfile.TarInfo(name))
+    for index in range(8192):
+        archive.addfile(tarfile.TarInfo(f"bundle/filler-{index:05d}"))
+PY
+if gnu_tar_path=$(command -v gtar 2>/dev/null); then
+  ln -s "$gnu_tar_path" "$gnu_tar_work/bin/tar"
+else
+  cat > "$gnu_tar_work/bin/tar" <<'FAKE_TAR'
+#!/usr/bin/env python3
+import os
+import sys
+
+if len(sys.argv) != 3 or sys.argv[1] != "-tzf":
+    raise SystemExit("fake GNU tar only supports -tzf")
+payload = b"bundle/Distro.lock\nbundle/Distro.sig\n" + b"bundle/filler\n" * 8192
+offset = 0
+while offset < len(payload):
+    try:
+        offset += os.write(1, payload[offset:])
+    except BrokenPipeError:
+        try:
+            os.write(2, b"tar: stdout: write error\n")
+        except OSError:
+            pass
+        raise SystemExit(2)
+FAKE_TAR
+  chmod 755 "$gnu_tar_work/bin/tar"
+fi
+# Deliberately exercise the pre-fix pipeline with the GNU-like tar command.
+if PATH="$gnu_tar_work/bin:$PATH" bash -c \
+  'set -o pipefail; "$2" -tzf "$1" | grep -q "/Distro.lock$"' \
+  _ "$gnu_tar_archive" tar >/dev/null 2>"$gnu_tar_work/pipeline.err"; then
+  echo "GNU tar regression pipeline unexpectedly ignored SIGPIPE" >&2
+  exit 1
+fi
+gnu_tar_listing="$gnu_tar_work/listing"
+PATH="$gnu_tar_work/bin:$PATH" write_tar_listing "$gnu_tar_archive" "$gnu_tar_listing"
+grep -q '/Distro.lock$' "$gnu_tar_listing"
 
 glob_work="$work/signing-glob"
 mkdir -p "$glob_work/product" "$glob_work/signed" "$glob_work/empty" "$glob_work/wrong"
@@ -125,6 +185,9 @@ for binary in astrid astrid-daemon astrid-build astrid-emit; do
 #!/bin/sh
 set -eu
 if [ -n "${AOS_DISTRO_ED25519_SEED:-}" ]; then
+  if [ -n "${AOS_TEST_SENTINEL:-}" ]; then
+    touch "$AOS_TEST_SENTINEL"
+  fi
   exit 96
 fi
 if [ "${1:-}" = --version ]; then
@@ -182,6 +245,25 @@ bash "$repo_root/scripts/package-release.sh" \
   0000000000000000000000000000000000000000000000000000000000000000 \
   "$work/capsules" \
   "$work/output"
+
+compose_sentinel="$work/compose-embedded-runtime-invoked"
+compose_seed_error="$work/compose-seed.error"
+if AOS_TEST_SENTINEL="$compose_sentinel" \
+  AOS_DISTRO_ED25519_SEED="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" \
+  bash "$repo_root/scripts/package-release.sh" \
+  "$target" \
+  "$work/aos" \
+  "$work/runtime.tar.gz" \
+  0000000000000000000000000000000000000000000000000000000000000000 \
+  "$work/capsules" \
+  "$work/output" >/dev/null 2>"$compose_seed_error"; then
+  echo "release composer accepted a seed without an explicit native sealer" >&2
+  exit 1
+fi
+test ! -e "$compose_sentinel"
+grep -Fq -- \
+  'release composer cannot sign Distro without an explicit native sealer; use --sign-release-archive' \
+  "$compose_seed_error"
 
 archive="$work/output/unicity-aos-$product_version-$target.tar.gz"
 test -f "$archive"
@@ -367,8 +449,10 @@ for unsigned_archive in "$multi_target_root"/*.tar.gz; do
     bash "$repo_root/scripts/package-release.sh" \
     --sign-release-archive "$unsigned_archive" "$signed_archive" "$native_sealer" "$fixture_archive" >/dev/null
   test ! -e "$sentinel"
-  tar -tzf "$signed_archive" | grep -q '/Distro.lock$'
-  tar -tzf "$signed_archive" | grep -q '/Distro.sig$'
+  signed_listing="$work/$(basename "$signed_archive").files"
+  write_tar_listing "$signed_archive" "$signed_listing"
+  grep -q '/Distro.lock$' "$signed_listing"
+  grep -q '/Distro.sig$' "$signed_listing"
   mkdir "$work/signed-$(basename "$unsigned_archive" .tar.gz)"
   tar -xzf "$signed_archive" -C "$work/signed-$(basename "$unsigned_archive" .tar.gz)"
   signed_root=$(find "$work/signed-$(basename "$unsigned_archive" .tar.gz)" -mindepth 1 -maxdepth 1 -type d -print -quit)
