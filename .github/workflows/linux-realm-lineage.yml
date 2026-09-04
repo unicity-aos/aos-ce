@@ -1,0 +1,304 @@
+name: Linux Realm private lineage
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-realm-lineage-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  B3SUM_VERSION: '1.8.5'
+  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  AOS_BUILDER_OCI: 'ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b'
+  AOS_HOST_TOOLS_SNAPSHOT_ID: '20240703T000000Z'
+
+jobs:
+  resolve-host-tools:
+    name: Resolve locked origin A host tools
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    container:
+      image: ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+      options: --security-opt=no-new-privileges --user 0:0
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          persist-credentials: false
+      - name: Resolve host tools from the pinned Ubuntu snapshot
+        run: |
+          capsules/capsule-linux-realm/scripts/resolve-host-tools.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-realm-host-tools-resolution-${{ env.HEAD_SHA }}
+          path: ${{ runner.temp }}/origin-a-host-tools-resolution/*
+          if-no-files-found: error
+          retention-days: 1
+
+  origin-a-member:
+    name: Rebuild origin A member (${{ matrix.member }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    container:
+      image: ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+      options: --security-opt=no-new-privileges --user 0:0
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        member:
+          - one
+          - two
+    needs:
+      - resolve-host-tools
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          persist-credentials: false
+      - name: Resolve and install locked tools from the pinned Ubuntu snapshot
+        run: |
+          capsules/capsule-linux-realm/scripts/resolve-host-tools.sh --install
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-realm-host-tools-resolution-${{ env.HEAD_SHA }}-${{ matrix.member }}
+          path: ${{ runner.temp }}/origin-a-host-tools-resolution/*
+          if-no-files-found: error
+          retention-days: 1
+      - name: Record pinned host-tool selection
+        run: |
+          printf 'PATH=%s\n' "$PATH"
+          dpkg-query -W -f='${Package}\t${Version}\n' \
+            gcc gcc-13 g++ g++-13 cpp-13 make clang-18 llvm-18 lld-18
+          make --version
+          printf 'gcc -dumpfullversion: '; gcc -dumpfullversion
+          printf 'g++ -dumpfullversion: '; g++ -dumpfullversion
+          gcc -v
+          clang-18 --version
+          apt-cache policy gcc-13 g++-13 cpp-13
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+      - name: Install pinned BLAKE3 tool
+        run: cargo install b3sum --locked --version "$B3SUM_VERSION"
+      - name: Rebuild origin A in a clean native Linux tree
+        env:
+          AOS_BUILD_JOBS: '2'
+          AOS_BUILDER_OCI: ${{ env.AOS_BUILDER_OCI }}
+          AOS_HOST_TOOLS_SNAPSHOT_ID: ${{ env.AOS_HOST_TOOLS_SNAPSHOT_ID }}
+        run: |
+          member_root="$RUNNER_TEMP/origin-a-${{ matrix.member }}"
+          output_root="$RUNNER_TEMP/origin-a-output-${{ matrix.member }}"
+          capsules/capsule-linux-realm/scripts/build-origin-a.sh \
+            "$member_root" "$output_root"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-realm-origin-a-${{ env.HEAD_SHA }}-${{ matrix.member }}
+          path: |
+            ${{ runner.temp }}/origin-a-output-${{ matrix.member }}/linux-system.squashfs
+            ${{ runner.temp }}/origin-a-${{ matrix.member }}/stage/rootfs.cpio.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  require-identical-origin-a:
+    name: Require identical origin A members
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    needs:
+      - origin-a-member
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+      - name: Install pinned BLAKE3 tool
+        run: cargo install b3sum --locked --version "$B3SUM_VERSION"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: linux-realm-origin-a-${{ env.HEAD_SHA }}-one
+          path: member-one
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: linux-realm-origin-a-${{ env.HEAD_SHA }}-two
+          path: member-two
+      - name: Fail closed unless every member is byte-identical
+        run: |
+          for member in member-one member-two; do
+            test "$(find "$member" -type f | wc -l)" -eq 2
+          done
+          cmp member-one/linux-system.squashfs member-two/linux-system.squashfs
+          cmp member-one/rootfs.cpio.gz member-two/rootfs.cpio.gz
+          sha256sum member-one/linux-system.squashfs member-two/linux-system.squashfs
+          sha256sum member-one/rootfs.cpio.gz member-two/rootfs.cpio.gz
+          b3sum member-one/linux-system.squashfs member-two/linux-system.squashfs
+          cp member-one/linux-system.squashfs linux-system.squashfs
+          sha256sum linux-system.squashfs > linux-system.squashfs.sha256
+          b3sum linux-system.squashfs > linux-system.squashfs.blake3
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-realm-origin-a-validated-${{ env.HEAD_SHA }}
+          path: |
+            linux-system.squashfs
+            linux-system.squashfs.sha256
+            linux-system.squashfs.blake3
+          if-no-files-found: error
+          retention-days: 1
+
+  pack-and-sign:
+    name: Pack, attest, and sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      AOS_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    needs:
+      - require-identical-origin-a
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          targets: wasm32-unknown-unknown
+      - name: Install pinned BLAKE3 tool
+        run: cargo install b3sum --locked --version "$B3SUM_VERSION"
+      - name: Resolve pinned runtime builder
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import tomllib
+          with open("release/runtime-compatibility.toml", "rb") as file:
+              metadata = tomllib.load(file)["runtime"]
+          print(f"RUNTIME_VERSION={metadata['version']}")
+          print(f"RUNTIME_TAG={metadata['tag']}")
+          print(f"RUNTIME_REPOSITORY={metadata['repository']}")
+          print(f"RUNTIME_IDENTITY={metadata['release-workflow-identity']}")
+          PY
+          TARGET=x86_64-unknown-linux-gnu
+          ASSET="astrid-${RUNTIME_VERSION}-${TARGET}.tar.gz"
+          BASE="https://github.com/${RUNTIME_REPOSITORY}/releases/download/${RUNTIME_TAG}"
+          curl --proto '=https' --tlsv1.2 -fsSLO "$BASE/$ASSET"
+          curl --proto '=https' --tlsv1.2 -fsSLO "$BASE/BLAKE3SUMS.txt"
+          curl --proto '=https' --tlsv1.2 -fsSLo "$ASSET.sigstore.json" "$BASE/$ASSET.sigstore.json"
+          EXPECTED=$(awk -v asset="$ASSET" '$2 == asset { print $1; exit }' BLAKE3SUMS.txt)
+          test -n "$EXPECTED"
+          test "$(b3sum -- "$ASSET" | awk '{print $1}')" = "$EXPECTED"
+          echo "RUNTIME_ASSET=$ASSET" >> "$GITHUB_ENV"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Verify and extract pinned runtime builder
+        run: |
+          cosign verify-blob \
+            --bundle "$RUNTIME_ASSET.sigstore.json" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "$RUNTIME_IDENTITY" \
+            "$RUNTIME_ASSET"
+          mkdir -p "$RUNNER_TEMP/astrid-runtime"
+          tar -xzf "$RUNTIME_ASSET" -C "$RUNNER_TEMP/astrid-runtime"
+          test -x "$RUNNER_TEMP/astrid-runtime/astrid-0.10.4-x86_64-unknown-linux-gnu/astrid-build"
+          echo "BUILDER=$RUNNER_TEMP/astrid-runtime/astrid-0.10.4-x86_64-unknown-linux-gnu/astrid-build" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: linux-realm-origin-a-validated-${{ env.HEAD_SHA }}
+          path: origin-a
+      - name: Install the hash-bound origin A system image
+        run: |
+          EXPECTED_SHA=$(awk '{print $1}' origin-a/linux-system.squashfs.sha256)
+          ACTUAL_SHA=$(sha256sum origin-a/linux-system.squashfs | awk '{print $1}')
+          test -n "$EXPECTED_SHA"
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA"
+          install -m 0644 origin-a/linux-system.squashfs \
+            capsules/capsule-linux-realm/assets/linux-system.squashfs
+      - name: Build canonical candidate one
+        run: |
+          cd capsules/capsule-linux-realm
+          source scripts/controller-reproducibility.sh
+          "$BUILDER" --output build-output
+          ./scripts/build-canonical-capsule.sh \
+            "$(pwd)/build-output/aos-linux-realm.capsule" \
+            "$(pwd)/dist/aos-linux-realm.capsule"
+      - name: Rebuild canonical candidate two from a clean target
+        run: |
+          cd capsules/capsule-linux-realm
+          source scripts/controller-reproducibility.sh
+          rm -rf "$GITHUB_WORKSPACE/target" build-output
+          rm -f dist/aos-linux-realm.capsule dist/aos-linux-realm.capsule.lineage.json
+          "$BUILDER" --output build-output
+          ./scripts/build-canonical-capsule.sh \
+            "$(pwd)/build-output/aos-linux-realm.capsule" \
+            "$(pwd)/dist/aos-linux-realm.capsule.second"
+          cmp dist/aos-linux-realm.capsule dist/aos-linux-realm.capsule.second
+      - name: Record capsule digests
+        run: |
+          cd capsules/capsule-linux-realm/dist
+          sha256sum aos-linux-realm.capsule aos-linux-realm.capsule.second
+          b3sum aos-linux-realm.capsule aos-linux-realm.capsule.second
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            capsules/capsule-linux-realm/dist/aos-linux-realm.capsule
+            capsules/capsule-linux-realm/dist/aos-linux-realm.capsule.lineage.json
+      - name: Sign the candidate and lineage manifest
+        env:
+          COSIGN_YES: 'true'
+        run: |
+          cd capsules/capsule-linux-realm/dist
+          cosign sign-blob --yes \
+            --bundle aos-linux-realm.capsule.sigstore.json \
+            aos-linux-realm.capsule
+          cosign sign-blob --yes \
+            --bundle aos-linux-realm.capsule.lineage.json.sigstore.json \
+            aos-linux-realm.capsule.lineage.json
+      - name: Verify the exact workflow identity
+        env:
+          WORKFLOW_IDENTITY: https://github.com/${{ github.workflow_ref }}
+        run: |
+          cd capsules/capsule-linux-realm/dist
+          for pair in \
+            'aos-linux-realm.capsule aos-linux-realm.capsule.sigstore.json' \
+            'aos-linux-realm.capsule.lineage.json aos-linux-realm.capsule.lineage.json.sigstore.json'
+          do
+            read -r asset bundle <<EOF
+          $pair
+          EOF
+            cosign verify-blob \
+              --bundle "$bundle" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity "$WORKFLOW_IDENTITY" \
+              --use-signed-timestamps \
+              "$asset"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aos-linux-realm-private-lineage-${{ env.HEAD_SHA }}
+          path: |
+            capsules/capsule-linux-realm/dist/aos-linux-realm.capsule
+            capsules/capsule-linux-realm/dist/aos-linux-realm.capsule.second
+            capsules/capsule-linux-realm/dist/aos-linux-realm.capsule.lineage.json
+            capsules/capsule-linux-realm/dist/*.sigstore.json
+          if-no-files-found: error
+          retention-days: 1

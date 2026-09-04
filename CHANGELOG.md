@@ -37,6 +37,9 @@
   provisioning, archive safety validation, BLAKE3 checksums, SHA-256
   compatibility checksums, Sigstore bundles, and provenance.
 - Host-target unit-test coverage for the capsule workspace.
+- The installable `aos-linux-realm` seed: principal-owned durable home storage,
+  an Astrid copy-on-write workspace projection, and bounded nested-WASM `pwd`,
+  `echo`, `write-file`, and `cat` commands with no host-process authority.
 - Forge in the default Community Edition distribution, including a discoverable
   bootstrap and skill that teach fresh agents to build a user-space
   meta-harness on AOS by seeing instructions, memory, skills, harness code,
@@ -48,6 +51,106 @@
   hook bus, collect private same-turn prompt context, and route it back only to
   the exact originating session. Adaptive, propose, automatic, and off modes
   preserve the agent's judgment while respecting its existing authority.
+- A versioned Linux Realm path-identity contract separating semantic mount IDs,
+  guest paths, Astrid resource URIs, and human display paths. Execution and
+  status responses distinguish the Linux guest's invocation-mounted workspace,
+  principal-generation home, and boot-local temporary storage.
+- A bounded Linux workspace portal: a GPL `trans=aos` 9P transport crosses a
+  private experimental SBI request into the Rust Realm machine and 9P server,
+  then resolves only the current invocation's Astrid `cwd://` COW capability.
+  PID 1 remounts it before every shell call so FIDs cannot cross invocation
+  boundaries.
+- Resource-backed Linux workspace I/O over the frozen `astrid:fs@1.0.0`
+  handle contract, replacing whole-file read/modify/write with bounded
+  positional streaming, real truncate and sync, host mode reporting, and
+  same-workspace rename without the former 10 MiB compatibility ceiling.
+- Crash-consistent `aos-linux-realm` home generations: a principal-scoped atomic
+  KV head selects immutable BLAKE3-addressed file and manifest blobs, with
+  concurrent-writer retry, corruption checks, daemon-restart recovery, and
+  bounded migration from the original direct-home format.
+- A second bounded 9P/SBI channel mounts those same principal-home generations
+  at Linux `/home/agent`. Linux create, positional write, truncate, directory,
+  rename, unlink, and flush operations select complete generations, and the
+  home survives clean guest shutdown and cold boot while the initramfs root
+  remains disposable.
+- The host-testable `aos-realm-core` semantic kernel with monotonic process and
+  pipe identities, explicit process transitions, direct-child wait/reap, typed
+  terminal signals, deterministic FIFO admission, atomic descriptor inheritance,
+  bounded pipe backpressure/EOF/broken-pipe behavior, and aggregate quotas.
+- A signed `pipe-echo` realm workload that runs two isolated Wasmi process stores
+  through the core scheduler and a four-byte stdout-to-stdin pipe, exercising
+  partial writes, read/write suspension, wakeup, EOF, and exact output accounting.
+- A principal-affine `aos-linux-realm` service with one resident Wasmtime Store
+  and semantic Realm machine per kernel-verified principal, monotonic per-boot
+  process identities, CAS-allocated boot sequences, an inner owner guard,
+  foreground resource reaping, and live process/pipe accounting through direct
+  metered tool entry points.
+- A principal-resident Linux lifecycle inside `aos-linux-realm`: Linux 6.18.39
+  remains alive in evictable per-principal RAM, accepts bounded framed console
+  commands across separately metered tool invocations, preserves userspace state,
+  shuts down cleanly through SBI, and restarts lazily without host-process
+  authority.
+- Principal-resolved AOS Realm resource envelopes for guest RAM, interpreted
+  steps, captured output, and an optional guest per-file ceiling, bounded by
+  Astrid's admin-owned principal profile. Zero step or file ceilings delegate
+  to the mandatory outer CPU/timeout or storage controls, respectively. Status
+  distinguishes configured and active limits, while a changed envelope
+  cold-reconfigures only that principal's warm Linux machine.
+- Dynamic Linux Realm compute admission. Omitted daemon worker and memory
+  ceilings derive from host CPU parallelism and physical RAM with a safety
+  reserve, then intersect a process-wide pool, the invoking principal's memory
+  and compute-worker quotas, existing reservations, and the signed worker
+  maximum. Realm probes the admitted envelope, subtracts only the signed
+  worker's concrete base and heap requirements, then reopens an exact
+  reservation for all remaining page-aligned guest RAM. The signed vCPU worker
+  now uses shared memory64, so neither the wasm32 controller nor a capsule-level
+  3 GiB constant silently limits an operator-assigned principal budget. The
+  pinned worker currently reports a 16 GiB shared-memory capability.
+  Worker fuel joins the ordinary cross-capsule principal CPU account and rate
+  limit.
+- Agent-native Linux Realm shell results. `realm_shell` now returns only
+  authenticated command output, reports nonzero exits through the tool error
+  bit, accepts an optional guest `workdir` confined to `/workspace`,
+  `/home/agent`, or `/tmp`, and keeps boot logs, protocol frames, resource
+  accounting, and mount receipts on the operator diagnostic surface.
+- Deterministic virtual SMP for Linux Realm: exact 1–64-hart FDT topology,
+  per-hart architectural, timer, interrupt, reservation, and translation state,
+  round-robin aggregate metering, SBI HSM/IPI/RFENCE/TIME services, an
+  SMP-enabled reproducible Linux image, and a signed-worker proof that brings
+  two Linux CPUs online through Astrid's real generic-compute runtime.
+  `linux_vcpus=0` derives a useful topology from current principal/host compute
+  admission; explicit per-principal values select 1–64 logical CPUs without
+  reserving unused native workers. Multi-hart machines cold-boot while the
+  existing format-1 prewarm artifact remains exactly one hart.
+- Private-stack isolation for parallel core-Wasm workers. Rust workers may
+  declare one linker-reserved stack arena; Astrid Compute validates the complete
+  optional ABI extension and relocates each admitted Store's LLVM stack pointer
+  to a disjoint slot before concurrent work. The signed Linux vCPU worker
+  reserves 64 independently addressable 512 KiB stacks and proves two targeted
+  workers cross a real shared-memory barrier without descriptor or stack
+  aliasing. Linux hart state remains deterministic until its separate
+  coordinator/state split is complete.
+- A reproducibly pinned Buildroot 2026.05.1, static musl, and BusyBox `ash`
+  workbench for the resident Linux guest, with an unprivileged `agent` shell,
+  token-bound command framing, bounded process resources, descendant cleanup,
+  exact exit-status propagation, and a deliberately explicit `linux-sh` surface.
+- A reproducible RV64GC/glibc development-image generation with the official
+  Rust 1.97.1 compiler, Cargo, rustfmt, Clippy, and
+  `wasm32-unknown-unknown` standard library; guest-native rustup 1.29.0 and
+  `astrid-build` 0.10.4; and principal-local Cargo/rustup state rooted in the
+  durable Realm home. Per-principal process and open-file ceilings now cross
+  the versioned command frame alongside the existing RAM, CPU, output, and
+  file-size envelope.
+- A private Realm `pipe`/`spawn-signed`/`wait`/`signal` ABI and signed
+  `guest-pipe-echo` workload, with generation-checked process handles, bounded
+  descendant admission, pre-partitioned request budgets, unified file/pipe
+  descriptor allocation, deterministic foreground-tree cleanup, and bounded
+  bounded execution and deterministic resource cleanup.
+- A versioned record-oriented signed-spawn ABI with bounded argv and environment
+  vectors, build-manifest-generated immutable-catalog resolution, multiple exact
+  descriptor mappings, atomic parent-endpoint close actions, kernel-owned file
+  and pipe descriptor allocation, and the guest-side `realm-sh` workload for
+  direct `echo`, environment, `echo | cat`, and file-backed `echo > PATH` jobs.
 - Homebrew formula updates initiated by the tap's authenticated stable-release
   poll, eliminating the cross-repository dispatch credential.
 - Strict, signed stable/dev/nightly channel and immutable release metadata

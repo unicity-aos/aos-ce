@@ -3,6 +3,15 @@ members = [
     "apps/adaptive-shell",
     "crates/unicity-aos-bootstrap",
     "crates/aos-mcp-broker",
+    "capsules/capsule-linux-realm",
+    "capsules/capsule-linux-realm/crates/realm-abi",
+    "capsules/capsule-linux-realm/crates/realm-core",
+    "capsules/capsule-linux-realm/crates/realm-machine",
+    "capsules/capsule-linux-realm/crates/realm-9p",
+    "capsules/capsule-linux-realm/crates/realm-runtime",
+    "capsules/capsule-linux-realm/crates/realm-vfs",
+    "capsules/capsule-linux-realm/crates/realm-vcpu-protocol",
+    "capsules/capsule-linux-realm/crates/realm-vcpu-worker",
     "capsules/capsule-agents",
     "capsules/capsule-cli",
     "capsules/capsule-context-engine",
@@ -41,15 +50,33 @@ astrid-sdk = { version = "=0.7.1", features = ["derive"] }
 astrid-core = "=0.10.4"
 astrid-types = { version = "=0.10.4", features = ["clock"] }
 astrid-uplink = "=0.10.4"
+aos-realm-abi = { path = "capsules/capsule-linux-realm/crates/realm-abi" }
+aos-realm-core = { path = "capsules/capsule-linux-realm/crates/realm-core" }
+aos-realm-machine = { path = "capsules/capsule-linux-realm/crates/realm-machine" }
+aos-realm-9p = { path = "capsules/capsule-linux-realm/crates/realm-9p" }
+aos-realm-runtime = { path = "capsules/capsule-linux-realm/crates/realm-runtime" }
+aos-realm-vfs = { path = "capsules/capsule-linux-realm/crates/realm-vfs" }
+aos-realm-vcpu-protocol = { path = "capsules/capsule-linux-realm/crates/realm-vcpu-protocol" }
+aos-realm-vcpu-worker = { path = "capsules/capsule-linux-realm/crates/realm-vcpu-worker" }
 axum = "0.8"
 blake3 = "1.8.5"
 clap = { version = "4.6", features = ["derive"] }
 fs2 = "0.4"
+ieee-apsqrt = "=0.1.1"
+rustc_apfloat = "=0.2.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "process", "rt", "time"] }
 toml = "0.8"
 uuid = { version = "1.22", features = ["rng-getrandom", "serde", "v4"] }
+# Current stable release. Wasmi 2.0 is still a beta line and is not admitted to
+# the reference runtime without a deliberate compatibility review.
+wasmi = { version = "=1.1.0", default-features = false, features = [
+    "extra-checks",
+    "prefer-btree-collections",
+] }
+# Build-only compiler for the checked-in smoke guest source.
+wat = { version = "=1.253.0", default-features = false }
 
 [profile.release]
 opt-level = "z"
@@ -57,3 +84,9 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# The nested RV64 interpreter is the Linux Realm's CPU hot path. Optimizing it
+# for speed keeps a full kernel boot inside the broker's bounded tool window;
+# the rest of the distro retains the size-first release profile above.
+[profile.release.package.aos-realm-machine]
+opt-level = 3

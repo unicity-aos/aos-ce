@@ -1,0 +1,10 @@
+config BR2_PACKAGE_AOS_NINJA
+	bool "ninja"
+	depends on BR2_INSTALL_LIBSTDCPP
+	depends on BR2_USE_MMU
+	help
+	  Ninja is a small build system with a focus on speed. Buildroot's
+	  built-in Ninja package is host-only; AOS Realm deliberately builds
+	  the same pinned source for the target development environment.
+
+	  https://ninja-build.org/

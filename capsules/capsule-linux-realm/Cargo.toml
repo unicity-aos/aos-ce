@@ -1,0 +1,29 @@
+[package]
+name = "aos-linux-realm"
+version = "0.1.0"
+edition = "2024"
+authors = [
+    "Joshua J. Bouw <dev@joshuajbouw.com>",
+    "Unicity Labs <info@unicity-labs.com>",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/unicity-aos/aos-ce"
+description = "Principal-owned Linux-compatible workbench capsule for Unicity AOS"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+aos-realm-machine = { workspace = true }
+aos-realm-9p = { workspace = true }
+aos-realm-runtime = { workspace = true }
+aos-realm-vfs = { workspace = true }
+aos-realm-vcpu-protocol = { workspace = true }
+astrid-sdk = { git = "https://github.com/astrid-runtime/sdk-rust.git", rev = "1a06329b5a0d6bb4d66ac942ae3bdcc3b66abf47", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+blake3 = { workspace = true }
+toml = { workspace = true }

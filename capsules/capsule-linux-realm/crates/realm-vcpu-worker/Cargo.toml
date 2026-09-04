@@ -1,0 +1,23 @@
+[package]
+name = "aos-realm-vcpu-worker"
+version = "0.1.0"
+edition = "2024"
+authors = [
+    "Joshua J. Bouw <dev@joshuajbouw.com>",
+    "Unicity Labs <info@unicity-labs.com>",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/unicity-aos/aos-ce"
+description = "Core-Wasm RV64 vCPU worker for the AOS Linux Realm"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+aos-realm-machine = { workspace = true }
+aos-realm-vcpu-protocol = { workspace = true }
+
+[dev-dependencies]
+astrid-compute = { git = "https://github.com/astrid-runtime/astrid.git", rev = "ff85b21fdce761f7453487063744a622998b196e" }
+astrid-core = { git = "https://github.com/astrid-runtime/astrid.git", rev = "ff85b21fdce761f7453487063744a622998b196e" }

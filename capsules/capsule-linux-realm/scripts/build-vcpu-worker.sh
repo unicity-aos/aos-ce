@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+realm_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$realm_root/../.." && pwd)
+manifest="$realm_root/crates/realm-vcpu-worker/Cargo.toml"
+artifact="$repo_root/target/wasm64-unknown-unknown/release/aos_realm_vcpu_worker.wasm"
+installed="$realm_root/assets/linux-vcpu.wasm"
+expected_rustc=2972b5e59f1c5529b6ba770437812fd83ab4ebd4
+expected_blake3=c8db98e1509d5f598f154b40fa68edc8fcef910aabb3a0b1990ae5c0618c7139
+toolchain=nightly-2026-04-04
+toolchain_root=$(rustc "+$toolchain" --print sysroot)
+cargo_home=${CARGO_HOME:-$HOME/.cargo}
+rustflags="--remap-path-prefix=$toolchain_root=/rust/toolchain \
+--remap-path-prefix=$cargo_home=/cargo \
+--remap-path-prefix=$repo_root=/src/aos-ce \
+-C target-feature=+atomics,+bulk-memory,+mutable-globals \
+-C link-arg=--import-memory=astrid_compute,memory -C link-arg=--shared-memory \
+-C link-arg=--no-stack-first -C link-arg=--global-base=65536 \
+-C link-arg=-z -C link-arg=stack-size=33554432 \
+-C link-arg=--export=__stack_pointer \
+-C link-arg=--initial-memory=67108864 \
+-C link-arg=--max-memory=17179869184"
+
+actual_rustc=$(rustc "+$toolchain" -vV | awk '/^commit-hash:/ { print $2 }')
+if [[ "$actual_rustc" != "$expected_rustc" ]]; then
+  echo "Linux vCPU worker requires $toolchain rustc $expected_rustc; found $actual_rustc" >&2
+  exit 1
+fi
+
+RUSTFLAGS="$rustflags" cargo "+$toolchain" -Zbuild-std=std,panic_abort build \
+  --release --target wasm64-unknown-unknown --manifest-path "$manifest"
+
+actual_blake3=$(b3sum "$artifact" | awk '{ print $1 }')
+if [[ "$actual_blake3" != "$expected_blake3" ]]; then
+  echo "Linux vCPU worker drifted: expected $expected_blake3, got $actual_blake3" >&2
+  exit 1
+fi
+
+if [[ "${1:-}" == "--check" ]]; then
+  cmp "$artifact" "$installed"
+  echo "Linux vCPU worker is reproducible: blake3:$actual_blake3"
+  exit 0
+fi
+
+mkdir -p "$(dirname "$installed")"
+install -m 0644 "$artifact" "$installed"
+echo "Installed Linux vCPU worker: blake3:$actual_blake3"

@@ -1,0 +1,4 @@
+# absolute-path	guest-directory	wasm-output	Rust-byte-symbol
+/bin/echo	echo	echo.wasm	ECHO_GUEST
+/bin/cat	stdin-cat	stdin_cat.wasm	STDIN_CAT_GUEST
+/usr/bin/env	env	env.wasm	ENV_GUEST
