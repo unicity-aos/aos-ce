@@ -1,6 +1,6 @@
 # Changelog
 
-## [2026.1.3] - Unreleased
+## [2026.9.0] - Unreleased
 
 ### Added
 
@@ -34,7 +34,7 @@
 - Runtime import holds the standalone daemon's existing singleton lock without
   changing the source, and interrupted unreceipted cutovers always roll back
   before recopying the current locked source.
-- A signed release path for the 21 installable `aos-*` artifacts
+- A signed release path for the 22 installable `aos-*` artifacts
   built from this source tree and selected locally by Community Edition, with
   exact source/manifest identity checks, product-archive inclusion, offline
   provisioning, archive safety validation, BLAKE3 checksums, SHA-256
@@ -57,7 +57,7 @@
   contracts with exact workflow identities, expiry, replay-resistant generation
   state, and fail-closed direct installer resolution.
 - A native release gate that initializes a clean AOS home, verifies the exact
-  21-capsule CE lock, grants, and ready set, repeats initialization without
+  22-capsule CE lock, grants, and ready set, repeats initialization without
   changing runtime state, and proves clean daemon shutdown before publication.
 - Native `aos status` output for authenticated running state and verified
   stopped state without invoking the runtime CLI.
