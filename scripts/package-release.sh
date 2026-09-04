@@ -2,13 +2,31 @@
 set -euo pipefail
 
 if [[ $# -ne 6 ]]; then
-  if [[ "${1:-}" != "--sign-release-archive" || $# -ne 3 ]]; then
+  case "${1:-}" in
+    --extract-release-sealer)
+      [[ $# -eq 3 ]] || {
+        echo "usage: $0 --extract-release-sealer <native-aos-archive> <output-sealer>" >&2
+        exit 2
+      }
+      ;;
+    --sign-release-archive)
+      [[ $# -eq 5 ]] || {
+        echo "usage: $0 --sign-release-archive <aos-archive> <signed-output-archive> <native-sealer> <native-aos-archive>" >&2
+        exit 2
+      }
+      ;;
+    *)
     echo "usage: $0 <target> <aos-binary> <runtime-archive> <runtime-blake3> <capsule-artifacts> <output-dir>" >&2
-    echo "usage: $0 --sign-release-archive <aos-archive> <signed-output-archive>" >&2
+    echo "usage: $0 --extract-release-sealer <native-aos-archive> <output-sealer>" >&2
+    echo "usage: $0 --sign-release-archive <aos-archive> <signed-output-archive> <native-sealer> <native-aos-archive>" >&2
     exit 2
-  fi
+      ;;
+  esac
 fi
-if [[ $# -eq 3 && "${1:-}" != "--sign-release-archive" ]]; then
+if [[ $# -eq 3 && "${1:-}" != "--extract-release-sealer" ]]; then
+  exit 2
+fi
+if [[ $# -eq 5 && "${1:-}" != "--sign-release-archive" ]]; then
   exit 2
 fi
 if ! command -v b3sum >/dev/null 2>&1; then
@@ -78,12 +96,13 @@ PY
 sign_staged_distro() {
   local staged=$1
   local seed_file=$2
+  local sealer=$3
   local shuttle="$SIGNING_WORK/aos-distro.shuttle"
   local mirror="$SIGNING_WORK/aos-distro-signed"
   local seal_log="$SIGNING_WORK/seal.log"
   rm -rf "$mirror"
   mkdir -p "$mirror"
-  "$staged/runtime/bin/astrid" distro seal \
+  "$sealer" distro seal \
     "$staged/Distro.toml" \
     --output "$shuttle" \
     --key "$seed_file" 2> "$seal_log"
@@ -92,6 +111,161 @@ sign_staged_distro() {
   cmp "$staged/Distro.toml" "$mirror/Distro.toml"
   install -m 0600 "$mirror/Distro.lock" "$staged/Distro.lock"
   install -m 0600 "$mirror/Distro.sig" "$staged/Distro.sig"
+}
+
+toml_value() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import pathlib
+import sys
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 and older
+    import tomli as tomllib
+
+path, section, key = sys.argv[1:]
+value = tomllib.loads(pathlib.Path(path).read_text(encoding="utf-8"))[section][key]
+if not isinstance(value, str) or not value:
+    raise SystemExit(f"{path}: [{section}] {key} must be a non-empty string")
+print(value)
+PY
+}
+
+require_native_release_sealer() {
+  local archive=$1
+  local output=$2
+  local expected_target=x86_64-unknown-linux-gnu
+  local work=$3
+  local extracted="$work/native-sealer-extract"
+  local product_version runtime_version runtime_tag runtime_repository runtime_identity
+
+  [[ -f "$archive" && ! -L "$archive" ]] || {
+    echo "native sealer candidate is missing or not a regular file: $archive" >&2
+    exit 1
+  }
+  [[ ! -e "$output" && ! -L "$output" ]] || {
+    echo "native sealer output already exists: $output" >&2
+    exit 1
+  }
+  product_version=$(toml_value "$repo_root/crates/unicity-aos-bootstrap/Cargo.toml" package version)
+  runtime_version=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime version)
+  runtime_tag=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime tag)
+  runtime_repository=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime repository)
+  runtime_identity=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime release-workflow-identity)
+  mkdir -p "$extracted"
+  extract_safe_tar "$archive" "$extracted" "unicity-aos-${product_version}-${expected_target}"
+  python3 - "$extracted" "$product_version" "$expected_target" "$runtime_version" "$runtime_tag" "$runtime_repository" "$runtime_identity" <<'PY'
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+root, product_version, target, runtime_version, runtime_tag, repository, identity = sys.argv[1:]
+root = pathlib.Path(root)
+expected_root = f"unicity-aos-{product_version}-{target}"
+entries = list(root.iterdir())
+if len(entries) != 1 or entries[0].name != expected_root or entries[0].is_symlink() or not entries[0].is_dir():
+    raise SystemExit("native sealer archive does not contain exactly the expected product root")
+bundle = entries[0]
+manifest_path = bundle / "release-manifest.json"
+sealer = bundle / "runtime/bin/astrid"
+if manifest_path.is_symlink() or not manifest_path.is_file():
+    raise SystemExit("native sealer archive is missing a regular release-manifest.json")
+if sealer.is_symlink() or not sealer.is_file() or not os.access(sealer, os.X_OK):
+    raise SystemExit("native sealer archive has no regular executable runtime/bin/astrid")
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"native sealer release manifest is unreadable: {error}")
+if manifest.get("schema_version") != 2:
+    raise SystemExit("native sealer release manifest schema is not supported")
+if manifest.get("target") != target:
+    raise SystemExit("native sealer release manifest target does not match x86_64-unknown-linux-gnu")
+if manifest.get("product", {}).get("version") != product_version:
+    raise SystemExit("native sealer release manifest product version does not match the checkout")
+runtime = manifest.get("runtime")
+if not isinstance(runtime, dict) or runtime != {
+    "repository": repository,
+    "version": runtime_version,
+    "tag": runtime_tag,
+    "asset": f"astrid-{runtime_version}-{target}.tar.gz",
+    "digest": runtime.get("digest") if isinstance(runtime, dict) else None,
+    "release_workflow_identity": identity,
+}:
+    raise SystemExit("native sealer release manifest runtime tuple does not match the checkout")
+digest = runtime["digest"]
+if not isinstance(digest, str) or re.fullmatch(r"blake3:[0-9a-f]{64}", digest) is None:
+    raise SystemExit("native sealer runtime digest is malformed")
+record = manifest.get("release_files", {}).get("runtime/bin/astrid")
+if not isinstance(record, dict) or set(record) != {"blake3", "mode"}:
+    raise SystemExit("native sealer release manifest lacks an exact astrid inventory record")
+if not isinstance(record["blake3"], str) or re.fullmatch(r"[0-9a-f]{64}", record["blake3"]) is None:
+    raise SystemExit("native sealer astrid inventory digest is malformed")
+if record["mode"] != 0o755:
+    raise SystemExit("native sealer astrid inventory mode is not executable")
+if stat.S_IMODE(sealer.stat().st_mode) != 0o755:
+    raise SystemExit("native sealer astrid mode does not match its inventory")
+PY
+  local extracted_sealer="$extracted/unicity-aos-${product_version}-${expected_target}/runtime/bin/astrid"
+  local expected_digest actual_digest version_output
+  expected_digest=$(python3 - "$extracted/unicity-aos-${product_version}-${expected_target}/release-manifest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["release_files"]["runtime/bin/astrid"]["blake3"])
+PY
+  )
+  actual_digest=$(b3sum -- "$extracted_sealer" | awk '{print $1}')
+  [[ "$actual_digest" == "$expected_digest" ]] || {
+    echo "native sealer bytes do not match release-manifest.json" >&2
+    exit 1
+  }
+  version_output=$("$extracted_sealer" --version)
+  python3 - "$runtime_version" "$version_output" <<'PY'
+import re
+import sys
+
+expected, output = sys.argv[1:]
+if re.search(rf"(?<![0-9]){re.escape(expected)}(?![0-9])", output) is None:
+    raise SystemExit("native sealer --version does not match release-manifest.json")
+PY
+  install -m 0755 "$extracted_sealer" "$output"
+}
+
+require_release_archive_root() {
+  local extracted=$1
+  local product_version=$2
+  python3 - "$extracted" "$product_version" <<'PY'
+import json
+import pathlib
+import sys
+
+root, product_version = sys.argv[1:]
+root = pathlib.Path(root)
+entries = list(root.iterdir())
+if len(entries) != 1 or entries[0].is_symlink() or not entries[0].is_dir():
+    raise SystemExit("AOS archive must contain exactly one regular product root")
+bundle = entries[0]
+manifest_path = bundle / "release-manifest.json"
+if manifest_path.is_symlink() or not manifest_path.is_file():
+    raise SystemExit("AOS archive is missing a regular release-manifest.json")
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"AOS archive release manifest is unreadable: {error}")
+if manifest.get("schema_version") != 2:
+    raise SystemExit("AOS archive release manifest schema is not supported")
+target = manifest.get("target")
+if not isinstance(target, str) or not target:
+    raise SystemExit("AOS archive release manifest target is missing")
+if manifest.get("product", {}).get("version") != product_version:
+    raise SystemExit("AOS archive release manifest product version does not match the checkout")
+if bundle.name != f"unicity-aos-{product_version}-{target}":
+    raise SystemExit("AOS archive root does not match its release-manifest target")
+print(bundle)
+PY
 }
 
 sealer_pubkey_equals_manifest() {
@@ -143,9 +317,21 @@ path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
 }
 
+if [[ "${1:-}" == "--extract-release-sealer" ]]; then
+  archive=$2
+  output=$3
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  require_native_release_sealer "$archive" "$output" "$work"
+  echo "$output"
+  exit
+fi
+
 if [[ "${1:-}" == "--sign-release-archive" ]]; then
   archive=$2
   signed_output=$3
+  native_sealer=$4
+  native_sealer_archive=$5
   [[ -f "$archive" && ! -L "$archive" ]] || {
     echo "AOS archive is missing or not a regular file: $archive" >&2
     exit 1
@@ -153,13 +339,26 @@ if [[ "${1:-}" == "--sign-release-archive" ]]; then
   work=$(mktemp -d)
   signing_seed="$work/aos-distro-seed"
   trap '[[ -z "$signing_seed" ]] || destroy_distro_seed "$signing_seed"; rm -rf "$work"' EXIT
-  decode_distro_seed "$signing_seed"
+  seed_value=${AOS_DISTRO_ED25519_SEED:-}
+  unset AOS_DISTRO_ED25519_SEED
+  require_native_release_sealer "$native_sealer_archive" "$work/verified-native-sealer" "$work"
+  [[ -f "$native_sealer" && ! -L "$native_sealer" && -x "$native_sealer" ]] || {
+    echo "explicit native sealer is missing or not a regular executable: $native_sealer" >&2
+    exit 1
+  }
+  cmp "$work/verified-native-sealer" "$native_sealer" || {
+    echo "explicit native sealer does not match the authenticated native candidate" >&2
+    exit 1
+  }
   extract_safe_tar "$archive" "$work/extracted" ""
-  archive_root=$(find "$work/extracted" -mindepth 1 -maxdepth 1 -type d -print -quit)
-  [[ -n "$archive_root" ]] || { echo "AOS archive has no product bundle root" >&2; exit 1; }
+  archive_root=$(require_release_archive_root \
+    "$work/extracted" \
+    "$(toml_value "$repo_root/crates/unicity-aos-bootstrap/Cargo.toml" package version)")
   SIGNING_WORK="$work/signing"
   mkdir -p "$SIGNING_WORK"
-  sign_staged_distro "$archive_root" "$signing_seed"
+  AOS_DISTRO_ED25519_SEED="$seed_value" decode_distro_seed "$signing_seed"
+  unset seed_value
+  sign_staged_distro "$archive_root" "$signing_seed" "$native_sealer"
   record_signed_distro_inventory "$archive_root/release-manifest.json"
   mkdir -p "$(dirname "$signed_output")"
   COPYFILE_DISABLE=1 tar -czf "$work/signed.tar.gz" -C "$work/extracted" "$(basename "$archive_root")"
@@ -176,23 +375,6 @@ runtime_archive=$3
 runtime_blake3=$4
 capsule_artifacts=$5
 output_dir=$6
-
-toml_value() {
-  python3 - "$1" "$2" "$3" <<'PY'
-import pathlib
-import sys
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10 and older
-    import tomli as tomllib
-
-path, section, key = sys.argv[1:]
-value = tomllib.loads(pathlib.Path(path).read_text(encoding="utf-8"))[section][key]
-if not isinstance(value, str) or not value:
-    raise SystemExit(f"{path}: [{section}] {key} must be a non-empty string")
-print(value)
-PY
-}
 
 product_version=$(toml_value "$repo_root/crates/unicity-aos-bootstrap/Cargo.toml" package version)
 distro_product_version=$(toml_value "$repo_root/distros/community/unicity-ce/Distro.toml" distro version)
