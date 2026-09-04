@@ -454,6 +454,23 @@ fi
 if [ "$1" = stop ]; then
     record_runtime_state "${AOS_TEST_RUNTIME_STATE_PREFIX:-$AOS_TEST_ARGS}.stop"
 fi
+recorded_command="${1:-unknown}"
+for argument in "$@"; do
+    case "$argument" in
+        start|stop|apply) recorded_command="$argument" ;;
+    esac
+done
+if [ -n "${AOS_TEST_RUNTIME_PIN_PREFIX:-}" ]; then
+    pin_destination="${AOS_TEST_RUNTIME_PIN_PREFIX}.${recorded_command}"
+    if [ -f "$ASTRID_HOME/trust/unicity-ce.pub" ]; then
+        cp "$ASTRID_HOME/trust/unicity-ce.pub" "$pin_destination"
+    else
+        : > "$pin_destination"
+    fi
+fi
+if [ -n "${AOS_TEST_RUN_DIR_PREFIX:-}" ]; then
+    printf '%s\n' "$ASTRID_RUN_DIR" > "${AOS_TEST_RUN_DIR_PREFIX}.${recorded_command}"
+fi
 printf '%s\n' "$ASTRID_HOME" > "$AOS_TEST_HOME"
 printf '%s\n' "$ASTRID_WORKSPACE_STATE_DIR" > "$AOS_TEST_WORKSPACE"
 printf '%s\n' "$ASTRID_ENFORCED_DISTRO" > "$AOS_TEST_DISTRO"

@@ -7,6 +7,86 @@ fn state(fixture: &super::support::Fixture, name: &str) -> String {
 }
 
 #[test]
+fn runtime_child_uses_product_run_dir_over_an_inherited_override() {
+    let fixture = Fixture::new("run-dir-override");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    let hostile = fixture.root.join("hostile-run");
+    fs::create_dir_all(&hostile).expect("create hostile inherited run directory");
+    let recorded_prefix = fixture.root.join("runtime-run-dir");
+
+    let status = fixture
+        .command()
+        .env("ASTRID_RUN_DIR", &hostile)
+        .env("AOS_TEST_RUN_DIR_PREFIX", &recorded_prefix)
+        .args(["--principal", "alice", "distro", "apply", "--yes"])
+        .status()
+        .expect("run apply with hostile inherited run directory");
+    assert!(status.success());
+
+    let expected = format!("{}\n", fixture.home.join("run").display());
+    for command in ["start", "apply", "stop"] {
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(format!("runtime-run-dir.{command}")))
+                .expect("read child run directory"),
+            expected,
+            "child {command} must use the product-owned run directory"
+        );
+    }
+    assert!(
+        fs::read_dir(&hostile)
+            .expect("read hostile inherited run directory")
+            .next()
+            .is_none(),
+        "inherited run directory must remain unused"
+    );
+}
+
+#[test]
+fn distribution_apply_seeds_missing_mounted_pin_before_dispatch() {
+    let fixture = Fixture::new("missing-mounted-pin");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    let selected = fixture.selected_distro();
+    let expected_key = unicity_aos_bootstrap::distro_trust::selected_signing_key(&selected)
+        .expect("read packaged distribution signing key");
+    let pin_prefix = fixture.root.join("runtime-pin");
+
+    let status = fixture
+        .command()
+        .env("AOS_TEST_NO_MOUNTED_PIN", "1")
+        .env(
+            "AOS_TEST_RUNTIME_STATE_PREFIX",
+            fixture.root.join("runtime-state"),
+        )
+        .env("AOS_TEST_RUNTIME_PIN_PREFIX", &pin_prefix)
+        .args(["--principal", "alice", "distro", "apply", "--yes"])
+        .status()
+        .expect("run apply without a pre-existing mounted pin");
+    assert!(status.success());
+
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("runtime-pin.start"))
+            .expect("read start pin projection"),
+        "",
+        "the fake runtime must not pre-seed the mounted pin"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("runtime-pin.apply"))
+            .expect("read apply pin projection")
+            .trim(),
+        expected_key,
+        "AOS must seed the packaged authorized identity on the mounted projection"
+    );
+    assert!(
+        fs::read_to_string(fixture.root.join("apply-args"))
+            .expect("read runtime dispatch args")
+            .contains("<distro>"),
+        "AOS must dispatch only after seeding the missing mounted pin"
+    );
+    assert!(state(&fixture, "runtime-state.apply").contains("trust"));
+    assert!(!fixture.home.join("trust").exists());
+}
+
+#[test]
 fn selected_distribution_apply_is_the_single_transaction() {
     let fixture = Fixture::new("distro-apply-default");
     fixture.install_runtime(RECORDING_RUNTIME);

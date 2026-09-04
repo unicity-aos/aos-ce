@@ -20,9 +20,13 @@ from pathlib import Path
 
 state_dir = Path(os.environ["FAKE_STATE_DIR"])
 aos_home = Path(os.environ["AOS_HOME"])
-run_dir = aos_home / "runtime/run"
+run_dir_value = os.environ.get("ASTRID_RUN_DIR")
+if not run_dir_value:
+    raise SystemExit("fake runtime requires ASTRID_RUN_DIR")
+run_dir = Path(run_dir_value)
+if not run_dir.is_absolute() or run_dir.is_symlink() or not run_dir.is_dir():
+    raise SystemExit("fake runtime requires ASTRID_RUN_DIR to be an absolute real directory")
 state_dir.mkdir(parents=True, exist_ok=True)
-run_dir.mkdir(parents=True, exist_ok=True)
 command = sys.argv[1] if len(sys.argv) > 1 else ""
 
 
@@ -146,9 +150,9 @@ EOF
 
 new_case() {
   rm -rf "$work/current"
-  mkdir -p "$work/current/home/.aos/runtime/run" "$work/current/state"
-  : > "$work/current/home/.aos/runtime/run/system.lock"
-  chmod 600 "$work/current/home/.aos/runtime/run/system.lock"
+  mkdir -p "$work/current/home/.aos/runtime" "$work/current/home/.aos/run" "$work/current/state"
+  : > "$work/current/home/.aos/run/system.lock"
+  chmod 600 "$work/current/home/.aos/run/system.lock"
 }
 
 run_gate() {
@@ -204,21 +208,53 @@ run_gate >/dev/null
 test "$(cat "$work/current/state/state")" = stopped
 test "$(cat "$work/current/state/stop-count")" -eq 1
 
+# Keep the gate paused in its running window so the path contract is checked
+# independently of the post-stop cleanup assertions in the gate itself.
+new_case
+run_gate_env FAKE_STATUS_DELAY=2 >"$work/success.log" 2>&1 &
+success_pid=$!
+success_state=$work/current/state
+success_home=$work/current/home/.aos
+for _ in $(seq 1 500); do
+  if [[ -f "$success_state/status-entered" ]]; then
+    break
+  fi
+  if ! kill -0 "$success_pid" 2>/dev/null; then
+    wait "$success_pid"
+    echo "final runtime boot gate exited before its running window" >&2
+    exit 1
+  fi
+  sleep 0.01
+done
+test -f "$success_state/status-entered"
+test "$(cat "$success_state/status-entered")" = running
+test -S "$success_home/run/system.sock"
+test -f "$success_home/run/system.ready"
+test -s "$success_home/run/system.token"
+for coordination in system.sock system.ready system.token; do
+  [[ ! -e "$success_home/runtime/run/$coordination" && ! -L "$success_home/runtime/run/$coordination" ]]
+done
+wait "$success_pid"
+for coordination in system.sock system.ready system.token; do
+  [[ ! -e "$success_home/run/$coordination" && ! -L "$success_home/run/$coordination" ]]
+  [[ ! -e "$success_home/runtime/run/$coordination" && ! -L "$success_home/runtime/run/$coordination" ]]
+done
+
 new_case
 expect_failure 'does not match exact pin' run_gate_env FAKE_VERSION=9.9.8
 
 for stale in system.sock system.ready system.token deferred.db; do
   new_case
   case "$stale" in
-    deferred.db) mkdir "$work/current/home/.aos/runtime/run/$stale" ;;
-    *) : > "$work/current/home/.aos/runtime/run/$stale" ;;
+    deferred.db) mkdir "$work/current/home/.aos/run/$stale" ;;
+    *) : > "$work/current/home/.aos/run/$stale" ;;
   esac
   expect_failure 'requires clean regenerated coordination state' run_gate
 done
 
 for linked in system.sock system.ready system.token; do
   new_case
-  ln -s "$work/current/outside" "$work/current/home/.aos/runtime/run/$linked"
+  ln -s "$work/current/outside" "$work/current/home/.aos/run/$linked"
   expect_failure 'requires clean regenerated coordination state' run_gate
 done
 

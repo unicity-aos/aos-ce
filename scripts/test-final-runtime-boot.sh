@@ -52,7 +52,6 @@ if [[ "$upgrade_ready" != true && "$upgrade_ready" != false ]]; then
   exit 1
 fi
 
-runtime_home=$aos_home/runtime
 run_dir=$aos_home/run
 for stale in system.sock system.ready system.token deferred.db; do
   if [[ -e "$run_dir/$stale" || -L "$run_dir/$stale" ]]; then
@@ -63,11 +62,11 @@ done
 
 home=$(dirname "$aos_home")
 run_aos() {
-  HOME="$home" AOS_HOME="$aos_home" "$aos_binary" "$@"
+  HOME="$home" AOS_HOME="$aos_home" ASTRID_RUN_DIR="$run_dir" "$aos_binary" "$@"
 }
 
 assert_singleton_lock_available() {
-  python3 - "$runtime_home/run/system.lock" <<'PY'
+  python3 - "$run_dir/system.lock" <<'PY'
 import fcntl
 import os
 import stat
