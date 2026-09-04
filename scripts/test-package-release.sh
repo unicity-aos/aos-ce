@@ -37,7 +37,35 @@ for spec in source_contract():
 PY
 
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
-  printf '#!/bin/sh\nexit 0\n' > "$runtime_root/$binary"
+  if [[ "$binary" == astrid ]]; then
+    cat > "$runtime_root/$binary" <<'RUNTIME'
+#!/bin/sh
+set -eu
+if [ "${2:-}" != seal ]; then exit 0; fi
+manifest=$3
+output=
+key=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) output=$2; shift 2 ;;
+    --key) key=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$output" ] && [ -f "$key" ]
+stage=$(dirname "$output")/aos-fixture-seal
+rm -rf "$stage"
+mkdir -p "$stage/capsules"
+cp "$manifest" "$stage/Distro.toml"
+cp "$(dirname "$manifest")"/capsules/*.capsule "$stage/capsules/"
+printf 'schema-version = 1\nfixture = true\n' > "$stage/Distro.lock"
+printf 'fixture-signature\n' > "$stage/Distro.sig"
+printf '  signed by ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n' >&2
+COPYFILE_DISABLE=1 tar -czf "$output" -C "$stage" Distro.toml Distro.lock Distro.sig capsules
+RUNTIME
+  else
+    printf '#!/bin/sh\nexit 0\n' > "$runtime_root/$binary"
+  fi
   chmod 755 "$runtime_root/$binary"
 done
 COPYFILE_DISABLE=1 tar -czf "$work/runtime.tar.gz" -C "$work" "$(basename "$runtime_root")"
@@ -69,14 +97,21 @@ tar -tzf "$archive" > "$work/files"
 grep -q '/bin/aos$' "$work/files"
 grep -q '/libexec/install.sh$' "$work/files"
 grep -q '/runtime/bin/astrid-daemon$' "$work/files"
+grep -q '/runtime-compatibility.toml$' "$work/files"
 test "$(grep -c '/capsules/aos-.*\.capsule$' "$work/files")" -eq 22
 grep -q '/capsule-assets.txt$' "$work/files"
 grep -q '/Distro.toml$' "$work/files"
 grep -q '/release-manifest.json$' "$work/files"
+if grep -Eq '/Distro\.(lock|sig)$' "$work/files"; then
+  echo "unsigned release packaging emitted a production Distro signature" >&2
+  exit 1
+fi
 
 tar -xzf "$archive" -C "$work"
 manifest=$(find "$work" -path '*/release-manifest.json' -print -quit)
 bundle_root=$(dirname "$manifest")
+test "$(stat -c '%a' "$bundle_root/bin/aos" 2>/dev/null || stat -f '%Lp' "$bundle_root/bin/aos")" = 755
+test "$(stat -c '%a' "$bundle_root/runtime/bin/astrid-daemon" 2>/dev/null || stat -f '%Lp' "$bundle_root/runtime/bin/astrid-daemon")" = 755
 test "$(grep -c '^source = "capsules/aos-.*\.capsule"$' "$bundle_root/Distro.toml")" -eq 22
 if grep -F '@unicity-aos/capsule-' "$bundle_root/Distro.toml" >/dev/null; then
   echo "release archive retained a legacy capsule repository source" >&2
@@ -91,6 +126,30 @@ manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 product_version, runtime_version, runtime_identity = sys.argv[2:]
 assert manifest["schema_version"] == 2
 assert manifest["product"]["version"] == product_version
+assert manifest["layout"] == {
+    "release_directory": f"releases/{product_version}",
+    "runtime_executables": "runtime/bin",
+    "capsule_assets": "capsules",
+}
+expected_inventory = {
+    "Distro.toml",
+    "README.md",
+    "bin/aos",
+    "capsule-assets.txt",
+    "libexec/install.sh",
+    "runtime-compatibility.toml",
+    "runtime/bin/astrid",
+    "runtime/bin/astrid-build",
+    "runtime/bin/astrid-daemon",
+    "runtime/bin/astrid-emit",
+    *(f"capsules/{asset}" for asset in manifest["capsules"]["assets"]),
+}
+assert set(manifest["release_files"]) == expected_inventory, (
+    set(manifest["release_files"]) - expected_inventory,
+    expected_inventory - set(manifest["release_files"]),
+)
+assert manifest["release_files"]["bin/aos"]["mode"] == 0o700
+assert manifest["release_files"]["libexec/install.sh"]["mode"] == 0o600
 assert manifest["runtime"]["version"] == runtime_version
 assert manifest["runtime"]["digest"] == "blake3:" + "0" * 64
 assert "sha256" not in manifest["runtime"]
@@ -102,7 +161,69 @@ assert manifest["contracts"]["sdk_rust_commit"] == "bbbc61c8821d6c536fb25d2068b6
 assert manifest["capsules"]["count"] == 22
 assert len(manifest["capsules"]["assets"]) == 22
 assert len(set(manifest["capsules"]["assets"])) == 22
+assert manifest["verifier"] == {
+    "version": "v3.1.1",
+    "asset": "cosign-linux-amd64",
+    "sha256": "ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc",
+}
 PY
+
+fixture_distro="$work/FixtureDistro.toml"
+python3 - "$bundle_root/Distro.toml" "$fixture_distro" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+official = 'pubkey = "ed25519:utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA="'
+fixture = 'pubkey = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="'
+if source.count(official) != 1:
+    raise SystemExit("product Distro does not carry exactly one official signing pin")
+pathlib.Path(sys.argv[2]).write_text(source.replace(official, fixture), encoding="utf-8")
+PY
+cp "$fixture_distro" "$bundle_root/Distro.toml"
+fixture_archive="$work/fixture-aos.tar.gz"
+COPYFILE_DISABLE=1 tar -czf "$fixture_archive" -C "$work" "$(basename "$bundle_root")"
+fixture_signed="$work/fixture-aos-signed.tar.gz"
+AOS_DISTRO_ED25519_SEED="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" \
+  bash "$repo_root/scripts/package-release.sh" \
+  --sign-release-archive "$fixture_archive" "$fixture_signed"
+unset AOS_DISTRO_ED25519_SEED
+tar -tzf "$fixture_signed" > "$work/fixture-files"
+grep -q '/Distro.lock$' "$work/fixture-files"
+grep -q '/Distro.sig$' "$work/fixture-files"
+mkdir "$work/fixture-extract"
+tar -xzf "$fixture_signed" -C "$work/fixture-extract"
+fixture_root="$work/fixture-extract/$(basename "$bundle_root")"
+cmp "$fixture_distro" "$fixture_root/Distro.toml"
+python3 - "$fixture_root/release-manifest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+files = json.loads(pathlib.Path(sys.argv[1]).read_text())["release_files"]
+assert {"Distro.lock", "Distro.sig"} <= files.keys()
+PY
+
+python3 - "$bundle_root/Distro.toml" "$fixture_distro" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+fixture = 'pubkey = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="'
+mismatch = 'pubkey = "ed25519:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="'
+if source.count(fixture) != 1:
+    raise SystemExit("fixture Distro does not carry exactly one fixture signing pin")
+pathlib.Path(sys.argv[2]).write_text(source.replace(fixture, mismatch), encoding="utf-8")
+PY
+cp "$fixture_distro" "$bundle_root/Distro.toml"
+mismatch_archive="$work/mismatch-aos.tar.gz"
+COPYFILE_DISABLE=1 tar -czf "$mismatch_archive" -C "$work" "$(basename "$bundle_root")"
+if AOS_DISTRO_ED25519_SEED="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" \
+  bash "$repo_root/scripts/package-release.sh" \
+  --sign-release-archive "$mismatch_archive" "$work/mismatch-aos-signed.tar.gz" >/dev/null 2>&1; then
+  echo "release signing accepted a sealer key that differs from Distro.toml" >&2
+  exit 1
+fi
 
 unsafe_root="$work/unsafe-runtime"
 mkdir -p "$unsafe_root/astrid-$runtime_version-$target"

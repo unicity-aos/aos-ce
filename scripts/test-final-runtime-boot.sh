@@ -53,7 +53,7 @@ if [[ "$upgrade_ready" != true && "$upgrade_ready" != false ]]; then
 fi
 
 runtime_home=$aos_home/runtime
-run_dir=$runtime_home/run
+run_dir=$aos_home/run
 for stale in system.sock system.ready system.token deferred.db; do
   if [[ -e "$run_dir/$stale" || -L "$run_dir/$stale" ]]; then
     echo "final runtime boot gate requires clean regenerated coordination state: $run_dir/$stale exists" >&2

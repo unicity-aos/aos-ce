@@ -17,6 +17,14 @@
   replaces the AOS process so it directly owns signals and exit status. Closes
   #64.
 - The `aos` product command and product-owned `~/.aos` state boundary.
+- The canonical `aos distro apply` transaction, with `aos init` retained as an
+  explicit-principal alias. AOS mounts Astrid first, seeds or verifies the
+  selected distribution's signing-key pin on the mounted trust projection,
+  dispatches one signed local apply without capsule grants, stops back to exactly
+  `astrid.volume`, and records an AOS-owned active-cutover receipt.
+- One AOS-owned runtime coordination directory, passed to every runtime child so
+  inherited external `ASTRID_RUN_DIR` values cannot split start, status, and
+  stop state.
 - A pinned Unicity CE distribution manifest over Astrid Runtime 0.10.4, emplaced
   as the bundled runtime's operator-enforced distro.
 - Reproducible macOS and Linux release bundles with primary BLAKE3 and
@@ -56,8 +64,8 @@
 - A native release gate that initializes a clean AOS home, verifies the exact
   21-capsule CE lock, grants, and ready set, repeats initialization without
   changing runtime state, and proves clean daemon shutdown before publication.
-- Native `aos status` output for authenticated running state and verified
-  stopped state without invoking the runtime CLI.
+- Native `aos status` output for authenticated running state and receipt-aware
+  stopped state that proves a volume-only home can reopen before reporting GO.
 - An opt-in daily nightly train with deterministic run-dated versions, exact
   Astrid compatibility pins, protected publication and promotion, and
   idempotent recovery after interrupted release or pointer updates. It is

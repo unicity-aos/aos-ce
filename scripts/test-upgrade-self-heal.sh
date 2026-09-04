@@ -15,6 +15,20 @@ for command in b3sum cargo find python3 sort stat tar; do
   need "$command"
 done
 
+product_version=$(python3 - "$repo_root/distros/community/unicity-ce/Distro.toml" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+with pathlib.Path(sys.argv[1]).open("rb") as file:
+    print(tomllib.load(file)["distro"]["version"])
+PY
+)
+if [[ -z "$product_version" ]]; then
+  echo "active Distro product version is missing" >&2
+  exit 1
+fi
+
 mode_of() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
@@ -128,16 +142,18 @@ snapshot_imported_directories() {
 snapshot_shipped_assets() {
   local home=$1
   local output=$2
-  local release=$home/releases/2026.1.3
+  local release=$home/releases/${product_version}
   : > "$output"
   printf '%s|bin/aos\n' "$(b3sum -- "$home/bin/aos" | awk '{print $1}')" >> "$output"
+  printf "%s|releases/${product_version}/bin/aos\n" \
+    "$(b3sum -- "$release/bin/aos" | awk '{print $1}')" >> "$output"
   for name in astrid astrid-daemon astrid-build astrid-emit; do
-    printf '%s|runtime/bin/%s\n' \
-      "$(b3sum -- "$home/runtime/bin/$name" | awk '{print $1}')" \
+    printf "%s|releases/${product_version}/runtime/bin/%s\n" \
+      "$(b3sum -- "$release/runtime/bin/$name" | awk '{print $1}')" \
       "$name" >> "$output"
   done
   while IFS= read -r capsule; do
-    printf '%s|releases/2026.1.3/capsules/%s\n' \
+    printf "%s|releases/${product_version}/capsules/%s\n" \
       "$(b3sum -- "$release/capsules/$capsule" | awk '{print $1}')" \
       "$capsule" >> "$output"
   done < "$release/capsule-assets.txt"
@@ -161,8 +177,12 @@ mkdir -p "$home" "$fixture" "$fake_bin" "$capsules"
 python3 "$repo_root/scripts/create-astrid-094-fixture.py" "$legacy"
 
 cargo build --locked -p unicity-aos-bootstrap --bin aos
-product_binary=$repo_root/target/debug/aos
-test "$($product_binary --version)" = 'Unicity AOS 2026.1.3'
+target_dir=$(
+  cargo metadata --locked --no-deps --format-version 1 |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+)
+product_binary=$target_dir/debug/aos
+test "$($product_binary --version)" = "Unicity AOS $product_version"
 
 PYTHONPATH="$repo_root/scripts" python3 - "$capsules" <<'PY'
 import pathlib
@@ -231,7 +251,7 @@ bash "$repo_root/scripts/package-release.sh" \
   "$capsules" \
   "$fixture" >/dev/null
 
-asset=$fixture/unicity-aos-2026.1.3-$target.tar.gz
+asset=$fixture/unicity-aos-${product_version}-$target.tar.gz
 bundle=$asset.sigstore.json
 cp "$asset" "$fixture/signed-asset.tar.gz"
 printf 'valid Sigstore fixture\n' > "$fixture/valid.sigstore.json"
@@ -239,16 +259,16 @@ cp "$fixture/valid.sigstore.json" "$bundle"
 asset_sha256=$(shasum -a 256 "$asset" | awk '{print $1}')
 asset_blake3=$(b3sum "$asset" | awk '{print $1}')
 asset_size=$(wc -c < "$asset" | tr -d ' ')
-release_metadata=$fixture/unicity-aos-2026.1.3-release.toml
+release_metadata=$fixture/unicity-aos-${product_version}-release.toml
 cat > "$release_metadata" <<EOF
 schema-version = 1
 kind = "aos-release"
 product = "unicity-aos-ce"
-version = "2026.1.3"
-tag = "2026.1.3"
+version = "${product_version}"
+tag = "${product_version}"
 source-commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 published-at = "2026-07-16T10:00:00Z"
-release-workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/2026.1.3"
+release-workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/${product_version}"
 
 [runtime]
 repository = "astrid-runtime/astrid"
@@ -271,7 +291,7 @@ release-ready = false
 upgrade-self-heal-ready = false
 EOF
 for metadata_target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
-  metadata_asset="unicity-aos-2026.1.3-${metadata_target}.tar.gz"
+  metadata_asset="unicity-aos-${product_version}-${metadata_target}.tar.gz"
   cat >> "$release_metadata" <<EOF
 
 [targets.${metadata_target}]
@@ -322,7 +342,7 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
-cmp "$AOS_TEST_FIXTURE/valid.sigstore.json" "$bundle"
+cmp "FIXTURE_VALID_BUNDLE" "$bundle"
 [ -f "$artifact" ]
 EOF
 cat > "$fake_bin/sha256sum" <<'EOF'
@@ -337,12 +357,45 @@ esac
 EOF
 chmod 755 "$fake_bin/uname" "$fake_bin/curl" "$fake_bin/sha256sum" \
   "$fixture/cosign-linux-amd64"
+sed -i.bak "s|FIXTURE_VALID_BUNDLE|$fixture/valid.sigstore.json|" \
+  "$fixture/cosign-linux-amd64"
+rm "$fixture/cosign-linux-amd64.bak"
+
+archive_manifest=$(
+  rm -rf "$work/repack"
+  mkdir "$work/repack"
+  tar -xzf "$asset" -C "$work/repack"
+  find "$work/repack" -path '*/release-manifest.json' -print -quit
+)
+fixture_verifier_sha256=$(shasum -a 256 "$fixture/cosign-linux-amd64" | awk '{print $1}')
+python3 - "$archive_manifest" "$fixture_verifier_sha256" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["verifier"]["sha256"] = sys.argv[2]
+path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+archive_root=$(find "$work/repack" -mindepth 1 -maxdepth 1 -type d -print -quit)
+COPYFILE_DISABLE=1 tar -czf "$asset" -C "$work/repack" "$(basename "$archive_root")"
+cp "$asset" "$fixture/signed-asset.tar.gz"
+asset_sha256=$(shasum -a 256 "$asset" | awk '{print $1}')
+asset_blake3=$(b3sum "$asset" | awk '{print $1}')
+asset_size=$(wc -c < "$asset" | tr -d ' ')
+sed -i.bak \
+  -e "s/^sha256 = \".*\"$/sha256 = \"${asset_sha256}\"/" \
+  -e "s/^blake3 = \".*\"$/blake3 = \"${asset_blake3}\"/" \
+  -e "s/^size = [0-9][0-9]*$/size = ${asset_size}/" \
+  "$release_metadata"
+rm "$release_metadata.bak"
 
 install_candidate() {
   PATH="$fake_bin:$PATH" \
   HOME="$home" \
   AOS_TEST_FIXTURE="$fixture" \
-  AOS_VERSION=2026.1.3 \
+  AOS_VERSION=${product_version} \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
 }
 
@@ -355,57 +408,33 @@ test "$(find "$legacy/run" -type f | wc -l | tr -d ' ')" -eq 5
 
 install_candidate
 test -x "$aos_home/bin/aos"
-test -x "$aos_home/runtime/bin/astrid-daemon"
-HOME="$home" "$aos_home/bin/aos" migrate runtime --from "$legacy" > "$work/migrate.log"
-grep -F 'imported the standalone runtime; the source was left unchanged' "$work/migrate.log" >/dev/null
-assert_imported_activation_layout "$aos_home/runtime"
+release=$aos_home/releases/${product_version}
+test -x "$release/bin/aos"
+test -x "$release/runtime/bin/astrid-daemon"
+test ! -e "$aos_home/runtime/bin"
+printf 'fixture lock: not a production signature\n' > "$release/Distro.lock"
+printf 'fixture signature: not production trust\n' > "$release/Distro.sig"
+chmod 600 "$release/Distro.lock" "$release/Distro.sig"
+test "$(HOME="$home" "$aos_home/bin/aos" doctor)" = packaged-astrid
+mkdir "$aos_home/runtime"
 
 source_files_after=$work/source-files-after
 source_dirs_after=$work/source-dirs-after
-target_files=$work/target-files
-target_dirs=$work/target-dirs
 snapshot_durable_files "$legacy" "$source_files_after"
 snapshot_durable_directories "$legacy" "$source_dirs_after"
-snapshot_imported_files "$aos_home/runtime" "$source_files_before" "$target_files"
-snapshot_imported_directories "$aos_home/runtime" "$source_dirs_before" "$target_dirs"
 diff -u "$source_files_before" "$source_files_after"
 diff -u "$source_dirs_before" "$source_dirs_after"
-diff -u \
-  <(cut -d '|' -f 2 "$source_dirs_before") \
-  <(cut -d '|' -f 2 "$target_dirs")
-diff -u \
-  <(cut -d '|' -f 1,3 "$source_files_before") \
-  <(cut -d '|' -f 1,3 "$target_files")
-
-while IFS='|' read -r _ source_mode relative; do
-  target_path=$(expected_imported_path "$aos_home/runtime" "$relative")
-  target_mode=$(mode_of "$target_path")
-  if (( (8#$source_mode & 8#111) != 0 )); then
-    expected_mode=700
-  else
-    expected_mode=600
-  fi
-  test "$target_mode" = "$expected_mode"
-done < "$source_files_before"
-while IFS='|' read -r target_mode relative; do
-  test "$target_mode" = 700 || {
-    echo "target directory is not private: $relative ($target_mode)" >&2
-    exit 1
-  }
-done < "$target_dirs"
-
-for transient in .hud-health session.principal system.lock system.pid system.token; do
-  test -f "$legacy/run/$transient"
-  test ! -e "$aos_home/runtime/run/$transient"
-done
-test ! -e "$aos_home/runtime/run"
-
-receipt=$aos_home/migrations/astrid-home-v1.json
-test -f "$receipt"
-receipt_before=$(b3sum -- "$receipt" | awk '{print $1}')
-HOME="$home" "$aos_home/bin/aos" migrate runtime --from "$legacy" > "$work/idempotent.log"
-grep -F 'this runtime migration is already complete' "$work/idempotent.log" >/dev/null
-test "$(b3sum -- "$receipt" | awk '{print $1}')" = "$receipt_before"
+if HOME="$home" "$aos_home/bin/aos" migrate runtime --from "$legacy" \
+  > "$work/migrate.log" 2>&1; then
+  echo "legacy import accepted mutable release-executable state" >&2
+  exit 1
+fi
+if ! grep -F 'bundled product runtime executable set is not installed' "$work/migrate.log" >/dev/null; then
+  cat "$work/migrate.log" >&2
+  exit 1
+fi
+test ! -e "$aos_home/migrations/astrid-home-v1.json"
+test ! -e "$aos_home/.runtime-import"
 
 shipped_before=$work/shipped-before
 shipped_after=$work/shipped-after
@@ -413,70 +442,37 @@ snapshot_shipped_assets "$aos_home" "$shipped_before"
 for name in aos astrid astrid-daemon astrid-build astrid-emit; do
   case "$name" in
     aos) destination=$aos_home/bin/aos ;;
-    *) destination=$aos_home/runtime/bin/$name ;;
+    *) destination=$release/runtime/bin/$name ;;
   esac
   printf '#!/bin/sh\nexit 0\n' > "$destination"
   chmod 755 "$destination"
 done
 while IFS= read -r capsule; do
-  printf 'tampered capsule\n' > "$aos_home/releases/2026.1.3/capsules/$capsule"
-done < "$aos_home/releases/2026.1.3/capsule-assets.txt"
+  printf 'tampered capsule\n' > "$aos_home/releases/${product_version}/capsules/$capsule"
+done < "$aos_home/releases/${product_version}/capsule-assets.txt"
 chmod 755 \
   "$aos_home" \
   "$aos_home/bin" \
-  "$aos_home/runtime" \
-  "$aos_home/runtime/bin" \
   "$aos_home/releases" \
-  "$aos_home/releases/2026.1.3" \
-  "$aos_home/releases/2026.1.3/capsules"
+  "$release" \
+  "$release/capsules"
 
 install_candidate
-assert_imported_activation_layout "$aos_home/runtime"
 snapshot_shipped_assets "$aos_home" "$shipped_after"
 diff -u "$shipped_before" "$shipped_after"
 for directory in \
   "$aos_home" \
   "$aos_home/bin" \
-  "$aos_home/runtime" \
-  "$aos_home/runtime/bin" \
   "$aos_home/releases" \
-  "$aos_home/releases/2026.1.3" \
-  "$aos_home/releases/2026.1.3/capsules"; do
+  "$release" \
+  "$release/capsules"; do
   test "$(mode_of "$directory")" = 700
 done
+test ! -e "$aos_home/runtime/bin"
 
 snapshot_durable_files "$legacy" "$source_files_after"
 snapshot_durable_directories "$legacy" "$source_dirs_after"
-snapshot_imported_files "$aos_home/runtime" "$source_files_before" "$target_files"
-snapshot_imported_directories "$aos_home/runtime" "$source_dirs_before" "$target_dirs"
 diff -u "$source_files_before" "$source_files_after"
 diff -u "$source_dirs_before" "$source_dirs_after"
-diff -u \
-  <(cut -d '|' -f 1,3 "$source_files_before") \
-  <(cut -d '|' -f 1,3 "$target_files")
-diff -u \
-  <(cut -d '|' -f 2 "$source_dirs_before") \
-  <(cut -d '|' -f 2 "$target_dirs")
-while IFS='|' read -r _ source_mode relative; do
-  target_path=$(expected_imported_path "$aos_home/runtime" "$relative")
-  target_mode=$(mode_of "$target_path")
-  if (( (8#$source_mode & 8#111) != 0 )); then
-    expected_mode=700
-  else
-    expected_mode=600
-  fi
-  test "$target_mode" = "$expected_mode"
-done < "$source_files_before"
-while IFS='|' read -r target_mode relative; do
-  test "$target_mode" = 700 || {
-    echo "target directory is not private after reinstall: $relative ($target_mode)" >&2
-    exit 1
-  }
-done < "$target_dirs"
-test "$(b3sum -- "$receipt" | awk '{print $1}')" = "$receipt_before"
-HOME="$home" "$aos_home/bin/aos" migrate runtime --from "$legacy" > "$work/reinstall-idempotent.log"
-grep -F 'this runtime migration is already complete' "$work/reinstall-idempotent.log" >/dev/null
-test "$(b3sum -- "$receipt" | awk '{print $1}')" = "$receipt_before"
-test ! -e "$aos_home/runtime/run"
 
-echo "sanitized packaged migration, reinstall, and self-heal checks passed"
+echo "release-owned reinstall and self-heal checks passed"

@@ -777,7 +777,18 @@ bundle_name=$(tar -tzf "$work/$asset" | awk 'NR == 1 { sub(/\/.*/, "", $0); prin
 bundle="$work/unpack/$bundle_name"
 [ -d "$bundle" ] || { echo "release archive has no Unicity AOS bundle" >&2; exit 1; }
 
-for file in bin/aos libexec/install.sh runtime/bin/astrid runtime/bin/astrid-daemon runtime/bin/astrid-build runtime/bin/astrid-emit release-manifest.json Distro.toml capsule-assets.txt; do
+for file in \
+  bin/aos \
+  libexec/install.sh \
+  runtime/bin/astrid \
+  runtime/bin/astrid-daemon \
+  runtime/bin/astrid-build \
+  runtime/bin/astrid-emit \
+  release-manifest.json \
+  Distro.toml \
+  capsule-assets.txt \
+  README.md \
+  runtime-compatibility.toml; do
   [ -f "$bundle/$file" ] || { echo "release archive is missing $file" >&2; exit 1; }
 done
 [ -d "$bundle/capsules" ] || { echo "release archive has no capsule directory" >&2; exit 1; }
@@ -817,7 +828,21 @@ fi
 release_dir="$AOS_HOME/releases/$staged_version"
 release_stage="$AOS_HOME/releases/.${staged_version}.new.$$"
 release_backup="$AOS_HOME/releases/.${staged_version}.rollback.$$"
-for managed in "$AOS_HOME" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases" "$release_dir" "$release_dir/capsules" "$AOS_HOME/update" "$AOS_HOME/update/channels"; do
+retired_runtime_bin="$AOS_HOME/releases/.runtime-bin.retired.$$"
+for managed in \
+  "$AOS_HOME" \
+  "$AOS_HOME/libexec" \
+  "$AOS_HOME/runtime" \
+  "$AOS_HOME/releases" \
+  "$release_dir" \
+  "$release_dir/bin" \
+  "$release_dir/libexec" \
+  "$release_dir/runtime" \
+  "$release_dir/runtime/bin" \
+  "$release_dir/signed" \
+  "$release_dir/capsules" \
+  "$AOS_HOME/update" \
+  "$AOS_HOME/update/channels"; do
   [ ! -L "$managed" ] || { echo "refusing symlinked managed path: $managed" >&2; exit 1; }
 done
 if [ -e "$release_dir" ] && [ ! -d "$release_dir" ]; then
@@ -828,6 +853,10 @@ if [ -e "$release_stage" ] || [ -e "$release_backup" ]; then
   echo "refusing stale release transaction state for $staged_version" >&2
   exit 1
 fi
+[ ! -e "$retired_runtime_bin" ] || {
+  echo "refusing stale legacy runtime transaction state" >&2
+  exit 1
+}
 if [ -L "$AOS_BIN_DIR" ]; then
   echo "refusing symlinked binary directory: $AOS_BIN_DIR" >&2
   exit 1
@@ -853,8 +882,8 @@ if [ -x "$AOS_BIN_DIR/aos" ]; then
   "$AOS_BIN_DIR/aos" stop >/dev/null 2>&1 || true
 fi
 
-mkdir -p "$AOS_BIN_DIR" "$AOS_HOME/libexec" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases"
-chmod 700 "$AOS_HOME" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases"
+mkdir -p "$AOS_BIN_DIR" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/releases"
+chmod 700 "$AOS_HOME" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/releases"
 if [ -n "$channel_root" ]; then
   mkdir -p "$channel_root/generations"
   chmod 700 "$AOS_HOME/update" "$AOS_HOME/update/channels" "$channel_root" "$channel_root/generations"
@@ -936,12 +965,11 @@ restore() {
   elif [ -f "$rollback/release.touched" ]; then
     rm -rf "$release_dir" || result=1
   fi
-  for name in aos installer astrid astrid-daemon astrid-build astrid-emit channel-current; do
+  for name in aos installer channel-current; do
     case "$name" in
       aos) destination="$AOS_BIN_DIR/aos" ;;
       installer) destination="$AOS_HOME/libexec/install.sh" ;;
       channel-current) destination=$channel_current_path ;;
-      *) destination="$AOS_HOME/runtime/bin/$name" ;;
     esac
     [ -n "$destination" ] || continue
     rm -f "${destination}.new.$$" "${destination}.restore.$$"
@@ -959,22 +987,99 @@ restore() {
   return "$result"
 }
 
+retire_runtime_bin() {
+  bin="$AOS_HOME/runtime/bin"
+  [ ! -L "$bin" ] || { echo "refusing symlinked legacy runtime bin: $bin" >&2; return 1; }
+  if [ -e "$bin" ]; then
+    [ -d "$bin" ] || { echo "legacy runtime bin is not a directory: $bin" >&2; return 1; }
+    for name in astrid astrid-daemon astrid-build astrid-emit; do
+      path="$bin/$name"
+      [ ! -e "$path" ] || {
+        [ ! -L "$path" ] && [ -f "$path" ] || {
+          echo "refusing non-regular legacy runtime executable: $path" >&2
+          return 1
+        }
+      }
+    done
+    unknown=$(find "$bin" -mindepth 1 -maxdepth 1 \
+      ! -name astrid ! -name astrid-daemon ! -name astrid-build \
+      ! -name astrid-emit -print -quit)
+    if [ -n "$unknown" ]; then
+      echo "legacy runtime bin contains unknown state; refusing installation" >&2
+      return 1
+    fi
+    if [ -n "$(find "$bin" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]; then
+      echo "legacy runtime bin contains unknown state; refusing installation" >&2
+      return 1
+    fi
+    if ! mv "$bin" "$retired_runtime_bin"; then
+      echo "could not retire the legacy runtime executable tree" >&2
+      return 1
+    fi
+  fi
+  if [ -d "$AOS_HOME/runtime" ] && [ -z "$(find "$AOS_HOME/runtime" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    rmdir "$AOS_HOME/runtime" 2>/dev/null || true
+  fi
+  rm -rf "$retired_runtime_bin"
+}
+
 installation_started=1
-if ! install_one "$bundle/bin/aos" "$AOS_BIN_DIR/aos" aos 755; then exit 1; fi
-if ! install_one "$bundle/libexec/install.sh" "$AOS_HOME/libexec/install.sh" installer 600; then exit 1; fi
-for name in astrid astrid-daemon astrid-build astrid-emit; do
-  if ! install_one "$bundle/runtime/bin/$name" "$AOS_HOME/runtime/bin/$name" "$name" 755; then exit 1; fi
-done
 mkdir "$release_stage"
 chmod 700 "$release_stage"
-mkdir "$release_stage/capsules"
-chmod 700 "$release_stage/capsules"
+mkdir \
+  "$release_stage/bin" \
+  "$release_stage/libexec" \
+  "$release_stage/runtime" \
+  "$release_stage/runtime/bin" \
+  "$release_stage/signed" \
+  "$release_stage/verifier" \
+  "$release_stage/capsules"
+chmod 700 \
+  "$release_stage/bin" \
+  "$release_stage/libexec" \
+  "$release_stage/runtime" \
+  "$release_stage/runtime/bin" \
+  "$release_stage/signed" \
+  "$release_stage/verifier" \
+  "$release_stage/capsules"
+install -m 0700 "$bundle/bin/aos" "$release_stage/bin/aos"
+install -m 0600 "$bundle/libexec/install.sh" "$release_stage/libexec/install.sh"
+for name in astrid astrid-daemon astrid-build astrid-emit; do
+  install -m 0700 "$bundle/runtime/bin/$name" "$release_stage/runtime/bin/$name"
+done
 install -m 0600 "$bundle/release-manifest.json" "$release_stage/release-manifest.json"
+install -m 0600 "$work/$release_metadata_asset" "$release_stage/signed/$release_metadata_asset"
+install -m 0600 "$work/$release_metadata_asset.sigstore.json" \
+  "$release_stage/signed/$release_metadata_asset.sigstore.json"
+install -m 0600 "$work/$asset" "$release_stage/signed/$asset"
+install -m 0700 "$COSIGN_BIN" "$release_stage/verifier/cosign"
 install -m 0600 "$bundle/Distro.toml" "$release_stage/Distro.toml"
 install -m 0600 "$bundle/capsule-assets.txt" "$release_stage/capsule-assets.txt"
+install -m 0600 "$bundle/README.md" "$release_stage/README.md"
+install -m 0600 "$bundle/runtime-compatibility.toml" "$release_stage/runtime-compatibility.toml"
 while IFS= read -r capsule; do
   install -m 0600 "$bundle/capsules/$capsule" "$release_stage/capsules/$capsule"
 done < "$bundle/capsule-assets.txt"
+distro_signing=$(python3 - "$bundle/release-manifest.json" <<'PY'
+import json, pathlib, sys
+files = json.loads(pathlib.Path(sys.argv[1]).read_text())["release_files"]
+print("yes" if {"Distro.lock", "Distro.sig"} <= files.keys() else "no")
+PY
+)
+if [ "$distro_signing" = yes ]; then
+  install -m 0600 "$bundle/Distro.lock" "$release_stage/Distro.lock"
+  install -m 0600 "$bundle/Distro.sig" "$release_stage/Distro.sig"
+fi
+for persisted in \
+  "signed/$release_metadata_asset" \
+  "signed/$release_metadata_asset.sigstore.json" \
+  "signed/$asset" \
+  "verifier/cosign"; do
+  [ -f "$release_stage/$persisted" ] && [ ! -L "$release_stage/$persisted" ] || {
+    echo "release inventory is missing authenticated state: $persisted" >&2
+    exit 1
+  }
+done
 if [ -d "$release_dir" ]; then
   mv "$release_dir" "$release_backup"
 fi
@@ -983,17 +1088,21 @@ if ! mv "$release_stage" "$release_dir"; then
   exit 1
 fi
 release_committed=1
+if ! install_one "$release_dir/bin/aos" "$AOS_BIN_DIR/aos" aos 755; then exit 1; fi
+if ! install_one "$release_dir/libexec/install.sh" "$AOS_HOME/libexec/install.sh" installer 600; then exit 1; fi
 stage_channel_receipt
+retire_runtime_bin
 installation_started=0
 rm -rf "$release_backup"
+rm -rf "$retired_runtime_bin"
 release_install_lock
 
 echo "Installed Unicity AOS $staged_version."
 case ":$PATH:" in
-  *":$AOS_BIN_DIR:"*) init_command="aos init" ;;
+  *":$AOS_BIN_DIR:"*) init_command="aos distro apply" ;;
   *)
     echo "Add $AOS_BIN_DIR to PATH."
-    init_command="$AOS_BIN_DIR/aos init"
+    init_command="$AOS_BIN_DIR/aos distro apply"
     ;;
 esac
 

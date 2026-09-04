@@ -361,6 +361,21 @@ jobs:
         run: |
           python3 scripts/capsule_release.py --artifacts capsule-artifacts
           cp capsule-artifacts/*.capsule artifacts/
+      - name: Sign the selected Distro in each product archive
+        if: needs.classify.outputs.nightly == 'false'
+        env:
+          AOS_DISTRO_ED25519_SEED: ${{ secrets.AOS_DISTRO_ED25519_SEED }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for asset in artifacts/aos-*-*-*.tar.gz; do
+            if tar -tzf "$asset" | grep -q '/Distro.sig$'; then
+              continue
+            fi
+            signed="$RUNNER_TEMP/$(basename "$asset")"
+            scripts/package-release.sh --sign-release-archive "$asset" "$signed"
+            mv "$signed" "$asset"
+          done
       - name: Generate checksums
         run: |
           cd artifacts

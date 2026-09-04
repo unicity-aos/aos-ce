@@ -23,6 +23,9 @@ session = "^1.0"
 spark = "^1.0"
 tool = "^1.0"
 
+[distro.signing]
+pubkey = "ed25519:utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA="
+
 [variables]
 openai_api_key = { secret = true, description = "API key for OpenAI-compatible LLM provider" }
 openai_base_url = { description = "API base URL", default = "https://api.openai.com" }

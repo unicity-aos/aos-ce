@@ -2,6 +2,20 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+product_version=$(python3 - "$repo_root/distros/community/unicity-ce/Distro.toml" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+with pathlib.Path(sys.argv[1]).open("rb") as file:
+    print(tomllib.load(file)["distro"]["version"])
+PY
+)
+if [[ -z "$product_version" ]]; then
+  echo "active Distro product version is missing" >&2
+  exit 1
+fi
+product_target=x86_64-unknown-linux-gnu
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 fixture="$work/fixture"
@@ -49,13 +63,14 @@ if [[ "$runtime_metadata_available" != true ]]; then
   exit 1
 fi
 
-cat > "$work/aos" <<'EOF'
+cat > "$work/aos" <<EOF
 #!/bin/sh
-if [ "${1:-}" = --version ]; then
-  echo 'Unicity AOS 2026.1.3'
+release_runtime="$work/home/.aos/releases/$product_version/runtime/bin/astrid"
+if [ "\${1:-}" = --version ]; then
+  echo "Unicity AOS $product_version"
   exit 0
 fi
-exit 0
+exec "\$release_runtime" "\$@"
 EOF
 chmod 755 "$work/aos"
 
@@ -85,7 +100,7 @@ bash "$repo_root/scripts/package-release.sh" \
   0000000000000000000000000000000000000000000000000000000000000000 \
   "$work/capsules" \
   "$fixture" >/dev/null
-asset="$fixture/unicity-aos-2026.1.3-x86_64-unknown-linux-gnu.tar.gz"
+asset="$fixture/unicity-aos-${product_version}-${product_target}.tar.gz"
 bundle="$asset.sigstore.json"
 signed_asset="$fixture/signed-asset.tar.gz"
 good_bundle="$fixture/valid.sigstore.json"
@@ -96,16 +111,16 @@ cp "$good_bundle" "$bundle"
 asset_sha256=$(shasum -a 256 "$asset" | awk '{print $1}')
 asset_blake3=$(b3sum "$asset" | awk '{print $1}')
 asset_size=$(wc -c < "$asset" | tr -d ' ')
-release_metadata="$fixture/unicity-aos-2026.1.3-release.toml"
+release_metadata="$fixture/unicity-aos-${product_version}-release.toml"
 cat > "$release_metadata" <<EOF
 schema-version = 1
 kind = "aos-release"
 product = "unicity-aos-ce"
-version = "2026.1.3"
-tag = "2026.1.3"
+version = "${product_version}"
+tag = "${product_version}"
 source-commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 published-at = "2026-07-16T10:00:00Z"
-release-workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/2026.1.3"
+release-workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/${product_version}"
 
 [runtime]
 repository = "astrid-runtime/astrid"
@@ -128,7 +143,7 @@ release-ready = true
 upgrade-self-heal-ready = true
 EOF
 for metadata_target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
-  metadata_asset="unicity-aos-2026.1.3-${metadata_target}.tar.gz"
+  metadata_asset="unicity-aos-${product_version}-${metadata_target}.tar.gz"
   cat >> "$release_metadata" <<EOF
 
 [targets.${metadata_target}]
@@ -232,8 +247,40 @@ EOF
 chmod 755 "$fake_bin/uname" "$fake_bin/date" "$fake_bin/curl" "$fake_bin/cosign" \
   "$fake_bin/sha256sum" "$fixture/cosign-linux-amd64"
 
+# The launcher re-checksums its persisted verifier. Rebind the archive's
+# authenticated verifier record to the deterministic fake verifier used by this
+# fixture before the release metadata is signed.
+rm -rf "$work/repack"
+mkdir "$work/repack"
+tar -xzf "$asset" -C "$work/repack"
+archive_manifest=$(find "$work/repack" -path '*/release-manifest.json' -print -quit)
+fixture_verifier_sha256=$(shasum -a 256 "$fixture/cosign-linux-amd64" | awk '{print $1}')
+python3 - "$archive_manifest" "$fixture_verifier_sha256" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["verifier"]["sha256"] = sys.argv[2]
+path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+archive_root=$(find "$work/repack" -mindepth 1 -maxdepth 1 -type d -print -quit)
+COPYFILE_DISABLE=1 tar -czf "$asset" -C "$work/repack" "$(basename "$archive_root")"
+cp "$asset" "$signed_asset"
+asset_sha256=$(shasum -a 256 "$asset" | awk '{print $1}')
+asset_blake3=$(b3sum "$asset" | awk '{print $1}')
+asset_size=$(wc -c < "$asset" | tr -d ' ')
+sed -i.bak \
+  -e "s/^sha256 = \".*\"$/sha256 = \"${asset_sha256}\"/" \
+  -e "s/^blake3 = \".*\"$/blake3 = \"${asset_blake3}\"/" \
+  -e "s/^size = [0-9][0-9]*$/size = ${asset_size}/" \
+  "$release_metadata"
+rm "$release_metadata.bak"
+cp "$release_metadata" "$fixture/release-good.toml"
+
 if PATH="$fake_bin:$PATH" HOME="$work/impossible-nightly-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --version "2026.1.3-nightly.20260230.g$(printf '%040d' 0)" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --version "${product_version}-nightly.20260230.g$(printf '%040d' 0)" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted a nightly version with an impossible date" >&2
   exit 1
 fi
@@ -242,20 +289,63 @@ test ! -e "$work/impossible-nightly-home/.aos"
 PATH="$fake_bin:$PATH" \
 HOME="$work/home" \
 AOS_TEST_FIXTURE="$fixture" \
-AOS_VERSION=2026.1.3 \
+AOS_VERSION=${product_version} \
 sh "$repo_root/install.sh" --yes --no-migrate-prompt
 
 test -x "$work/home/.aos/bin/aos"
-test -x "$work/home/.aos/runtime/bin/astrid-daemon"
-release_dir="$work/home/.aos/releases/2026.1.3"
+release_dir="$work/home/.aos/releases/${product_version}"
+test -x "$release_dir/bin/aos"
+for binary in astrid astrid-daemon astrid-build astrid-emit; do
+  test -x "$release_dir/runtime/bin/$binary"
+done
+test ! -e "$work/home/.aos/runtime/bin"
 test -f "$release_dir/release-manifest.json"
+statement_name="unicity-aos-${product_version}-release.toml"
+test -f "$release_dir/signed/$statement_name"
+test -f "$release_dir/signed/$statement_name.sigstore.json"
+test -f "$release_dir/signed/unicity-aos-${product_version}-${product_target}.tar.gz"
+test -x "$release_dir/verifier/cosign"
+cmp "$fixture/cosign-linux-amd64" "$release_dir/verifier/cosign"
+test "$(stat -c '%a' "$release_dir/verifier/cosign" 2>/dev/null || stat -f '%Lp' "$release_dir/verifier/cosign")" = 700
+test -f "$release_dir/runtime-compatibility.toml"
 test -f "$release_dir/Distro.toml"
 test -f "$release_dir/capsule-assets.txt"
 test "$(find "$release_dir/capsules" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 22
 while IFS= read -r capsule; do
   cmp "$work/capsules/$capsule" "$release_dir/capsules/$capsule"
 done < "$release_dir/capsule-assets.txt"
-test "$("$work/home/.aos/bin/aos" --version)" = 'Unicity AOS 2026.1.3'
+test "$("$work/home/.aos/bin/aos" --version)" = "Unicity AOS $product_version"
+doctor_output=$(HOME="$work/home" "$work/home/.aos/bin/aos" doctor 2>"$work/doctor.log") || {
+  cat "$work/doctor.log" >&2
+  exit 1
+}
+test "$doctor_output" = astrid
+mkdir -p "$work/home/.aos/runtime/bin"
+printf '#!/bin/sh\necho mutable-runtime-copy-used\nexit 91\n' \
+  > "$work/home/.aos/runtime/bin/astrid"
+chmod 755 "$work/home/.aos/runtime/bin/astrid"
+doctor_output=$(HOME="$work/home" "$work/home/.aos/bin/aos" doctor 2>"$work/doctor.log") || {
+  cat "$work/doctor.log" >&2
+  exit 1
+}
+test "$doctor_output" = astrid
+rm -rf "$work/home/.aos/runtime/bin"
+
+mkdir -p "$work/home/.aos/runtime/bin"
+cp "$release_dir/runtime/bin/astrid" "$work/home/.aos/runtime/bin/astrid"
+chmod 755 "$work/home/.aos/runtime/bin/astrid"
+printf 'unknown-legacy-state\n' > "$work/home/.aos/runtime/bin/unknown"
+if PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=${product_version} \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  echo "installer accepted unknown legacy runtime-bin state" >&2
+  exit 1
+fi
+test -f "$work/home/.aos/runtime/bin/astrid"
+test -f "$work/home/.aos/runtime/bin/unknown"
+test -z "$(find "$work/home/.aos/releases" -maxdepth 1 -name ".${product_version}.new.*" -print -quit)"
+test -z "$(find "$work/home/.aos/releases" -maxdepth 1 -name ".${product_version}.rollback.*" -print -quit)"
+rm -rf "$work/home/.aos/runtime/bin"
+
 test -f "$work/home/.aos/libexec/install.sh"
 test "$(stat -c '%a' "$work/home/.aos/libexec/install.sh" 2>/dev/null || stat -f '%Lp' "$work/home/.aos/libexec/install.sh")" = 600
 test "$(cat "$work/home/.astrid/sentinel")" = 'standalone-runtime-state'
@@ -288,12 +378,12 @@ test -f "$accepted_bundle"
 test "$(awk '$1 == "generation" { print $3 }' "$accepted_channel")" = 2
 grep -Fx 'https://github.com/unicity-aos/aos-ce/.github/workflows/promote-channel.yml@refs/heads/main' \
   "$fixture/cosign-identities" >/dev/null
-grep -Fx 'https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/2026.1.3' \
+grep -Fx "https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/${product_version}" \
   "$fixture/cosign-identities" >/dev/null
 
 cp "$fixture/channel-good.toml" "$fixture/channel.toml"
-nightly_version="2026.1.3-nightly.20260717.gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-sed -i.bak "s/version = \"2026.1.3\"/version = \"$nightly_version\"/" "$fixture/channel.toml"
+nightly_version="${product_version}-nightly.20260717.gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+sed -i.bak "s/version = \"${product_version}\"/version = \"$nightly_version\"/" "$fixture/channel.toml"
 rm "$fixture/channel.toml.bak"
 if PATH="$fake_bin:$PATH" HOME="$work/nightly-on-stable-home" AOS_TEST_FIXTURE="$fixture" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
@@ -350,7 +440,7 @@ cp "$fixture/release-good.toml" "$release_metadata"
 sed -i.bak 's/release-ready = true/release-ready = "true"/' "$release_metadata"
 rm "$release_metadata.bak"
 if PATH="$fake_bin:$PATH" HOME="$work/quoted-gate-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --version 2026.1.3 --yes --no-migrate-prompt >/dev/null 2>&1; then
+  sh "$repo_root/install.sh" --version "${product_version}" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted a quoted TOML readiness gate" >&2
   exit 1
 fi
@@ -440,7 +530,7 @@ fi
 test ! -e "$work/unavailable-channel-home/.aos"
 
 if PATH="$fake_bin:$PATH" HOME="$work/mutually-exclusive-home" AOS_TEST_FIXTURE="$fixture" \
-  sh "$repo_root/install.sh" --channel dev --version 2026.1.3 --yes --no-migrate-prompt \
+  sh "$repo_root/install.sh" --channel dev --version "${product_version}" --yes --no-migrate-prompt \
   >/dev/null 2>&1; then
   echo "installer accepted mutually exclusive channel and version selectors" >&2
   exit 1
@@ -448,7 +538,7 @@ fi
 test ! -e "$work/mutually-exclusive-home/.aos"
 
 printf 'tampered capsule\n' > "$release_dir/capsules/aos-cli.capsule"
-PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=${product_version} \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
 cmp "$work/capsules/aos-cli.capsule" "$release_dir/capsules/aos-cli.capsule"
 
@@ -462,7 +552,7 @@ echo existing-unicity-aos
 EOF
 chmod 755 "$work/home/.aos/bin/aos"
 cp "$work/home/.aos/bin/aos" "$work/aos-before-unattended-upgrade"
-if PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+if PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=${product_version} \
   AOS_STOP_MARKER="$work/unattended-stop-called" \
   sh "$repo_root/install.sh" --no-migrate-prompt </dev/null >"$work/unattended-upgrade.log" 2>&1; then
   echo "installer replaced an existing installation without confirmation" >&2
@@ -474,7 +564,7 @@ grep -F 'rerun with --yes to replace it without a prompt' "$work/unattended-upgr
 
 rm -f "$fixture/cosign-called"
 if PATH="$fake_bin:$PATH" HOME="$work/bad-verifier-home" AOS_TEST_FIXTURE="$fixture" \
-  AOS_TEST_BAD_COSIGN_DIGEST=1 AOS_VERSION=2026.1.3 \
+  AOS_TEST_BAD_COSIGN_DIGEST=1 AOS_VERSION=${product_version} \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted a Sigstore verifier with the wrong digest" >&2
   exit 1
@@ -483,7 +573,7 @@ test ! -e "$fixture/cosign-called"
 test ! -e "$work/bad-verifier-home/.aos"
 
 printf 'invalid Sigstore fixture\n' > "$bundle"
-if PATH="$fake_bin:$PATH" HOME="$work/bad-bundle-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+if PATH="$fake_bin:$PATH" HOME="$work/bad-bundle-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=${product_version} \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted an invalid Sigstore bundle" >&2
   exit 1
@@ -492,7 +582,7 @@ test ! -e "$work/bad-bundle-home/.aos"
 cp "$good_bundle" "$bundle"
 
 mv "$bundle" "$work/missing-bundle"
-if PATH="$fake_bin:$PATH" HOME="$work/missing-bundle-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+if PATH="$fake_bin:$PATH" HOME="$work/missing-bundle-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=${product_version} \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted a release with no Sigstore bundle" >&2
   exit 1
@@ -501,7 +591,7 @@ test ! -e "$work/missing-bundle-home/.aos"
 mv "$work/missing-bundle" "$bundle"
 
 printf 'modified after signing\n' >> "$asset"
-if PATH="$fake_bin:$PATH" HOME="$work/modified-asset-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+if PATH="$fake_bin:$PATH" HOME="$work/modified-asset-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=${product_version} \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted release bytes that did not match the Sigstore bundle" >&2
   exit 1
@@ -518,7 +608,7 @@ set -eu
 EOF
 chmod 755 "$work/symlink-target"
 ln -s "$work/symlink-target" "$symlink_home/.aos/bin/aos"
-if PATH="$fake_bin:$PATH" HOME="$symlink_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+if PATH="$fake_bin:$PATH" HOME="$symlink_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=${product_version} \
   AOS_SYMLINK_MARKER="$work/symlink-executed" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer replaced a symlinked destination" >&2
@@ -534,7 +624,7 @@ mkdir -p "$custom_bin_home" "$custom_bin_target"
 cp "$work/symlink-target" "$custom_bin_target/aos"
 ln -s "$custom_bin_target" "$custom_bin_link"
 if PATH="$fake_bin:$PATH" HOME="$custom_bin_home" AOS_BIN_DIR="$custom_bin_link" \
-  AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+  AOS_TEST_FIXTURE="$fixture" AOS_VERSION=${product_version} \
   AOS_SYMLINK_MARKER="$work/custom-bin-symlink-executed" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >"$work/custom-bin-symlink.log" 2>&1; then
   echo "installer accepted a symlinked custom binary directory" >&2
@@ -547,7 +637,7 @@ managed_symlink_home="$work/managed-symlink-home"
 mkdir -p "$managed_symlink_home" "$work/managed-symlink-target/bin"
 ln -s "$work/managed-symlink-target" "$managed_symlink_home/.aos"
 ln -s "$work/symlink-target" "$work/managed-symlink-target/bin/aos"
-if PATH="$fake_bin:$PATH" HOME="$managed_symlink_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+if PATH="$fake_bin:$PATH" HOME="$managed_symlink_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=${product_version} \
   AOS_SYMLINK_MARKER="$work/managed-symlink-executed" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted a symlinked managed installation root" >&2
@@ -557,7 +647,7 @@ test ! -e "$work/managed-symlink-executed"
 
 directory_home="$work/directory-destination-home"
 mkdir -p "$directory_home/.aos/bin/aos"
-if PATH="$fake_bin:$PATH" HOME="$directory_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+if PATH="$fake_bin:$PATH" HOME="$directory_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=${product_version} \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer replaced a directory destination" >&2
   exit 1
@@ -567,7 +657,7 @@ test -d "$directory_home/.aos/bin/aos"
 for binary in aos astrid astrid-daemon astrid-build astrid-emit; do
   case "$binary" in
     aos) destination="$work/home/.aos/bin/aos" ;;
-    *) destination="$work/home/.aos/runtime/bin/$binary" ;;
+    *) destination="$release_dir/runtime/bin/$binary" ;;
   esac
   printf '#!/bin/sh\necho old-%s\n' "$binary" > "$destination"
   chmod 755 "$destination"
@@ -592,10 +682,10 @@ real_mv=$(command -v mv)
 if PATH="$fail_bin:$fake_bin:$PATH" \
   HOME="$work/home" \
   AOS_TEST_FIXTURE="$fixture" \
-  AOS_VERSION=2026.1.3 \
+  AOS_VERSION=${product_version} \
   REAL_MV="$real_mv" \
   MV_FAILED="$work/mv-failed" \
-  MV_FAIL_DESTINATION="$release_dir" \
+  MV_FAIL_DESTINATION="$work/home/.aos/bin/aos" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer ignored a mid-install failure" >&2
   exit 1
@@ -603,7 +693,7 @@ fi
 for binary in aos astrid astrid-daemon astrid-build astrid-emit; do
   case "$binary" in
     aos) destination="$work/home/.aos/bin/aos" ;;
-    *) destination="$work/home/.aos/runtime/bin/$binary" ;;
+    *) destination="$release_dir/runtime/bin/$binary" ;;
   esac
   test "$("$destination")" = "old-$binary"
 done
@@ -629,24 +719,24 @@ bash "$repo_root/scripts/package-release.sh" \
   "$work/capsules" \
   "$fixture" >/dev/null
 cp "$asset" "$signed_asset"
-if PATH="$fake_bin:$PATH" HOME="$work/mismatch-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+if PATH="$fake_bin:$PATH" HOME="$work/mismatch-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=${product_version} \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted a bundle whose binary version did not match the requested release" >&2
   exit 1
 fi
 test ! -e "$work/mismatch-home/.aos"
 
-unsafe_root="$work/unsafe-bundle/unicity-aos-2026.1.3-x86_64-unknown-linux-gnu"
+unsafe_root="$work/unsafe-bundle/unicity-aos-${product_version}-x86_64-unknown-linux-gnu"
 mkdir -p "$unsafe_root/bin" "$unsafe_root/runtime/bin"
 ln -s "$work/aos" "$unsafe_root/bin/aos"
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
   cp "$runtime_root/$binary" "$unsafe_root/runtime/bin/$binary"
 done
 printf '{}\n' > "$unsafe_root/release-manifest.json"
-COPYFILE_DISABLE=1 tar -czf "$fixture/unicity-aos-2026.1.3-x86_64-unknown-linux-gnu.tar.gz" \
+COPYFILE_DISABLE=1 tar -czf "$fixture/unicity-aos-${product_version}-x86_64-unknown-linux-gnu.tar.gz" \
   -C "$work/unsafe-bundle" "$(basename "$unsafe_root")"
 cp "$asset" "$signed_asset"
-if PATH="$fake_bin:$PATH" HOME="$work/unsafe-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.1.3 \
+if PATH="$fake_bin:$PATH" HOME="$work/unsafe-home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=${product_version} \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted a symlink in the release archive" >&2
   exit 1

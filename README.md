@@ -19,15 +19,15 @@ docs/         Product and operator documentation
 ## Install
 
 The supported installer installs the `aos` product command, its pinned runtime,
-and the exact 21 Community Edition capsules built from this source tree under
+and the exact 22 Community Edition capsules built from this source tree under
 the product-owned `~/.aos` root:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL https://aos.unicity.ai/install.sh | sh
-aos init
+aos --principal alice distro apply
 ```
 
-`aos init`, including `aos init --offline`, provisions from those local,
+`aos --principal alice distro apply`, including `--offline`, provisions from those local,
 product-versioned capsule assets. Re-running the installer performs a
 coordinated product upgrade without
 rewriting a standalone runtime installation. Every release publishes
@@ -100,12 +100,14 @@ See [Extending an agent's world on AOS](docs/meta-harness.md) for the world
 model, research loop, Forge boundary, optional worker pattern, and
 representative user experiences.
 
-Provisioning another principal keeps the authenticated operator separate from
-the target environment:
+Provision one explicitly selected principal in one transaction:
 
 ```sh
-aos --principal operator init --target-principal alice
+aos --principal alice distro apply
 ```
+
+`aos init` remains a compatibility alias for the same selected-distribution
+transaction.
 
 This AOS release fixes its distribution state to Unicity CE. Use a standalone
 `astrid` installation and runtime home to apply another distribution. Homebrew
