@@ -99,30 +99,35 @@ with tarfile.open(archive_path, "w:gz") as archive:
     for index in range(8192):
         archive.addfile(tarfile.TarInfo(f"bundle/filler-{index:05d}"))
 PY
-if gnu_tar_path=$(command -v gtar 2>/dev/null); then
-  ln -s "$gnu_tar_path" "$gnu_tar_work/bin/tar"
-else
-  cat > "$gnu_tar_work/bin/tar" <<'FAKE_TAR'
+cat > "$gnu_tar_work/bin/tar" <<'FAKE_TAR'
 #!/usr/bin/env python3
 import os
+import stat
 import sys
 
 if len(sys.argv) != 3 or sys.argv[1] != "-tzf":
     raise SystemExit("fake GNU tar only supports -tzf")
-payload = b"bundle/Distro.lock\nbundle/Distro.sig\n" + b"bundle/filler\n" * 8192
-offset = 0
-while offset < len(payload):
+
+prefix = b"bundle/Distro.lock\nbundle/Distro.sig\n"
+filler = b"bundle/filler\n" * 256
+
+try:
+    os.write(1, prefix)
+    if stat.S_ISFIFO(os.fstat(1).st_mode):
+        # Keep the controlled producer alive until grep -q closes its pipe.
+        while True:
+            os.write(1, filler)
+    else:
+        for _ in range(32):
+            os.write(1, filler)
+except BrokenPipeError:
     try:
-        offset += os.write(1, payload[offset:])
-    except BrokenPipeError:
-        try:
-            os.write(2, b"tar: stdout: write error\n")
-        except OSError:
-            pass
-        raise SystemExit(2)
+        os.write(2, b"tar: stdout: write error\n")
+    except OSError:
+        pass
+    raise SystemExit(2)
 FAKE_TAR
-  chmod 755 "$gnu_tar_work/bin/tar"
-fi
+chmod 755 "$gnu_tar_work/bin/tar"
 # Deliberately exercise the pre-fix pipeline with the GNU-like tar command.
 if PATH="$gnu_tar_work/bin:$PATH" bash -c \
   'set -o pipefail; "$2" -tzf "$1" | grep -q "/Distro.lock$"' \
