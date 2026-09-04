@@ -295,10 +295,10 @@ record_release_file() {
   printf '%s\t%s\t%s\n' "$relative" "$mode" "$(awk '{print $1}' <<<"$digest")" \
     >> "$release_inventory"
 }
-record_release_file bin/aos 700
+record_release_file bin/aos 755
 record_release_file libexec/install.sh 600
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
-  record_release_file "runtime/bin/$binary" 700
+  record_release_file "runtime/bin/$binary" 755
 done
 record_release_file capsule-assets.txt 600
 record_release_file Distro.toml 600

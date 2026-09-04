@@ -224,8 +224,9 @@ assert set(manifest["release_files"]) == expected_inventory, (
     set(manifest["release_files"]) - expected_inventory,
     expected_inventory - set(manifest["release_files"]),
 )
-assert manifest["release_files"]["bin/aos"]["mode"] == 0o700
+assert manifest["release_files"]["bin/aos"]["mode"] == 0o755
 assert manifest["release_files"]["libexec/install.sh"]["mode"] == 0o600
+assert manifest["release_files"]["runtime/bin/astrid-daemon"]["mode"] == 0o755
 assert manifest["runtime"]["version"] == runtime_version
 assert manifest["runtime"]["digest"] == "blake3:" + "0" * 64
 assert "sha256" not in manifest["runtime"]
