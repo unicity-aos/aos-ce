@@ -463,7 +463,7 @@ fn prepare_client_message(
     {
         advertise_form_elicitation(&mut value);
     }
-    Some(serde_json::to_vec(&value).unwrap_or_else(|_| frame.to_vec()))
+    Some(json_frame(&value).unwrap_or_else(|| frame.to_vec()))
 }
 
 enum TransportAction {

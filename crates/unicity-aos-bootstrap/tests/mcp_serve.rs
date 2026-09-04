@@ -1,11 +1,12 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct Fixture {
     root: PathBuf,
@@ -193,6 +194,79 @@ echo 'runtime diagnostics only' >&2
 }
 
 #[test]
+fn serve_newline_frames_transformed_initialize_for_line_reading_runtime() {
+    let fixture = Fixture::new("transformed-newline");
+    fixture.install_runtime(
+        r#"#!/bin/sh
+IFS= read -r line || exit 91
+printf '%s\n' "$line" > "$AOS_TEST_FRAME"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+"#,
+    );
+    let frame_path = fixture.root.join("transformed-frame");
+    let mut child = fixture
+        .command()
+        .env("AOS_TEST_FRAME", &frame_path)
+        .args(["mcp", "serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start MCP bridge");
+    let mut stdin = child.stdin.take().expect("bridge stdin");
+    let stdout = child.stdout.take().expect("bridge stdout");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout)
+            .read_line(&mut line)
+            .map(|bytes| (bytes, line));
+        let _ = sender.send(result);
+    });
+
+    stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{}},"clientInfo":{"name":"test","version":"1"}}}
+"#,
+        )
+        .expect("write initialize frame");
+    let response = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok((bytes, line))) => {
+            assert!(bytes > 0, "line-reading runtime returned an empty frame");
+            line
+        }
+        Ok(Err(error)) => panic!("read transformed response: {error}"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            drop(stdin);
+            let _ = wait_for_child(&mut child, Duration::from_secs(2));
+            panic!("line-reading runtime did not receive transformed initialize frame");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            drop(stdin);
+            let _ = wait_for_child(&mut child, Duration::from_secs(2));
+            panic!("line-reading runtime probe disconnected before receiving a frame");
+        }
+    };
+    drop(stdin);
+    let status = wait_for_child(&mut child, Duration::from_secs(2));
+    assert!(
+        status.success(),
+        "bridge failed after forwarding transformed initialize: {status}"
+    );
+    let transformed = fs::read_to_string(&frame_path).expect("read transformed frame");
+    let transformed: serde_json::Value =
+        serde_json::from_str(transformed.trim()).expect("transformed initialize JSON");
+    assert_eq!(transformed["method"], "initialize");
+    assert!(
+        transformed
+            .pointer("/params/capabilities/elicitation/form")
+            .is_some(),
+        "initialize must be transformed before forwarding"
+    );
+    assert_eq!(response, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+}
+
+#[test]
 fn serve_preserves_child_numeric_and_signal_termination() {
     let fixture = Fixture::new("child-exit");
     fixture.install_runtime(
@@ -282,6 +356,21 @@ fn process_exists(pid: &str) -> bool {
         .expect("probe runtime child")
         .status
         .success()
+}
+
+fn wait_for_child(child: &mut Child, timeout: Duration) -> ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().expect("probe bridge process") {
+            Some(status) => return status,
+            None if Instant::now() >= deadline => {
+                child.kill().expect("terminate stalled bridge process");
+                let _ = child.wait();
+                panic!("bridge process did not exit within {timeout:?}");
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }
 
 fn shell_literal_path(path: &Path) -> String {
