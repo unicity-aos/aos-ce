@@ -19,7 +19,7 @@ docs/         Product and operator documentation
 ## Install
 
 The supported installer installs the `aos` product command, its pinned runtime,
-and the exact 21 Community Edition capsules built from this source tree under
+and the exact 22 Community Edition capsules built from this source tree under
 the product-owned `~/.aos` root:
 
 ```sh

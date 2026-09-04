@@ -14,7 +14,7 @@ import release_metadata
 from test_release_metadata import release_fixture
 
 
-VERSION = "2026.1.3"
+VERSION = "2026.9.0"
 RUNTIME_VERSION = "0.10.4"
 
 
