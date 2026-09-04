@@ -25,7 +25,7 @@ local bundle supports `aos init --offline`.
 | Category | Capsules |
 |----------|----------|
 | **Uplinks** | cli, registry |
-| **LLM providers** | openai-compat (select during init) |
+| **LLM providers** | openai-compat, orcarouter (select during init) |
 | **Core** | react, session, identity, users, router, prompt-builder, context-engine, hook-bridge, hook-adapter-oracle |
 | **Tools** | shell, http, fs, system |
 | **Extensions** | skills, agents, memory |

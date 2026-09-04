@@ -29,6 +29,10 @@ openai_base_url = { description = "API base URL", default = "https://api.openai.
 openai_model = { description = "Default model ID", default = "gpt-5.4" }
 openai_temperature = { description = "Default temperature (0.0-2.0, blank = provider default)", default = "" }
 openai_max_tokens = { description = "Max output tokens", default = "128000" }
+orcarouter_api_key = { secret = true, description = "API key for the OrcaRouter LLM gateway" }
+orcarouter_model = { description = "Default OrcaRouter model ID", default = "orcarouter/free" }
+orcarouter_temperature = { description = "Default temperature (0.0-2.0, blank = provider default)", default = "" }
+orcarouter_max_tokens = { description = "Max output tokens", default = "128000" }
 
 # ---------------------------------------------------------------------------
 # Uplinks (frontends)
@@ -62,6 +66,13 @@ source = "capsules/aos-openai-compat.capsule"
 version = "0.2.0"
 group = "llm"
 env = { api_key = "{{ openai_api_key }}", base_url = "{{ openai_base_url }}", model = "{{ openai_model }}", temperature = "{{ openai_temperature }}", max_output_tokens = "{{ openai_max_tokens }}" }
+
+[[capsule]]
+name = "aos-orcarouter"
+source = "capsules/aos-orcarouter.capsule"
+version = "0.1.0"
+group = "llm"
+env = { api_key = "{{ orcarouter_api_key }}", model = "{{ orcarouter_model }}", temperature = "{{ orcarouter_temperature }}", max_output_tokens = "{{ orcarouter_max_tokens }}" }
 
 # ---------------------------------------------------------------------------
 # Core infrastructure (always installed)

@@ -17,6 +17,7 @@ members = [
     "capsules/capsule-mcp",
     "capsules/capsule-openai",
     "capsules/capsule-openai-compat",
+    "capsules/capsule-orcarouter",
     "capsules/capsule-prompt-builder",
     "capsules/capsule-react",
     "capsules/capsule-registry",
