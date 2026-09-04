@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import musl_release_metadata
+
 
 SCRIPT = Path(__file__).with_name("validate-release-contract.py")
 ROOT = SCRIPT.parent.parent
@@ -149,6 +151,50 @@ class ReleaseReadinessTests(unittest.TestCase):
         else:
             with self.assertRaisesRegex(ValueError, "refusing to publish"):
                 VALIDATOR.main(["--require-release-ready"])
+
+    def test_main_admits_checked_in_false_ready_musl_pin(self) -> None:
+        pin = VALIDATOR.readiness_metadata(
+            ROOT / "release/runtime-musl-compatibility.toml"
+        )
+        runtime = musl_release_metadata.validate_runtime_pin(
+            pin, require_ready=False
+        )
+        self.assertFalse(runtime["release-ready"])
+        self.assertEqual(VALIDATOR.main([]), 0)
+
+    def test_require_release_ready_follows_the_gnu_gate_only(self) -> None:
+        gnu = VALIDATOR.readiness_metadata(
+            ROOT / "release/runtime-compatibility.toml"
+        )["runtime"]
+        musl = VALIDATOR.readiness_metadata(
+            ROOT / "release/runtime-musl-compatibility.toml"
+        )["runtime"]
+        self.assertTrue(gnu["release-ready"])
+        self.assertFalse(musl["release-ready"])
+        self.assertEqual(VALIDATOR.main(["--require-release-ready"]), 0)
+
+    def test_musl_pin_rejects_identity_extra_keys_and_empty_ready_fields(self) -> None:
+        pin = VALIDATOR.readiness_metadata(
+            ROOT / "release/runtime-musl-compatibility.toml"
+        )
+        pin["runtime"]["tag"] = "v9.9.9"
+        with self.assertRaisesRegex(ValueError, "tag/version mismatch"):
+            musl_release_metadata.validate_runtime_pin(pin, require_ready=False)
+
+        pin = VALIDATOR.readiness_metadata(
+            ROOT / "release/runtime-musl-compatibility.toml"
+        )
+        pin["runtime"]["surprise"] = True
+        with self.assertRaisesRegex(ValueError, "unknown keys"):
+            musl_release_metadata.validate_runtime_pin(pin, require_ready=False)
+
+        pin = VALIDATOR.readiness_metadata(
+            ROOT / "release/runtime-musl-compatibility.toml"
+        )
+        pin["runtime"]["release-ready"] = True
+        pin["runtime"]["musl-release-metadata-blake3"] = ""
+        with self.assertRaises(ValueError):
+            musl_release_metadata.validate_runtime_pin(pin, require_ready=False)
 
     def test_cli_matches_the_current_publication_gate(self) -> None:
         staged = subprocess.run(

@@ -95,6 +95,7 @@ jobs:
       - run: python3 scripts/validate-release-contract.py
       - run: python3 scripts/test_validate_release_contract.py
       - run: python3 scripts/test_release_metadata.py
+      - run: python3 scripts/test_musl_release_metadata.py
       - run: python3 scripts/test_nightly_version.py
       - run: python3 scripts/test_channel_transaction.py
       - run: python3 scripts/test_channel_publication.py
