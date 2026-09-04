@@ -303,8 +303,7 @@ async fn serve(
                                 ))
                             })?;
                     },
-                    TransportAction::Rewrite(mut message) => {
-                        rewrite_server_identity(&mut message);
+                    TransportAction::Rewrite(message) => {
                         let frame = json_frame(&message).ok_or_else(|| {
                             ServeFailure::Io("failed to encode initialize response".to_owned())
                         })?;
@@ -460,10 +459,11 @@ fn prepare_client_message(
     *client_supports_form = supports_form_elicitation(&value);
     if matches!(mode, InteractionMode::Auto | InteractionMode::Native)
         && (mode == InteractionMode::Native || !*client_supports_form)
+        && advertise_form_elicitation(&mut value)
     {
-        advertise_form_elicitation(&mut value);
+        return Some(json_frame(&value).unwrap_or_else(|| frame.to_vec()));
     }
-    Some(json_frame(&value).unwrap_or_else(|| frame.to_vec()))
+    None
 }
 
 enum TransportAction {
@@ -481,15 +481,13 @@ fn transport_action(
     let Ok(text) = std::str::from_utf8(frame) else {
         return TransportAction::Forward;
     };
-    let Ok(message) = serde_json::from_str::<Value>(text) else {
+    let Ok(mut message) = serde_json::from_str::<Value>(text) else {
         return TransportAction::Forward;
     };
     let handling = elicitation_handling(&message, mode, client_supports_form);
     match handling {
         ElicitationHandling::Forward => {
-            if message.pointer("/result/protocolVersion").is_some()
-                && message.pointer("/result/capabilities").is_some()
-            {
+            if rewrite_server_identity(&mut message) {
                 TransportAction::Rewrite(message)
             } else {
                 TransportAction::Forward
@@ -506,19 +504,21 @@ fn supports_form_elicitation(initialize: &Value) -> bool {
         .is_some_and(Value::is_object)
 }
 
-fn advertise_form_elicitation(initialize: &mut Value) {
+fn advertise_form_elicitation(initialize: &mut Value) -> bool {
     let Some(params) = initialize.get_mut("params").and_then(Value::as_object_mut) else {
-        return;
+        return false;
     };
     let Some(capabilities) = object_entry(params, "capabilities") else {
-        return;
+        return false;
     };
     let Some(elicitation) = object_entry(capabilities, "elicitation") else {
-        return;
+        return false;
     };
-    elicitation
-        .entry("form".to_owned())
-        .or_insert_with(|| Value::Object(Map::new()));
+    if elicitation.contains_key("form") {
+        return false;
+    }
+    elicitation.insert("form".to_owned(), Value::Object(Map::new()));
+    true
 }
 
 fn object_entry<'a>(
@@ -565,24 +565,35 @@ fn elicitation_handling(
     }
 }
 
-fn rewrite_server_identity(message: &mut Value) {
+fn rewrite_server_identity(message: &mut Value) -> bool {
     if message.pointer("/result/protocolVersion").is_none()
         || message.pointer("/result/capabilities").is_none()
     {
-        return;
+        return false;
     }
     let Some(info) = message
         .pointer_mut("/result/serverInfo")
         .and_then(Value::as_object_mut)
     else {
-        return;
+        return false;
     };
-    info.insert("name".to_owned(), Value::String("unicity-aos".to_owned()));
-    info.insert("title".to_owned(), Value::String("Unicity AOS".to_owned()));
-    info.insert(
-        "version".to_owned(),
-        Value::String(env!("CARGO_PKG_VERSION").to_owned()),
-    );
+    let mut changed = false;
+    let name = Value::String("unicity-aos".to_owned());
+    if info.get("name") != Some(&name) {
+        info.insert("name".to_owned(), name);
+        changed = true;
+    }
+    let title = Value::String("Unicity AOS".to_owned());
+    if info.get("title") != Some(&title) {
+        info.insert("title".to_owned(), title);
+        changed = true;
+    }
+    let version = Value::String(env!("CARGO_PKG_VERSION").to_owned());
+    if info.get("version") != Some(&version) {
+        info.insert("version".to_owned(), version);
+        changed = true;
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -621,20 +632,19 @@ mod tests {
                 .is_some()
         );
 
-        let mut supported = false;
-        let forwarded = prepare_client_message(
-            initialize(json!({ "elicitation": { "form": {} } })).as_bytes(),
-            InteractionMode::Auto,
-            &mut supported,
-        )
-        .expect("initialize is transformed");
-        let forwarded: Value = serde_json::from_slice(&forwarded).expect("json");
-        assert!(supported);
-        assert!(
-            forwarded
-                .pointer("/params/capabilities/elicitation/form")
-                .is_some()
-        );
+        for mode in [InteractionMode::Auto, InteractionMode::Native] {
+            let mut supported = false;
+            let forwarded = prepare_client_message(
+                initialize(json!({ "elicitation": { "form": {} } })).as_bytes(),
+                mode,
+                &mut supported,
+            );
+            assert!(supported);
+            assert!(
+                forwarded.is_none(),
+                "{mode:?} must preserve already-capable initialize bytes"
+            );
+        }
     }
 
     #[test]
@@ -642,13 +652,10 @@ mod tests {
         for mode in [InteractionMode::Client, InteractionMode::Deny] {
             let mut supported = false;
             let forwarded =
-                prepare_client_message(initialize(json!({})).as_bytes(), mode, &mut supported)
-                    .expect("initialize is transformed");
-            let forwarded: Value = serde_json::from_slice(&forwarded).expect("json");
+                prepare_client_message(initialize(json!({})).as_bytes(), mode, &mut supported);
             assert!(
-                forwarded
-                    .pointer("/params/capabilities/elicitation/form")
-                    .is_none()
+                forwarded.is_none(),
+                "{mode:?} must preserve unchanged initialize bytes"
             );
         }
     }
@@ -664,10 +671,11 @@ mod tests {
         .to_string();
         let mut supported = false;
         let forwarded =
-            prepare_client_message(malformed.as_bytes(), InteractionMode::Auto, &mut supported)
-                .expect("initialize is transformed");
-        let forwarded: Value = serde_json::from_slice(&forwarded).expect("json");
-        assert_eq!(forwarded["params"]["capabilities"], "not-an-object");
+            prepare_client_message(malformed.as_bytes(), InteractionMode::Auto, &mut supported);
+        assert!(
+            forwarded.is_none(),
+            "malformed capabilities must preserve raw bytes"
+        );
         assert!(!supported);
     }
 
@@ -729,8 +737,26 @@ mod tests {
                 "serverInfo": { "name": "astrid", "version": "0.10.4" }
             }
         });
-        rewrite_server_identity(&mut response);
+        assert!(rewrite_server_identity(&mut response));
         assert_eq!(response["result"]["serverInfo"]["name"], "unicity-aos");
         assert_eq!(response["result"]["serverInfo"]["title"], "Unicity AOS");
+    }
+
+    #[test]
+    fn initialize_response_with_correct_identity_is_not_rewritten() {
+        let mut response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "serverInfo": {
+                    "name": "unicity-aos",
+                    "title": "Unicity AOS",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        });
+        assert!(!rewrite_server_identity(&mut response));
     }
 }

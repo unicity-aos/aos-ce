@@ -194,6 +194,84 @@ echo 'runtime diagnostics only' >&2
 }
 
 #[test]
+fn serve_preserves_unchanged_initialize_request_bytes() {
+    let fixture = Fixture::new("unchanged-initialize-request");
+    fixture.install_runtime(
+        r#"#!/bin/sh
+cat > "$AOS_TEST_PAYLOAD"
+cat "$AOS_TEST_PAYLOAD"
+"#,
+    );
+    let payload_path = fixture.root.join("payload");
+    let payload = b"  {\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"version\":\"1\",\"name\":\"test\"},\"capabilities\":{\"elicitation\":{\"form\":{}}},\"protocolVersion\":\"2025-11-25\"},\"id\":1,\"jsonrpc\":\"2.0\"}  \n";
+
+    let mut child = fixture
+        .command()
+        .env("AOS_TEST_PAYLOAD", &payload_path)
+        .args(["mcp", "serve", "--interaction", "client"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start MCP bridge");
+    child
+        .stdin
+        .take()
+        .expect("bridge stdin")
+        .write_all(payload)
+        .expect("write initialize frame");
+    let output = child.wait_with_output().expect("relay initialize frame");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, payload);
+    assert_eq!(
+        fs::read(&payload_path).expect("read runtime input"),
+        payload
+    );
+}
+
+#[test]
+fn serve_preserves_unchanged_initialize_response_bytes() {
+    let fixture = Fixture::new("unchanged-initialize-response");
+    fixture.install_runtime(
+        r#"#!/bin/sh
+IFS= read -r line || exit 91
+printf '%s\n' '  {"result":{"capabilities":{"roots":{}},"protocolVersion":"2025-11-25"},"id":1,"jsonrpc":"2.0"}  '
+"#,
+    );
+    let request = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}
+"#;
+    let expected_response = b"  {\"result\":{\"capabilities\":{\"roots\":{}},\"protocolVersion\":\"2025-11-25\"},\"id\":1,\"jsonrpc\":\"2.0\"}  \n";
+
+    let mut child = fixture
+        .command()
+        .args(["mcp", "serve", "--interaction", "client"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start MCP bridge");
+    child
+        .stdin
+        .take()
+        .expect("bridge stdin")
+        .write_all(request)
+        .expect("write initialize request");
+    let output = child.wait_with_output().expect("relay initialize response");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, expected_response);
+}
+
+#[test]
 fn serve_newline_frames_transformed_initialize_for_line_reading_runtime() {
     let fixture = Fixture::new("transformed-newline");
     fixture.install_runtime(
