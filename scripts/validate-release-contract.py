@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import musl_release_metadata
+
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -139,9 +141,30 @@ def main(argv: list[str] | None = None) -> int:
     product = strings("crates/unicity-aos-bootstrap/Cargo.toml")
     distro = strings("distros/community/unicity-ce/Distro.toml")
     compatibility = strings("release/runtime-compatibility.toml")
+    compatibility_metadata = readiness_metadata("release/runtime-compatibility.toml")
     validate_release_readiness(
-        readiness_metadata("release/runtime-compatibility.toml"),
+        compatibility_metadata,
         require_release_ready=args.require_release_ready,
+    )
+    musl_runtime = musl_release_metadata.validate_runtime_pin(
+        readiness_metadata("release/runtime-musl-compatibility.toml"),
+        require_ready=False,
+    )
+    gnu_runtime = compatibility_metadata["runtime"]
+    for key in ("repository", "version", "tag", "source-commit"):
+        require(
+            musl_runtime[key] == gnu_runtime[key],
+            f"musl runtime {key} does not match the GNU runtime pin",
+        )
+    require(
+        gnu_runtime["release-metadata-asset"]
+        == musl_runtime["legacy-release-metadata-asset"],
+        "musl runtime legacy metadata asset does not match the GNU runtime pin",
+    )
+    require(
+        gnu_runtime["release-metadata-blake3"]
+        == musl_runtime["legacy-release-metadata-blake3"],
+        "musl runtime legacy metadata BLAKE3 does not match the GNU runtime pin",
     )
 
     product_version = product[("package", "version")]

@@ -4,6 +4,9 @@
 
 ### Added
 
+- A staged, fail-closed Linux musl runtime-compatibility contract and strict
+  metadata schema/validator. The pin keeps the current Astrid 0.10.4 identity
+  with `release-ready = false` and empty musl publication fields. Related #62.
 - An unpublished native Rust semantic catalog capsule that owns the finite v1
   component inventory, complete primitive records, two complete theme packs,
   hostile-value validation, fail-closed token fallback, safe unknown-component
