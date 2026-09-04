@@ -115,6 +115,11 @@
 
 ### Fixed
 
+- Stable `github-release` signing discovers product archives by filename
+  `unicity-aos-*.tar.gz` and refuses to publish when none are signed. The
+  download-artifact pattern `aos-*-*-*` is unchanged because it names GitHub
+  artifacts, not archive files.
+
 - Build Linux product binaries on a pinned glibc 2.31 baseline and reject AOS
   or bundled Astrid executables that require glibc newer than 2.34, restoring
   support for RHEL, Oracle Linux, Rocky Linux, and AlmaLinux 9. Closes #58.
