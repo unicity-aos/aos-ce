@@ -342,9 +342,21 @@ exit 1
         .expect("create runtime run directory");
     fs::write(&ready_marker, []).expect("create runtime ready marker");
     let marker_to_remove = ready_marker.clone();
+    let run_dir = fixture.home.join("runtime/run");
+    let volume = fixture.home.join("runtime/astrid.volume");
     let shutdown = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(200));
+
+        // The runtime must finish materializing its private volume before the
+        // readiness marker is removed, so AOS cannot report a partial stop.
+        fs::write(&volume, b"volume-state").expect("create private runtime volume");
+        let mut permissions = fs::metadata(&volume)
+            .expect("inspect private runtime volume")
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&volume, permissions).expect("make runtime volume private");
         fs::remove_file(marker_to_remove).expect("remove runtime ready marker");
+        fs::remove_dir_all(run_dir).expect("remove runtime run directory");
     });
 
     let output = fixture
@@ -360,6 +372,24 @@ exit 1
         "<--future-runtime-global>\n<future-value>\n<stop>\n"
     );
     assert!(!ready_marker.exists());
+    let runtime = fixture.home.join("runtime");
+    let entries: Vec<_> = fs::read_dir(&runtime)
+        .expect("read stopped runtime state")
+        .map(|entry| {
+            entry
+                .expect("read stopped runtime entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(entries, vec!["astrid.volume"]);
+    let volume = runtime.join("astrid.volume");
+    let metadata = fs::symlink_metadata(&volume).expect("inspect stopped runtime volume");
+    assert!(metadata.is_file());
+    assert!(!metadata.file_type().is_symlink());
+    assert!(metadata.len() > 0);
+    assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8(output.stdout).expect("utf8 stop output"),
