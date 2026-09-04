@@ -15,6 +15,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from capsule_release import ContractError, CapsuleSpec, source_contract, validate_artifacts
 
 
+EXPECTED_CAPSULE_ASSETS = frozenset(
+    {
+        "aos-cli.capsule",
+        "aos-mcp.capsule",
+        "aos-registry.capsule",
+        "aos-openai-compat.capsule",
+        "aos-react.capsule",
+        "aos-session.capsule",
+        "aos-identity.capsule",
+        "aos-users.capsule",
+        "aos-router.capsule",
+        "aos-prompt-builder.capsule",
+        "aos-context-engine.capsule",
+        "aos-hook-bridge.capsule",
+        "aos-hook-adapter-oracle.capsule",
+        "aos-meta-harness.capsule",
+        "aos-shell.capsule",
+        "aos-http.capsule",
+        "aos-fs.capsule",
+        "aos-system.capsule",
+        "aos-forge.capsule",
+        "aos-skills.capsule",
+        "aos-agents.capsule",
+        "aos-memory.capsule",
+    }
+)
+
+
 def add_bytes(
     archive: tarfile.TarFile,
     name: str,
@@ -88,14 +116,13 @@ class CapsuleReleaseTests(unittest.TestCase):
         self.assertEqual(len(self.specs), 22)
         self.assertEqual(len({spec.asset for spec in self.specs}), 22)
         assets = {spec.asset for spec in self.specs}
-        self.assertIn("aos-forge.capsule", assets)
-        self.assertNotIn("aos-telegram.capsule", assets)
+        self.assertEqual(assets, EXPECTED_CAPSULE_ASSETS)
         distro = Path(__file__).resolve().parent.parent / "distros/community/unicity-ce/Distro.toml"
         text = distro.read_text(encoding="utf-8")
         self.assertNotIn("@unicity-aos/", text)
         self.assertEqual(text.count('source = "capsules/'), 22)
-        for spec in self.specs:
-            self.assertIn(f'source = "capsules/{spec.asset}"', text)
+        for asset in EXPECTED_CAPSULE_ASSETS:
+            self.assertIn(f'source = "capsules/{asset}"', text)
 
     def test_accepts_exact_safe_artifact_set(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
