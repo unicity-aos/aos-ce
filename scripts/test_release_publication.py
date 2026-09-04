@@ -21,6 +21,32 @@ import release_publication
 
 VERSION = "2026.9.0"
 SOURCE_COMMIT = "a" * 40
+EXPECTED_CAPSULE_ASSETS = frozenset(
+    {
+        "aos-cli.capsule",
+        "aos-mcp.capsule",
+        "aos-registry.capsule",
+        "aos-openai-compat.capsule",
+        "aos-react.capsule",
+        "aos-session.capsule",
+        "aos-identity.capsule",
+        "aos-users.capsule",
+        "aos-router.capsule",
+        "aos-prompt-builder.capsule",
+        "aos-context-engine.capsule",
+        "aos-hook-bridge.capsule",
+        "aos-hook-adapter-oracle.capsule",
+        "aos-meta-harness.capsule",
+        "aos-shell.capsule",
+        "aos-http.capsule",
+        "aos-fs.capsule",
+        "aos-system.capsule",
+        "aos-forge.capsule",
+        "aos-skills.capsule",
+        "aos-agents.capsule",
+        "aos-memory.capsule",
+    }
+)
 
 
 def add_file(archive: tarfile.TarFile, name: str, value: bytes) -> None:
@@ -113,7 +139,31 @@ class ReleasePublicationTests(unittest.TestCase):
             artifacts, compatibility = self.fixture(Path(temp))
             payloads = self.validate(artifacts, compatibility)
             self.assertIn(f"unicity-aos-{VERSION}-release.toml", payloads)
-            self.assertEqual(len([name for name in payloads if name.endswith(".capsule")]), 22)
+            capsules = {name for name in payloads if name.endswith(".capsule")}
+            self.assertEqual(capsules, EXPECTED_CAPSULE_ASSETS)
+            self.assertTrue(
+                {
+                    "aos-mcp.capsule",
+                    "aos-hook-adapter-oracle.capsule",
+                    "aos-meta-harness.capsule",
+                }
+                <= capsules
+            )
+
+    def test_rejects_missing_named_capsule_or_bundle(self) -> None:
+        for asset in EXPECTED_CAPSULE_ASSETS:
+            with self.subTest(asset=asset):
+                with tempfile.TemporaryDirectory() as temp:
+                    artifacts, compatibility = self.fixture(Path(temp))
+                    (artifacts / asset).unlink()
+                    with self.assertRaisesRegex(ValueError, "asset set differs"):
+                        self.validate(artifacts, compatibility)
+
+                with tempfile.TemporaryDirectory() as temp:
+                    artifacts, compatibility = self.fixture(Path(temp))
+                    (artifacts / f"{asset}.sigstore.json").unlink()
+                    with self.assertRaisesRegex(ValueError, "asset set differs"):
+                        self.validate(artifacts, compatibility)
 
     def test_rejects_missing_asset(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
