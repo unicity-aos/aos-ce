@@ -225,6 +225,7 @@ impl MigrationLock {
 pub(crate) fn migrate_runtime(home: &AosHome, source: &Path) -> io::Result<MigrationOutcome> {
     let source = checked_root(source, "legacy runtime home")?;
     let target = checked_target_path(&home.runtime_home())?;
+    let release_runtime_bin = home.release_runtime_bin_dir();
     if source == target || source.starts_with(&target) || target.starts_with(&source) {
         return invalid("legacy runtime home and product runtime home must not overlap");
     }
@@ -238,14 +239,14 @@ pub(crate) fn migrate_runtime(home: &AosHome, source: &Path) -> io::Result<Migra
     if receipt_path.is_file() {
         let receipt: Receipt = read_receipt(&receipt_path)?;
         if receipt.source == source {
-            validate_completed_target(&target, &receipt)?;
+            validate_completed_target(&target, &release_runtime_bin, &receipt)?;
             remove_backup(&target_backup(&target))?;
             return Ok(MigrationOutcome::AlreadyMigrated);
         }
         return invalid("an existing migration receipt belongs to a different source");
     }
 
-    validate_target(&target)?;
+    validate_target(&target, &release_runtime_bin)?;
     validate_source_layout(&source)?;
     let staging = home.root().join(STAGING_DIR);
     if staging.exists() {
@@ -256,7 +257,7 @@ pub(crate) fn migrate_runtime(home: &AosHome, source: &Path) -> io::Result<Migra
 
     let result = (|| {
         create_private_dir(&staging)?;
-        let mut entries = copy_product_binaries(&target, &staging)?;
+        let mut entries = Vec::new();
         copy_etc_state(&source, &staging, &mut entries)?;
         for name in PERSISTENT_TOP_LEVEL {
             copy_if_present(
@@ -610,7 +611,8 @@ fn checked_root(path: &Path, description: &str) -> io::Result<PathBuf> {
     path.canonicalize()
 }
 
-fn validate_target(target: &Path) -> io::Result<()> {
+fn validate_target(target: &Path, release_runtime_bin: &Path) -> io::Result<()> {
+    validate_release_runtime_bin(release_runtime_bin)?;
     let target_metadata = fs::symlink_metadata(target).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -621,36 +623,19 @@ fn validate_target(target: &Path) -> io::Result<()> {
         return invalid("bundled product runtime must be a real directory");
     }
     let bin = target.join("bin");
-    let bin_metadata = fs::symlink_metadata(&bin).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "bundled product runtime executable set is not installed",
-        )
-    })?;
-    if bin_metadata.file_type().is_symlink() || !bin_metadata.is_dir() {
-        return invalid("bundled product runtime bin must be a real directory");
-    }
-    let expected: HashSet<_> = RUNTIME_EXECUTABLE_NAMES.iter().copied().collect();
-    let mut actual = HashSet::new();
-    for entry in fs::read_dir(&bin)? {
-        let entry = entry?;
-        let name = entry.file_name().into_string().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "product runtime bin contains a non-UTF-8 entry",
-            )
-        })?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if !expected.contains(name.as_str())
-            || metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || !actual.insert(name)
-        {
-            return invalid("product runtime home contains data; migration refuses to merge state");
+    match fs::symlink_metadata(&bin) {
+        Ok(bin_metadata) => {
+            if bin_metadata.file_type().is_symlink() || !bin_metadata.is_dir() {
+                return invalid("bundled product runtime bin must be a real directory");
+            }
+            if fs::read_dir(&bin)?.next().transpose()?.is_some() {
+                return invalid(
+                    "product runtime home contains data; migration refuses to merge state",
+                );
+            }
         }
-    }
-    if actual.len() != expected.len() {
-        return invalid("bundled product runtime executable set is incomplete");
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     for entry in fs::read_dir(target)? {
         let entry = entry?;
@@ -663,7 +648,12 @@ fn validate_target(target: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_completed_target(target: &Path, receipt: &Receipt) -> io::Result<()> {
+fn validate_completed_target(
+    target: &Path,
+    release_runtime_bin: &Path,
+    _receipt: &Receipt,
+) -> io::Result<()> {
+    validate_release_runtime_bin(release_runtime_bin)?;
     let target_metadata = fs::symlink_metadata(target).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -674,29 +664,65 @@ fn validate_completed_target(target: &Path, receipt: &Receipt) -> io::Result<()>
         return invalid("completed product runtime must be a real directory");
     }
     let bin = target.join("bin");
-    let bin_metadata = fs::symlink_metadata(&bin).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "completed product runtime executable set is not installed",
-        )
-    })?;
-    if bin_metadata.file_type().is_symlink() || !bin_metadata.is_dir() {
-        return invalid("completed product runtime bin must be a real directory");
-    }
-    for name in RUNTIME_EXECUTABLE_NAMES {
-        let relative = PathBuf::from("bin").join(name);
-        if !receipt.entries.iter().any(|entry| entry.path == relative) {
-            return invalid("migration receipt omits a bundled runtime executable");
+    match fs::symlink_metadata(&bin) {
+        Ok(bin_metadata) => {
+            if bin_metadata.file_type().is_symlink() || !bin_metadata.is_dir() {
+                return invalid("completed product runtime bin must be a real directory");
+            }
+            for entry in fs::read_dir(&bin)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if RUNTIME_EXECUTABLE_NAMES
+                    .iter()
+                    .any(|runtime| name == OsStr::new(runtime))
+                {
+                    return invalid(
+                        "completed product runtime contains a shipped executable in mutable state",
+                    );
+                }
+            }
         }
-        let metadata = fs::symlink_metadata(bin.join(name)).map_err(|_| {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn validate_release_runtime_bin(release_runtime_bin: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(release_runtime_bin).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "completed product runtime executable set is incomplete",
+                "bundled product release runtime executable set is not installed",
+            )
+        } else {
+            error
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return invalid("bundled product release runtime bin must be a real directory");
+    }
+    let expected: HashSet<_> = RUNTIME_EXECUTABLE_NAMES.iter().copied().collect();
+    let mut actual = HashSet::new();
+    for entry in fs::read_dir(release_runtime_bin)? {
+        let entry = entry?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "product release runtime bin contains a non-UTF-8 entry",
             )
         })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return invalid("completed product runtime executable must be a regular file");
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !expected.contains(name.as_str())
+            || metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || !actual.insert(name)
+        {
+            return invalid("product release runtime contains unexpected data");
         }
+    }
+    if actual.len() != expected.len() {
+        return invalid("bundled product release runtime executable set is incomplete");
     }
     Ok(())
 }
@@ -751,18 +777,6 @@ fn copy_etc_state(source_root: &Path, staging: &Path, entries: &mut Vec<Entry>) 
         copy_tree(&entry.path(), &staging.join(&relative), &relative, entries)?;
     }
     Ok(())
-}
-
-fn copy_product_binaries(target: &Path, staging: &Path) -> io::Result<Vec<Entry>> {
-    RUNTIME_EXECUTABLE_NAMES
-        .iter()
-        .map(|name| {
-            let source = target.join("bin").join(name);
-            let relative = PathBuf::from("bin").join(name);
-            let destination = staging.join(&relative);
-            copy_executable(&source, &destination, &relative)
-        })
-        .collect()
 }
 
 fn copy_if_present(
@@ -900,25 +914,6 @@ fn set_private_copied_file_permissions(path: &Path, source: &fs::Metadata) -> io
 #[cfg(not(unix))]
 fn set_private_copied_file_permissions(_path: &Path, _source: &fs::Metadata) -> io::Result<()> {
     Ok(())
-}
-
-fn copy_executable(source: &Path, destination: &Path, relative: &Path) -> io::Result<Entry> {
-    let metadata = fs::symlink_metadata(source)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return invalid("bundled runtime executable must be a regular file");
-    }
-    if let Some(parent) = destination.parent() {
-        create_private_dir(parent)?;
-    }
-    let bytes = fs::copy(source, destination)?;
-    fs::set_permissions(destination, metadata.permissions())?;
-    File::open(destination)?.sync_all()?;
-    sync_parent(destination)?;
-    Ok(Entry {
-        path: relative.to_path_buf(),
-        bytes,
-        digest: blake3_file(destination)?,
-    })
 }
 
 fn replace_target(target: &Path, staging: &Path) -> io::Result<PathBuf> {
@@ -1213,17 +1208,20 @@ mod tests {
     }
 
     fn install_product_runtime(product: &AosHome) {
-        install_runtime_at(&product.runtime_home());
+        fs::create_dir_all(product.runtime_home()).expect("create product runtime home");
+        install_runtime_at(&product.release_runtime_bin_dir());
     }
 
-    fn install_runtime_at(runtime: &Path) {
+    fn install_runtime_at(runtime_bin: &Path) {
         for name in crate::RUNTIME_EXECUTABLE_NAMES {
-            let relative = format!("bin/{name}");
-            write(runtime, &relative, format!("bundled-{name}").as_bytes());
+            fs::create_dir_all(runtime_bin).expect("create bundled release runtime bin");
+            let path = runtime_bin.join(name);
+            fs::write(&path, format!("bundled-{name}").as_bytes())
+                .expect("write bundled executable");
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(runtime.join(relative), fs::Permissions::from_mode(0o755))
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
                     .expect("make bundled executable executable");
             }
         }
@@ -1398,16 +1396,13 @@ mod tests {
             fs::read(runtime.join("config.toml")).unwrap(),
             b"[security]\nstrict = true\n"
         );
-        assert_eq!(
-            fs::read(runtime.join("bin/astrid")).unwrap(),
-            b"bundled-astrid"
-        );
         for name in crate::RUNTIME_EXECUTABLE_NAMES {
             assert_eq!(
-                fs::read(runtime.join("bin").join(name)).unwrap(),
+                fs::read(product.release_runtime_bin_dir().join(name)).unwrap(),
                 format!("bundled-{name}").as_bytes(),
-                "the supported product installer executable set must survive migration"
+                "the immutable product executable set must survive migration"
             );
+            assert!(!runtime.join("bin").join(name).exists());
         }
         assert!(!runtime.join("run").exists());
         assert_eq!(fs::read(runtime.join("log/daemon.log")).unwrap(), b"log");
@@ -1857,7 +1852,7 @@ mod tests {
             );
         }
         for name in crate::RUNTIME_EXECUTABLE_NAMES {
-            let path = runtime.join("bin").join(name);
+            let path = product.release_runtime_bin_dir().join(name);
             assert_eq!(
                 fs::read(&path).unwrap(),
                 format!("bundled-{name}").as_bytes()
@@ -1866,6 +1861,7 @@ mod tests {
                 fs::metadata(path).unwrap().permissions().mode() & 0o777,
                 0o755
             );
+            assert!(!runtime.join("bin").join(name).exists());
         }
         for directory in ["etc", "home", "keys", "secrets", "var", "wit", "log"] {
             assert_eq!(
@@ -2186,13 +2182,17 @@ mod tests {
         install_product_runtime(&product);
         migrate_runtime(&product, &source).expect("migration succeeds");
 
-        write(&product.runtime_home(), "bin/astrid", b"tamperd-binary");
+        write(
+            &product.release_runtime_bin_dir(),
+            "astrid",
+            b"tamperd-binary",
+        );
         assert_eq!(
             migrate_runtime(&product, &source)
                 .expect("a later product update may replace its runtime executable"),
             MigrationOutcome::AlreadyMigrated
         );
-        fs::remove_file(product.runtime_home().join("bin/astrid"))
+        fs::remove_file(product.release_runtime_bin_dir().join("astrid"))
             .expect("remove runtime executable");
         let error = migrate_runtime(&product, &source)
             .expect_err("an incomplete completed runtime must not be accepted");
@@ -2212,7 +2212,7 @@ mod tests {
             .expect_err("the product runtime cannot be imported through a path alias");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(
-            fs::read(source.join("bin/astrid")).unwrap(),
+            fs::read(product.release_runtime_bin_dir().join("astrid")).unwrap(),
             b"bundled-astrid"
         );
         assert!(!product.migration_receipt().exists());
@@ -2255,7 +2255,7 @@ mod tests {
         assert!(!product.root().join(".runtime-import").exists());
         assert!(!product.migration_receipt().exists());
         assert_eq!(
-            fs::read(product.runtime_home().join("bin/astrid")).unwrap(),
+            fs::read(product.release_runtime_bin_dir().join("astrid")).unwrap(),
             b"bundled-astrid"
         );
         drop(held);
@@ -2350,7 +2350,8 @@ mod tests {
         let receipt = product.migration_receipt();
         let staged_receipt = receipt.with_extension("tmp");
         fs::rename(&receipt, &staged_receipt).expect("stage committed receipt");
-        install_runtime_at(&product.root().join("runtime.pre-migration"));
+        fs::create_dir_all(product.root().join("runtime.pre-migration"))
+            .expect("create runtime transaction backup");
         write(&source, "keys/runtime.key", b"current-runtime-key");
         write(&source, "var/new-state", b"current-source-state");
         write(
@@ -2412,10 +2413,7 @@ mod tests {
         )
         .expect("roll back invalid cutover");
 
-        assert_eq!(
-            fs::read(target.join("bin/astrid")).unwrap(),
-            b"bundled-astrid"
-        );
+        assert_eq!(file_snapshot(&target), BTreeMap::new());
         assert!(!backup.exists());
         assert!(!product.migration_receipt().with_extension("tmp").exists());
         fs::remove_dir_all(root).expect("remove fixture root");
@@ -2456,7 +2454,7 @@ mod tests {
         );
         for name in crate::RUNTIME_EXECUTABLE_NAMES {
             assert_eq!(
-                fs::read(product.runtime_home().join("bin").join(name)).unwrap(),
+                fs::read(product.release_runtime_bin_dir().join(name)).unwrap(),
                 format!("bundled-{name}").as_bytes()
             );
         }
@@ -2523,7 +2521,7 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(!product.runtime_home().join("keys/runtime.key").exists());
         assert_eq!(
-            fs::read(product.runtime_home().join("bin/astrid")).unwrap(),
+            fs::read(product.release_runtime_bin_dir().join("astrid")).unwrap(),
             b"bundled-astrid"
         );
         fs::remove_dir_all(root).expect("remove fixture root");
@@ -2539,12 +2537,12 @@ mod tests {
         let product = AosHome::from_root(root.join("product"));
         write(&source, "keys/runtime.key", b"runtime-key");
         install_product_runtime(&product);
-        fs::remove_file(product.runtime_home().join("bin/astrid"))
+        fs::remove_file(product.release_runtime_bin_dir().join("astrid"))
             .expect("remove regular executable");
         write(&root, "runtime-target", b"bundled-astrid");
         symlink(
             root.join("runtime-target"),
-            product.runtime_home().join("bin/astrid"),
+            product.release_runtime_bin_dir().join("astrid"),
         )
         .expect("create bundled binary symlink");
 
