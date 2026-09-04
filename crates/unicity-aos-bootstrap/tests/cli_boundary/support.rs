@@ -476,6 +476,9 @@ printf '%s\n' "$ASTRID_WORKSPACE_STATE_DIR" > "$AOS_TEST_WORKSPACE"
 printf '%s\n' "$ASTRID_ENFORCED_DISTRO" > "$AOS_TEST_DISTRO"
 printf '%s\n' "$ASTRID_CLIENT_CONFIG_PATH" > "$AOS_TEST_CLIENT_CONFIG"
 printf '%s\n' "$PATH" > "$AOS_TEST_PATH"
+if [ "$1" = start ]; then
+    exit "${AOS_TEST_START_EXIT:-${AOS_TEST_EXIT:-0}}"
+fi
 exit "${AOS_TEST_EXIT:-0}"
 "#;
 

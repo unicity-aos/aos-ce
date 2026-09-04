@@ -237,8 +237,22 @@ fn prepare_distribution_apply(principal: Option<&str>, args: &DistributionApplyA
             return ExitCode::FAILURE;
         }
     };
-    if let Err(error) = home.run_runtime_lifecycle(["start"]) {
+    let started = home.run_runtime_lifecycle(["start"]).and_then(|status| {
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "runtime start exited with {}",
+                status.code().unwrap_or(1)
+            )))
+        }
+    });
+    if let Err(error) = started {
         eprintln!("aos: failed to mount Astrid before trust seeding: {error}");
+        let shutdown = stop_distribution_apply(&home);
+        if let Err(stop_error) = shutdown {
+            eprintln!("aos: start-failure shutdown failed: {stop_error}");
+        }
         return ExitCode::FAILURE;
     }
     if let Err(error) = distro_trust::seed_selected_pin(&home, &selected) {

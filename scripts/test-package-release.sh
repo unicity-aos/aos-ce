@@ -20,6 +20,82 @@ with (root / "release/runtime-compatibility.toml").open("rb") as file:
 print(product, runtime["version"], runtime["release-workflow-identity"])
 PY
 )
+
+# Release artifacts are downloaded by artifact name but signed by their
+# product archive filename. Keep the workflow's discovery and fail-closed
+# guards exercised here so either naming contract cannot silently drift.
+sign_step=$(python3 - "$repo_root/.github/workflows/release.yml" <<'PY'
+import pathlib
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+start = next(
+    index
+    for index, line in enumerate(lines)
+    if line.strip() == "- name: Sign the selected Distro in each product archive"
+)
+end = next(
+    index
+    for index in range(start + 1, len(lines))
+    if lines[index].startswith("      - name: ")
+)
+print("\n".join(lines[start:end]))
+PY
+)
+if grep -Fq -- 'artifacts/aos-*-*-*.tar.gz' <<<"$sign_step"; then
+  echo "release signing loop still uses artifact names instead of product archive names" >&2
+  exit 1
+fi
+grep -Fq -- 'assets=(artifacts/unicity-aos-*.tar.gz)' <<<"$sign_step"
+grep -Fq -- 'no product archives found to sign' <<<"$sign_step"
+grep -Fq -- 'no product archives contain Distro.sig after signing' <<<"$sign_step"
+grep -Fq -- 'pattern: aos-*-*-*' "$repo_root/.github/workflows/release.yml"
+
+assert_signed_product_archives() {
+  local artifacts_dir=$1
+  local signed_archives=0
+  local -a assets
+
+  shopt -s nullglob
+  assets=("$artifacts_dir"/unicity-aos-*.tar.gz)
+  (( ${#assets[@]} > 0 )) || return 1
+  for asset in "${assets[@]}"; do
+    if tar -tzf "$asset" 2>/dev/null | grep -q '/Distro.sig$'; then
+      signed_archives=$((signed_archives + 1))
+    fi
+  done
+  (( signed_archives > 0 ))
+}
+
+glob_work="$work/signing-glob"
+mkdir -p "$glob_work/product" "$glob_work/signed" "$glob_work/empty" "$glob_work/wrong"
+product_archive="$glob_work/product/unicity-aos-${product_version}-${target}.tar.gz"
+printf 'product archive fixture\n' > "$product_archive"
+shopt -s nullglob
+old_assets=("$glob_work/product"/aos-*-*-*.tar.gz)
+test "${#old_assets[@]}" -eq 0
+new_assets=("$glob_work/product"/unicity-aos-*.tar.gz)
+test "${#new_assets[@]}" -eq 1
+test "$(basename "${new_assets[0]}")" = "unicity-aos-${product_version}-${target}.tar.gz"
+
+printf 'fixture signature\n' > "$glob_work/signed/Distro.sig"
+mkdir "$glob_work/signed/unicity-aos-${product_version}-${target}"
+mv "$glob_work/signed/Distro.sig" \
+  "$glob_work/signed/unicity-aos-${product_version}-${target}/Distro.sig"
+COPYFILE_DISABLE=1 tar -czf \
+  "$glob_work/signed/unicity-aos-${product_version}-${target}.tar.gz" \
+  -C "$glob_work/signed" "unicity-aos-${product_version}-${target}"
+assert_signed_product_archives "$glob_work/signed"
+if assert_signed_product_archives "$glob_work/empty"; then
+  echo "release signing guard accepted an empty artifact directory" >&2
+  exit 1
+fi
+printf 'wrong archive name\n' > "$glob_work/wrong/aos-${product_version}-${target}-wrong.tar.gz"
+if assert_signed_product_archives "$glob_work/wrong"; then
+  echo "release signing guard accepted a directory without product archives" >&2
+  exit 1
+fi
+
 runtime_root="$work/astrid-$runtime_version-$target"
 mkdir -p "$runtime_root" "$work/output"
 mkdir -p "$work/capsules"

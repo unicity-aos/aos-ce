@@ -289,6 +289,44 @@ fn distribution_apply_stops_on_runtime_failure_without_a_second_pass() {
 }
 
 #[test]
+fn distribution_apply_fails_closed_on_start_failure_without_pin_or_dispatch() {
+    let fixture = Fixture::new("start-failure");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    let pin_prefix = fixture.root.join("runtime-pin");
+
+    let output = fixture
+        .command()
+        .env("AOS_TEST_START_EXIT", "42")
+        .env("AOS_TEST_NO_MOUNTED_PIN", "1")
+        .env("AOS_TEST_RUNTIME_PIN_PREFIX", &pin_prefix)
+        .args(["--principal", "alice", "distro", "apply", "--yes"])
+        .output()
+        .expect("run distribution apply with a failing runtime start");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("lifecycle")).expect("read lifecycle commands"),
+        "start\nstop\n",
+        "a failed start must be cleaned up before returning"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("runtime-pin.start"))
+            .expect("read start pin projection"),
+        "",
+        "a failed start must not seed the mounted pin"
+    );
+    let args = fs::read_to_string(&fixture.args).expect("read final lifecycle args");
+    assert!(
+        !args.contains("<distro>"),
+        "failed start dispatched apply: {args}"
+    );
+    assert!(
+        !fixture.root.join("apply-args").exists(),
+        "failed start must not dispatch distribution apply"
+    );
+}
+
+#[test]
 fn distribution_apply_requires_an_explicit_principal() {
     let fixture = Fixture::new("distro-apply-principal-required");
     fixture.install_runtime(RECORDING_RUNTIME);
