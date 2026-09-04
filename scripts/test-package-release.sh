@@ -49,23 +49,95 @@ fi
 grep -Fq -- 'assets=(artifacts/unicity-aos-*.tar.gz)' <<<"$sign_step"
 grep -Fq -- 'no product archives found to sign' <<<"$sign_step"
 grep -Fq -- 'no product archives contain Distro.sig after signing' <<<"$sign_step"
+native_sealer_ref="\"\$AOS_DISTRO_NATIVE_SEALER\""
+native_sealer_archive_ref="\"\$AOS_DISTRO_NATIVE_SEALER_ARCHIVE\""
+grep -Fq -- "$native_sealer_ref" <<<"$sign_step"
+grep -Fq -- "$native_sealer_archive_ref" <<<"$sign_step"
 grep -Fq -- 'pattern: aos-*-*-*' "$repo_root/.github/workflows/release.yml"
+grep -Fq -- 'name: aos-x86_64-unknown-linux-gnu' "$repo_root/.github/workflows/release.yml"
+grep -Fq -- '--extract-release-sealer' "$repo_root/.github/workflows/release.yml"
+grep -Fq -- 'stable Distro sealing requires Astrid 2026.9.0+' "$repo_root/.github/workflows/release.yml"
+
+write_tar_listing() {
+  local archive=$1
+  local listing=$2
+  tar -tzf "$archive" > "$listing"
+}
 
 assert_signed_product_archives() {
   local artifacts_dir=$1
   local signed_archives=0
   local -a assets
+  local asset listing
 
   shopt -s nullglob
   assets=("$artifacts_dir"/unicity-aos-*.tar.gz)
   (( ${#assets[@]} > 0 )) || return 1
   for asset in "${assets[@]}"; do
-    if tar -tzf "$asset" 2>/dev/null | grep -q '/Distro.sig$'; then
-      signed_archives=$((signed_archives + 1))
+    listing=$(mktemp "$work/tar-listing.XXXXXX")
+    if write_tar_listing "$asset" "$listing" 2>/dev/null; then
+      if grep -q '/Distro.sig$' "$listing"; then
+        signed_archives=$((signed_archives + 1))
+      fi
     fi
+    rm -f "$listing"
   done
   (( signed_archives > 0 ))
 }
+
+gnu_tar_work="$work/gnu-tar-regression"
+mkdir -p "$gnu_tar_work/bin"
+gnu_tar_archive="$gnu_tar_work/archive.tar.gz"
+python3 - "$gnu_tar_archive" <<'PY'
+import sys
+import tarfile
+
+archive_path = sys.argv[1]
+with tarfile.open(archive_path, "w:gz") as archive:
+    for name in ("bundle/Distro.lock", "bundle/Distro.sig"):
+        archive.addfile(tarfile.TarInfo(name))
+    for index in range(8192):
+        archive.addfile(tarfile.TarInfo(f"bundle/filler-{index:05d}"))
+PY
+cat > "$gnu_tar_work/bin/tar" <<'FAKE_TAR'
+#!/usr/bin/env python3
+import os
+import stat
+import sys
+
+if len(sys.argv) != 3 or sys.argv[1] != "-tzf":
+    raise SystemExit("fake GNU tar only supports -tzf")
+
+prefix = b"bundle/Distro.lock\nbundle/Distro.sig\n"
+filler = b"bundle/filler\n" * 256
+
+try:
+    os.write(1, prefix)
+    if stat.S_ISFIFO(os.fstat(1).st_mode):
+        # Keep the controlled producer alive until grep -q closes its pipe.
+        while True:
+            os.write(1, filler)
+    else:
+        for _ in range(32):
+            os.write(1, filler)
+except BrokenPipeError:
+    try:
+        os.write(2, b"tar: stdout: write error\n")
+    except OSError:
+        pass
+    raise SystemExit(2)
+FAKE_TAR
+chmod 755 "$gnu_tar_work/bin/tar"
+# Deliberately exercise the pre-fix pipeline with the GNU-like tar command.
+if PATH="$gnu_tar_work/bin:$PATH" bash -c \
+  'set -o pipefail; "$2" -tzf "$1" | grep -q "/Distro.lock$"' \
+  _ "$gnu_tar_archive" tar >/dev/null 2>"$gnu_tar_work/pipeline.err"; then
+  echo "GNU tar regression pipeline unexpectedly ignored SIGPIPE" >&2
+  exit 1
+fi
+gnu_tar_listing="$gnu_tar_work/listing"
+PATH="$gnu_tar_work/bin:$PATH" write_tar_listing "$gnu_tar_archive" "$gnu_tar_listing"
+grep -q '/Distro.lock$' "$gnu_tar_listing"
 
 glob_work="$work/signing-glob"
 mkdir -p "$glob_work/product" "$glob_work/signed" "$glob_work/empty" "$glob_work/wrong"
@@ -117,6 +189,16 @@ for binary in astrid astrid-daemon astrid-build astrid-emit; do
     cat > "$runtime_root/$binary" <<'RUNTIME'
 #!/bin/sh
 set -eu
+if [ -n "${AOS_DISTRO_ED25519_SEED:-}" ]; then
+  if [ -n "${AOS_TEST_SENTINEL:-}" ]; then
+    touch "$AOS_TEST_SENTINEL"
+  fi
+  exit 96
+fi
+if [ "${1:-}" = --version ]; then
+  echo "astrid __RUNTIME_VERSION__"
+  exit 0
+fi
 if [ "${2:-}" != seal ]; then exit 0; fi
 manifest=$3
 output=
@@ -144,6 +226,8 @@ RUNTIME
   fi
   chmod 755 "$runtime_root/$binary"
 done
+sed -i.bak "s/__RUNTIME_VERSION__/$runtime_version/" "$runtime_root/astrid"
+rm "$runtime_root/astrid.bak"
 COPYFILE_DISABLE=1 tar -czf "$work/runtime.tar.gz" -C "$work" "$(basename "$runtime_root")"
 printf '#!/bin/sh\nexit 0\n' > "$work/aos"
 chmod 755 "$work/aos"
@@ -166,6 +250,25 @@ bash "$repo_root/scripts/package-release.sh" \
   0000000000000000000000000000000000000000000000000000000000000000 \
   "$work/capsules" \
   "$work/output"
+
+compose_sentinel="$work/compose-embedded-runtime-invoked"
+compose_seed_error="$work/compose-seed.error"
+if AOS_TEST_SENTINEL="$compose_sentinel" \
+  AOS_DISTRO_ED25519_SEED="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" \
+  bash "$repo_root/scripts/package-release.sh" \
+  "$target" \
+  "$work/aos" \
+  "$work/runtime.tar.gz" \
+  0000000000000000000000000000000000000000000000000000000000000000 \
+  "$work/capsules" \
+  "$work/output" >/dev/null 2>"$compose_seed_error"; then
+  echo "release composer accepted a seed without an explicit native sealer" >&2
+  exit 1
+fi
+test ! -e "$compose_sentinel"
+grep -Fq -- \
+  'release composer cannot sign Distro without an explicit native sealer; use --sign-release-archive' \
+  "$compose_seed_error"
 
 archive="$work/output/unicity-aos-$product_version-$target.tar.gz"
 test -f "$archive"
@@ -261,9 +364,12 @@ cp "$fixture_distro" "$bundle_root/Distro.toml"
 fixture_archive="$work/fixture-aos.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$fixture_archive" -C "$work" "$(basename "$bundle_root")"
 fixture_signed="$work/fixture-aos-signed.tar.gz"
+native_sealer="$work/native-distro-sealer"
+bash "$repo_root/scripts/package-release.sh" \
+  --extract-release-sealer "$fixture_archive" "$native_sealer"
 AOS_DISTRO_ED25519_SEED="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" \
   bash "$repo_root/scripts/package-release.sh" \
-  --sign-release-archive "$fixture_archive" "$fixture_signed"
+  --sign-release-archive "$fixture_archive" "$fixture_signed" "$native_sealer" "$fixture_archive"
 unset AOS_DISTRO_ED25519_SEED
 tar -tzf "$fixture_signed" > "$work/fixture-files"
 grep -q '/Distro.lock$' "$work/fixture-files"
@@ -297,8 +403,134 @@ mismatch_archive="$work/mismatch-aos.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$mismatch_archive" -C "$work" "$(basename "$bundle_root")"
 if AOS_DISTRO_ED25519_SEED="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" \
   bash "$repo_root/scripts/package-release.sh" \
-  --sign-release-archive "$mismatch_archive" "$work/mismatch-aos-signed.tar.gz" >/dev/null 2>&1; then
+  --sign-release-archive "$mismatch_archive" "$work/mismatch-aos-signed.tar.gz" "$native_sealer" "$fixture_archive" >/dev/null 2>&1; then
   echo "release signing accepted a sealer key that differs from Distro.toml" >&2
+  exit 1
+fi
+
+multi_target_root="$work/multi-target-archives"
+mkdir "$multi_target_root"
+targets=(
+  x86_64-unknown-linux-gnu
+  aarch64-unknown-linux-gnu
+  x86_64-apple-darwin
+  aarch64-apple-darwin
+)
+for archive_target in "${targets[@]}"; do
+  target_root="$multi_target_root/unicity-aos-${product_version}-${archive_target}"
+  cp -R "$bundle_root" "$target_root"
+  cp "$fixture_root/Distro.toml" "$target_root/Distro.toml"
+  rm -f "$target_root/Distro.lock" "$target_root/Distro.sig"
+  cat > "$target_root/runtime/bin/astrid" <<'SENTINEL'
+#!/bin/sh
+touch "${AOS_TEST_SENTINEL:?}"
+exit 97
+SENTINEL
+  chmod 755 "$target_root/runtime/bin/astrid"
+  sentinel_digest=$(b3sum -- "$target_root/runtime/bin/astrid" | awk '{print $1}')
+  python3 - "$target_root/release-manifest.json" "$archive_target" "$runtime_version" "$sentinel_digest" <<'PY'
+import json
+import pathlib
+import sys
+
+path, target, runtime_version, digest = sys.argv[1:]
+manifest = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+manifest["target"] = target
+manifest["runtime"]["asset"] = f"astrid-{runtime_version}-{target}.tar.gz"
+manifest["release_files"]["runtime/bin/astrid"] = {"blake3": digest, "mode": 0o755}
+pathlib.Path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+  COPYFILE_DISABLE=1 tar -czf \
+    "$multi_target_root/unicity-aos-${product_version}-${archive_target}.tar.gz" \
+    -C "$multi_target_root" "$(basename "$target_root")"
+  rm -rf "$target_root"
+done
+
+sentinel="$work/embedded-target-sealer-invoked"
+for unsigned_archive in "$multi_target_root"/*.tar.gz; do
+  signed_archive="$work/signed-$(basename "$unsigned_archive")"
+  AOS_TEST_SENTINEL="$sentinel" \
+    AOS_DISTRO_ED25519_SEED="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" \
+    bash "$repo_root/scripts/package-release.sh" \
+    --sign-release-archive "$unsigned_archive" "$signed_archive" "$native_sealer" "$fixture_archive" >/dev/null
+  test ! -e "$sentinel"
+  signed_listing="$work/$(basename "$signed_archive").files"
+  write_tar_listing "$signed_archive" "$signed_listing"
+  grep -q '/Distro.lock$' "$signed_listing"
+  grep -q '/Distro.sig$' "$signed_listing"
+  mkdir "$work/signed-$(basename "$unsigned_archive" .tar.gz)"
+  tar -xzf "$signed_archive" -C "$work/signed-$(basename "$unsigned_archive" .tar.gz)"
+  signed_root=$(find "$work/signed-$(basename "$unsigned_archive" .tar.gz)" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  cmp "$fixture_root/Distro.toml" "$signed_root/Distro.toml"
+done
+
+wrong_target_source="$work/wrong-target-sealer-source.tar.gz"
+wrong_target_root="$work/unicity-aos-${product_version}-x86_64-unknown-linux-gnu-wrong-target"
+cp -R "$fixture_root" "$wrong_target_root"
+python3 - "$wrong_target_root/release-manifest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["target"] = "aarch64-unknown-linux-gnu"
+path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+COPYFILE_DISABLE=1 tar -czf "$wrong_target_source" -C "$work" "$(basename "$wrong_target_root")"
+if bash "$repo_root/scripts/package-release.sh" \
+  --extract-release-sealer "$wrong_target_source" "$work/wrong-target-sealer" >/dev/null 2>&1; then
+  echo "release sealer extraction accepted a source archive with the wrong target" >&2
+  exit 1
+fi
+
+wrong_digest_source="$work/wrong-digest-sealer-source.tar.gz"
+wrong_digest_root="$work/unicity-aos-${product_version}-x86_64-unknown-linux-gnu-wrong-digest"
+cp -R "$fixture_root" "$wrong_digest_root"
+python3 - "$wrong_digest_root/release-manifest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["release_files"]["runtime/bin/astrid"]["blake3"] = "f" * 64
+path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+COPYFILE_DISABLE=1 tar -czf "$wrong_digest_source" -C "$work" "$(basename "$wrong_digest_root")"
+if bash "$repo_root/scripts/package-release.sh" \
+  --extract-release-sealer "$wrong_digest_source" "$work/wrong-digest-sealer" >/dev/null 2>&1; then
+  echo "release sealer extraction accepted bytes that differ from the manifest" >&2
+  exit 1
+fi
+
+wrong_version_source="$work/wrong-version-sealer-source.tar.gz"
+wrong_version_root="$work/unicity-aos-${product_version}-x86_64-unknown-linux-gnu-wrong-version"
+cp -R "$fixture_root" "$wrong_version_root"
+sed -i.bak "s/astrid $runtime_version/astrid 9.9.9/" "$wrong_version_root/runtime/bin/astrid"
+rm "$wrong_version_root/runtime/bin/astrid.bak"
+wrong_version_digest=$(b3sum -- "$wrong_version_root/runtime/bin/astrid" | awk '{print $1}')
+python3 - "$wrong_version_root/release-manifest.json" "$wrong_version_digest" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["release_files"]["runtime/bin/astrid"]["blake3"] = sys.argv[2]
+path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+COPYFILE_DISABLE=1 tar -czf "$wrong_version_source" -C "$work" "$(basename "$wrong_version_root")"
+if bash "$repo_root/scripts/package-release.sh" \
+  --extract-release-sealer "$wrong_version_source" "$work/wrong-version-sealer" >/dev/null 2>&1; then
+  echo "release sealer extraction accepted a binary with the wrong version" >&2
+  exit 1
+fi
+
+if AOS_DISTRO_ED25519_SEED="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" \
+  bash "$repo_root/scripts/package-release.sh" \
+  --sign-release-archive "$fixture_archive" "$work/missing-sealer-signed.tar.gz" "$work/missing-sealer" "$fixture_archive" >/dev/null 2>&1; then
+  echo "release signing accepted a missing explicit native sealer" >&2
   exit 1
 fi
 

@@ -386,6 +386,7 @@ jobs:
           import tomllib
           with open("release/runtime-compatibility.toml", "rb") as file:
               metadata = tomllib.load(file)["runtime"]
+          print(f"RUNTIME_VERSION={metadata['version']}")
           print(f"RUNTIME_TAG={metadata['tag']}")
           PY
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -394,6 +395,11 @@ jobs:
           pattern: aos-*-*-*
           merge-multiple: true
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.classify.outputs.nightly == 'false'
+        with:
+          name: aos-x86_64-unknown-linux-gnu
+          path: native-sealer-candidate
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: capsule-artifacts
           name: aos-community-capsules
@@ -401,6 +407,33 @@ jobs:
         run: |
           python3 scripts/capsule_release.py --artifacts capsule-artifacts
           cp capsule-artifacts/*.capsule artifacts/
+      - name: Prepare authenticated native Distro sealer
+        if: needs.classify.outputs.nightly == 'false'
+        run: |
+          set -euo pipefail
+          python3 - "$RUNTIME_VERSION" <<'PY'
+          import sys
+
+          version = tuple(int(part) for part in sys.argv[1].split("."))
+          if version < (2026, 9, 0):
+              raise SystemExit(
+                  "stable Distro sealing requires Astrid 2026.9.0+ with the "
+                  "030f6c43+ local-capsule runtime contract"
+              )
+          PY
+          shopt -s nullglob
+          candidates=(native-sealer-candidate/unicity-aos-*.tar.gz)
+          if (( ${#candidates[@]} != 1 )); then
+            echo "expected exactly one same-run x86_64-unknown-linux-gnu AOS archive" >&2
+            exit 1
+          fi
+          sealer="$RUNNER_TEMP/aos-native-distro-sealer"
+          scripts/package-release.sh \
+            --extract-release-sealer "${candidates[0]}" "$sealer"
+          {
+            echo "AOS_DISTRO_NATIVE_SEALER=$sealer"
+            echo "AOS_DISTRO_NATIVE_SEALER_ARCHIVE=${candidates[0]}"
+          } >> "$GITHUB_ENV"
       - name: Sign the selected Distro in each product archive
         if: needs.classify.outputs.nightly == 'false'
         env:
@@ -413,12 +446,25 @@ jobs:
             echo "no product archives found to sign" >&2
             exit 1
           fi
+          [[ -n "${AOS_DISTRO_NATIVE_SEALER:-}" ]] || {
+            echo "authenticated native Distro sealer is unavailable" >&2
+            exit 1
+          }
+          [[ -n "${AOS_DISTRO_NATIVE_SEALER_ARCHIVE:-}" ]] || {
+            echo "authenticated native Distro sealer archive is unavailable" >&2
+            exit 1
+          }
           for asset in "${assets[@]}"; do
             if tar -tzf "$asset" | grep -q '/Distro.sig$'; then
               continue
             fi
             signed="$RUNNER_TEMP/$(basename "$asset")"
-            scripts/package-release.sh --sign-release-archive "$asset" "$signed"
+            scripts/package-release.sh \
+              --sign-release-archive \
+              "$asset" \
+              "$signed" \
+              "$AOS_DISTRO_NATIVE_SEALER" \
+              "$AOS_DISTRO_NATIVE_SEALER_ARCHIVE"
             mv "$signed" "$asset"
           done
           signed_archives=0
