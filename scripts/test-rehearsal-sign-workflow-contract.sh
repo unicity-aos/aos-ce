@@ -28,6 +28,25 @@ if grep -Eq 'tar[[:space:]][^|]*\|[[:space:]]*grep[[:space:]]+(-q|--quiet)' "$wo
   echo "rehearsal workflow must not pipe tar into grep -q" >&2
   exit 1
 fi
+for stale_binding in \
+  '${darwin_runtime[0]}' \
+  '${linux_runtime[0]}' \
+  '${darwin_aos[0]}' \
+  '${linux_aos[0]}'
+do
+  if grep -Fq "$stale_binding" "$workflow"; then
+    echo "rehearsal workflow contains stale artifact binding: $stale_binding" >&2
+    exit 1
+  fi
+done
+for scalar_binding in \
+  'DARWIN_RUNTIME_ARCHIVE=$DARWIN_RUNTIME_ARCHIVE' \
+  'LINUX_RUNTIME_ARCHIVE=$LINUX_RUNTIME_ARCHIVE' \
+  'DARWIN_AOS_BINARY=$DARWIN_AOS_BINARY' \
+  'LINUX_AOS_BINARY=$LINUX_AOS_BINARY'
+do
+  grep -Fq "$scalar_binding" "$workflow"
+done
 grep -Fq 'QA_SEED_FILE="$RUNNER_TEMP/rehearsal-qa-seed"' "$workflow"
 [[ $(grep -Fc 'QA_SEED_FILE' "$workflow") -ge 4 ]]
 grep -Fq 'actions/upload-artifact@' "$workflow"
@@ -69,6 +88,85 @@ if grep -Fq 'utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA=' "$workflow"; then
   echo "rehearsal workflow must not copy the production Distro public key" >&2
   exit 1
 fi
+
+python3 - "$workflow" <<'PY'
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+matches = list(re.finditer(r"(?m)^  ([A-Za-z0-9_-]+):\n", text))
+sections = {
+    match.group(1): text[match.start(): (
+        matches[index + 1].start() if index + 1 < len(matches) else len(text)
+    )]
+    for index, match in enumerate(matches)
+}
+
+identity = sections.get("prepare-rehearsal-identity")
+if identity is None:
+    raise SystemExit("rehearsal workflow is missing prepare-rehearsal-identity")
+if "pubkey: ${{ steps.identity.outputs.pubkey }}" not in identity:
+    raise SystemExit("ephemeral QA public key must be the reusable identity output")
+if 'astrid-version = "=2026.9.0"' not in identity:
+    raise SystemExit("identity overlays must set Distro astrid-version to 2026.9.0")
+if "$overlays/runtime-compatibility.toml" not in identity:
+    raise SystemExit("identity job must publish runtime-compatibility.toml")
+if "$overlays/Distro.toml" not in identity:
+    raise SystemExit("identity job must publish Distro.toml")
+if "rehearsal-qa-seed" not in identity:
+    raise SystemExit("identity job must persist its private seed")
+
+capsules = sections.get("build-capsules")
+if capsules is None:
+    raise SystemExit("rehearsal workflow is missing build-capsules")
+build_index = capsules.index("scripts/build-capsule-assets.sh")
+for marker in (
+    "python-version: '3.12'",
+    "toolchain: '1.95.0'",
+    "targets: wasm32-unknown-unknown",
+):
+    marker_index = capsules.find(marker)
+    if marker_index < 0:
+        raise SystemExit(f"capsule job is missing {marker}")
+    if marker_index > build_index:
+        raise SystemExit("capsule toolchain must be installed before the capsule build")
+
+for job_name in ("build-aos-darwin-binary", "build-aos-linux-gnu-binary"):
+    job = sections.get(job_name)
+    if job is None:
+        raise SystemExit(f"rehearsal workflow is missing {job_name}")
+    if "prepare-rehearsal-identity" not in job:
+        raise SystemExit(f"{job_name} must wait for rehearsal overlays")
+    for marker in (
+        "name: rehearsal-overlays",
+        'git worktree add --detach "$BUILD_CHECKOUT" "$SOURCE_COMMIT"',
+        "rehearsal-overlays/runtime-compatibility.toml",
+        "rehearsal-overlays/Distro.toml",
+        "cargo build",
+    ):
+        if marker not in job:
+            raise SystemExit(f"{job_name} is missing {marker}")
+    if not (
+        job.index("name: rehearsal-overlays")
+        < job.index("rehearsal-overlays/runtime-compatibility.toml")
+        < job.index("rehearsal-overlays/Distro.toml")
+        < job.index("cargo build")
+    ):
+        raise SystemExit(f"{job_name} must install both source overlays before compiling AOS")
+
+compose = sections.get("compose-and-sign")
+if compose is None:
+    raise SystemExit("rehearsal workflow is missing compose-and-sign")
+for marker in ("name: rehearsal-overlays", "name: rehearsal-qa-seed", "QA_PUBKEY"):
+    if marker not in compose:
+        raise SystemExit(f"compose job is missing {marker}")
+if 'astrid-version"] != "=2026.9.0"' not in compose:
+    raise SystemExit("compose job must validate Distro astrid-version")
+
+if re.search(r"QA_SEED[^\n]*GITHUB_(?:ENV|OUTPUT)", text):
+    raise SystemExit("ephemeral QA seed must never be emitted")
+PY
 
 python3 - "$workflow" <<'PY'
 import pathlib

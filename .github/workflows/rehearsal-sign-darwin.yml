@@ -44,6 +44,172 @@ jobs:
           git merge-base --is-ancestor "$COMMIT" origin/main
           echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
 
+  prepare-rehearsal-identity:
+    name: Prepare ephemeral QA identity and overlays
+    needs: verify-source
+    runs-on: ubuntu-latest
+    outputs:
+      pubkey: ${{ steps.identity.outputs.pubkey }}
+    env:
+      SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Generate ephemeral QA identity
+        id: identity
+        env:
+          ASTRID_SOURCE_COMMIT: ${{ env.ASTRID_SOURCE_COMMIT }}
+        run: |
+          set -euo pipefail
+          QA_SEED_FILE="$RUNNER_TEMP/rehearsal-qa-seed"
+          QA_SEED=$(python3 -c 'import secrets; value=secrets.token_hex(32); assert len(value) == 64 and all(byte in "0123456789abcdef" for byte in value); print(value)')
+          PUBKEY=$(QA_SEED="$QA_SEED" ASTRID_SOURCE_COMMIT="$ASTRID_SOURCE_COMMIT" python3 - <<'PY'
+          import base64
+          import os
+          import subprocess
+
+          seed = os.environ["QA_SEED"]
+          if len(seed) != 64 or any(byte not in "0123456789abcdef" for byte in seed):
+              raise SystemExit("ephemeral QA seed is malformed")
+          private_der = bytes.fromhex("302e020100300506032b657004220420") + bytes.fromhex(seed)
+          public_der = subprocess.check_output(
+              ["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+              input=private_der,
+              stderr=subprocess.DEVNULL,
+          )
+          prefix = bytes.fromhex("302a300506032b6570032100")
+          if len(public_der) != 44 or not public_der.startswith(prefix):
+              raise SystemExit("openssl produced an unexpected Ed25519 public-key encoding")
+          encoded = base64.b64encode(public_der[len(prefix):]).decode("ascii")
+          print(f"ed25519:{encoded}")
+          PY
+          )
+          [[ "$PUBKEY" == ed25519:* ]]
+          python3 - "$QA_SEED_FILE" "$QA_SEED" <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          seed = sys.argv[2]
+          if len(seed) != 64 or any(byte not in "0123456789abcdef" for byte in seed):
+              raise SystemExit("refusing to persist a malformed QA seed")
+          descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(descriptor, "wb") as file:
+              file.write(bytes.fromhex(seed))
+              file.flush()
+              os.fsync(file.fileno())
+          PY
+          echo "pubkey=$PUBKEY" >> "$GITHUB_OUTPUT"
+      - name: Materialize exact source overlays
+        run: |
+          set -euo pipefail
+          CHECKOUT="$RUNNER_TEMP/rehearsal-source"
+          overlays="$RUNNER_TEMP/rehearsal-overlays"
+          git worktree add --detach "$CHECKOUT" "$SOURCE_COMMIT"
+          mkdir "$overlays"
+          python3 - "$CHECKOUT/release/runtime-compatibility.toml" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          lines = path.read_text(encoding="utf-8").splitlines()
+          replacements = {
+              "version": 'version = "2026.9.0"',
+              "tag": 'tag = "rehearsal-only-3de333f1b39d41bacfb535b49d83198212bf2403"',
+              "version-requirement": 'version-requirement = "=2026.9.0"',
+              "release-workflow-identity": (
+                  'release-workflow-identity = "rehearsal-only:'
+                  'unicity-aos/aos-ce/.github/workflows/rehearsal-sign-darwin.yml'
+                  '@workflow_dispatch/3de333f1b39d41bacfb535b49d83198212bf2403"'
+              ),
+              "source-commit": (
+                  'source-commit = "3de333f1b39d41bacfb535b49d83198212bf2403"'
+              ),
+              "release-metadata-available": "release-metadata-available = false",
+              "release-metadata-asset": (
+                  'release-metadata-asset = "REHEARSAL-ONLY-no-metadata"'
+              ),
+              "release-metadata-blake3": (
+                  'release-metadata-blake3 = "'
+                  + "0" * 64
+                  + '"'
+              ),
+          }
+          in_runtime = False
+          replaced = set()
+          for index, line in enumerate(lines):
+              if line == "[runtime]":
+                  in_runtime = True
+                  continue
+              if line.startswith("["):
+                  in_runtime = False
+              if not in_runtime or "=" not in line:
+                  continue
+              key = line.split("=", 1)[0].strip()
+              if key in replacements:
+                  lines[index] = replacements[key]
+                  replaced.add(key)
+          if replaced != set(replacements):
+              raise SystemExit(f"runtime overlay did not consume: {set(replacements) - replaced}")
+          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+          python3 - "$CHECKOUT/distros/community/unicity-ce/Distro.toml" \
+            "${{ steps.identity.outputs.pubkey }}" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          pubkey = sys.argv[2]
+          lines = path.read_text(encoding="utf-8").splitlines()
+          in_distro = False
+          in_signing = False
+          replaced = set()
+          for index, line in enumerate(lines):
+              if line == "[distro]":
+                  in_distro = True
+                  continue
+              if line == "[distro.signing]":
+                  in_signing = True
+                  continue
+              if line.startswith("["):
+                  in_distro = False
+                  in_signing = False
+              if "=" not in line:
+                  continue
+              key = line.split("=", 1)[0].strip()
+              if in_distro and key == "astrid-version":
+                  lines[index] = 'astrid-version = "=2026.9.0"'
+                  replaced.add("astrid-version")
+              if in_signing and key == "pubkey":
+                  lines[index] = f'pubkey = "{pubkey}"'
+                  replaced.add("pubkey")
+          if replaced != {"astrid-version", "pubkey"}:
+              raise SystemExit("distro overlay did not consume both rehearsal values")
+          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+          install -m 0644 \
+            "$CHECKOUT/release/runtime-compatibility.toml" \
+            "$overlays/runtime-compatibility.toml"
+          install -m 0644 \
+            "$CHECKOUT/distros/community/unicity-ce/Distro.toml" \
+            "$overlays/Distro.toml"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rehearsal-overlays
+          path: ${{ runner.temp }}/rehearsal-overlays/**
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rehearsal-qa-seed
+          path: ${{ runner.temp }}/rehearsal-qa-seed
+
   build-astrid-darwin:
     name: Build Astrid Darwin runtime
     needs: verify-source
@@ -160,7 +326,9 @@ jobs:
 
   build-aos-darwin-binary:
     name: Build AOS Darwin binary
-    needs: verify-source
+    needs:
+      - verify-source
+      - prepare-rehearsal-identity
     runs-on: macos-latest
     env:
       SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
@@ -172,6 +340,10 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ env.SOURCE_COMMIT }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rehearsal-overlays
+          path: rehearsal-overlays
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: '1.95.0'
@@ -181,17 +353,31 @@ jobs:
           key: rehearsal-aos-${{ env.SOURCE_COMMIT }}-${{ env.TARGET }}
       - name: Build the product binary
         run: |
+          BUILD_CHECKOUT="$RUNNER_TEMP/aos-overlaid-source"
+          git worktree add --detach "$BUILD_CHECKOUT" "$SOURCE_COMMIT"
+          install -m 0644 \
+            rehearsal-overlays/runtime-compatibility.toml \
+            "$BUILD_CHECKOUT/release/runtime-compatibility.toml"
+          install -m 0644 \
+            rehearsal-overlays/Distro.toml \
+            "$BUILD_CHECKOUT/distros/community/unicity-ce/Distro.toml"
           VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/unicity-aos-bootstrap/Cargo.toml", "rb"))["package"]["version"])')
           [[ "$VERSION" == "$AOS_PRODUCT_VERSION" ]]
-          cargo build --locked --release --target "$TARGET" -p unicity-aos-bootstrap
+          cargo build \
+            --manifest-path "$BUILD_CHECKOUT/Cargo.toml" \
+            --target-dir "$BUILD_CHECKOUT/target" \
+            --locked --release --target "$TARGET" -p unicity-aos-bootstrap
+          echo "AOS_BINARY=$BUILD_CHECKOUT/target/$TARGET/release/aos" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aos-${{ env.TARGET }}-binary
-          path: target/${{ env.TARGET }}/release/aos
+          path: ${{ env.AOS_BINARY }}
 
   build-aos-linux-gnu-binary:
     name: Build AOS GNU binary
-    needs: verify-source
+    needs:
+      - verify-source
+      - prepare-rehearsal-identity
     runs-on: ubuntu-latest
     env:
       SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
@@ -203,25 +389,38 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ env.SOURCE_COMMIT }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rehearsal-overlays
+          path: rehearsal-overlays
       - name: Build against the Linux release baseline
         run: |
+          BUILD_CHECKOUT="$RUNNER_TEMP/aos-overlaid-source"
+          git worktree add --detach "$BUILD_CHECKOUT" "$SOURCE_COMMIT"
+          install -m 0644 \
+            rehearsal-overlays/runtime-compatibility.toml \
+            "$BUILD_CHECKOUT/release/runtime-compatibility.toml"
+          install -m 0644 \
+            rehearsal-overlays/Distro.toml \
+            "$BUILD_CHECKOUT/distros/community/unicity-ce/Distro.toml"
           docker run --rm \
             --env TARGET \
-            --volume "$PWD:/workspace" \
+            --volume "$BUILD_CHECKOUT:/workspace" \
             --workdir /workspace \
             "$LINUX_BUILD_IMAGE" \
             bash -euxo pipefail -c '
               export CARGO_TARGET_DIR=/workspace/target/glibc-2.31
               cargo build --locked --release --target "$TARGET" -p unicity-aos-bootstrap
             '
+          echo "AOS_BINARY=$BUILD_CHECKOUT/target/glibc-2.31/$TARGET/release/aos" >> "$GITHUB_ENV"
       - name: Enforce the Linux glibc compatibility ceiling
         run: |
           python3 scripts/check_glibc.py --max-version 2.34 \
-            "target/glibc-2.31/${TARGET}/release/aos"
+            "$AOS_BINARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aos-${{ env.TARGET }}-binary
-          path: target/glibc-2.31/${{ env.TARGET }}/release/aos
+          path: ${{ env.AOS_BINARY }}
 
   build-capsules:
     name: Build rehearsal capsules
@@ -237,6 +436,16 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ env.SOURCE_COMMIT }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: rehearsal-aos-capsules-${{ env.SOURCE_COMMIT }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: astrid-${{ env.TARGET }}
@@ -266,6 +475,7 @@ jobs:
     name: Compose and sign Darwin rehearsal
     needs:
       - verify-source
+      - prepare-rehearsal-identity
       - build-astrid-darwin
       - build-astrid-linux-gnu
       - build-aos-darwin-binary
@@ -276,6 +486,7 @@ jobs:
       SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
       DARWIN_TARGET: aarch64-apple-darwin
       LINUX_TARGET: x86_64-unknown-linux-gnu
+      QA_PUBKEY: ${{ needs.prepare-rehearsal-identity.outputs.pubkey }}
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -311,6 +522,14 @@ jobs:
         with:
           name: aos-community-capsules
           path: capsule-artifacts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rehearsal-overlays
+          path: rehearsal-overlays
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rehearsal-qa-seed
+          path: qa-seed-download
       - name: Bind exact consumed artifacts
         run: |
           set -euo pipefail
@@ -323,131 +542,59 @@ jobs:
           [[ -f "$LINUX_AOS_BINARY" && -x "$LINUX_AOS_BINARY" ]]
           chmod 0755 "$DARWIN_AOS_BINARY" "$LINUX_AOS_BINARY"
           {
-            echo "DARWIN_RUNTIME_ARCHIVE=${darwin_runtime[0]}"
-            echo "LINUX_RUNTIME_ARCHIVE=${linux_runtime[0]}"
-            echo "DARWIN_AOS_BINARY=${darwin_aos[0]}"
-            echo "LINUX_AOS_BINARY=${linux_aos[0]}"
+            echo "DARWIN_RUNTIME_ARCHIVE=$DARWIN_RUNTIME_ARCHIVE"
+            echo "LINUX_RUNTIME_ARCHIVE=$LINUX_RUNTIME_ARCHIVE"
+            echo "DARWIN_AOS_BINARY=$DARWIN_AOS_BINARY"
+            echo "LINUX_AOS_BINARY=$LINUX_AOS_BINARY"
           } >> "$GITHUB_ENV"
       - name: Create disposable rehearsal checkout and overlays
         run: |
           set -euo pipefail
           CHECKOUT="$RUNNER_TEMP/rehearsal-checkout"
           git worktree add --detach "$CHECKOUT" "$SOURCE_COMMIT"
-          python3 - "$CHECKOUT/release/runtime-compatibility.toml" <<'PY'
+          install -m 0644 \
+            rehearsal-overlays/runtime-compatibility.toml \
+            "$CHECKOUT/release/runtime-compatibility.toml"
+          install -m 0644 \
+            rehearsal-overlays/Distro.toml \
+            "$CHECKOUT/distros/community/unicity-ce/Distro.toml"
+          python3 - "$CHECKOUT/distros/community/unicity-ce/Distro.toml" \
+            "$QA_PUBKEY" <<'PY'
           import pathlib
           import sys
+          import tomllib
 
           path = pathlib.Path(sys.argv[1])
-          lines = path.read_text(encoding="utf-8").splitlines()
-          replacements = {
-              "version": 'version = "2026.9.0"',
-              "tag": 'tag = "rehearsal-only-3de333f1b39d41bacfb535b49d83198212bf2403"',
-              "version-requirement": 'version-requirement = "=2026.9.0"',
-              "release-workflow-identity": (
-                  'release-workflow-identity = "rehearsal-only:'
-                  'unicity-aos/aos-ce/.github/workflows/rehearsal-sign-darwin.yml'
-                  '@workflow_dispatch/3de333f1b39d41bacfb535b49d83198212bf2403"'
-              ),
-              "source-commit": (
-                  'source-commit = "3de333f1b39d41bacfb535b49d83198212bf2403"'
-              ),
-              "release-metadata-available": "release-metadata-available = false",
-              "release-metadata-asset": (
-                  'release-metadata-asset = "REHEARSAL-ONLY-no-metadata"'
-              ),
-              "release-metadata-blake3": (
-                  'release-metadata-blake3 = "'
-                  + "0" * 64
-                  + '"'
-              ),
-          }
-          in_runtime = False
-          replaced = set()
-          for index, line in enumerate(lines):
-              if line == "[runtime]":
-                  in_runtime = True
-                  continue
-              if line.startswith("["):
-                  in_runtime = False
-              if not in_runtime or "=" not in line:
-                  continue
-              key = line.split("=", 1)[0].strip()
-              if key in replacements:
-                  lines[index] = replacements[key]
-                  replaced.add(key)
-          if replaced != set(replacements):
-              raise SystemExit(f"runtime overlay did not consume: {set(replacements) - replaced}")
-          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          expected_pubkey = sys.argv[2]
+          metadata = tomllib.loads(path.read_text(encoding="utf-8"))["distro"]
+          if metadata["astrid-version"] != "=2026.9.0":
+              raise SystemExit("rehearsal Distro astrid-version does not match the runtime overlay")
+          if metadata["signing"]["pubkey"] != expected_pubkey:
+              raise SystemExit("rehearsal Distro pubkey does not match the upstream identity")
           PY
           echo "REHEARSAL_CHECKOUT=$CHECKOUT" >> "$GITHUB_ENV"
-      - name: Generate ephemeral QA identity
-        id: qa-identity
-        env:
-          ASTRID_SOURCE_COMMIT: ${{ env.ASTRID_SOURCE_COMMIT }}
+      - name: Bind private QA seed
         run: |
           set -euo pipefail
           QA_SEED_FILE="$RUNNER_TEMP/rehearsal-qa-seed"
-          QA_SEED=$(python3 -c 'import secrets; value=secrets.token_hex(32); assert len(value) == 64 and all(byte in "0123456789abcdef" for byte in value); print(value)')
-          PUBKEY=$(QA_SEED="$QA_SEED" ASTRID_SOURCE_COMMIT="$ASTRID_SOURCE_COMMIT" python3 - <<'PY'
-          import base64
-          import os
-          import subprocess
-
-          seed = os.environ["QA_SEED"]
-          if len(seed) != 64 or any(byte not in "0123456789abcdef" for byte in seed):
-              raise SystemExit("ephemeral QA seed is malformed")
-          private_der = bytes.fromhex("302e020100300506032b657004220420") + bytes.fromhex(seed)
-          public_der = subprocess.check_output(
-              ["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
-              input=private_der,
-              stderr=subprocess.DEVNULL,
-          )
-          prefix = bytes.fromhex("302a300506032b6570032100")
-          if len(public_der) != 44 or not public_der.startswith(prefix):
-              raise SystemExit("openssl produced an unexpected Ed25519 public-key encoding")
-          encoded = base64.b64encode(public_der[len(prefix):]).decode("ascii")
-          print(f"ed25519:{encoded}")
-          PY
-          )
-          [[ "$PUBKEY" == ed25519:* ]]
-          python3 - "$QA_SEED_FILE" "$QA_SEED" <<'PY'
+          python3 - qa-seed-download/rehearsal-qa-seed "$QA_SEED_FILE" <<'PY'
           import os
           import pathlib
           import sys
 
-          path = pathlib.Path(sys.argv[1])
-          seed = sys.argv[2]
+          source = pathlib.Path(sys.argv[1])
+          destination = pathlib.Path(sys.argv[2])
+          seed = source.read_bytes().hex()
           if len(seed) != 64 or any(byte not in "0123456789abcdef" for byte in seed):
-              raise SystemExit("refusing to persist a malformed QA seed")
-          descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              raise SystemExit("refusing to bind a malformed QA seed")
+          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
           with os.fdopen(descriptor, "wb") as file:
               file.write(bytes.fromhex(seed))
               file.flush()
               os.fsync(file.fileno())
+          source.chmod(0o000)
+          source.unlink()
           PY
-          python3 - "$REHEARSAL_CHECKOUT/distros/community/unicity-ce/Distro.toml" "$PUBKEY" <<'PY'
-          import pathlib
-          import sys
-
-          path = pathlib.Path(sys.argv[1])
-          pubkey = sys.argv[2]
-          lines = path.read_text(encoding="utf-8").splitlines()
-          in_signing = False
-          replaced = False
-          for index, line in enumerate(lines):
-              if line == "[distro.signing]":
-                  in_signing = True
-                  continue
-              if line.startswith("["):
-                  in_signing = False
-              if in_signing and line.split("=", 1)[0].strip() == "pubkey":
-                  lines[index] = f'pubkey = "{pubkey}"'
-                  replaced = True
-          if not replaced:
-              raise SystemExit("distro signing overlay did not find [distro.signing].pubkey")
-          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-          PY
-          echo "REHEARSAL_PUBKEY=$PUBKEY" >> "$GITHUB_OUTPUT"
       - name: Compose the GNU native sealer source
         run: |
           set -euo pipefail
@@ -500,7 +647,6 @@ jobs:
         id: sign
         env:
           ASTRID_SOURCE_COMMIT: ${{ env.ASTRID_SOURCE_COMMIT }}
-          QA_PUBKEY: ${{ steps.qa-identity.outputs.REHEARSAL_PUBKEY }}
         run: |
           set -euo pipefail
           QA_SEED_FILE="$RUNNER_TEMP/rehearsal-qa-seed"
@@ -520,6 +666,25 @@ jobs:
           PY
           )
           [[ "$QA_PUBKEY" == ed25519:* ]]
+          DERIVED_PUBKEY=$(QA_SEED="$QA_SEED" python3 - <<'PY'
+          import base64
+          import os
+          import subprocess
+
+          seed = os.environ["QA_SEED"]
+          private_der = bytes.fromhex("302e020100300506032b657004220420") + bytes.fromhex(seed)
+          public_der = subprocess.check_output(
+              ["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+              input=private_der,
+              stderr=subprocess.DEVNULL,
+          )
+          prefix = bytes.fromhex("302a300506032b6570032100")
+          if len(public_der) != 44 or not public_der.startswith(prefix):
+              raise SystemExit("persisted QA seed produced an invalid public key")
+          print("ed25519:" + base64.b64encode(public_der[len(prefix):]).decode("ascii"))
+          PY
+          )
+          [[ "$DERIVED_PUBKEY" == "$QA_PUBKEY" ]]
           signed="$RUNNER_TEMP/$(basename "$DARWIN_ARCHIVE")"
           AOS_DISTRO_ED25519_SEED="$QA_SEED" \
             "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
