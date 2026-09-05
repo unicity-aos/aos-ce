@@ -61,6 +61,10 @@
   changing runtime state, and proves clean daemon shutdown before publication.
 - Native `aos status` output for authenticated running state and verified
   stopped state without invoking the runtime CLI.
+- A selected `aos distro apply --principal P --yes` path that verifies the
+  bundled Distro.toml, Distro.lock, and Distro.sig with Astrid 0.10.4's signed
+  lock algorithm, seeds the runtime trust pin, confirms a volume-only stop, and
+  records an AOS-owned activation receipt.
 - An opt-in daily nightly train with deterministic run-dated versions, exact
   Astrid compatibility pins, protected publication and promotion, and
   idempotent recovery after interrupted release or pointer updates. It is
@@ -106,9 +110,8 @@
 - Bootstrap the default CE system fleet through Astrid's canonical distro
   installer before the daemon-backed authorization pass, allowing a completely
   fresh AOS home and non-default targets to use the same runtime trust path.
-- Keep the authenticated init operator separate from its target principal,
-  prevent AOS distribution replacement, and fail closed while signed direct
-  update channels remain unpublished.
+- Keep the authenticated init operator separate from its target principal and
+  fail closed while signed direct update channels remain unpublished.
 - Require explicit machine-readable runtime-compatibility and upgrade/self-heal
   approvals before the tag-triggered workflow can package or publish a release,
   backed by a packaged migration/reinstall test over the frozen 2026-07-15

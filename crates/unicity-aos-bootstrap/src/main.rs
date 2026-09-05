@@ -15,6 +15,7 @@ use astrid_core::PrincipalId;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use unicity_aos_bootstrap::{AOS_WORKSPACE_STATE_DIR, AosHome};
 
+mod distro_trust;
 mod hook;
 mod mcp;
 
@@ -54,8 +55,11 @@ enum ProductCommand {
     /// Update AOS and its coordinated runtime executable set.
     #[command(name = "update", alias = "self-update", alias = "self_update")]
     Update(UpdateArgs),
-    /// Distribution state is fixed to Unicity CE in this AOS release.
-    Distro(DistroArgs),
+    /// Apply the signed Unicity CE distribution bundled with this AOS release.
+    Distro {
+        #[command(subcommand)]
+        command: DistroCommand,
+    },
     /// Deliver a host hook through the authenticated AOS event bus.
     Hook(hook::HookArgs),
     /// Expose this AOS installation to an MCP host over stdio.
@@ -94,11 +98,30 @@ enum McpCommand {
     Serve(mcp::ServeArgs),
 }
 
+#[derive(Subcommand)]
+enum DistroCommand {
+    /// Apply the selected bundled Unicity CE distribution.
+    Apply(DistroApplyArgs),
+}
+
 #[derive(Args)]
-struct DistroArgs {
-    /// Runtime distribution arguments retained only to provide a safe refusal.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    arguments: Vec<OsString>,
+struct DistroApplyArgs {
+    /// Authenticated runtime principal for this apply.
+    #[arg(
+        long,
+        value_name = "PRINCIPAL",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    principal: Option<String>,
+    /// Confirm this non-interactive apply.
+    #[arg(short = 'y', long)]
+    yes: bool,
+    /// Keep Astrid's resolver offline.
+    #[arg(long)]
+    offline: bool,
+    /// Variable forwarded to Astrid's distro apply.
+    #[arg(long = "var", value_name = "KEY=VALUE")]
+    vars: Vec<String>,
 }
 
 #[derive(Args)]
@@ -324,7 +347,7 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
             &cli.command,
             Some(
                 ProductCommand::Init(_)
-                    | ProductCommand::Distro(_)
+                    | ProductCommand::Distro { .. }
                     | ProductCommand::Hook(_)
                     | ProductCommand::Mcp { .. }
                     | ProductCommand::Status(_)
@@ -346,7 +369,9 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
             command: MigrateCommand::Runtime { from },
         }) => Some(handle_migrate_runtime(&from)),
         Some(ProductCommand::Update(args)) => Some(handle_self_update(&args)),
-        Some(ProductCommand::Distro(args)) => Some(refuse_distro_command(&args.arguments)),
+        Some(ProductCommand::Distro {
+            command: DistroCommand::Apply(args),
+        }) => Some(handle_distro_apply(cli.principal, args)),
         Some(ProductCommand::Hook(args)) => Some(handle_hook(cli.principal, args)),
         Some(ProductCommand::Mcp {
             command: McpCommand::Serve(args),
@@ -780,12 +805,187 @@ fn handle_self_update(args: &UpdateArgs) -> ExitCode {
     command_exit_code(command.status(), "run the installed signed AOS updater")
 }
 
-fn refuse_distro_command(_arguments: &[OsString]) -> ExitCode {
-    eprintln!(
-        "aos: Unicity CE owns the distribution state for this AOS installation; `aos distro` cannot apply or replace it"
-    );
-    eprintln!("AOS does not expose raw distribution mutation beneath another command namespace.");
-    ExitCode::from(2)
+fn distro_principal(
+    leading_principal: Option<String>,
+    command_principal: Option<String>,
+) -> Result<PrincipalId, String> {
+    let principal = match (leading_principal, command_principal) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "'--principal' was provided both before and after `distro apply`; provide it once"
+                    .to_owned(),
+            );
+        }
+        (Some(principal), None) | (None, Some(principal)) => principal,
+        (None, None) => {
+            return Err(
+                "`aos distro apply` requires an explicit '--principal PRINCIPAL'".to_owned(),
+            );
+        }
+    };
+    PrincipalId::new(principal).map_err(|error| format!("invalid distro apply principal: {error}"))
+}
+
+fn handle_distro_apply(leading_principal: Option<String>, args: DistroApplyArgs) -> ExitCode {
+    if !args.yes {
+        eprintln!("aos: `distro apply` requires '--yes' for non-interactive application");
+        return ExitCode::from(2);
+    }
+    let principal = match distro_principal(leading_principal, args.principal) {
+        Ok(principal) => principal,
+        Err(error) => {
+            eprintln!("aos: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let home = match resolve_home() {
+        Ok(home) => home,
+        Err(code) => return code,
+    };
+    let verified = match distro_trust::verify_selected_release(&home) {
+        Ok(verified) => verified,
+        Err(error) => {
+            eprintln!("aos: bundled Distro Apply verification failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = distro_trust::check_existing_receipt(&home, &verified, principal.as_str()) {
+        eprintln!("aos: refusing Distro Apply before dispatch: {error}");
+        return ExitCode::FAILURE;
+    }
+
+    let start_result = home.run_runtime_with_args([OsStr::new("start")]);
+    let start_status = match start_result {
+        Ok(status) => Some(status),
+        Err(error) => {
+            eprintln!("aos: failed to start bundled runtime for Distro Apply: {error}");
+            None
+        }
+    };
+
+    let mut apply_code = ExitCode::FAILURE;
+    let mut apply_error = None;
+    if let Some(status) = start_status {
+        if !status.success() {
+            apply_code = child_exit_code(status);
+            apply_error = Some(format!(
+                "bundled runtime start exited with {}",
+                status.code().unwrap_or(1)
+            ));
+        } else if let Err(error) = distro_trust::seed_runtime_trust(&home, &verified.signing_pubkey)
+        {
+            apply_error = Some(format!("failed to seed runtime distro trust: {error}"));
+        } else {
+            let mut runtime_args = vec![
+                OsString::from("--principal"),
+                OsString::from(principal.as_str()),
+                OsString::from("distro"),
+                OsString::from("apply"),
+                OsString::from("--yes"),
+                verified.manifest_path.clone().into_os_string(),
+            ];
+            if args.offline {
+                runtime_args.push(OsString::from("--offline"));
+            }
+            for value in args.vars {
+                runtime_args.push(OsString::from("--var"));
+                runtime_args.push(OsString::from(value));
+            }
+            let output_result =
+                home.runtime_command_with_args(&runtime_args)
+                    .and_then(|mut command| {
+                        command.env("ASTRID_ENFORCED_DISTRO", &verified.manifest_path);
+                        command.output()
+                    });
+            match output_result {
+                Ok(output) => {
+                    apply_code = child_exit_code(output.status);
+                    if !output.status.success() {
+                        apply_error = Some(format!(
+                            "bundled Distro Apply exited with {}",
+                            output.status.code().unwrap_or(1)
+                        ));
+                    }
+                    if let Err(error) = emit_runtime_output(&output) {
+                        apply_code = ExitCode::FAILURE;
+                        apply_error = Some(format!(
+                            "failed to write bundled Distro Apply output: {error}"
+                        ));
+                    }
+                }
+                Err(error) => {
+                    apply_error = Some(format!("failed to run bundled Distro Apply: {error}"));
+                }
+            }
+        }
+    } else {
+        apply_error = Some("bundled runtime did not start for Distro Apply".to_owned());
+    }
+
+    let stop_error = stop_after_distro_apply(&home);
+    if let Some(error) = apply_error {
+        eprintln!("aos: Distro Apply failed: {error}");
+        if let Err(stop_error) = stop_error {
+            eprintln!("aos: Distro Apply shutdown failed: {stop_error}");
+        }
+        return apply_code;
+    }
+    if let Err(error) = stop_error {
+        eprintln!("aos: Distro Apply shutdown failed: {error}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = distro_trust::write_active_receipt(&home, &verified, principal.as_str()) {
+        eprintln!("aos: Distro Apply succeeded but receipt write failed: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+fn stop_after_distro_apply(home: &AosHome) -> Result<(), String> {
+    let output_result = home
+        .runtime_command_with_args([OsStr::new("stop")])
+        .and_then(|mut command| command.output());
+    let confirmation = wait_for_confirmed_stop(home);
+    let output = match output_result {
+        Ok(output) => output,
+        Err(error) => {
+            if let Err(confirmation_error) = confirmation {
+                return Err(format!(
+                    "failed to run bundled runtime stop: {error}; {confirmation_error}"
+                ));
+            }
+            return Err(format!("failed to run bundled runtime stop: {error}"));
+        }
+    };
+    let expected_disconnect = expected_shutdown_disconnect(&output);
+    if confirmation.is_ok() && (output.status.success() || expected_disconnect) {
+        if expected_disconnect {
+            std::io::stdout()
+                .write_all(&output.stdout)
+                .map_err(|error| format!("failed to write bundled runtime output: {error}"))?;
+            if output.stdout.is_empty() {
+                println!("Unicity AOS stopped.");
+            }
+        } else {
+            emit_runtime_output(&output)
+                .map_err(|error| format!("failed to write bundled runtime output: {error}"))?;
+        }
+        return Ok(());
+    }
+
+    emit_runtime_output(&output)
+        .map_err(|error| format!("failed to write bundled runtime output: {error}"))?;
+    if let Err(error) = confirmation {
+        return Err(format!("shutdown confirmation failed: {error}"));
+    }
+    if output.status.success() {
+        Err("runtime stop exited successfully but stopped-state confirmation failed".to_owned())
+    } else {
+        Err(format!(
+            "bundled runtime stop exited with {}",
+            output.status.code().unwrap_or(1)
+        ))
+    }
 }
 
 fn command_exit_code(status: io::Result<std::process::ExitStatus>, operation: &str) -> ExitCode {
@@ -1043,9 +1243,9 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        DaemonCommand, ProductCli, ProductCommand, child_exit_code, handle_product_command,
-        help_targets_product, is_owned_root, leading_owned_root, runtime_args_for_dispatch,
-        runtime_stop_requested, status_principal,
+        DaemonCommand, DistroCommand, ProductCli, ProductCommand, child_exit_code,
+        distro_principal, handle_product_command, help_targets_product, is_owned_root,
+        leading_owned_root, runtime_args_for_dispatch, runtime_stop_requested, status_principal,
     };
 
     #[test]
@@ -1101,6 +1301,75 @@ mod tests {
             Some(std::path::Path::new("/workspace"))
         );
         assert!(args.verbose);
+    }
+
+    #[test]
+    fn product_cli_parses_only_the_selected_signed_distro_apply_surface() {
+        let cli = ProductCli::try_parse_from([
+            "aos",
+            "--principal",
+            "operator",
+            "distro",
+            "apply",
+            "--yes",
+            "--offline",
+            "--var",
+            "model=fixture",
+        ])
+        .expect("parse signed distro apply");
+        assert_eq!(cli.principal.as_deref(), Some("operator"));
+        let Some(ProductCommand::Distro {
+            command: DistroCommand::Apply(args),
+        }) = cli.command
+        else {
+            panic!("expected distro apply command");
+        };
+        assert!(args.yes);
+        assert!(args.offline);
+        assert_eq!(args.vars, ["model=fixture"]);
+        assert!(
+            ProductCli::try_parse_from([
+                "aos",
+                "distro",
+                "apply",
+                "--principal",
+                "operator",
+                "--yes",
+                "--accept-new-key",
+            ])
+            .is_err()
+        );
+        assert!(
+            ProductCli::try_parse_from([
+                "aos",
+                "distro",
+                "apply",
+                "--principal",
+                "operator",
+                "--yes",
+                "/tmp/other.toml",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn distro_apply_principal_is_explicit_and_validated() {
+        assert_eq!(
+            distro_principal(Some("operator".to_owned()), None)
+                .expect("leading principal")
+                .as_str(),
+            "operator"
+        );
+        assert_eq!(
+            distro_principal(None, Some("operator".to_owned()))
+                .expect("command principal")
+                .as_str(),
+            "operator"
+        );
+        assert!(distro_principal(None, None).is_err());
+        assert!(distro_principal(Some("operator".to_owned()), Some("other".to_owned())).is_err());
+        assert!(distro_principal(None, Some("not/a/principal".to_owned())).is_err());
     }
 
     #[test]
