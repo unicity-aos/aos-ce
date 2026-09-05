@@ -130,6 +130,74 @@ print(value)
 PY
 }
 
+validate_schema_v2_membership() {
+  local manifest=$1
+  local bundle=${2:-}
+  python3 - "$manifest" "$bundle" <<'PY'
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+manifest_path, bundle_arg = sys.argv[1:]
+try:
+    manifest = json.loads(pathlib.Path(manifest_path).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"release manifest is unreadable: {error}")
+
+expected_executables = [
+    "bin/aos",
+    "runtime/bin/astrid",
+    "runtime/bin/astrid-daemon",
+    "runtime/bin/astrid-build",
+    "runtime/bin/astrid-emit",
+]
+executables = manifest.get("executables")
+if executables != expected_executables:
+    raise SystemExit("release manifest executables membership is missing or non-canonical")
+
+release_files = manifest.get("release_files")
+if not isinstance(release_files, dict):
+    raise SystemExit("release manifest release_files inventory is missing")
+for relative in expected_executables:
+    record = release_files.get(relative)
+    if not isinstance(record, dict) or set(record) != {"blake3", "mode"}:
+        raise SystemExit(f"release manifest executable inventory record is invalid: {relative}")
+    if not isinstance(record["blake3"], str) or re.fullmatch(r"[0-9a-f]{64}", record["blake3"]) is None:
+        raise SystemExit(f"release manifest executable digest is malformed: {relative}")
+    if type(record["mode"]) is not int or record["mode"] != 0o755:
+        raise SystemExit(f"release manifest executable mode is not 0755: {relative}")
+for relative, record in release_files.items():
+    if isinstance(record, dict) and record.get("mode") == 0o755 and relative not in expected_executables:
+        raise SystemExit(f"release manifest has an unlisted executable inventory record: {relative}")
+
+capsules = manifest.get("capsules")
+if not isinstance(capsules, dict):
+    raise SystemExit("release manifest capsules section is missing")
+assets = capsules.get("assets")
+if not isinstance(assets, list) or any(not isinstance(asset, str) for asset in assets):
+    raise SystemExit("release manifest capsule assets are missing or malformed")
+required = capsules.get("required")
+if required != ["aos-mcp.capsule"]:
+    raise SystemExit("release manifest capsules.required must name aos-mcp.capsule")
+if any(asset not in assets for asset in required):
+    raise SystemExit("release manifest capsules.required is not a subset of capsules.assets")
+if "aos-mcp.capsule" not in assets:
+    raise SystemExit("release manifest capsules.assets is missing aos-mcp.capsule")
+
+if bundle_arg:
+    bundle = pathlib.Path(bundle_arg)
+    for relative in expected_executables:
+        path = bundle / relative
+        if path.is_symlink() or not path.is_file():
+            raise SystemExit(f"release manifest executable is missing from archive: {relative}")
+        if stat.S_IMODE(path.stat().st_mode) != 0o755 or not os.access(path, os.X_OK):
+            raise SystemExit(f"release archive executable mode is not 0755: {relative}")
+PY
+}
+
 require_native_release_sealer() {
   local archive=$1
   local output=$2
@@ -153,6 +221,9 @@ require_native_release_sealer() {
   runtime_identity=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime release-workflow-identity)
   mkdir -p "$extracted"
   extract_safe_tar "$archive" "$extracted" "unicity-aos-${product_version}-${expected_target}"
+  validate_schema_v2_membership \
+    "$extracted/unicity-aos-${product_version}-${expected_target}/release-manifest.json" \
+    "$extracted/unicity-aos-${product_version}-${expected_target}"
   python3 - "$extracted" "$product_version" "$expected_target" "$runtime_version" "$runtime_tag" "$runtime_repository" "$runtime_identity" <<'PY'
 import json
 import os
@@ -237,7 +308,8 @@ PY
 require_release_archive_root() {
   local extracted=$1
   local product_version=$2
-  python3 - "$extracted" "$product_version" <<'PY'
+  local bundle
+  bundle=$(python3 - "$extracted" "$product_version" <<'PY'
 import json
 import pathlib
 import sys
@@ -266,6 +338,9 @@ if bundle.name != f"unicity-aos-{product_version}-{target}":
     raise SystemExit("AOS archive root does not match its release-manifest target")
 print(bundle)
 PY
+  )
+  validate_schema_v2_membership "$bundle/release-manifest.json" "$bundle"
+  printf '%s\n' "$bundle"
 }
 
 sealer_pubkey_equals_manifest() {
@@ -503,6 +578,13 @@ manifest = {
     "schema_version": 2,
     "product": {"name": "Unicity AOS Community Edition", "version": product},
     "target": target,
+    "executables": [
+        "bin/aos",
+        "runtime/bin/astrid",
+        "runtime/bin/astrid-daemon",
+        "runtime/bin/astrid-build",
+        "runtime/bin/astrid-emit",
+    ],
     "layout": {
         "release_directory": f"releases/{product}",
         "runtime_executables": "runtime/bin",
@@ -523,7 +605,11 @@ manifest = {
         "sdk_rust_version": sdk_version,
         "sdk_rust_commit": sdk_commit,
     },
-    "capsules": {"count": len(capsules), "assets": capsules},
+    "capsules": {
+        "count": len(capsules),
+        "assets": capsules,
+        "required": ["aos-mcp.capsule"],
+    },
 }
 verifiers = {
     "aarch64-apple-darwin": {
@@ -548,6 +634,8 @@ if target not in verifiers:
 manifest["verifier"] = {"version": "v3.1.1", **verifiers[target]}
 pathlib.Path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
+
+validate_schema_v2_membership "$work/$root/release-manifest.json" "$work/$root"
 
 tar -czf "$output_dir/$asset" -C "$work" "$root"
 echo "$output_dir/$asset"

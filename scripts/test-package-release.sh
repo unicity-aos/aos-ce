@@ -305,6 +305,14 @@ manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 product_version, runtime_version, runtime_identity = sys.argv[2:]
 assert manifest["schema_version"] == 2
 assert manifest["product"]["version"] == product_version
+expected_executables = [
+    "bin/aos",
+    "runtime/bin/astrid",
+    "runtime/bin/astrid-daemon",
+    "runtime/bin/astrid-build",
+    "runtime/bin/astrid-emit",
+]
+assert manifest["executables"] == expected_executables
 assert manifest["layout"] == {
     "release_directory": f"releases/{product_version}",
     "runtime_executables": "runtime/bin",
@@ -330,6 +338,7 @@ assert set(manifest["release_files"]) == expected_inventory, (
 assert manifest["release_files"]["bin/aos"]["mode"] == 0o755
 assert manifest["release_files"]["libexec/install.sh"]["mode"] == 0o600
 assert manifest["release_files"]["runtime/bin/astrid-daemon"]["mode"] == 0o755
+assert all(manifest["release_files"][path]["mode"] == 0o755 for path in expected_executables)
 assert manifest["runtime"]["version"] == runtime_version
 assert manifest["runtime"]["digest"] == "blake3:" + "0" * 64
 assert "sha256" not in manifest["runtime"]
@@ -341,6 +350,9 @@ assert manifest["contracts"]["sdk_rust_commit"] == "bbbc61c8821d6c536fb25d2068b6
 assert manifest["capsules"]["count"] == 22
 assert len(manifest["capsules"]["assets"]) == 22
 assert len(set(manifest["capsules"]["assets"])) == 22
+assert manifest["capsules"]["required"] == ["aos-mcp.capsule"]
+assert set(manifest["capsules"]["required"]) <= set(manifest["capsules"]["assets"])
+assert "aos-mcp.capsule" in manifest["capsules"]["assets"]
 assert manifest["verifier"] == {
     "version": "v3.1.1",
     "asset": "cosign-linux-amd64",
@@ -363,6 +375,45 @@ PY
 cp "$fixture_distro" "$bundle_root/Distro.toml"
 fixture_archive="$work/fixture-aos.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$fixture_archive" -C "$work" "$(basename "$bundle_root")"
+
+membership_mutations="$work/membership-mutations"
+mkdir "$membership_mutations"
+for mutation in missing-executables extra-executable mismatched-executable-mode missing-required missing-aos-mcp; do
+  mutation_dir="$membership_mutations/$mutation"
+  mkdir "$mutation_dir"
+  mutation_root="$mutation_dir/$(basename "$bundle_root")"
+  cp -R "$bundle_root" "$mutation_root"
+  python3 - "$mutation_root/release-manifest.json" "$mutation" <<'PY'
+import json
+import pathlib
+import sys
+
+path, mutation = sys.argv[1:]
+manifest = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+if mutation == "missing-executables":
+    del manifest["executables"]
+elif mutation == "extra-executable":
+    manifest["executables"].append("runtime/bin/not-a-real-executable")
+elif mutation == "mismatched-executable-mode":
+    manifest["release_files"]["runtime/bin/astrid"]["mode"] = 0o600
+elif mutation == "missing-required":
+    assert "aos-mcp.capsule" in manifest["capsules"]["assets"]
+    del manifest["capsules"]["required"]
+elif mutation == "missing-aos-mcp":
+    manifest["capsules"]["assets"].remove("aos-mcp.capsule")
+else:
+    raise SystemExit(f"unknown mutation: {mutation}")
+pathlib.Path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+  mutation_archive="$mutation_dir/$mutation.tar.gz"
+  COPYFILE_DISABLE=1 tar -czf "$mutation_archive" -C "$mutation_dir" "$(basename "$mutation_root")"
+  if bash "$repo_root/scripts/package-release.sh" \
+    --extract-release-sealer "$mutation_archive" "$mutation_dir/native-sealer" >/dev/null 2>&1; then
+    echo "release sealer extraction accepted the $mutation manifest mutation" >&2
+    exit 1
+  fi
+done
+
 fixture_signed="$work/fixture-aos-signed.tar.gz"
 native_sealer="$work/native-distro-sealer"
 bash "$repo_root/scripts/package-release.sh" \
