@@ -48,6 +48,26 @@ grep -Fq 'b3sum --check BLAKE3SUMS.txt' "$release_workflow"
 grep -Fq "repos/\$GITHUB_REPOSITORY/immutable-releases" "$release_workflow"
 grep -Fq '.immutable == true' "$release_workflow"
 grep -Fq 'AOS_RELEASE_ADMIN_TOKEN' "$release_workflow"
+
+python3 - "$repo_root" "$release_workflow" <<'PY'
+import pathlib
+import sys
+
+repo_root = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(repo_root / "scripts"))
+
+from capsule_release import source_contract
+
+text = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+expected = len(source_contract())
+claim = (
+    f"The release also contains the {expected} signed, installable capsule artifacts "
+    "selected by Community Edition."
+)
+if claim not in text:
+    raise SystemExit("release notes must state the capsule count enforced by source_contract")
+PY
+
 grep -Fq 'actions: read' "$workflow"
 grep -Fq 'actions/runs/$GITHUB_RUN_ID' "$release_workflow"
 grep -Fq -- "- '!20[0-9][0-9].*-nightly.*'" "$release_workflow"
