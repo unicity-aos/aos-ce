@@ -660,6 +660,7 @@ jobs:
           "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
             --extract-release-sealer "${candidates[0]}" "$sealer"
           {
+            echo "LINUX_ARCHIVE=${candidates[0]}"
             echo "NATIVE_SEALER=$sealer"
             echo "NATIVE_SEALER_ARCHIVE=${candidates[0]}"
           } >> "$GITHUB_ENV"
@@ -685,7 +686,7 @@ jobs:
           )
           [[ ${#candidates[@]} -eq 1 ]]
           echo "DARWIN_ARCHIVE=${candidates[0]}" >> "$GITHUB_ENV"
-      - name: Sign the Darwin rehearsal candidate
+      - name: Sign the Darwin and GNU rehearsal candidates
         id: sign
         env:
           ASTRID_SOURCE_COMMIT: ${{ env.ASTRID_SOURCE_COMMIT }}
@@ -727,21 +728,37 @@ jobs:
           PY
           )
           [[ "$DERIVED_PUBKEY" == "$QA_PUBKEY" ]]
-          signed="$RUNNER_TEMP/$(basename "$DARWIN_ARCHIVE")"
+          signed_darwin="$RUNNER_TEMP/$(basename "$DARWIN_ARCHIVE")"
           AOS_DISTRO_ED25519_SEED="$QA_SEED" \
             "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
             --sign-release-archive \
             "$DARWIN_ARCHIVE" \
-            "$signed" \
+            "$signed_darwin" \
             "$NATIVE_SEALER" \
             "$NATIVE_SEALER_ARCHIVE"
-          SIGNED_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-tar-listing.XXXXXX")
-          write_tar_listing "$signed" "$SIGNED_TAR_LISTING"
-          if ! grep -q '/Distro.sig$' "$SIGNED_TAR_LISTING"; then
-            echo "signed rehearsal archive has no Distro signature" >&2
+          SIGNED_DARWIN_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-darwin-tar-listing.XXXXXX")
+          write_tar_listing "$signed_darwin" "$SIGNED_DARWIN_TAR_LISTING"
+          if ! grep -q '/Distro.sig$' "$SIGNED_DARWIN_TAR_LISTING"; then
+            echo "signed Darwin rehearsal archive has no Distro signature" >&2
             exit 1
           fi
-          unlink "$SIGNED_TAR_LISTING"
+          unlink "$SIGNED_DARWIN_TAR_LISTING"
+          signed_gnu="$RUNNER_TEMP/$(basename "$LINUX_ARCHIVE")"
+          AOS_DISTRO_ED25519_SEED="$QA_SEED" \
+            "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
+            --sign-release-archive \
+            "$LINUX_ARCHIVE" \
+            "$signed_gnu" \
+            "$NATIVE_SEALER" \
+            "$NATIVE_SEALER_ARCHIVE"
+          SIGNED_GNU_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-gnu-tar-listing.XXXXXX")
+          write_tar_listing "$signed_gnu" "$SIGNED_GNU_TAR_LISTING"
+          if ! grep -q '/Distro.sig$' "$SIGNED_GNU_TAR_LISTING"; then
+            echo "signed GNU rehearsal archive has no Distro signature" >&2
+            exit 1
+          fi
+          unlink "$SIGNED_GNU_TAR_LISTING"
+          # Destroy the persistent QA seed only after both signed archives were verified.
           python3 - "$QA_SEED_FILE" <<'PY'
           import os
           import pathlib
@@ -754,7 +771,12 @@ jobs:
               os.fsync(file.fileno())
           path.unlink()
           PY
-          echo "SIGNED_ARCHIVE=$signed" >> "$GITHUB_ENV"
+          [[ ! -e "$QA_SEED_FILE" ]]
+          echo "ephemeral QA seed destroyed after both signed archive verifications"
+          {
+            echo "SIGNED_DARWIN_ARCHIVE=$signed_darwin"
+            echo "SIGNED_GNU_ARCHIVE=$signed_gnu"
+          } >> "$GITHUB_ENV"
       - name: Prove overlay-built GNU AOS accepts the signed Distro
         run: |
           set -euo pipefail
@@ -765,8 +787,8 @@ jobs:
           mkdir -m 0700 "$aos_home/releases"
           release_dir="$aos_home/releases/${AOS_PRODUCT_VERSION}"
           mkdir -m 0700 "$release_dir"
-          tar -xzf "$SIGNED_ARCHIVE" -C "$extract"
-          bundle="$extract/unicity-aos-${AOS_PRODUCT_VERSION}-${DARWIN_TARGET}"
+          tar -xzf "$SIGNED_GNU_ARCHIVE" -C "$extract"
+          bundle="$extract/unicity-aos-${AOS_PRODUCT_VERSION}-${LINUX_TARGET}"
           for member in Distro.toml Distro.lock Distro.sig release-manifest.json
           do
             [[ -f "$bundle/$member" && ! -L "$bundle/$member" ]]
@@ -826,39 +848,68 @@ jobs:
           set -euo pipefail
           output="$RUNNER_TEMP/rehearsal-darwin"
           mkdir -p "$output"
-          cp "$SIGNED_ARCHIVE" "$output/"
-          extract="$RUNNER_TEMP/signed-extract"
-          mkdir "$extract"
-          tar -xzf "$SIGNED_ARCHIVE" -C "$extract"
-          bundle="$extract/unicity-aos-${AOS_PRODUCT_VERSION}-${DARWIN_TARGET}"
-          cp "$bundle/release-manifest.json" "$output/"
-          cp "$bundle/runtime-compatibility.toml" "$output/"
-          cp "$bundle/Distro.toml" "$output/"
-          cp "$bundle/Distro.lock" "$output/"
-          cp "$bundle/Distro.sig" "$output/"
+          cp "$SIGNED_DARWIN_ARCHIVE" "$output/"
+          cp "$SIGNED_GNU_ARCHIVE" "$output/"
+          darwin_extract="$RUNNER_TEMP/signed-darwin-extract"
+          gnu_extract="$RUNNER_TEMP/signed-gnu-extract"
+          mkdir "$darwin_extract" "$gnu_extract"
+          tar -xzf "$SIGNED_DARWIN_ARCHIVE" -C "$darwin_extract"
+          tar -xzf "$SIGNED_GNU_ARCHIVE" -C "$gnu_extract"
+          darwin_bundle="$darwin_extract/unicity-aos-${AOS_PRODUCT_VERSION}-${DARWIN_TARGET}"
+          gnu_bundle="$gnu_extract/unicity-aos-${AOS_PRODUCT_VERSION}-${LINUX_TARGET}"
+          cp "$darwin_bundle/release-manifest.json" "$output/"
+          cp "$darwin_bundle/runtime-compatibility.toml" "$output/"
+          cp "$darwin_bundle/Distro.toml" "$output/"
+          cp "$darwin_bundle/Distro.lock" "$output/"
+          cp "$darwin_bundle/Distro.sig" "$output/"
+          cp "$gnu_bundle/release-manifest.json" "$output/release-manifest-${LINUX_TARGET}.json"
+          cp "$gnu_bundle/runtime-compatibility.toml" "$output/runtime-compatibility-${LINUX_TARGET}.toml"
+          cp "$gnu_bundle/Distro.toml" "$output/Distro-${LINUX_TARGET}.toml"
+          cp "$gnu_bundle/Distro.lock" "$output/Distro-${LINUX_TARGET}.lock"
+          cp "$gnu_bundle/Distro.sig" "$output/Distro-${LINUX_TARGET}.sig"
           cd "$output"
-          asset=$(basename "$SIGNED_ARCHIVE")
-          BLAKE3=$(b3sum -- "$asset" | awk '{print $1}')
-          SHA256=$(sha256sum -- "$asset" | awk '{print $1}')
+          darwin_asset=$(basename "$SIGNED_DARWIN_ARCHIVE")
+          gnu_asset=$(basename "$SIGNED_GNU_ARCHIVE")
+          DARWIN_BLAKE3=$(b3sum -- "$darwin_asset" | awk '{print $1}')
+          DARWIN_SHA256=$(sha256sum -- "$darwin_asset" | awk '{print $1}')
+          GNU_BLAKE3=$(b3sum -- "$gnu_asset" | awk '{print $1}')
+          GNU_SHA256=$(sha256sum -- "$gnu_asset" | awk '{print $1}')
           {
             echo "# REHEARSAL-ONLY digests; not publication checksums"
-            b3sum -- "$asset"
+            b3sum -- "$darwin_asset"
+            b3sum -- "$gnu_asset"
           } > REHEARSAL-BLAKE3SUMS.txt
           {
             echo "# REHEARSAL-ONLY digests; not publication checksums"
-            sha256sum -- "$asset"
+            sha256sum -- "$darwin_asset"
+            sha256sum -- "$gnu_asset"
           } > REHEARSAL-SHA256SUMS.txt
           python3 - "$output/REHEARSAL-ONLY-identity.json" \
             "$SOURCE_COMMIT" \
             "$ASTRID_SOURCE_COMMIT" \
             "$QA_PUBKEY" \
-            "$BLAKE3" \
-            "$SHA256" <<'PY'
+            "$darwin_asset" \
+            "$DARWIN_BLAKE3" \
+            "$DARWIN_SHA256" \
+            "$gnu_asset" \
+            "$GNU_BLAKE3" \
+            "$GNU_SHA256" <<'PY'
           import json
           import pathlib
           import sys
 
-          output, aos_commit, astrid_commit, pubkey, blake3, sha256 = sys.argv[1:]
+          (
+              output,
+              aos_commit,
+              astrid_commit,
+              pubkey,
+              darwin_archive,
+              darwin_blake3,
+              darwin_sha256,
+              gnu_archive,
+              gnu_blake3,
+              gnu_sha256,
+          ) = sys.argv[1:]
           identity = {
               "schema_version": 1,
               "scope": "REHEARSAL-ONLY",
@@ -873,14 +924,30 @@ jobs:
                   "source_commit": astrid_commit,
                   "runtime_version": "2026.9.0",
                   "runtime_target": "aarch64-apple-darwin",
+                  "runtime_targets": [
+                      "aarch64-apple-darwin",
+                      "x86_64-unknown-linux-gnu",
+                  ],
               },
               "distro_signing": {
                   "key_scope": "ephemeral-per-run-qa",
                   "public_key": pubkey,
               },
               "signed_archive_digests": {
-                  "blake3_rehearsal_only": f"blake3:{blake3}",
-                  "sha256_rehearsal_only": f"sha256:{sha256}",
+                  "aarch64-apple-darwin": {
+                      "archive": darwin_archive,
+                      "blake3_rehearsal_only": f"blake3:{darwin_blake3}",
+                      "sha256_rehearsal_only": f"sha256:{darwin_sha256}",
+                      "key_scope": "ephemeral-per-run-qa",
+                      "public_key": pubkey,
+                  },
+                  "x86_64-unknown-linux-gnu": {
+                      "archive": gnu_archive,
+                      "blake3_rehearsal_only": f"blake3:{gnu_blake3}",
+                      "sha256_rehearsal_only": f"sha256:{gnu_sha256}",
+                      "key_scope": "ephemeral-per-run-qa",
+                      "public_key": pubkey,
+                  },
               },
           }
           pathlib.Path(output).write_text(
