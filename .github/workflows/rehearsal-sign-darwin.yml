@@ -216,6 +216,12 @@ jobs:
           install -m 0644 \
             "$CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs" \
             "$overlays/distro_trust.rs"
+          install -m 0644 \
+            "$CHECKOUT/.github/rehearsal/astrid-4fe0cfd64aac7f7d0a8a88284f887ef2788d7a94/Cargo.toml" \
+            "$overlays/Cargo.toml"
+          install -m 0644 \
+            "$CHECKOUT/.github/rehearsal/astrid-4fe0cfd64aac7f7d0a8a88284f887ef2788d7a94/Cargo.lock" \
+            "$overlays/Cargo.lock"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rehearsal-overlays
@@ -388,6 +394,12 @@ jobs:
           install -m 0644 \
             rehearsal-overlays/distro_trust.rs \
             "$BUILD_CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs"
+          install -m 0644 \
+            rehearsal-overlays/Cargo.toml \
+            "$BUILD_CHECKOUT/Cargo.toml"
+          install -m 0644 \
+            rehearsal-overlays/Cargo.lock \
+            "$BUILD_CHECKOUT/Cargo.lock"
           VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/unicity-aos-bootstrap/Cargo.toml", "rb"))["package"]["version"])')
           [[ "$VERSION" == "$AOS_PRODUCT_VERSION" ]]
           cargo build \
@@ -433,6 +445,12 @@ jobs:
           install -m 0644 \
             rehearsal-overlays/distro_trust.rs \
             "$BUILD_CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs"
+          install -m 0644 \
+            rehearsal-overlays/Cargo.toml \
+            "$BUILD_CHECKOUT/Cargo.toml"
+          install -m 0644 \
+            rehearsal-overlays/Cargo.lock \
+            "$BUILD_CHECKOUT/Cargo.lock"
           docker run --rm \
             --env TARGET \
             --volume "$BUILD_CHECKOUT:/workspace" \

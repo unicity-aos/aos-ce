@@ -342,6 +342,10 @@ assert set(manifest["release_files"]) == expected_inventory, (
 assert manifest["release_files"]["bin/aos"]["mode"] == 0o755
 assert manifest["release_files"]["libexec/install.sh"]["mode"] == 0o600
 assert manifest["release_files"]["runtime/bin/astrid-daemon"]["mode"] == 0o755
+assert all(
+    set(record) == {"blake3", "mode", "sha256"}
+    for record in manifest["release_files"].values()
+)
 assert all(manifest["release_files"][path]["mode"] == 0o755 for path in expected_executables)
 assert manifest["runtime"]["version"] == runtime_version
 assert manifest["runtime"]["digest"] == "blake3:" + "0" * 64
@@ -464,6 +468,9 @@ record = manifest["release_files"][provider]
 assert record == {
     "blake3": subprocess.check_output(["b3sum", "--", str(provider_path)], text=True).split()[0],
     "mode": 0o755,
+    "sha256": subprocess.check_output(
+        ["sha256sum", "--", str(provider_path)], text=True
+    ).split()[0],
 }
 PY
 

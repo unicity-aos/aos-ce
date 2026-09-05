@@ -177,7 +177,7 @@ if not isinstance(release_files, dict):
     raise SystemExit("release manifest release_files inventory is missing")
 for relative in expected_executables:
     record = release_files.get(relative)
-    if not isinstance(record, dict) or set(record) != {"blake3", "mode"}:
+    if not isinstance(record, dict) or set(record) != {"blake3", "mode", "sha256"}:
         raise SystemExit(f"release manifest executable inventory record is invalid: {relative}")
     if not isinstance(record["blake3"], str) or re.fullmatch(r"[0-9a-f]{64}", record["blake3"]) is None:
         raise SystemExit(f"release manifest executable digest is malformed: {relative}")
@@ -283,7 +283,7 @@ digest = runtime["digest"]
 if not isinstance(digest, str) or re.fullmatch(r"blake3:[0-9a-f]{64}", digest) is None:
     raise SystemExit("native sealer runtime digest is malformed")
 record = manifest.get("release_files", {}).get("runtime/bin/astrid")
-if not isinstance(record, dict) or set(record) != {"blake3", "mode"}:
+if not isinstance(record, dict) or set(record) != {"blake3", "mode", "sha256"}:
     raise SystemExit("native sealer release manifest lacks an exact astrid inventory record")
 if not isinstance(record["blake3"], str) or re.fullmatch(r"[0-9a-f]{64}", record["blake3"]) is None:
     raise SystemExit("native sealer astrid inventory digest is malformed")
@@ -390,18 +390,28 @@ PY
 
 record_signed_distro_inventory() {
   local manifest=$1
-  local lock_digest signature_digest
-  lock_digest=$(b3sum -- "$(dirname "$manifest")/Distro.lock" | awk '{print $1}')
-  signature_digest=$(b3sum -- "$(dirname "$manifest")/Distro.sig" | awk '{print $1}')
-  python3 - "$manifest" "$lock_digest" "$signature_digest" <<'PY'
+  local lock_blake3 lock_sha256 signature_blake3 signature_sha256
+  lock_blake3=$(b3sum -- "$(dirname "$manifest")/Distro.lock" | awk '{print $1}')
+  lock_sha256=$(sha256sum -- "$(dirname "$manifest")/Distro.lock" | awk '{print $1}')
+  signature_blake3=$(b3sum -- "$(dirname "$manifest")/Distro.sig" | awk '{print $1}')
+  signature_sha256=$(sha256sum -- "$(dirname "$manifest")/Distro.sig" | awk '{print $1}')
+  python3 - "$manifest" "$lock_blake3" "$lock_sha256" "$signature_blake3" "$signature_sha256" <<'PY'
 import json
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
 manifest = json.loads(path.read_text(encoding="utf-8"))
-manifest["release_files"]["Distro.lock"] = {"blake3": sys.argv[2], "mode": 384}
-manifest["release_files"]["Distro.sig"] = {"blake3": sys.argv[3], "mode": 384}
+manifest["release_files"]["Distro.lock"] = {
+    "blake3": sys.argv[2],
+    "mode": 384,
+    "sha256": sys.argv[3],
+}
+manifest["release_files"]["Distro.sig"] = {
+    "blake3": sys.argv[4],
+    "mode": 384,
+    "sha256": sys.argv[5],
+}
 path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
 }
@@ -562,9 +572,12 @@ release_inventory="$work/release-files.tsv"
 record_release_file() {
   local relative=$1
   local mode=$2
-  local digest
-  digest=$(b3sum -- "$work/$root/$relative")
-  printf '%s\t%s\t%s\n' "$relative" "$mode" "$(awk '{print $1}' <<<"$digest")" \
+  local blake3_digest sha256_digest
+  blake3_digest=$(b3sum -- "$work/$root/$relative")
+  sha256_digest=$(sha256sum -- "$work/$root/$relative")
+  printf '%s\t%s\t%s\t%s\n' "$relative" "$mode" \
+    "$(awk '{print $1}' <<<"$blake3_digest")" \
+    "$(awk '{print $1}' <<<"$sha256_digest")" \
     >> "$release_inventory"
 }
 record_release_file bin/aos 755
@@ -593,8 +606,12 @@ path, capsule_list, inventory_path, product, target, runtime_repo, runtime, tag,
 capsules = pathlib.Path(capsule_list).read_text(encoding="utf-8").splitlines()
 release_files = {}
 for line in pathlib.Path(inventory_path).read_text(encoding="utf-8").splitlines():
-    relative, mode, file_digest = line.split("\t")
-    release_files[relative] = {"blake3": file_digest, "mode": int(mode, 8)}
+    relative, mode, blake3_digest, sha256_digest = line.split("\t")
+    release_files[relative] = {
+        "blake3": blake3_digest,
+        "mode": int(mode, 8),
+        "sha256": sha256_digest,
+    }
 runtime_executables = [
     "bin/aos",
     "runtime/bin/astrid",
