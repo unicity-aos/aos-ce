@@ -248,13 +248,23 @@ for marker in (
         raise SystemExit(f"compose job is missing shared-identity archive evidence marker: {marker}")
 darwin_verify = compose.index("signed Darwin rehearsal archive has no Distro signature")
 gnu_verify = compose.index("signed GNU rehearsal archive has no Distro signature")
-seed_destroy = compose.index(
-    "# Destroy the persistent QA seed only after both signed archives were verified."
-)
-if not (darwin_verify < gnu_verify < seed_destroy):
-    raise SystemExit("persistent QA seed must be destroyed only after both signed archives are verified")
-if '[[ ! -e "$QA_SEED_FILE" ]]' not in compose:
-    raise SystemExit("compose job must prove the persistent QA seed was destroyed")
+seed_zero = compose.index('file.write(b"\\0" * 32)')
+seed_flush = compose.index("file.flush()", seed_zero)
+seed_fsync = compose.index("os.fsync(file.fileno())", seed_flush)
+seed_unlink = compose.index("path.unlink()", seed_fsync)
+seed_absence = compose.index('[[ ! -e "$QA_SEED_FILE" ]]', seed_unlink)
+if not (
+    darwin_verify
+    < gnu_verify
+    < seed_zero
+    < seed_flush
+    < seed_fsync
+    < seed_unlink
+    < seed_absence
+):
+    raise SystemExit(
+        "persistent QA seed zero-write/fsync/unlink/absence proof must follow both archive verifications"
+    )
 
 darwin_runtime = sections.get("build-astrid-darwin")
 if darwin_runtime is None:
