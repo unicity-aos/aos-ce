@@ -55,6 +55,18 @@ bash -n "$repo_root/scripts/bind-rehearsal-consumed-artifacts.sh"
 grep -Fq 'print_stat' "$repo_root/scripts/bind-rehearsal-consumed-artifacts.sh"
 grep -Fq 'chmod 0755' "$repo_root/scripts/bind-rehearsal-consumed-artifacts.sh"
 bash "$repo_root/scripts/test-bind-rehearsal-consumed-artifacts.sh"
+validator_harness="$repo_root/scripts/test-invoke-runtime-archive-validator.sh"
+[[ -f "$validator_harness" ]]
+bash -n "$validator_harness"
+bash "$validator_harness"
+if [[ $(grep -Fc 'python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py"' "$workflow") -ne 2 ]]; then
+  echo "rehearsal workflow must invoke the runtime archive validator with python3 at both compose sites" >&2
+  exit 1
+fi
+if grep -Eq '^[[:space:]]*"\$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive\.py"' "$workflow"; then
+  echo "rehearsal workflow must not direct-exec the runtime archive validator" >&2
+  exit 1
+fi
 if grep -Fq '[[ -f "$DARWIN_AOS_BINARY" && -x "$DARWIN_AOS_BINARY" ]]' "$workflow"; then
   echo "rehearsal workflow must not assert execute bits before chmod" >&2
   exit 1
@@ -193,6 +205,39 @@ if 'ASTRID_RUNTIME_VERSION: &str = "0.10.4"' not in compose:
     raise SystemExit("compose job must reject a leftover production ASTRID_RUNTIME_VERSION overlay")
 if 'runtime["version"] != "2026.9.0"' not in compose:
     raise SystemExit("compose job must validate runtime-compatibility version")
+
+validator_call = 'python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py"'
+for step_name in ("Compose the GNU native sealer source", "Compose the Darwin candidate"):
+    step = re.search(
+        rf"(?ms)^      - name: {re.escape(step_name)}\n(?P<body>.*?)(?=^      - name:|\Z)",
+        compose,
+    )
+    if step is None:
+        raise SystemExit(f"compose job is missing {step_name}")
+    body = step.group("body")
+    if body.count(validator_call) != 1:
+        raise SystemExit(f"{step_name} must invoke the runtime archive validator exactly once")
+    if re.search(rf"(?m)^\s*{re.escape(validator_call)}\s+\\\s*$", body) is None:
+        raise SystemExit(f"{step_name} must invoke the validator with python3 and continued arguments")
+
+if re.search(r'(?m)^\s*"\$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive\.py"', compose):
+    raise SystemExit("compose job must not direct-exec the runtime archive validator")
+
+lines = text.splitlines()
+for index, line in enumerate(lines):
+    if "scripts/validate-runtime-archive.py" in line and (
+        re.search(r"\bchmod\b", line) or ".chmod(" in line
+    ):
+        raise SystemExit("rehearsal workflow must not chmod the runtime archive validator")
+    if re.match(r"^\s*chmod\b", line):
+        command = line
+        end = index
+        while command.rstrip().endswith("\\") and end + 1 < len(lines):
+            end += 1
+            command += "\n" + lines[end]
+        if "scripts/validate-runtime-archive.py" in command:
+            raise SystemExit("rehearsal workflow must not chmod the runtime archive validator")
+
 if "Prove overlay-built GNU AOS accepts the signed Distro" not in compose:
     raise SystemExit("compose job must execute overlay-built AOS against the signed Distro")
 probe = '"$LINUX_AOS_BINARY" distro apply --principal operator-qa --yes'

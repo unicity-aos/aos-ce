@@ -635,7 +635,7 @@ jobs:
       - name: Compose the GNU native sealer source
         run: |
           set -euo pipefail
-          "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py" \
+          python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py" \
             "$LINUX_RUNTIME_ARCHIVE" \
             "astrid-${ASTRID_RUNTIME_VERSION}-${LINUX_TARGET}" \
             astrid astrid-daemon astrid-build astrid-emit
@@ -662,7 +662,7 @@ jobs:
       - name: Compose the Darwin candidate
         run: |
           set -euo pipefail
-          "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py" \
+          python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py" \
             "$DARWIN_RUNTIME_ARCHIVE" \
             "astrid-${ASTRID_RUNTIME_VERSION}-${DARWIN_TARGET}" \
             astrid astrid-daemon astrid-build astrid-emit

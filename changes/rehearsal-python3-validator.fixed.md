@@ -1,0 +1,1 @@
+- Run the runtime archive validator through Python during Darwin rehearsal composition so mode-0644 sources execute reliably.
