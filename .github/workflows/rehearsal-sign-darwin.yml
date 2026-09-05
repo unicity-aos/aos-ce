@@ -247,16 +247,20 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: rehearsal-astrid-${{ env.ASTRID_SOURCE_COMMIT }}-darwin
-      - name: Build the four runtime binaries
+      - name: Build the Darwin runtime binaries
         run: |
           VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
           [[ "$VERSION" == "$ASTRID_RUNTIME_VERSION" ]]
-          cargo build --locked --release --target "$ASTRID_RUNTIME_TARGET" -p astrid
+          cargo build --locked --release --target "$ASTRID_RUNTIME_TARGET" \
+            -p astrid -p astrid-storage-provider-fskit
       - name: Package the rehearsal runtime archive
         run: |
           root="astrid-${ASTRID_RUNTIME_VERSION}-${ASTRID_RUNTIME_TARGET}"
           mkdir -p "$RUNNER_TEMP/runtime-stage/$root"
-          for binary in astrid astrid-daemon astrid-build astrid-emit; do
+          for binary in \
+            astrid astrid-daemon astrid-build astrid-emit \
+            astrid-storage-provider-fskit
+          do
             install -m 0755 \
               "target/${ASTRID_RUNTIME_TARGET}/release/$binary" \
               "$RUNNER_TEMP/runtime-stage/$root/$binary"
@@ -665,7 +669,8 @@ jobs:
           python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py" \
             "$DARWIN_RUNTIME_ARCHIVE" \
             "astrid-${ASTRID_RUNTIME_VERSION}-${DARWIN_TARGET}" \
-            astrid astrid-daemon astrid-build astrid-emit
+            astrid astrid-daemon astrid-build astrid-emit \
+            astrid-storage-provider-fskit
           python3 scripts/capsule_release.py --artifacts capsule-artifacts
           "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
             "$DARWIN_TARGET" \

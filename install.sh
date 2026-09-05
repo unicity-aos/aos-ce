@@ -555,16 +555,19 @@ validate_accepted_channel() {
 
 os=$(uname -s)
 arch=$(uname -m)
+runtime_binaries="astrid astrid-daemon astrid-build astrid-emit"
 case "$os:$arch" in
   Darwin:arm64|Darwin:aarch64)
     target=aarch64-apple-darwin
     cosign_asset=cosign-darwin-arm64
     cosign_sha256=94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5
+    runtime_binaries="$runtime_binaries astrid-storage-provider-fskit"
     ;;
   Darwin:x86_64)
     target=x86_64-apple-darwin
     cosign_asset=cosign-darwin-amd64
     cosign_sha256=14d2678dfbfde18798151e86fbd91ebdadbb7424b18412a42a155dd8a2df4c7a
+    runtime_binaries="$runtime_binaries astrid-storage-provider-fskit"
     ;;
   Linux:aarch64|Linux:arm64)
     target=aarch64-unknown-linux-gnu
@@ -777,7 +780,11 @@ bundle_name=$(tar -tzf "$work/$asset" | awk 'NR == 1 { sub(/\/.*/, "", $0); prin
 bundle="$work/unpack/$bundle_name"
 [ -d "$bundle" ] || { echo "release archive has no Unicity AOS bundle" >&2; exit 1; }
 
-for file in bin/aos libexec/install.sh runtime/bin/astrid runtime/bin/astrid-daemon runtime/bin/astrid-build runtime/bin/astrid-emit release-manifest.json Distro.toml capsule-assets.txt; do
+for file in bin/aos libexec/install.sh release-manifest.json Distro.toml capsule-assets.txt; do
+  [ -f "$bundle/$file" ] || { echo "release archive is missing $file" >&2; exit 1; }
+done
+for name in $runtime_binaries; do
+  file="runtime/bin/$name"
   [ -f "$bundle/$file" ] || { echo "release archive is missing $file" >&2; exit 1; }
 done
 
@@ -1004,7 +1011,7 @@ if [ -L "$AOS_BIN_DIR/aos" ] || { [ -e "$AOS_BIN_DIR/aos" ] && [ ! -f "$AOS_BIN_
   echo "refusing non-regular install destination: $AOS_BIN_DIR/aos" >&2
   exit 1
 fi
-for name in astrid astrid-daemon astrid-build astrid-emit; do
+for name in $runtime_binaries; do
   legacy="$AOS_HOME/runtime/bin/$name"
   [ ! -L "$legacy" ] || {
     echo "refusing symlinked legacy runtime executable: $legacy" >&2
@@ -1043,7 +1050,7 @@ if [ "$AOS_BIN_DIR" = "$AOS_HOME/bin" ]; then
 fi
 rollback="$work/rollback"
 mkdir "$rollback"
-for name in astrid astrid-daemon astrid-build astrid-emit; do
+for name in $runtime_binaries; do
   legacy="$AOS_HOME/runtime/bin/$name"
   if [ -f "$legacy" ]; then
     cp -p "$legacy" "$rollback/$name"
@@ -1122,7 +1129,7 @@ restore() {
   elif [ -f "$rollback/release.touched" ]; then
     rm -rf "$release_dir" || result=1
   fi
-  for name in aos installer astrid astrid-daemon astrid-build astrid-emit channel-current; do
+  for name in aos installer $runtime_binaries channel-current; do
     case "$name" in
       aos) destination="$AOS_BIN_DIR/aos" ;;
       installer) destination="$AOS_HOME/libexec/install.sh" ;;
@@ -1152,7 +1159,7 @@ mkdir "$release_stage"
 chmod 700 "$release_stage"
 mkdir "$release_stage/runtime" "$release_stage/runtime/bin" "$release_stage/capsules"
 chmod 700 "$release_stage/runtime" "$release_stage/runtime/bin" "$release_stage/capsules"
-for name in astrid astrid-daemon astrid-build astrid-emit; do
+for name in $runtime_binaries; do
   install -m 0700 "$bundle/runtime/bin/$name" "$release_stage/runtime/bin/$name"
 done
 install -m 0600 "$bundle/release-manifest.json" "$release_stage/release-manifest.json"
@@ -1178,7 +1185,7 @@ stage_channel_receipt
 # runtime home. They are no longer a valid launch location; remove only those
 # known managed files after the new immutable release is committed.
 if [ -d "$AOS_HOME/runtime/bin" ] && [ ! -L "$AOS_HOME/runtime/bin" ]; then
-  for name in astrid astrid-daemon astrid-build astrid-emit; do
+  for name in $runtime_binaries; do
     legacy="$AOS_HOME/runtime/bin/$name"
     [ ! -L "$legacy" ] || { echo "refusing symlinked legacy runtime executable: $legacy" >&2; exit 1; }
     [ ! -e "$legacy" ] || [ -f "$legacy" ] || {

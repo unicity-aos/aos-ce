@@ -131,7 +131,7 @@ snapshot_shipped_assets() {
   local release=$home/releases/2026.9.0
   : > "$output"
   printf '%s|bin/aos\n' "$(b3sum -- "$home/bin/aos" | awk '{print $1}')" >> "$output"
-  for name in astrid astrid-daemon astrid-build astrid-emit; do
+  for name in $runtime_binaries; do
     printf '%s|releases/2026.9.0/runtime/bin/%s\n' \
       "$(b3sum -- "$release/runtime/bin/$name" | awk '{print $1}')" \
       "$name" >> "$output"
@@ -180,7 +180,34 @@ for spec in source_contract():
     write_fixture(output / spec.asset, spec)
 PY
 
-target=x86_64-unknown-linux-gnu
+host_os=$(uname -s)
+host_arch=$(uname -m)
+runtime_binaries="astrid astrid-daemon astrid-build astrid-emit"
+case "$host_os:$host_arch" in
+  Darwin:arm64|Darwin:aarch64)
+    target=aarch64-apple-darwin
+    cosign_asset=cosign-darwin-arm64
+    cosign_sha256=94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5
+    runtime_binaries="$runtime_binaries astrid-storage-provider-fskit"
+    ;;
+  Darwin:x86_64)
+    target=x86_64-apple-darwin
+    cosign_asset=cosign-darwin-amd64
+    cosign_sha256=14d2678dfbfde18798151e86fbd91ebdadbb7424b18412a42a155dd8a2df4c7a
+    runtime_binaries="$runtime_binaries astrid-storage-provider-fskit"
+    ;;
+  Linux:aarch64|Linux:arm64)
+    target=aarch64-unknown-linux-gnu
+    cosign_asset=cosign-linux-arm64
+    cosign_sha256=2ec865872e331c32fd12b08dae15332d3f92c0aa029219589684a4903ca85d11
+    ;;
+  Linux:x86_64|Linux:amd64)
+    target=x86_64-unknown-linux-gnu
+    cosign_asset=cosign-linux-amd64
+    cosign_sha256=ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc
+    ;;
+  *) echo "unsupported self-heal test host: $host_os/$host_arch" >&2; exit 1 ;;
+esac
 if ! read -r \
   runtime_version \
   runtime_tag \
@@ -222,7 +249,7 @@ if [[ "$runtime_metadata_available" != true ]]; then
 fi
 runtime_root=$work/astrid-$runtime_version-$target
 mkdir "$runtime_root"
-for name in astrid astrid-daemon astrid-build astrid-emit; do
+for name in $runtime_binaries; do
   printf '#!/bin/sh\necho packaged-%s\n' "$name" > "$runtime_root/$name"
   chmod 755 "$runtime_root/$name"
 done
@@ -288,11 +315,11 @@ EOF
 done
 cp "$fixture/valid.sigstore.json" "$release_metadata.sigstore.json"
 
-cat > "$fake_bin/uname" <<'EOF'
+cat > "$fake_bin/uname" <<EOF
 #!/bin/sh
-case "${1:-}" in
-  -s) echo Linux ;;
-  -m) echo x86_64 ;;
+case "\${1:-}" in
+  -s) echo "$host_os" ;;
+  -m) echo "$host_arch" ;;
   *) exit 2 ;;
 esac
 EOF
@@ -312,7 +339,7 @@ done
 [ -n "$url" ]
 cp "$AOS_TEST_FIXTURE/$(basename "$url")" "$output"
 EOF
-cat > "$fixture/cosign-linux-amd64" <<'EOF'
+cat > "$fixture/$cosign_asset" <<'EOF'
 #!/bin/sh
 set -eu
 [ "${1:-}" = verify-blob ]
@@ -329,18 +356,18 @@ done
 cmp "$AOS_TEST_FIXTURE/valid.sigstore.json" "$bundle"
 [ -f "$artifact" ]
 EOF
-cat > "$fake_bin/sha256sum" <<'EOF'
+cat > "$fake_bin/sha256sum" <<EOF
 #!/bin/sh
 set -eu
-case "$1" in
+case "\$1" in
   */cosign)
-    printf '%s  %s\n' ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc "$1"
+    printf '%s  %s\n' "$cosign_sha256" "\$1"
     ;;
-  *) exec /usr/bin/shasum -a 256 "$1" ;;
+  *) exec /usr/bin/shasum -a 256 "\$1" ;;
 esac
 EOF
 chmod 755 "$fake_bin/uname" "$fake_bin/curl" "$fake_bin/sha256sum" \
-  "$fixture/cosign-linux-amd64"
+  "$fixture/$cosign_asset"
 
 install_candidate() {
   PATH="$fake_bin:$PATH" \
@@ -360,7 +387,7 @@ test "$(find "$legacy/run" -type f | wc -l | tr -d ' ')" -eq 5
 install_candidate
 test -x "$aos_home/bin/aos"
 test -x "$aos_home/releases/2026.9.0/runtime/bin/astrid-daemon"
-for name in astrid astrid-daemon astrid-build astrid-emit; do
+for name in $runtime_binaries; do
   test ! -e "$aos_home/runtime/bin/$name"
 done
 HOME="$home" "$aos_home/bin/aos" migrate runtime --from "$legacy" > "$work/migrate.log"
@@ -417,7 +444,7 @@ test "$(b3sum -- "$receipt" | awk '{print $1}')" = "$receipt_before"
 shipped_before=$work/shipped-before
 shipped_after=$work/shipped-after
 snapshot_shipped_assets "$aos_home" "$shipped_before"
-for name in aos astrid astrid-daemon astrid-build astrid-emit; do
+for name in aos $runtime_binaries; do
   case "$name" in
     aos) destination=$aos_home/bin/aos ;;
     *) destination=$aos_home/releases/2026.9.0/runtime/bin/$name ;;

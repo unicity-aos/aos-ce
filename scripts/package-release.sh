@@ -147,12 +147,18 @@ try:
 except (OSError, json.JSONDecodeError) as error:
     raise SystemExit(f"release manifest is unreadable: {error}")
 
+runtime_executables = [
+    "astrid",
+    "astrid-daemon",
+    "astrid-build",
+    "astrid-emit",
+]
+target = manifest.get("target")
+if isinstance(target, str) and target.endswith("-apple-darwin"):
+    runtime_executables.append("astrid-storage-provider-fskit")
 expected_executables = [
     "bin/aos",
-    "runtime/bin/astrid",
-    "runtime/bin/astrid-daemon",
-    "runtime/bin/astrid-build",
-    "runtime/bin/astrid-emit",
+    *(f"runtime/bin/{name}" for name in runtime_executables),
 ]
 executables = manifest.get("executables")
 if executables != expected_executables:
@@ -486,6 +492,11 @@ if [[ ! "$runtime_blake3" =~ ^[0-9a-f]{64}$ ]]; then
 fi
 python3 "$repo_root/scripts/capsule_release.py" --artifacts "$capsule_artifacts"
 
+runtime_binaries=(astrid astrid-daemon astrid-build astrid-emit)
+if [[ "$target" == *-apple-darwin ]]; then
+  runtime_binaries+=(astrid-storage-provider-fskit)
+fi
+
 work=$(mktemp -d)
 signing_seed=
 trap '[[ -z "$signing_seed" ]] || destroy_distro_seed "$signing_seed"; rm -rf "$work"' EXIT
@@ -500,7 +511,7 @@ mkdir -p \
 python3 "$repo_root/scripts/validate-runtime-archive.py" \
   "$runtime_archive" \
   "astrid-${runtime_version}-${target}" \
-  astrid astrid-daemon astrid-build astrid-emit
+  "${runtime_binaries[@]}"
 tar -xzf "$runtime_archive" -C "$work/runtime-extract"
 
 runtime_root="$work/runtime-extract/astrid-${runtime_version}-${target}"
@@ -511,7 +522,7 @@ fi
 
 install -m 0755 "$aos_binary" "$work/$root/bin/aos"
 install -m 0644 "$repo_root/install.sh" "$work/$root/libexec/install.sh"
-for binary in astrid astrid-daemon astrid-build astrid-emit; do
+for binary in "${runtime_binaries[@]}"; do
   if [[ ! -x "$runtime_root/$binary" ]]; then
     echo "runtime archive is missing $binary" >&2
     exit 1
@@ -548,7 +559,7 @@ record_release_file() {
 }
 record_release_file bin/aos 755
 record_release_file libexec/install.sh 600
-for binary in astrid astrid-daemon astrid-build astrid-emit; do
+for binary in "${runtime_binaries[@]}"; do
   record_release_file "runtime/bin/$binary" 755
 done
 record_release_file capsule-assets.txt 600
@@ -584,6 +595,11 @@ manifest = {
         "runtime/bin/astrid-daemon",
         "runtime/bin/astrid-build",
         "runtime/bin/astrid-emit",
+        *(
+            ["runtime/bin/astrid-storage-provider-fskit"]
+            if target.endswith("-apple-darwin")
+            else []
+        ),
     ],
     "layout": {
         "release_directory": f"releases/{product}",
