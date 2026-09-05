@@ -558,10 +558,11 @@ jobs:
           LINUX_RUNTIME_ARCHIVE="astrid-linux/astrid-${ASTRID_RUNTIME_VERSION}-${LINUX_TARGET}.tar.gz"
           DARWIN_AOS_BINARY="aos-darwin-binary/aos"
           LINUX_AOS_BINARY="aos-linux-binary/aos"
-          [[ -f "$DARWIN_RUNTIME_ARCHIVE" && -f "$LINUX_RUNTIME_ARCHIVE" ]]
-          [[ -f "$DARWIN_AOS_BINARY" && -x "$DARWIN_AOS_BINARY" ]]
-          [[ -f "$LINUX_AOS_BINARY" && -x "$LINUX_AOS_BINARY" ]]
-          chmod 0755 "$DARWIN_AOS_BINARY" "$LINUX_AOS_BINARY"
+          bash scripts/bind-rehearsal-consumed-artifacts.sh \
+            "$DARWIN_RUNTIME_ARCHIVE" \
+            "$LINUX_RUNTIME_ARCHIVE" \
+            "$DARWIN_AOS_BINARY" \
+            "$LINUX_AOS_BINARY"
           {
             echo "DARWIN_RUNTIME_ARCHIVE=$DARWIN_RUNTIME_ARCHIVE"
             echo "LINUX_RUNTIME_ARCHIVE=$LINUX_RUNTIME_ARCHIVE"
