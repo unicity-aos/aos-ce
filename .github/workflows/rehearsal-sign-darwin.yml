@@ -195,12 +195,27 @@ jobs:
               raise SystemExit("distro overlay did not consume both rehearsal values")
           path.write_text("\n".join(lines) + "\n", encoding="utf-8")
           PY
+          python3 - "$CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+          old = 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "0.10.4";'
+          new = 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "2026.9.0";'
+          if text.count(old) != 1:
+              raise SystemExit("rehearsal runtime-version overlay did not find a unique production constant")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
           install -m 0644 \
             "$CHECKOUT/release/runtime-compatibility.toml" \
             "$overlays/runtime-compatibility.toml"
           install -m 0644 \
             "$CHECKOUT/distros/community/unicity-ce/Distro.toml" \
             "$overlays/Distro.toml"
+          install -m 0644 \
+            "$CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs" \
+            "$overlays/distro_trust.rs"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rehearsal-overlays
@@ -361,6 +376,9 @@ jobs:
           install -m 0644 \
             rehearsal-overlays/Distro.toml \
             "$BUILD_CHECKOUT/distros/community/unicity-ce/Distro.toml"
+          install -m 0644 \
+            rehearsal-overlays/distro_trust.rs \
+            "$BUILD_CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs"
           VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/unicity-aos-bootstrap/Cargo.toml", "rb"))["package"]["version"])')
           [[ "$VERSION" == "$AOS_PRODUCT_VERSION" ]]
           cargo build \
@@ -403,6 +421,9 @@ jobs:
           install -m 0644 \
             rehearsal-overlays/Distro.toml \
             "$BUILD_CHECKOUT/distros/community/unicity-ce/Distro.toml"
+          install -m 0644 \
+            rehearsal-overlays/distro_trust.rs \
+            "$BUILD_CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs"
           docker run --rm \
             --env TARGET \
             --volume "$BUILD_CHECKOUT:/workspace" \
@@ -558,19 +579,34 @@ jobs:
           install -m 0644 \
             rehearsal-overlays/Distro.toml \
             "$CHECKOUT/distros/community/unicity-ce/Distro.toml"
+          install -m 0644 \
+            rehearsal-overlays/distro_trust.rs \
+            "$CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs"
           python3 - "$CHECKOUT/distros/community/unicity-ce/Distro.toml" \
+            "$CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs" \
+            "$CHECKOUT/release/runtime-compatibility.toml" \
             "$QA_PUBKEY" <<'PY'
           import pathlib
           import sys
           import tomllib
 
-          path = pathlib.Path(sys.argv[1])
-          expected_pubkey = sys.argv[2]
-          metadata = tomllib.loads(path.read_text(encoding="utf-8"))["distro"]
+          distro_path = pathlib.Path(sys.argv[1])
+          trust_path = pathlib.Path(sys.argv[2])
+          runtime_path = pathlib.Path(sys.argv[3])
+          expected_pubkey = sys.argv[4]
+          metadata = tomllib.loads(distro_path.read_text(encoding="utf-8"))["distro"]
           if metadata["astrid-version"] != "=2026.9.0":
               raise SystemExit("rehearsal Distro astrid-version does not match the runtime overlay")
           if metadata["signing"]["pubkey"] != expected_pubkey:
               raise SystemExit("rehearsal Distro pubkey does not match the upstream identity")
+          trust = trust_path.read_text(encoding="utf-8")
+          if 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "2026.9.0";' not in trust:
+              raise SystemExit("rehearsal AOS compile overlay is missing ASTRID_RUNTIME_VERSION 2026.9.0")
+          if 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "0.10.4";' in trust:
+              raise SystemExit("rehearsal AOS compile overlay still pins ASTRID_RUNTIME_VERSION 0.10.4")
+          runtime = tomllib.loads(runtime_path.read_text(encoding="utf-8"))["runtime"]
+          if runtime["version"] != "2026.9.0":
+              raise SystemExit("rehearsal runtime-compatibility version does not match 2026.9.0")
           PY
           echo "REHEARSAL_CHECKOUT=$CHECKOUT" >> "$GITHUB_ENV"
       - name: Bind private QA seed
