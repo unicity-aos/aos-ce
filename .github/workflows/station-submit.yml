@@ -1,0 +1,143 @@
+name: Station v1 adapter contract
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  station-v2-contract:
+    name: Fail-closed Station v1 contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+      - name: Install pinned BLAKE3 tool
+        run: cargo install b3sum --locked --version 1.8.5
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Checkout tagged 2026.1.3 source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: unicity-aos/aos-ce
+          ref: 2026.1.3
+          path: .ci/aos-ce-2026.1.3
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify and stage tagged source input path
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/.ci/aos-ce-2026.1.3"
+          test "$(git -C "$source" rev-parse '2026.1.3^{commit}')" = "efaa39f3f0ba80cf2c24985fd4383d8d73dd801a"
+          test "$(git -C "$source" rev-parse 'HEAD^{commit}')" = "efaa39f3f0ba80cf2c24985fd4383d8d73dd801a"
+          test "$(git -C "$source" rev-parse 'HEAD^{tree}')" = "46a8a976d54eb82ac922c56ae41d713595895ff5"
+          target="$RUNNER_TEMP/aos-ce-2026.1.3"
+          test ! -e "$target"
+          mv "$source" "$target"
+          printf 'AOS_CE_TAG_SOURCE_ROOT=%s\n' "$target" >> "$GITHUB_ENV"
+      - name: Download signed 2026.1.3 evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/aos-ce-evidence"
+          mkdir -p "$evidence"
+          gh release download 2026.1.3 --repo unicity-aos/aos-ce --dir "$evidence"
+          test -f "$evidence/unicity-aos-2026.1.3-release.toml"
+          test -f "$evidence/BLAKE3SUMS.txt"
+          printf 'AOS_CE_EVIDENCE_ASSETS=%s\n' "$evidence" >> "$GITHUB_ENV"
+      - name: Checkout reviewed Station publication interface
+        id: station_tools_checkout
+        continue-on-error: true
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: astrid-runtime/station-tools
+          ref: fd233f91b40d00c5f721ba99436ce30eca9036ba
+          path: .ci/station-tools-33d1d127
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Report unavailable station-tools pin and fail closed
+        if: steps.station_tools_checkout.outcome != 'success'
+        run: |
+          echo "::error::station-tools publication pin fd233f91b40d00c5f721ba99436ce30eca9036ba was not fetchable; need-a-ruling"
+          exit 1
+      - name: Verify and stage station-tools input path
+        shell: bash
+        run: |
+          set -euo pipefail
+          station_tools="$GITHUB_WORKSPACE/.ci/station-tools-33d1d127"
+          test "$(git -C "$station_tools" rev-parse 'HEAD^{commit}')" = "fd233f91b40d00c5f721ba99436ce30eca9036ba"
+          test "$(git -C "$station_tools" rev-parse 'HEAD^{tree}')" = "0bf775f225bfb9177d5788ec8c32d5453f75c660"
+          test -z "$(git -C "$station_tools" status --porcelain=v1 --untracked-files=all)"
+          target="$RUNNER_TEMP/station-tools-33d1d127"
+          test ! -e "$target"
+          mv "$station_tools" "$target"
+          printf 'AOS_CE_STATION_TOOLS=%s\n' "$target" >> "$GITHUB_ENV"
+      - name: Provision locked Station dependency graph in a clean Cargo home
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="$RUNNER_TEMP/aos-station-cargo-home"
+          test ! -e "$cargo_home"
+          mkdir -p "$cargo_home"
+          printf 'CARGO_HOME=%s\n' "$cargo_home" >> "$GITHUB_ENV"
+          CARGO_HOME="$cargo_home" cargo fetch \
+            --manifest-path "$AOS_CE_STATION_TOOLS/Cargo.toml" \
+            --locked
+      - name: Assert b3sum-only Cargo home fails closed for Station dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          b3sum_home="$RUNNER_TEMP/aos-b3sum-only-home"
+          test ! -e "$b3sum_home"
+          mkdir -p "$b3sum_home"
+          CARGO_HOME="$b3sum_home" cargo install b3sum --locked --version 1.8.5
+          set +e
+          b3sum_stderr="$RUNNER_TEMP/aos-b3sum-build.stderr"
+          CARGO_HOME="$b3sum_home" cargo build \
+            --manifest-path "$AOS_CE_STATION_TOOLS/Cargo.toml" \
+            --offline --locked \
+            2>"$b3sum_stderr"
+          status=$?
+          set -e
+          test "$status" -eq 101
+          grep -F 'no matching package named `thiserror` found' "$b3sum_stderr"
+          grep -F 'offline mode (--offline)' "$b3sum_stderr"
+      - name: Run adapter boundary regressions
+        run: python3 -m unittest -v scripts/test_aos_station_adapter.py
+      - name: Assert live path remains inert
+        run: |
+          output="$RUNNER_TEMP/aos-station-live-path"
+          set +e
+          python3 scripts/aos_station_adapter.py \
+            --artifacts "$RUNNER_TEMP/missing-assets" \
+            --source-root "$RUNNER_TEMP/missing-source" \
+            --current-main-root "$GITHUB_WORKSPACE" \
+            --station-tools "$RUNNER_TEMP/missing-station-tools" \
+            --output "$output" \
+            >"$RUNNER_TEMP/adapter.stdout" 2>"$RUNNER_TEMP/adapter.stderr"
+          status=$?
+          set -e
+          test "$status" -eq 2
+          test ! -e "$output"
+          grep -F "blocked before writes" "$RUNNER_TEMP/adapter.stderr"
+      - name: Assert publication APIs remain absent from the workflow
+        run: |
+          forbidden_git="git p"
+          forbidden_git="${forbidden_git}ush"
+          forbidden_release="gh release"
+          forbidden_release="${forbidden_release} upload"
+          forbidden_api="write_"
+          forbidden_api="${forbidden_api}submission"
+          ! grep -R -n -E "${forbidden_git}|${forbidden_release}|${forbidden_api}" \
+            scripts/aos_station_adapter.py scripts/aos_station_adapter .github/workflows/station-submit.yml
