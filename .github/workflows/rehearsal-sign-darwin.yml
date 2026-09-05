@@ -504,6 +504,11 @@ jobs:
         run: |
           set -euo pipefail
           QA_SEED_FILE="$RUNNER_TEMP/rehearsal-qa-seed"
+          write_tar_listing() {
+            local archive=$1
+            local listing=$2
+            tar -tzf "$archive" > "$listing"
+          }
           QA_SEED=$(python3 - "$QA_SEED_FILE" <<'PY'
           import pathlib
           import sys
@@ -523,10 +528,13 @@ jobs:
             "$signed" \
             "$NATIVE_SEALER" \
             "$NATIVE_SEALER_ARCHIVE"
-          if ! tar -tzf "$signed" | grep -q '/Distro.sig$'; then
+          SIGNED_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-tar-listing.XXXXXX")
+          write_tar_listing "$signed" "$SIGNED_TAR_LISTING"
+          if ! grep -q '/Distro.sig$' "$SIGNED_TAR_LISTING"; then
             echo "signed rehearsal archive has no Distro signature" >&2
             exit 1
           fi
+          unlink "$SIGNED_TAR_LISTING"
           python3 - "$QA_SEED_FILE" <<'PY'
           import os
           import pathlib

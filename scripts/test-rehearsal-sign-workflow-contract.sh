@@ -20,6 +20,14 @@ grep -Fq 'submodules: recursive' "$workflow"
 grep -Fq -- '--extract-release-sealer' "$workflow"
 grep -Fq -- '--sign-release-archive' "$workflow"
 grep -Fq 'secrets.token_hex(32)' "$workflow"
+grep -Fq 'write_tar_listing' "$workflow"
+grep -Fq 'tar -tzf "$archive" > "$listing"' "$workflow"
+grep -Fq 'SIGNED_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-tar-listing.XXXXXX")' "$workflow"
+grep -Fq "grep -q '/Distro.sig$' \"\$SIGNED_TAR_LISTING\"" "$workflow"
+if grep -Eq 'tar[[:space:]][^|]*\|[[:space:]]*grep[[:space:]]+(-q|--quiet)' "$workflow"; then
+  echo "rehearsal workflow must not pipe tar into grep -q" >&2
+  exit 1
+fi
 grep -Fq 'QA_SEED_FILE="$RUNNER_TEMP/rehearsal-qa-seed"' "$workflow"
 [[ $(grep -Fc 'QA_SEED_FILE' "$workflow") -ge 4 ]]
 grep -Fq 'actions/upload-artifact@' "$workflow"
