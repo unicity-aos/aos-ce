@@ -22,11 +22,30 @@ grep -Fq 'ASTRID_RUNTIME_TARGET: aarch64-apple-darwin' "$workflow"
 grep -Fq 'submodules: recursive' "$workflow"
 grep -Fq -- '--extract-release-sealer' "$workflow"
 grep -Fq -- '--sign-release-archive' "$workflow"
+if [[ $(grep -Fc -- '--sign-release-archive' "$workflow") -ne 2 ]]; then
+  echo "rehearsal workflow must sign exactly one Darwin and one GNU archive" >&2
+  exit 1
+fi
+if [[ $(grep -Fc 'AOS_DISTRO_ED25519_SEED="$QA_SEED"' "$workflow") -ne 2 ]]; then
+  echo "Darwin and GNU rehearsal archives must share one ephemeral QA seed" >&2
+  exit 1
+fi
+if [[ $(grep -Fc '"$NATIVE_SEALER" \' "$workflow") -ne 2 ]] || \
+   [[ $(grep -Fc '"$NATIVE_SEALER_ARCHIVE"' "$workflow") -ne 2 ]]; then
+  echo "Darwin and GNU rehearsal archives must share the authenticated GNU native sealer" >&2
+  exit 1
+fi
 grep -Fq 'secrets.token_hex(32)' "$workflow"
 grep -Fq 'write_tar_listing' "$workflow"
 grep -Fq 'tar -tzf "$archive" > "$listing"' "$workflow"
-grep -Fq 'SIGNED_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-tar-listing.XXXXXX")' "$workflow"
-grep -Fq "grep -q '/Distro.sig$' \"\$SIGNED_TAR_LISTING\"" "$workflow"
+grep -Fq 'SIGNED_DARWIN_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-darwin-tar-listing.XXXXXX")' "$workflow"
+grep -Fq 'SIGNED_GNU_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-gnu-tar-listing.XXXXXX")' "$workflow"
+grep -Fq "grep -q '/Distro.sig$' \"\$SIGNED_DARWIN_TAR_LISTING\"" "$workflow"
+grep -Fq "grep -q '/Distro.sig$' \"\$SIGNED_GNU_TAR_LISTING\"" "$workflow"
+grep -Fq 'SIGNED_DARWIN_ARCHIVE=$signed_darwin' "$workflow"
+grep -Fq 'SIGNED_GNU_ARCHIVE=$signed_gnu' "$workflow"
+grep -Fq 'LINUX_ARCHIVE=${candidates[0]}' "$workflow"
+grep -Fq 'ephemeral QA seed destroyed after both signed archive verifications' "$workflow"
 if grep -Eq 'tar[[:space:]][^|]*\|[[:space:]]*grep[[:space:]]+(-q|--quiet)' "$workflow"; then
   echo "rehearsal workflow must not pipe tar into grep -q" >&2
   exit 1
@@ -207,6 +226,36 @@ if 'ASTRID_RUNTIME_VERSION: &str = "0.10.4"' not in compose:
 if 'runtime["version"] != "2026.9.0"' not in compose:
     raise SystemExit("compose job must validate runtime-compatibility version")
 
+sign_call_archives = re.findall(
+    r'AOS_DISTRO_ED25519_SEED="\$QA_SEED"\s+\\\s*'
+    r'"\$REHEARSAL_CHECKOUT/scripts/package-release\.sh"\s+\\\s*'
+    r'--sign-release-archive\s+\\\s*("\$[A-Z_]+")',
+    compose,
+)
+if sign_call_archives != ['"$DARWIN_ARCHIVE"', '"$LINUX_ARCHIVE"']:
+    raise SystemExit(
+        "rehearsal workflow must make exactly one shared-identity Darwin sign call followed by one GNU sign call"
+    )
+if compose.count('"$NATIVE_SEALER"') != 2 or compose.count('"$NATIVE_SEALER_ARCHIVE"') != 2:
+    raise SystemExit("both target sign calls must use the authenticated GNU native sealer")
+for marker in (
+    'SIGNED_DARWIN_ARCHIVE=$signed_darwin',
+    'SIGNED_GNU_ARCHIVE=$signed_gnu',
+    'grep -q \'/Distro.sig$\' "$SIGNED_DARWIN_TAR_LISTING"',
+    'grep -q \'/Distro.sig$\' "$SIGNED_GNU_TAR_LISTING"',
+):
+    if marker not in compose:
+        raise SystemExit(f"compose job is missing shared-identity archive evidence marker: {marker}")
+darwin_verify = compose.index("signed Darwin rehearsal archive has no Distro signature")
+gnu_verify = compose.index("signed GNU rehearsal archive has no Distro signature")
+seed_destroy = compose.index(
+    "# Destroy the persistent QA seed only after both signed archives were verified."
+)
+if not (darwin_verify < gnu_verify < seed_destroy):
+    raise SystemExit("persistent QA seed must be destroyed only after both signed archives are verified")
+if '[[ ! -e "$QA_SEED_FILE" ]]' not in compose:
+    raise SystemExit("compose job must prove the persistent QA seed was destroyed")
+
 darwin_runtime = sections.get("build-astrid-darwin")
 if darwin_runtime is None:
     raise SystemExit("rehearsal workflow is missing build-astrid-darwin")
@@ -259,6 +308,10 @@ if "Prove overlay-built GNU AOS accepts the signed Distro" not in compose:
 probe = '"$LINUX_AOS_BINARY" distro apply --principal operator-qa --yes'
 if probe not in compose:
     raise SystemExit("compose job must run overlay-built GNU AOS distro apply as the consume probe")
+if 'tar -xzf "$SIGNED_GNU_ARCHIVE"' not in compose:
+    raise SystemExit("GNU consume probe must consume the signed GNU archive")
+if 'bundle="$extract/unicity-aos-${AOS_PRODUCT_VERSION}-${LINUX_TARGET}"' not in compose:
+    raise SystemExit("GNU consume probe must select the signed GNU archive root")
 if "rehearsal-consume-aos" not in compose:
     raise SystemExit("compose job must plant the signed Distro into a disposable AOS_HOME")
 if "bundled Distro Apply verification failed" not in compose:
@@ -278,6 +331,21 @@ if not (
     < compose.index("Assemble rehearsal-only evidence")
 ):
     raise SystemExit("compose job must prove overlay-built AOS after signing and before evidence upload")
+
+for marker in (
+    'cp "$SIGNED_DARWIN_ARCHIVE" "$output/"',
+    'cp "$SIGNED_GNU_ARCHIVE" "$output/"',
+    'b3sum -- "$darwin_asset"',
+    'b3sum -- "$gnu_asset"',
+    'sha256sum -- "$darwin_asset"',
+    'sha256sum -- "$gnu_asset"',
+    '"aarch64-apple-darwin": {',
+    '"x86_64-unknown-linux-gnu": {',
+    '"publication_allowed": False',
+    '"key_scope": "ephemeral-per-run-qa"',
+):
+    if marker not in compose:
+        raise SystemExit(f"rehearsal evidence is missing: {marker}")
 
 if re.search(r"QA_SEED[^\n]*GITHUB_(?:ENV|OUTPUT)", text):
     raise SystemExit("ephemeral QA seed must never be emitted")
