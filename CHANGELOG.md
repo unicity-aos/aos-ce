@@ -122,6 +122,8 @@
 
 ### Fixed
 
+- Require stopped AOS runtime homes to contain only a non-empty private `astrid.volume` (Unix mode `0600`).
+
 - Stable `github-release` signing discovers product archives by filename
   `unicity-aos-*.tar.gz` and refuses to publish when none are signed. The
   download-artifact pattern `aos-*-*-*` is unchanged because it names GitHub
