@@ -5,6 +5,7 @@
 //! callers cannot substitute another manifest or opt into Astrid's unsigned
 //! trust bypasses.
 
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -307,6 +308,35 @@ pub(crate) fn write_active_receipt(
     write_private_atomic(&path, &bytes)
 }
 
+/// Require the materialized runtime state produced by a successful Distro Apply.
+///
+/// Generic stopped-state confirmation preserves an empty or absent runtime home
+/// for a fresh installation.  Distro Apply is stricter: a successful apply must
+/// leave exactly one non-empty private volume before its activation receipt is
+/// written.
+pub(crate) fn require_stopped_volume(home: &AosHome) -> io::Result<()> {
+    let runtime = home.runtime_home();
+    require_directory(&runtime, "stopped runtime state")?;
+    for entry in fs::read_dir(&runtime)? {
+        let entry = entry?;
+        if entry.file_name() != OsStr::new("astrid.volume") {
+            return Err(invalid_data(
+                "stopped runtime state must contain only astrid.volume",
+            ));
+        }
+    }
+
+    let volume = runtime.join("astrid.volume");
+    require_regular_file(&volume, "stopped runtime astrid.volume")?;
+    let metadata = fs::metadata(&volume)?;
+    if metadata.len() == 0 {
+        return Err(invalid_data(
+            "stopped runtime astrid.volume must not be empty",
+        ));
+    }
+    require_private_mode(&metadata, "stopped runtime astrid.volume")
+}
+
 fn receipt_path(home: &AosHome) -> PathBuf {
     home.root()
         .join("receipts")
@@ -320,14 +350,8 @@ fn verify_release_inventory(
     signature_bytes: &[u8],
 ) -> io::Result<()> {
     let path = release_dir.join("release-manifest.json");
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(invalid_data("release-manifest.json must be a regular file"));
-    }
+    require_regular_file(&path, "release-manifest.json")?;
+    let metadata = fs::metadata(&path)?;
     require_private_mode(&metadata, "release-manifest.json")?;
     let bytes = fs::read(&path)?;
     let manifest: serde_json::Value = serde_json::from_slice(&bytes)

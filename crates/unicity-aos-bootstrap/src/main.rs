@@ -934,6 +934,10 @@ fn handle_distro_apply(leading_principal: Option<String>, args: DistroApplyArgs)
         eprintln!("aos: Distro Apply shutdown failed: {error}");
         return ExitCode::FAILURE;
     }
+    if let Err(error) = distro_trust::require_stopped_volume(&home) {
+        eprintln!("aos: Distro Apply stopped without a required volume: {error}");
+        return ExitCode::FAILURE;
+    }
     if let Err(error) = distro_trust::write_active_receipt(&home, &verified, principal.as_str()) {
         eprintln!("aos: Distro Apply succeeded but receipt write failed: {error}");
         return ExitCode::FAILURE;

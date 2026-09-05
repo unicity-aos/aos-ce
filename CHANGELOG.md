@@ -62,9 +62,10 @@
 - Native `aos status` output for authenticated running state and verified
   stopped state without invoking the runtime CLI.
 - A selected `aos distro apply --principal P --yes` path that verifies the
-  bundled Distro.toml, Distro.lock, and Distro.sig with Astrid 0.10.4's signed
-  lock algorithm, seeds the runtime trust pin, confirms a volume-only stop, and
-  records an AOS-owned activation receipt.
+  authenticated release inventory and bundled Distro.toml, Distro.lock, and
+  Distro.sig with Astrid 0.10.4's signed lock algorithm, seeds the runtime trust
+  pin, requires an exact non-empty private volume-only stop, and records an
+  AOS-owned activation receipt.
 - An opt-in daily nightly train with deterministic run-dated versions, exact
   Astrid compatibility pins, protected publication and promotion, and
   idempotent recovery after interrupted release or pointer updates. It is

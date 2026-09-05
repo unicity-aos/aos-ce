@@ -82,8 +82,10 @@ impl Fixture {
         let signing_pubkey = format!("ed25519:{}", keypair.export_public_key().to_base64());
         let embedded = include_str!("../../../distros/community/unicity-ce/Distro.toml");
         let original_pubkey = "ed25519:utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA=";
-        let manifest = embedded.replace(original_pubkey, &signing_pubkey);
-        let manifest_hash = format!("blake3:{}", blake3::hash(manifest.as_bytes()).to_hex());
+        let manifest_bytes = embedded
+            .replace(original_pubkey, &signing_pubkey)
+            .into_bytes();
+        let manifest_hash = format!("blake3:{}", blake3::hash(&manifest_bytes).to_hex());
         let lock = FixtureLock {
             schema_version: 1,
             distro: FixtureLockMeta {
@@ -102,12 +104,40 @@ impl Fixture {
         hasher.update(b"astrid-distro-lock-sig-v1\0");
         hasher.update(&canonical_lock);
         let signature = keypair.sign(hasher.finalize().as_bytes()).to_hex();
+        let signature_bytes = format!("{signature}\n").into_bytes();
         let release = self.release_dir();
-        fs::write(release.join("Distro.toml"), manifest).expect("write fixture Distro.toml");
-        fs::write(release.join("Distro.lock"), lock_bytes).expect("write fixture Distro.lock");
-        fs::write(release.join("Distro.sig"), format!("{signature}\n"))
-            .expect("write fixture Distro.sig");
-        for name in ["Distro.toml", "Distro.lock", "Distro.sig"] {
+        fs::write(release.join("Distro.toml"), &manifest_bytes).expect("write fixture Distro.toml");
+        fs::write(release.join("Distro.lock"), &lock_bytes).expect("write fixture Distro.lock");
+        fs::write(release.join("Distro.sig"), &signature_bytes).expect("write fixture Distro.sig");
+        let release_manifest = serde_json::json!({
+            "release_files": {
+                "Distro.toml": {
+                    "blake3": blake3::hash(&manifest_bytes).to_hex().to_string(),
+                    "mode": 384,
+                },
+                "Distro.lock": {
+                    "blake3": blake3::hash(&lock_bytes).to_hex().to_string(),
+                    "mode": 384,
+                },
+                "Distro.sig": {
+                    "blake3": blake3::hash(&signature_bytes).to_hex().to_string(),
+                    "mode": 384,
+                },
+            },
+        });
+        let release_manifest_bytes = serde_json::to_vec_pretty(&release_manifest)
+            .expect("serialize fixture release manifest");
+        fs::write(
+            release.join("release-manifest.json"),
+            release_manifest_bytes,
+        )
+        .expect("write fixture release manifest");
+        for name in [
+            "Distro.toml",
+            "Distro.lock",
+            "Distro.sig",
+            "release-manifest.json",
+        ] {
             let path = release.join(name);
             let mut permissions = fs::metadata(&path)
                 .expect("inspect fixture distro member")
@@ -211,8 +241,22 @@ elif [ "$1" = "stop" ]; then
     else
         find "$ASTRID_HOME" -mindepth 1 -maxdepth 1 ! -name astrid.volume -exec rm -rf {} +
     fi
-    printf 'volume-state\n' > "$ASTRID_HOME/astrid.volume"
-    chmod 600 "$ASTRID_HOME/astrid.volume"
+    case "${AOS_TEST_STOP_VOLUME:-present}" in
+        absent)
+            rm -f "$ASTRID_HOME/astrid.volume"
+            ;;
+        empty)
+            : > "$ASTRID_HOME/astrid.volume"
+            chmod 600 "$ASTRID_HOME/astrid.volume"
+            ;;
+        *)
+            printf 'volume-state\n' > "$ASTRID_HOME/astrid.volume"
+            chmod 600 "$ASTRID_HOME/astrid.volume"
+            ;;
+    esac
+    if [ "${AOS_TEST_REMOVE_RUNTIME:-0}" = "1" ]; then
+        rm -rf "$ASTRID_HOME"
+    fi
     exit "${AOS_TEST_EXIT:-0}"
 elif [ "$1" = "--principal" ] && [ "$2" = "default" ] && [ "$3" = "init" ]; then
     output="$AOS_TEST_BOOTSTRAP_ARGS"
@@ -1285,6 +1329,43 @@ fn signed_distro_apply_requires_the_bundled_signature_before_start() {
 }
 
 #[test]
+fn signed_distro_apply_requires_the_bundled_lock_before_start() {
+    let fixture = Fixture::new("distro-apply-missing-lock");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    fixture.install_signed_distro();
+    fs::remove_file(fixture.release_dir().join("Distro.lock")).expect("remove fixture lock");
+
+    let output = fixture
+        .command()
+        .args(["distro", "apply", "--principal", "operator", "--yes"])
+        .output()
+        .expect("run lockless distro apply");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Distro.lock"));
+    assert!(!fixture.root.join("start-args").exists());
+    assert!(!fixture.root.join("apply-args").exists());
+}
+
+#[test]
+fn signed_distro_apply_requires_the_release_inventory_before_start() {
+    let fixture = Fixture::new("distro-apply-missing-release-manifest");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    fixture.install_signed_distro();
+    fs::remove_file(fixture.release_dir().join("release-manifest.json"))
+        .expect("remove fixture release manifest");
+
+    let output = fixture
+        .command()
+        .args(["distro", "apply", "--principal", "operator", "--yes"])
+        .output()
+        .expect("run manifestless distro apply");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("release-manifest.json"));
+    assert!(!fixture.root.join("start-args").exists());
+    assert!(!fixture.root.join("apply-args").exists());
+}
+
+#[test]
 fn failed_distro_apply_still_stops_and_does_not_write_a_receipt() {
     let fixture = Fixture::new("distro-apply-failure");
     fixture.install_runtime(RECORDING_RUNTIME);
@@ -1308,6 +1389,84 @@ fn failed_distro_apply_still_stops_and_does_not_write_a_receipt() {
             .exists()
     );
     assert!(!fixture.home.join("runtime/trust").exists());
+}
+
+#[test]
+fn successful_distro_apply_without_a_runtime_writes_no_receipt() {
+    let fixture = Fixture::new("distro-apply-absent-runtime");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    fixture.install_signed_distro();
+
+    let output = fixture
+        .command()
+        .env("AOS_TEST_REMOVE_RUNTIME", "1")
+        .args(["distro", "apply", "--principal", "operator", "--yes"])
+        .output()
+        .expect("run distro apply without runtime materialization");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("required volume"));
+    assert!(fixture.root.join("start-args").exists());
+    assert!(fixture.root.join("apply-args").exists());
+    assert!(fixture.root.join("stop-args").exists());
+    assert!(
+        !fixture
+            .home
+            .join("receipts")
+            .join("unicity-ce.active.json")
+            .exists()
+    );
+}
+
+#[test]
+fn successful_distro_apply_without_a_volume_writes_no_receipt() {
+    let fixture = Fixture::new("distro-apply-missing-volume");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    fixture.install_signed_distro();
+
+    let output = fixture
+        .command()
+        .env("AOS_TEST_STOP_VOLUME", "absent")
+        .args(["distro", "apply", "--principal", "operator", "--yes"])
+        .output()
+        .expect("run distro apply without a volume");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("required volume"));
+    assert!(fixture.root.join("start-args").exists());
+    assert!(fixture.root.join("apply-args").exists());
+    assert!(fixture.root.join("stop-args").exists());
+    assert!(
+        !fixture
+            .home
+            .join("receipts")
+            .join("unicity-ce.active.json")
+            .exists()
+    );
+}
+
+#[test]
+fn successful_distro_apply_with_an_empty_volume_writes_no_receipt() {
+    let fixture = Fixture::new("distro-apply-empty-volume");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    fixture.install_signed_distro();
+
+    let output = fixture
+        .command()
+        .env("AOS_TEST_STOP_VOLUME", "empty")
+        .args(["distro", "apply", "--principal", "operator", "--yes"])
+        .output()
+        .expect("run distro apply with an empty volume");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("shutdown"));
+    assert!(fixture.root.join("start-args").exists());
+    assert!(fixture.root.join("apply-args").exists());
+    assert!(fixture.root.join("stop-args").exists());
+    assert!(
+        !fixture
+            .home
+            .join("receipts")
+            .join("unicity-ce.active.json")
+            .exists()
+    );
 }
 
 #[test]
