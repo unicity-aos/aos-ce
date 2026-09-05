@@ -699,6 +699,14 @@ if [ -n "$release_metadata_sha256" ] && [ "$(sha256_file "$work/$release_metadat
 fi
 validate_release_metadata "$work/$release_metadata_asset" "$AOS_VERSION" "$release_identity"
 
+# The signed runtime tuple is the authority for GNU runtime membership. Keep
+# the historical 0.10.4 four-binary set stable, and require the FUSE provider
+# only for the versioned 2026.9.0 runtime contract. Darwin's FSKit member is
+# selected above and remains independent of this Linux-only rule.
+if [ "$os" = Linux ] && [ "$runtime_version" = 2026.9.0 ]; then
+  runtime_binaries="$runtime_binaries astrid-storage-provider-fuse"
+fi
+
 target_section="[targets.${target}]"
 asset=$(toml_value "$work/$release_metadata_asset" "$target_section" asset)
 asset_sha256=$(toml_value "$work/$release_metadata_asset" "$target_section" sha256)
