@@ -1,0 +1,29 @@
+[package]
+name = "aos-trace"
+version = "0.1.0"
+description = "Durable trace and evaluation archive for Unicity AOS agents"
+authors = ["Marek Sepp <marek.sepp@gmail.com>", "Unicity Labs <info@unicity-labs.com>"]
+astrid-version = ">=0.7.0"
+
+[[component]]
+id = "trace-tools"
+file = "aos_trace.wasm"
+type = "executable"
+capabilities = { fs_read = ["cwd://"], fs_write = ["cwd://"] }
+
+[publish]
+"tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }
+"tool.v1.response.describe.*" = { wit = "@unicity-astrid/wit/tool/describe-response" }
+
+[subscribe]
+"tool.v1.execute.record_trace" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_record_trace" }
+"tool.v1.execute.list_traces" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_list_traces" }
+"tool.v1.execute.get_trace" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_get_trace" }
+"tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }
+
+[env]
+# Name of the project folder the archive is written under (set by the
+# distro). Override to rebrand without forking: set cwd_dir = ".myagent"
+# in your Distro.toml. Shares the convention used by aos-memory so both
+# capsules land in the same project-local directory.
+cwd_dir = { type = "string", request = "Project folder name", default = ".astrid" }
