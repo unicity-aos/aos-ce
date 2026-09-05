@@ -269,6 +269,105 @@ test "$(stat -c '%a' "$release_dir/release-manifest.json" 2>/dev/null || stat -f
 test "$(stat -c '%a' "$release_dir/runtime/bin/astrid" 2>/dev/null || stat -f '%Lp' "$release_dir/runtime/bin/astrid")" = 700
 test "$(stat -c '%a' "$release_dir/capsules" 2>/dev/null || stat -f '%Lp' "$release_dir/capsules")" = 700
 
+unsigned_asset="$work/unsigned-asset.tar.gz"
+unsigned_metadata="$work/release-unsigned.toml"
+cp "$asset" "$unsigned_asset"
+cp "$release_metadata" "$unsigned_metadata"
+bundle_root_name="unicity-aos-2026.9.0-x86_64-unknown-linux-gnu"
+
+set_fixture_asset() {
+  archive=$1
+  previous_sha256=$asset_sha256
+  previous_blake3=$asset_blake3
+  previous_size=$asset_size
+  cp "$archive" "$asset"
+  asset_sha256=$(shasum -a 256 "$asset" | awk '{print $1}')
+  asset_blake3=$(b3sum "$asset" | awk '{print $1}')
+  asset_size=$(wc -c < "$asset" | tr -d ' ')
+  sed -i.bak "s/sha256 = \"$previous_sha256\"/sha256 = \"$asset_sha256\"/g" "$release_metadata"
+  rm "$release_metadata.bak"
+  sed -i.bak "s/blake3 = \"$previous_blake3\"/blake3 = \"$asset_blake3\"/g" "$release_metadata"
+  rm "$release_metadata.bak"
+  sed -i.bak "s/^size = $previous_size$/size = $asset_size/g" "$release_metadata"
+  rm "$release_metadata.bak"
+}
+
+restore_unsigned_fixture_asset() {
+  cp "$unsigned_asset" "$asset"
+  cp "$unsigned_metadata" "$release_metadata"
+  asset_sha256=$(shasum -a 256 "$asset" | awk '{print $1}')
+  asset_blake3=$(b3sum "$asset" | awk '{print $1}')
+  asset_size=$(wc -c < "$asset" | tr -d ' ')
+}
+
+signed_tree="$work/signed-tree"
+mkdir "$signed_tree"
+tar -xzf "$unsigned_asset" -C "$signed_tree"
+signed_root="$signed_tree/$bundle_root_name"
+printf 'schema-version = 1\nsigned fixture lock\n' > "$signed_root/Distro.lock"
+printf 'signed fixture signature\n' > "$signed_root/Distro.sig"
+lock_blake3=$(b3sum "$signed_root/Distro.lock" | awk '{print $1}')
+sig_blake3=$(b3sum "$signed_root/Distro.sig" | awk '{print $1}')
+python3 - "$signed_root/release-manifest.json" "$lock_blake3" "$sig_blake3" <<'PY'
+import json
+import pathlib
+import sys
+
+path, lock_digest, sig_digest = sys.argv[1:]
+manifest = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+manifest["release_files"]["Distro.lock"] = {"blake3": lock_digest, "mode": 0o600}
+manifest["release_files"]["Distro.sig"] = {"blake3": sig_digest, "mode": 0o600}
+pathlib.Path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+signed_archive="$work/signed-distro.tar.gz"
+COPYFILE_DISABLE=1 tar -czf "$signed_archive" -C "$signed_tree" "$bundle_root_name"
+set_fixture_asset "$signed_archive"
+signed_home="$work/signed-home"
+mkdir -p "$signed_home/.astrid"
+printf 'standalone-runtime-state\n' > "$signed_home/.astrid/sentinel"
+PATH="$fake_bin:$PATH" HOME="$signed_home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_VERSION=2026.9.0 sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+signed_release_dir="$signed_home/.aos/releases/2026.9.0"
+for distro_member in Distro.toml Distro.lock Distro.sig; do
+  test -f "$signed_release_dir/$distro_member"
+  test "$(stat -c '%a' "$signed_release_dir/$distro_member" 2>/dev/null || stat -f '%Lp' "$signed_release_dir/$distro_member")" = 600
+  test ! -e "$signed_home/.aos/runtime/$distro_member"
+  test ! -e "$signed_home/.astrid/$distro_member"
+done
+test "$(cat "$signed_home/.astrid/sentinel")" = standalone-runtime-state
+
+missing_tree="$work/signed-missing-tree"
+mkdir "$missing_tree"
+tar -xzf "$signed_archive" -C "$missing_tree"
+rm "$missing_tree/$bundle_root_name/Distro.sig"
+missing_archive="$work/signed-missing-distro.tar.gz"
+COPYFILE_DISABLE=1 tar -czf "$missing_archive" -C "$missing_tree" "$bundle_root_name"
+set_fixture_asset "$missing_archive"
+missing_home="$work/signed-missing-home"
+if PATH="$fake_bin:$PATH" HOME="$missing_home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_VERSION=2026.9.0 sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  echo "installer accepted a signed archive missing Distro.sig" >&2
+  exit 1
+fi
+test ! -e "$missing_home/.aos/releases/2026.9.0"
+
+symlink_tree="$work/signed-symlink-tree"
+mkdir "$symlink_tree"
+tar -xzf "$signed_archive" -C "$symlink_tree"
+rm "$symlink_tree/$bundle_root_name/Distro.sig"
+ln -s Distro.lock "$symlink_tree/$bundle_root_name/Distro.sig"
+symlink_archive="$work/signed-symlink-distro.tar.gz"
+COPYFILE_DISABLE=1 tar -czf "$symlink_archive" -C "$symlink_tree" "$bundle_root_name"
+set_fixture_asset "$symlink_archive"
+symlink_home="$work/signed-symlink-home"
+if PATH="$fake_bin:$PATH" HOME="$symlink_home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_VERSION=2026.9.0 sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  echo "installer accepted a signed archive with a Distro.sig symlink" >&2
+  exit 1
+fi
+test ! -e "$symlink_home/.aos/releases/2026.9.0"
+restore_unsigned_fixture_asset
+
 python=${PYTHON3:-python3}
 "$python" "$repo_root/scripts/release_metadata.py" render-channel \
   --channel stable \

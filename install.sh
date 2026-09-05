@@ -780,6 +780,162 @@ bundle="$work/unpack/$bundle_name"
 for file in bin/aos libexec/install.sh runtime/bin/astrid runtime/bin/astrid-daemon runtime/bin/astrid-build runtime/bin/astrid-emit release-manifest.json Distro.toml capsule-assets.txt; do
   [ -f "$bundle/$file" ] || { echo "release archive is missing $file" >&2; exit 1; }
 done
+
+# Read the two optional signed-distro members from the schema-v2 release
+# inventory.  Keep this parser dependency-free: the installer is also used on
+# hosts that do not have Python or jq.  The archive manifest is JSON emitted by
+# package-release.sh; the small scanner still tracks quoted strings and nested
+# objects so a member name in another manifest field cannot opt into signing.
+release_inventory_entry() {
+  manifest=$1
+  wanted=$2
+  awk -v wanted="$wanted" '
+    function object_after(text, start,    open, i, c, depth, quoted, escaped) {
+      open = index(substr(text, start), "{")
+      if (!open) return ""
+      open += start - 1
+      depth = 1
+      quoted = 0
+      escaped = 0
+      for (i = open + 1; i <= length(text); i++) {
+        c = substr(text, i, 1)
+        if (quoted) {
+          if (escaped) escaped = 0
+          else if (c == "\\") escaped = 1
+          else if (c == "\"") quoted = 0
+          continue
+        }
+        if (c == "\"") quoted = 1
+        else if (c == "{") depth++
+        else if (c == "}") {
+          depth--
+          if (depth == 0) return substr(text, open + 1, i - open - 1)
+        }
+      }
+      return ""
+    }
+    {
+      if (NR == 1) all = $0
+      else all = all " " $0
+    }
+    END {
+      release_start = index(all, "\"release_files\"")
+      if (!release_start) {
+        print "missing|||"
+        exit
+      }
+      release_object = object_after(all, release_start + length("\"release_files\""))
+      if (release_object == "") {
+        print "invalid|||"
+        exit
+      }
+
+      marker = "\"" wanted "\""
+      search = release_object
+      found = 0
+      while ((position = index(search, marker)) != 0) {
+        tail = substr(search, position + length(marker))
+        if (tail ~ /^[[:space:]]*:/) {
+          found = 1
+          break
+        }
+        search = substr(search, position + length(marker))
+      }
+      if (!found) {
+        print "missing|||"
+        exit
+      }
+      sub(/^[[:space:]]*:[[:space:]]*/, "", tail)
+      if (substr(tail, 1, 1) != "{") {
+        print "invalid|||"
+        exit
+      }
+      record = object_after(tail, 1)
+      if (record == "") {
+        print "invalid|||"
+        exit
+      }
+      digest = ""
+      field = record
+      if (field ~ /"blake3"[[:space:]]*:[[:space:]]*"/) {
+        sub(/.*"blake3"[[:space:]]*:[[:space:]]*"/, "", field)
+        sub(/".*/, "", field)
+        digest = field
+      }
+      mode = ""
+      field = record
+      if (field ~ /"mode"[[:space:]]*:[[:space:]]*[0-9]+/) {
+        sub(/.*"mode"[[:space:]]*:[[:space:]]*/, "", field)
+        sub(/[^0-9].*/, "", field)
+        mode = field
+      }
+      print "found|" digest "|" mode "|"
+    }
+  ' "$manifest"
+}
+
+release_inventory_status() {
+  printf '%s' "$1" | awk -F '|' '{print $1}'
+}
+
+release_inventory_digest() {
+  printf '%s' "$1" | awk -F '|' '{print $2}'
+}
+
+release_inventory_mode() {
+  printf '%s' "$1" | awk -F '|' '{print $3}'
+}
+
+distro_toml_inventory=$(release_inventory_entry "$bundle/release-manifest.json" Distro.toml)
+distro_lock_inventory=$(release_inventory_entry "$bundle/release-manifest.json" Distro.lock)
+distro_sig_inventory=$(release_inventory_entry "$bundle/release-manifest.json" Distro.sig)
+distro_toml_inventory_status=$(release_inventory_status "$distro_toml_inventory")
+distro_lock_inventory_status=$(release_inventory_status "$distro_lock_inventory")
+distro_sig_inventory_status=$(release_inventory_status "$distro_sig_inventory")
+distro_archive_signed=0
+if [ "$distro_lock_inventory_status" != missing ] || [ "$distro_sig_inventory_status" != missing ]; then
+  distro_archive_signed=1
+fi
+if [ "$distro_archive_signed" -eq 1 ]; then
+  [ "$distro_toml_inventory_status" = found ] && \
+    [ "$distro_lock_inventory_status" = found ] && \
+    [ "$distro_sig_inventory_status" = found ] || {
+      echo "signed release inventory is missing a Distro member record" >&2
+      exit 1
+    }
+  for distro_member in Distro.toml Distro.lock Distro.sig; do
+    [ -f "$bundle/$distro_member" ] && [ ! -L "$bundle/$distro_member" ] || {
+      echo "signed release archive is missing a regular $distro_member" >&2
+      exit 1
+    }
+  done
+  command -v b3sum >/dev/null 2>&1 || {
+    echo "b3sum is required to verify signed Distro member inventory" >&2
+    exit 1
+  }
+  for distro_member in Distro.toml Distro.lock Distro.sig; do
+    case "$distro_member" in
+      Distro.toml) distro_inventory="$distro_toml_inventory" ;;
+      Distro.lock) distro_inventory="$distro_lock_inventory" ;;
+      Distro.sig) distro_inventory="$distro_sig_inventory" ;;
+    esac
+    distro_digest=$(release_inventory_digest "$distro_inventory")
+    distro_mode=$(release_inventory_mode "$distro_inventory")
+    printf '%s\n' "$distro_digest" | grep -Eq '^[0-9a-f]{64}$' || {
+      echo "signed release inventory has a malformed $distro_member digest" >&2
+      exit 1
+    }
+    [ "$distro_mode" = 384 ] || {
+      echo "signed release inventory has an invalid $distro_member mode" >&2
+      exit 1
+    }
+    actual_distro_digest=$(b3sum -- "$bundle/$distro_member" | awk '{print $1}')
+    [ "$actual_distro_digest" = "$distro_digest" ] || {
+      echo "signed release inventory digest mismatch: $distro_member" >&2
+      exit 1
+    }
+  done
+fi
 [ -d "$bundle/capsules" ] || { echo "release archive has no capsule directory" >&2; exit 1; }
 if ! awk '
   !/^aos-[a-z0-9-]+\.capsule$/ { invalid = 1 }
@@ -1001,6 +1157,10 @@ for name in astrid astrid-daemon astrid-build astrid-emit; do
 done
 install -m 0600 "$bundle/release-manifest.json" "$release_stage/release-manifest.json"
 install -m 0600 "$bundle/Distro.toml" "$release_stage/Distro.toml"
+if [ "$distro_archive_signed" -eq 1 ]; then
+  install -m 0600 "$bundle/Distro.lock" "$release_stage/Distro.lock"
+  install -m 0600 "$bundle/Distro.sig" "$release_stage/Distro.sig"
+fi
 install -m 0600 "$bundle/capsule-assets.txt" "$release_stage/capsule-assets.txt"
 while IFS= read -r capsule; do
   install -m 0600 "$bundle/capsules/$capsule" "$release_stage/capsules/$capsule"
