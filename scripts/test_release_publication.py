@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import io
 import shutil
 import sys
-import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capsule_release
 import release_metadata
 import release_publication
+from test_capsule_release import write_fixture
 
 
 VERSION = "2026.9.0"
@@ -49,25 +48,13 @@ EXPECTED_CAPSULE_ASSETS = frozenset(
 )
 
 
-def add_file(archive: tarfile.TarFile, name: str, value: bytes) -> None:
-    member = tarfile.TarInfo(name)
-    member.size = len(value)
-    member.mtime = 0
-    member.uid = 0
-    member.gid = 0
-    archive.addfile(member, io.BytesIO(value))
-
-
 class ReleasePublicationTests(unittest.TestCase):
     def fixture(self, root: Path) -> tuple[Path, Path]:
         artifacts = root / "artifacts"
         artifacts.mkdir()
         specs = capsule_release.source_contract()
         for spec in specs:
-            with tarfile.open(artifacts / spec.asset, "w:gz") as archive:
-                add_file(archive, "Capsule.toml", spec.manifest.read_bytes())
-                for component in spec.components:
-                    add_file(archive, component, b"\0asm")
+            write_fixture(artifacts / spec.asset, spec)
 
         for target in release_metadata.TARGETS:
             (artifacts / f"unicity-aos-{VERSION}-{target}.tar.gz").write_bytes(
