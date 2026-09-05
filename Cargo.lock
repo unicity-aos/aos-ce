@@ -1873,6 +1873,7 @@ name = "unicity-aos-bootstrap"
 version = "2026.9.0"
 dependencies = [
  "astrid-core",
+ "astrid-crypto",
  "astrid-types 0.10.4",
  "astrid-uplink",
  "axum",
