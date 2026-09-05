@@ -154,7 +154,15 @@ runtime_executables = [
     "astrid-emit",
 ]
 target = manifest.get("target")
-if isinstance(target, str) and target.endswith("-apple-darwin"):
+runtime = manifest.get("runtime")
+runtime_version = runtime.get("version") if isinstance(runtime, dict) else None
+if (
+    isinstance(target, str)
+    and target.endswith("-unknown-linux-gnu")
+    and runtime_version == "2026.9.0"
+):
+    runtime_executables.append("astrid-storage-provider-fuse")
+elif isinstance(target, str) and target.endswith("-apple-darwin"):
     runtime_executables.append("astrid-storage-provider-fskit")
 expected_executables = [
     "bin/aos",
@@ -493,7 +501,9 @@ fi
 python3 "$repo_root/scripts/capsule_release.py" --artifacts "$capsule_artifacts"
 
 runtime_binaries=(astrid astrid-daemon astrid-build astrid-emit)
-if [[ "$target" == *-apple-darwin ]]; then
+if [[ "$target" == *-unknown-linux-gnu && "$runtime_version" == "2026.9.0" ]]; then
+  runtime_binaries+=(astrid-storage-provider-fuse)
+elif [[ "$target" == *-apple-darwin ]]; then
   runtime_binaries+=(astrid-storage-provider-fskit)
 fi
 
@@ -585,22 +595,22 @@ release_files = {}
 for line in pathlib.Path(inventory_path).read_text(encoding="utf-8").splitlines():
     relative, mode, file_digest = line.split("\t")
     release_files[relative] = {"blake3": file_digest, "mode": int(mode, 8)}
+runtime_executables = [
+    "bin/aos",
+    "runtime/bin/astrid",
+    "runtime/bin/astrid-daemon",
+    "runtime/bin/astrid-build",
+    "runtime/bin/astrid-emit",
+]
+if target.endswith("-unknown-linux-gnu") and runtime == "2026.9.0":
+    runtime_executables.append("runtime/bin/astrid-storage-provider-fuse")
+elif target.endswith("-apple-darwin"):
+    runtime_executables.append("runtime/bin/astrid-storage-provider-fskit")
 manifest = {
     "schema_version": 2,
     "product": {"name": "Unicity AOS Community Edition", "version": product},
     "target": target,
-    "executables": [
-        "bin/aos",
-        "runtime/bin/astrid",
-        "runtime/bin/astrid-daemon",
-        "runtime/bin/astrid-build",
-        "runtime/bin/astrid-emit",
-        *(
-            ["runtime/bin/astrid-storage-provider-fskit"]
-            if target.endswith("-apple-darwin")
-            else []
-        ),
-    ],
+    "executables": runtime_executables,
     "layout": {
         "release_directory": f"releases/{product}",
         "runtime_executables": "runtime/bin",

@@ -316,13 +316,17 @@ jobs:
                 --release \
                 --target "$TARGET" \
                 --target-dir target/glibc-2.31 \
-                -p astrid
+                -p astrid \
+                -p astrid-storage-provider-fuse
             '
       - name: Package the rehearsal runtime archive
         run: |
           root="astrid-${ASTRID_RUNTIME_VERSION}-${TARGET}"
           mkdir -p "$RUNNER_TEMP/runtime-stage/$root"
-          for binary in astrid astrid-daemon astrid-build astrid-emit; do
+          for binary in \
+            astrid astrid-daemon astrid-build astrid-emit \
+            astrid-storage-provider-fuse
+          do
             install -m 0755 \
               "target/glibc-2.31/${TARGET}/release/$binary" \
               "$RUNNER_TEMP/runtime-stage/$root/$binary"
@@ -331,7 +335,8 @@ jobs:
             "$RUNNER_TEMP/runtime-stage/$root/astrid" \
             "$RUNNER_TEMP/runtime-stage/$root/astrid-daemon" \
             "$RUNNER_TEMP/runtime-stage/$root/astrid-build" \
-            "$RUNNER_TEMP/runtime-stage/$root/astrid-emit"
+            "$RUNNER_TEMP/runtime-stage/$root/astrid-emit" \
+            "$RUNNER_TEMP/runtime-stage/$root/astrid-storage-provider-fuse"
           MTIME=$(git log -1 --format=%ct)
           python3 scripts/package_release_archive.py \
             --root "$RUNNER_TEMP/runtime-stage/$root" \
@@ -642,7 +647,8 @@ jobs:
           python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py" \
             "$LINUX_RUNTIME_ARCHIVE" \
             "astrid-${ASTRID_RUNTIME_VERSION}-${LINUX_TARGET}" \
-            astrid astrid-daemon astrid-build astrid-emit
+            astrid astrid-daemon astrid-build astrid-emit \
+            astrid-storage-provider-fuse
           python3 scripts/capsule_release.py --artifacts capsule-artifacts
           "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
             "$LINUX_TARGET" \

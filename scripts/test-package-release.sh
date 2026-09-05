@@ -276,6 +276,10 @@ tar -tzf "$archive" > "$work/files"
 grep -q '/bin/aos$' "$work/files"
 grep -q '/libexec/install.sh$' "$work/files"
 grep -q '/runtime/bin/astrid-daemon$' "$work/files"
+if grep -q '/runtime/bin/astrid-storage-provider-fuse$' "$work/files"; then
+  echo "0.10.4 GNU release archive unexpectedly contains the FUSE provider" >&2
+  exit 1
+fi
 grep -q '/runtime-compatibility.toml$' "$work/files"
 test "$(grep -c '/capsules/aos-.*\.capsule$' "$work/files")" -eq 22
 grep -q '/capsule-assets.txt$' "$work/files"
@@ -359,6 +363,128 @@ assert manifest["verifier"] == {
     "sha256": "ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc",
 }
 PY
+
+# Rehearsal runtime 2026.9.0 has an explicit GNU FUSE provider contract while
+# the stable 0.10.4 GNU archive above remains the four portable binaries.
+versioned_repo="$work/aos-2026.9.0-contract"
+mkdir -p \
+  "$versioned_repo/scripts" \
+  "$versioned_repo/crates/unicity-aos-bootstrap" \
+  "$versioned_repo/distros/community/unicity-ce"
+cp "$repo_root/Cargo.toml" "$versioned_repo/Cargo.toml"
+cp "$repo_root/crates/unicity-aos-bootstrap/Cargo.toml" \
+  "$versioned_repo/crates/unicity-aos-bootstrap/Cargo.toml"
+cp -R "$repo_root/capsules" "$versioned_repo/"
+cp -R "$repo_root/release" "$versioned_repo/"
+cp "$repo_root/distros/community/unicity-ce/Distro.toml" \
+  "$versioned_repo/distros/community/unicity-ce/Distro.toml"
+cp "$repo_root/install.sh" "$repo_root/README.md" "$versioned_repo/"
+cp "$repo_root/scripts/capsule_release.py" \
+  "$repo_root/scripts/package-release.sh" \
+  "$repo_root/scripts/validate-runtime-archive.py" \
+  "$versioned_repo/scripts/"
+python3 - "$versioned_repo/release/runtime-compatibility.toml" \
+  "$versioned_repo/distros/community/unicity-ce/Distro.toml" <<'PY'
+import pathlib
+import sys
+
+runtime_path, distro_path = map(pathlib.Path, sys.argv[1:])
+runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
+replacements = {
+    "version": 'version = "2026.9.0"',
+    "tag": 'tag = "rehearsal-only-2026.9.0"',
+    "version-requirement": 'version-requirement = "=2026.9.0"',
+    "release-workflow-identity": 'release-workflow-identity = "rehearsal-only:test"',
+}
+in_runtime = False
+for index, line in enumerate(runtime_lines):
+    if line == "[runtime]":
+        in_runtime = True
+        continue
+    if line.startswith("["):
+        in_runtime = False
+    if in_runtime and "=" in line:
+        key = line.split("=", 1)[0].strip()
+        if key in replacements:
+            runtime_lines[index] = replacements[key]
+runtime_path.write_text("\n".join(runtime_lines) + "\n", encoding="utf-8")
+distro_text = distro_path.read_text(encoding="utf-8")
+distro_path.write_text(
+    distro_text.replace('astrid-version = "=0.10.4"', 'astrid-version = "=2026.9.0"'),
+    encoding="utf-8",
+)
+PY
+
+versioned_runtime_root="$work/astrid-2026.9.0-$target"
+versioned_runtime_archive="$work/runtime-2026.9.0.tar.gz"
+versioned_output="$work/output-2026.9.0"
+mkdir -p "$versioned_runtime_root" "$versioned_output"
+for binary in astrid astrid-daemon astrid-build astrid-emit astrid-storage-provider-fuse; do
+  printf '#!/bin/sh\nexit 0\n' > "$versioned_runtime_root/$binary"
+  chmod 755 "$versioned_runtime_root/$binary"
+done
+COPYFILE_DISABLE=1 tar -czf "$versioned_runtime_archive" \
+  -C "$work" "$(basename "$versioned_runtime_root")"
+bash "$versioned_repo/scripts/package-release.sh" \
+  "$target" \
+  "$work/aos" \
+  "$versioned_runtime_archive" \
+  0000000000000000000000000000000000000000000000000000000000000000 \
+  "$work/capsules" \
+  "$versioned_output" >/dev/null
+versioned_archive="$versioned_output/unicity-aos-$product_version-$target.tar.gz"
+versioned_files="$work/versioned-files"
+tar -tzf "$versioned_archive" > "$versioned_files"
+grep -q '/runtime/bin/astrid-storage-provider-fuse$' "$versioned_files"
+mkdir "$work/versioned-extract"
+tar -xzf "$versioned_archive" -C "$work/versioned-extract"
+versioned_bundle="$work/versioned-extract/unicity-aos-$product_version-$target"
+versioned_provider="$versioned_bundle/runtime/bin/astrid-storage-provider-fuse"
+test -x "$versioned_provider"
+test "$(stat -c '%a' "$versioned_provider" 2>/dev/null || stat -f '%Lp' "$versioned_provider")" = 755
+python3 - "$versioned_bundle/release-manifest.json" "$versioned_provider" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+manifest_path, provider_path = map(pathlib.Path, sys.argv[1:])
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+provider = "runtime/bin/astrid-storage-provider-fuse"
+assert manifest["runtime"]["version"] == "2026.9.0"
+assert manifest["executables"] == [
+    "bin/aos",
+    "runtime/bin/astrid",
+    "runtime/bin/astrid-daemon",
+    "runtime/bin/astrid-build",
+    "runtime/bin/astrid-emit",
+    provider,
+]
+record = manifest["release_files"][provider]
+assert record == {
+    "blake3": subprocess.check_output(["b3sum", "--", str(provider_path)], text=True).split()[0],
+    "mode": 0o755,
+}
+PY
+
+versioned_runtime_name=$(basename "$versioned_runtime_root")
+missing_versioned_root="$work/missing-2026.9.0-fuse/$versioned_runtime_name"
+mkdir -p "$missing_versioned_root" "$work/missing-2026.9.0-output"
+for binary in astrid astrid-daemon astrid-build astrid-emit; do
+  cp "$versioned_runtime_root/$binary" "$missing_versioned_root/$binary"
+done
+COPYFILE_DISABLE=1 tar -czf "$work/missing-2026.9.0-runtime.tar.gz" \
+  -C "$work/missing-2026.9.0-fuse" "$(basename "$versioned_runtime_root")"
+if bash "$versioned_repo/scripts/package-release.sh" \
+  "$target" \
+  "$work/aos" \
+  "$work/missing-2026.9.0-runtime.tar.gz" \
+  0000000000000000000000000000000000000000000000000000000000000000 \
+  "$work/capsules" \
+  "$work/missing-2026.9.0-output" >/dev/null 2>&1; then
+  echo "2026.9.0 GNU package accepted a runtime without the FUSE provider" >&2
+  exit 1
+fi
 
 darwin_target=aarch64-apple-darwin
 darwin_runtime_root="$work/astrid-$runtime_version-$darwin_target"
@@ -550,8 +676,8 @@ for archive_target in "${targets[@]}"; do
   rm -f "$target_root/Distro.lock" "$target_root/Distro.sig"
   cat > "$target_root/runtime/bin/astrid" <<'SENTINEL'
 #!/bin/sh
-touch "${AOS_TEST_SENTINEL:?}"
-exit 97
+  touch "${AOS_TEST_SENTINEL:?}"
+  exit 97
 SENTINEL
   chmod 755 "$target_root/runtime/bin/astrid"
   sentinel_digest=$(b3sum -- "$target_root/runtime/bin/astrid" | awk '{print $1}')
