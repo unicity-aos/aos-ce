@@ -336,6 +336,120 @@ for distro_member in Distro.toml Distro.lock Distro.sig; do
 done
 test "$(cat "$signed_home/.astrid/sentinel")" = standalone-runtime-state
 
+# Signed archives must carry a complete, authenticated Distro inventory.  Keep
+# each mutation in the archive manifest so the installer exercises its own
+# fail-closed parser rather than a packaging helper.
+incomplete_lock_tree="$work/signed-incomplete-lock-tree"
+mkdir "$incomplete_lock_tree"
+tar -xzf "$signed_archive" -C "$incomplete_lock_tree"
+python3 - "$incomplete_lock_tree/$bundle_root_name/release-manifest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["release_files"].pop("Distro.sig")
+path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+incomplete_lock_archive="$work/signed-incomplete-lock-distro.tar.gz"
+COPYFILE_DISABLE=1 tar -czf "$incomplete_lock_archive" -C "$incomplete_lock_tree" "$bundle_root_name"
+set_fixture_asset "$incomplete_lock_archive"
+incomplete_lock_home="$work/signed-incomplete-lock-home"
+if PATH="$fake_bin:$PATH" HOME="$incomplete_lock_home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_VERSION=2026.9.0 sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  echo "installer accepted a signed inventory listing Distro.lock without Distro.sig" >&2
+  exit 1
+fi
+test ! -e "$incomplete_lock_home/.aos/releases/2026.9.0"
+
+incomplete_toml_tree="$work/signed-incomplete-toml-tree"
+mkdir "$incomplete_toml_tree"
+tar -xzf "$signed_archive" -C "$incomplete_toml_tree"
+python3 - "$incomplete_toml_tree/$bundle_root_name/release-manifest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["release_files"].pop("Distro.toml")
+path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+incomplete_toml_archive="$work/signed-incomplete-toml-distro.tar.gz"
+COPYFILE_DISABLE=1 tar -czf "$incomplete_toml_archive" -C "$incomplete_toml_tree" "$bundle_root_name"
+set_fixture_asset "$incomplete_toml_archive"
+incomplete_toml_home="$work/signed-incomplete-toml-home"
+if PATH="$fake_bin:$PATH" HOME="$incomplete_toml_home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_VERSION=2026.9.0 sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  echo "installer accepted a signed inventory listing Distro.lock and Distro.sig without Distro.toml" >&2
+  exit 1
+fi
+test ! -e "$incomplete_toml_home/.aos/releases/2026.9.0"
+
+digest_mismatch_tree="$work/signed-digest-mismatch-tree"
+mkdir "$digest_mismatch_tree"
+tar -xzf "$signed_archive" -C "$digest_mismatch_tree"
+printf 'tampered signed Distro.lock\n' >> "$digest_mismatch_tree/$bundle_root_name/Distro.lock"
+digest_mismatch_archive="$work/signed-digest-mismatch-distro.tar.gz"
+COPYFILE_DISABLE=1 tar -czf "$digest_mismatch_archive" -C "$digest_mismatch_tree" "$bundle_root_name"
+set_fixture_asset "$digest_mismatch_archive"
+digest_mismatch_home="$work/signed-digest-mismatch-home"
+if PATH="$fake_bin:$PATH" HOME="$digest_mismatch_home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_VERSION=2026.9.0 sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  echo "installer accepted a signed Distro member whose bytes disagreed with inventory" >&2
+  exit 1
+fi
+test ! -e "$digest_mismatch_home/.aos/releases/2026.9.0"
+
+mode_mutation_tree="$work/signed-mode-mutation-tree"
+mkdir "$mode_mutation_tree"
+tar -xzf "$signed_archive" -C "$mode_mutation_tree"
+python3 - "$mode_mutation_tree/$bundle_root_name/release-manifest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["release_files"]["Distro.lock"]["mode"] = 0o644
+path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+mode_mutation_archive="$work/signed-mode-mutation-distro.tar.gz"
+COPYFILE_DISABLE=1 tar -czf "$mode_mutation_archive" -C "$mode_mutation_tree" "$bundle_root_name"
+set_fixture_asset "$mode_mutation_archive"
+mode_mutation_home="$work/signed-mode-mutation-home"
+if PATH="$fake_bin:$PATH" HOME="$mode_mutation_home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_VERSION=2026.9.0 sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  echo "installer accepted a signed Distro member with a non-0600 inventory mode" >&2
+  exit 1
+fi
+test ! -e "$mode_mutation_home/.aos/releases/2026.9.0"
+
+malformed_digest_tree="$work/signed-malformed-digest-tree"
+mkdir "$malformed_digest_tree"
+tar -xzf "$signed_archive" -C "$malformed_digest_tree"
+python3 - "$malformed_digest_tree/$bundle_root_name/release-manifest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["release_files"]["Distro.sig"]["blake3"] = "malformed"
+path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+malformed_digest_archive="$work/signed-malformed-digest-distro.tar.gz"
+COPYFILE_DISABLE=1 tar -czf "$malformed_digest_archive" -C "$malformed_digest_tree" "$bundle_root_name"
+set_fixture_asset "$malformed_digest_archive"
+malformed_digest_home="$work/signed-malformed-digest-home"
+if PATH="$fake_bin:$PATH" HOME="$malformed_digest_home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_VERSION=2026.9.0 sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  echo "installer accepted a signed Distro member with a malformed inventory digest" >&2
+  exit 1
+fi
+test ! -e "$malformed_digest_home/.aos/releases/2026.9.0"
+
 missing_tree="$work/signed-missing-tree"
 mkdir "$missing_tree"
 tar -xzf "$signed_archive" -C "$missing_tree"
