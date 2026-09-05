@@ -1,0 +1,2 @@
+- Require Community capsule archives to use Astrid 2026.9 durable members, including the signed provenance envelope and canonical WIT dependency tree, with fail-closed member types and structural provenance validation.
+- Emit that exact durable archive from the authenticated publication inventory fixture so the release contract rejects stale Capsule.toml-plus-wasm positives.

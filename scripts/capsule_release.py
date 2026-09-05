@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import re
 import stat
 import sys
@@ -22,6 +23,21 @@ except ModuleNotFoundError:  # Python 3.10 and older
 ROOT = Path(__file__).resolve().parent.parent
 POLICY = ROOT / "release" / "community-capsules.txt"
 DISTRO = ROOT / "distros" / "community" / "unicity-ce" / "Distro.toml"
+PROVENANCE_FILE = "Capsule.provenance.json"
+PROVENANCE_KEYS = frozenset(
+    {"schema_version", "algorithm", "content_digest", "signer", "signature"}
+)
+DURABLE_DIRECTORY_MEMBERS = frozenset(
+    {"wit", "wit/deps", "wit/deps/astrid-contracts"}
+)
+DURABLE_FILE_MEMBERS = frozenset(
+    {
+        "Capsule.toml",
+        PROVENANCE_FILE,
+        "wit/capsule.wit",
+        "wit/deps/astrid-contracts/astrid-contracts.wit",
+    }
+)
 
 
 class ContractError(RuntimeError):
@@ -190,6 +206,57 @@ def _read_embedded_manifest(archive: tarfile.TarFile, member: tarfile.TarInfo, a
         raise ContractError(f"{asset}: embedded Capsule.toml is invalid: {error}") from error
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant {value!r}")
+
+
+def _read_provenance(archive: tarfile.TarFile, member: tarfile.TarInfo, asset: Path) -> None:
+    if member.size > 64 * 1024:
+        raise ContractError(f"{asset}: {PROVENANCE_FILE} exceeds 64 KiB")
+    stream = archive.extractfile(member)
+    if stream is None:
+        raise ContractError(f"{asset}: {PROVENANCE_FILE} is not a regular file")
+    try:
+        envelope = json.loads(
+            stream.read().decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ContractError(f"{asset}: {PROVENANCE_FILE} is invalid JSON: {error}") from error
+    if not isinstance(envelope, dict):
+        raise ContractError(f"{asset}: {PROVENANCE_FILE} must contain a JSON object")
+    if set(envelope) != PROVENANCE_KEYS:
+        missing = sorted(PROVENANCE_KEYS - set(envelope))
+        unexpected = sorted(set(envelope) - PROVENANCE_KEYS)
+        raise ContractError(
+            f"{asset}: {PROVENANCE_FILE} keys differ; missing={missing}, unexpected={unexpected}"
+        )
+    if type(envelope["schema_version"]) is not int or envelope["schema_version"] != 1:
+        raise ContractError(f"{asset}: {PROVENANCE_FILE} schema_version must be integer 1")
+    if envelope["algorithm"] != "ed25519-blake3-tree-v1":
+        raise ContractError(
+            f"{asset}: {PROVENANCE_FILE} algorithm must be 'ed25519-blake3-tree-v1'"
+        )
+    content_digest = envelope["content_digest"]
+    if not isinstance(content_digest, str) or re.fullmatch(r"[0-9a-f]{64}", content_digest) is None:
+        raise ContractError(
+            f"{asset}: {PROVENANCE_FILE} content_digest must be 64 lowercase hexadecimal characters"
+        )
+    for key in ("algorithm", "signer", "signature"):
+        if not isinstance(envelope[key], str) or not envelope[key]:
+            raise ContractError(f"{asset}: {PROVENANCE_FILE} {key} must be a non-empty string")
+
+
 def validate_archive(asset: Path, spec: CapsuleSpec) -> None:
     try:
         archive = tarfile.open(asset, mode="r:gz")
@@ -215,13 +282,24 @@ def validate_archive(asset: Path, spec: CapsuleSpec) -> None:
             names[canonical_name] = member
             portability_names[portability_name] = canonical_name
 
-        expected_members = {"Capsule.toml", *spec.components}
+        expected_members = {
+            *DURABLE_DIRECTORY_MEMBERS,
+            *DURABLE_FILE_MEMBERS,
+            *spec.components,
+        }
         if set(names) != expected_members:
             raise ContractError(
                 f"{asset}: archive member set differs; "
                 f"missing={sorted(expected_members - set(names))}, "
                 f"unexpected={sorted(set(names) - expected_members)}"
             )
+
+        for name in DURABLE_DIRECTORY_MEMBERS:
+            if not names[name].isdir():
+                raise ContractError(f"{asset}: archive member {name!r} must be a directory")
+        for name in (*DURABLE_FILE_MEMBERS, *spec.components):
+            if not names[name].isfile():
+                raise ContractError(f"{asset}: archive member {name!r} must be a regular file")
 
         manifest_member = names.get("Capsule.toml")
         if manifest_member is None or not manifest_member.isfile():
@@ -248,6 +326,11 @@ def validate_archive(asset: Path, spec: CapsuleSpec) -> None:
             member = names.get(component)
             if member is None or not member.isfile():
                 raise ContractError(f"{asset}: component {component} is missing")
+
+        _read_provenance(archive, names[PROVENANCE_FILE], asset)
+        for name in ("wit/capsule.wit", "wit/deps/astrid-contracts/astrid-contracts.wit"):
+            if names[name].size == 0:
+                raise ContractError(f"{asset}: archive member {name!r} must not be empty")
 
 
 def validate_artifacts(directory: Path, specs: list[CapsuleSpec]) -> None:
