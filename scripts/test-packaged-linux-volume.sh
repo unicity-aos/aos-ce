@@ -42,13 +42,13 @@ cleanup() {
   set +e
   # Inspect the kernel's actual mount table instead of trusting our flags: a
   # failed mount/unmount must never be hidden by an early shell exit.
-  if [[ -n "${mountpoint:-}" ]] && findmnt -n --target "$mountpoint" >/dev/null 2>&1; then
+  if mount_is_active; then
     if [[ -x "${aos:-}" ]]; then
       run_aos storage unmount "$mountpoint" >/dev/null 2>&1 || unsafe=1
     else
       unsafe=1
     fi
-    findmnt -n --target "$mountpoint" >/dev/null 2>&1 && unsafe=1
+    mount_is_active && unsafe=1
   fi
   if [[ -x "${aos:-}" ]]; then
     # Stop is idempotent for a stopped disposable daemon.  A failure is only
@@ -202,6 +202,11 @@ run_default() {
   HOME="$work/home" AOS_HOME="$work/home/.aos" ASTRID_PRINCIPAL=default \
     "$aos" --principal default "$@"
 }
+active_receipt="$work/home/.aos/receipts/unicity-ce.active.json"
+runtime_distro_lock="$work/home/.aos/runtime/home/operator-qa/.config/distro.lock"
+mount_is_active() {
+  [[ -n "${mountpoint:-}" ]] && findmnt -n --mountpoint "$mountpoint" >/dev/null 2>&1
+}
 
 # This uses the package's own product binary and signed Distro files. A
 # non-admin QA identity is explicit; no unsigned or source checkout fallback is
@@ -247,11 +252,13 @@ for pass in 1 2 3; do
     echo "Distro Apply failed without the documented partial-install marker" >&2
     exit "$apply_status"
   fi
-  if find "$work/home/.aos" -type f -name 'Distro.lock' -o -name 'distro.lock' | grep -q .; then
+  # Sealed release/Distro.lock is package input, not installation progress.
+  # Probe the exact principal runtime lock and completion receipt instead.
+  if [[ -e "$runtime_distro_lock" || -L "$runtime_distro_lock" ]]; then
     echo "partial Distro Apply wrote a lock; refusing to retry" >&2
     exit 1
   fi
-  [[ ! -e "$work/home/.aos/receipts/unicity-ce.active.json" ]] || {
+  [[ ! -e "$active_receipt" && ! -L "$active_receipt" ]] || {
     echo "partial Distro Apply wrote an activation receipt" >&2
     exit 1
   }
@@ -260,7 +267,7 @@ done
   echo "Distro Apply did not converge after the bounded 10+10+2 passes" >&2
   exit 1
 }
-receipt="$work/home/.aos/receipts/unicity-ce.active.json"
+receipt="$active_receipt"
 [[ -f "$receipt" && ! -L "$receipt" ]] || {
   echo "Distro Apply did not persist its success receipt" >&2
   exit 1
@@ -317,7 +324,7 @@ if not isinstance(rows, list) or len(rows) != 22:
 if any(row.get("state") != "ready" for row in rows):
     raise SystemExit("one or more Distro capsules is not ready")
 PY
-if ! find "$work/home/.aos" -type f -name 'distro.lock' -o -name 'Distro.lock' | grep -q .; then
+if [[ ! -f "$runtime_distro_lock" || -L "$runtime_distro_lock" ]]; then
   echo "completed Distro Apply did not leave a durable Distro.lock" >&2
   exit 1
 fi
@@ -325,7 +332,7 @@ fi
 mountpoint="$work/mount"
 mkdir -m 0700 "$mountpoint"
 run_aos storage mount --as operator-qa --read-write "$mountpoint"
-mount_fstype=$(findmnt -n -o FSTYPE --target "$mountpoint" || true)
+mount_fstype=$(findmnt -n -o FSTYPE --mountpoint "$mountpoint" || true)
 [[ "$mount_fstype" == fuse* ]] || {
   echo "mountpoint is not a FUSE filesystem (type=$mount_fstype)" >&2
   exit 1
@@ -366,7 +373,7 @@ run_aos storage sync "$mountpoint"
 await_dirty false
 
 run_aos storage unmount "$mountpoint"
-if findmnt -n --target "$mountpoint" >/dev/null 2>&1; then
+if mount_is_active; then
   echo "FUSE mount survived unmount" >&2
   exit 1
 fi

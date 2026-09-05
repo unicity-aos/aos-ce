@@ -40,12 +40,16 @@ for required in \
   'agent show operator-qa --format json' \
   'distro apply --principal operator-qa --yes --offline' \
   'Installation incomplete:' \
+  'for pass in 1 2 3; do' \
+  'active_receipt="$work/home/.aos/receipts/unicity-ce.active.json"' \
+  'runtime_distro_lock="$work/home/.aos/runtime/home/operator-qa/.config/distro.lock"' \
   'exactly 22 ready capsules' \
   'unsafe cleanup; preserving disposable evidence' \
   'runner_image=' \
   'command -v fusermount3' \
   'storage mount --as operator-qa --read-write' \
-  'findmnt -n -o FSTYPE --target' \
+  'findmnt -n -o FSTYPE --mountpoint' \
+  'mount_is_active' \
   '/proc/self/mountinfo' \
   'storage status' \
   'storage sync' \
