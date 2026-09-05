@@ -1,0 +1,1 @@
+- Require authenticated GNU 2026.9.0 rehearsal archives to carry the `astrid-storage-provider-fuse` runtime member while preserving the historical GNU 0.10.4 four-binary portable contract; this archive-only rehearsal requirement does not imply installer persistence or release shipment.

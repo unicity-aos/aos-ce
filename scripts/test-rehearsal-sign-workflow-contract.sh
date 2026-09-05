@@ -307,6 +307,16 @@ for marker in (
     if marker not in darwin_runtime:
         raise SystemExit(f"Darwin runtime job is missing {marker}")
 
+gnu_runtime = sections.get("build-astrid-linux-gnu")
+if gnu_runtime is None:
+    raise SystemExit("rehearsal workflow is missing build-astrid-linux-gnu")
+for marker in (
+    "-p astrid-storage-provider-fuse",
+    "astrid-storage-provider-fuse",
+):
+    if marker not in gnu_runtime:
+        raise SystemExit(f"GNU runtime job is missing {marker}")
+
 validator_call = 'python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py"'
 for step_name in ("Compose the GNU native sealer source", "Compose the Darwin candidate"):
     step = re.search(
@@ -320,11 +330,14 @@ for step_name in ("Compose the GNU native sealer source", "Compose the Darwin ca
         raise SystemExit(f"{step_name} must invoke the runtime archive validator exactly once")
     if re.search(rf"(?m)^\s*{re.escape(validator_call)}\s+\\\s*$", body) is None:
         raise SystemExit(f"{step_name} must invoke the validator with python3 and continued arguments")
+    has_fuse = "astrid-storage-provider-fuse" in body
     has_fskit = "astrid-storage-provider-fskit" in body
     if step_name == "Compose the Darwin candidate" and not has_fskit:
         raise SystemExit("Darwin composition must require the FSKit provider")
+    if step_name == "Compose the GNU native sealer source" and not has_fuse:
+        raise SystemExit("GNU composition must require the FUSE provider")
     if step_name == "Compose the GNU native sealer source" and has_fskit:
-        raise SystemExit("GNU composition must retain the four portable runtime binaries")
+        raise SystemExit("GNU composition must not require the Darwin FSKit provider")
 
 if re.search(r'(?m)^\s*"\$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive\.py"', compose):
     raise SystemExit("compose job must not direct-exec the runtime archive validator")
