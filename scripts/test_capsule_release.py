@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import tarfile
 import tempfile
@@ -61,6 +62,25 @@ def add_bytes(
     archive.addfile(member, io.BytesIO(data) if member.isfile() else None)
 
 
+def provenance_bytes(*, mutation: Optional[str] = None) -> bytes:
+    envelope: dict[str, object] = {
+        "schema_version": 1,
+        "algorithm": "ed25519-blake3-tree-v1",
+        "content_digest": "0" * 64,
+        "signer": "fixture-signer",
+        "signature": "fixture-signature",
+    }
+    if mutation == "provenance-wrong-schema":
+        envelope["schema_version"] = 2
+    elif mutation == "provenance-wrong-algorithm":
+        envelope["algorithm"] = "wrong-algorithm"
+    elif mutation == "provenance-wrong-digest":
+        envelope["content_digest"] = "not-a-digest"
+    elif mutation == "provenance-extra-key":
+        envelope["extra"] = "not allowed"
+    return json.dumps(envelope).encode("utf-8")
+
+
 def write_fixture(path: Path, spec: CapsuleSpec, *, mutation: Optional[str] = None) -> None:
     manifest = spec.manifest.read_bytes()
     with tarfile.open(path, mode="w:gz") as archive:
@@ -88,6 +108,10 @@ def write_fixture(path: Path, spec: CapsuleSpec, *, mutation: Optional[str] = No
             archive.addfile(device)
         if mutation == "unexpected-member":
             add_bytes(archive, "unexpected.txt", b"not allowed")
+        if mutation == "provenance-directory":
+            add_bytes(archive, "Capsule.provenance.json", b"", kind=tarfile.DIRTYPE)
+        if mutation == "provenance-non-json":
+            add_bytes(archive, "Capsule.provenance.json", b"not json")
         if mutation == "wrong-manifest":
             manifest = manifest.replace(
                 f'name = "{spec.package}"'.encode(),
@@ -101,6 +125,28 @@ def write_fixture(path: Path, spec: CapsuleSpec, *, mutation: Optional[str] = No
             if mutation == "missing-component" and component == spec.components[0]:
                 continue
             add_bytes(archive, component, b"\x00asm")
+        if mutation != "missing-wit-tree":
+            add_bytes(archive, "wit", b"", kind=tarfile.DIRTYPE)
+            if mutation != "missing-wit-capsule":
+                add_bytes(archive, "wit/capsule.wit", b"package fixture:capsule;\n")
+            add_bytes(archive, "wit/deps", b"", kind=tarfile.DIRTYPE)
+            add_bytes(archive, "wit/deps/astrid-contracts", b"", kind=tarfile.DIRTYPE)
+            if mutation != "missing-contracts-wit":
+                contracts_wit = b"package fixture:contracts;\n"
+                if mutation == "empty-wit":
+                    contracts_wit = b""
+                add_bytes(
+                    archive,
+                    "wit/deps/astrid-contracts/astrid-contracts.wit",
+                    contracts_wit,
+                )
+        if mutation != "missing-provenance":
+            if mutation == "provenance-directory":
+                pass
+            elif mutation == "provenance-non-json":
+                pass
+            else:
+                add_bytes(archive, "Capsule.provenance.json", provenance_bytes(mutation=mutation))
 
 
 class CapsuleReleaseTests(unittest.TestCase):
@@ -161,6 +207,39 @@ class CapsuleReleaseTests(unittest.TestCase):
 
     def test_rejects_unexpected_member(self) -> None:
         self.assert_mutation_rejected("unexpected-member")
+
+    def test_rejects_missing_provenance(self) -> None:
+        self.assert_mutation_rejected("missing-provenance")
+
+    def test_rejects_missing_wit_tree(self) -> None:
+        self.assert_mutation_rejected("missing-wit-tree")
+
+    def test_rejects_missing_wit_capsule(self) -> None:
+        self.assert_mutation_rejected("missing-wit-capsule")
+
+    def test_rejects_missing_contracts_wit(self) -> None:
+        self.assert_mutation_rejected("missing-contracts-wit")
+
+    def test_rejects_provenance_directory(self) -> None:
+        self.assert_mutation_rejected("provenance-directory")
+
+    def test_rejects_non_json_provenance(self) -> None:
+        self.assert_mutation_rejected("provenance-non-json")
+
+    def test_rejects_wrong_provenance_schema(self) -> None:
+        self.assert_mutation_rejected("provenance-wrong-schema")
+
+    def test_rejects_wrong_provenance_algorithm(self) -> None:
+        self.assert_mutation_rejected("provenance-wrong-algorithm")
+
+    def test_rejects_wrong_provenance_digest(self) -> None:
+        self.assert_mutation_rejected("provenance-wrong-digest")
+
+    def test_rejects_extra_provenance_key(self) -> None:
+        self.assert_mutation_rejected("provenance-extra-key")
+
+    def test_rejects_empty_wit(self) -> None:
+        self.assert_mutation_rejected("empty-wit")
 
     def test_rejects_wrong_embedded_identity(self) -> None:
         self.assert_mutation_rejected("wrong-manifest")
