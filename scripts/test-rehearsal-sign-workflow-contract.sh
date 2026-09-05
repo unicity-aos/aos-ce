@@ -177,6 +177,30 @@ if 'ASTRID_RUNTIME_VERSION: &str = "0.10.4"' not in compose:
     raise SystemExit("compose job must reject a leftover production ASTRID_RUNTIME_VERSION overlay")
 if 'runtime["version"] != "2026.9.0"' not in compose:
     raise SystemExit("compose job must validate runtime-compatibility version")
+if "Prove overlay-built GNU AOS accepts the signed Distro" not in compose:
+    raise SystemExit("compose job must execute overlay-built AOS against the signed Distro")
+probe = '"$LINUX_AOS_BINARY" distro apply --principal operator-qa --yes'
+if probe not in compose:
+    raise SystemExit("compose job must run overlay-built GNU AOS distro apply as the consume probe")
+if "rehearsal-consume-aos" not in compose:
+    raise SystemExit("compose job must plant the signed Distro into a disposable AOS_HOME")
+if "bundled Distro Apply verification failed" not in compose:
+    raise SystemExit("compose job must fail closed if overlay-built AOS rejects the signed Distro")
+if "failed to start bundled runtime for Distro Apply" not in compose:
+    raise SystemExit("compose job must stop the Distro probe before runtime start")
+if "for member in Distro.toml Distro.lock Distro.sig release-manifest.json" not in compose:
+    raise SystemExit("compose job must plant exact signed Distro members and release-manifest.json")
+if "install -m 0600" not in compose:
+    raise SystemExit("compose job must plant signed Distro members with private mode 0600")
+if '"$DARWIN_AOS_BINARY" distro apply' in compose:
+    raise SystemExit("compose job must not execute the Darwin AOS binary on the GNU consume probe")
+if not (
+    compose.index("--sign-release-archive")
+    < compose.index("Prove overlay-built GNU AOS accepts the signed Distro")
+    < compose.index(probe)
+    < compose.index("Assemble rehearsal-only evidence")
+):
+    raise SystemExit("compose job must prove overlay-built AOS after signing and before evidence upload")
 
 if re.search(r"QA_SEED[^\n]*GITHUB_(?:ENV|OUTPUT)", text):
     raise SystemExit("ephemeral QA seed must never be emitted")

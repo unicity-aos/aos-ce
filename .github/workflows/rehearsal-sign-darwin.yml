@@ -749,6 +749,72 @@ jobs:
           path.unlink()
           PY
           echo "SIGNED_ARCHIVE=$signed" >> "$GITHUB_ENV"
+      - name: Prove overlay-built GNU AOS accepts the signed Distro
+        run: |
+          set -euo pipefail
+          user_home="$RUNNER_TEMP/rehearsal-consume-user"
+          aos_home="$RUNNER_TEMP/rehearsal-consume-aos"
+          extract="$RUNNER_TEMP/signed-consume-extract"
+          mkdir -m 0700 "$user_home" "$aos_home" "$extract"
+          mkdir -m 0700 "$aos_home/releases"
+          release_dir="$aos_home/releases/${AOS_PRODUCT_VERSION}"
+          mkdir -m 0700 "$release_dir"
+          tar -xzf "$SIGNED_ARCHIVE" -C "$extract"
+          bundle="$extract/unicity-aos-${AOS_PRODUCT_VERSION}-${DARWIN_TARGET}"
+          for member in Distro.toml Distro.lock Distro.sig release-manifest.json
+          do
+            [[ -f "$bundle/$member" && ! -L "$bundle/$member" ]]
+            install -m 0600 "$bundle/$member" "$release_dir/$member"
+          done
+          python3 - "$release_dir" <<'PY'
+          import pathlib
+          import stat
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          for name in (
+              "Distro.toml",
+              "Distro.lock",
+              "Distro.sig",
+              "release-manifest.json",
+          ):
+              path = root / name
+              metadata = path.lstat()
+              if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                  raise SystemExit(f"{name} must be a regular file")
+              if metadata.st_mode & 0o7777 != 0o600:
+                  raise SystemExit(f"{name} must use private mode 0600")
+          PY
+          stderr="$RUNNER_TEMP/rehearsal-consume.err"
+          set +e
+          HOME="$user_home" AOS_HOME="$aos_home" \
+            "$LINUX_AOS_BINARY" distro apply --principal operator-qa --yes \
+            >"$RUNNER_TEMP/rehearsal-consume.out" 2>"$stderr"
+          status=$?
+          set -e
+          python3 - "$stderr" "$status" "$aos_home" <<'PY'
+          import pathlib
+          import sys
+
+          stderr = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          status = int(sys.argv[2])
+          home = pathlib.Path(sys.argv[3])
+          if status == 0:
+              raise SystemExit("overlay-built AOS completed Distro Apply; rehearsal probe must stop before runtime")
+          if "bundled Distro Apply verification failed" in stderr:
+              raise SystemExit("overlay-built AOS rejected the signed Distro before runtime")
+          if "failed to start bundled runtime for Distro Apply" not in stderr:
+              raise SystemExit(
+                  "overlay-built AOS did not prove verify_selected_release before runtime:\n"
+                  f"{stderr}"
+              )
+          receipt = home / "receipts" / "unicity-ce.active.json"
+          if receipt.exists():
+              raise SystemExit("rehearsal Distro probe wrote an activation receipt")
+          runtime = home / "runtime"
+          if runtime.exists():
+              raise SystemExit("rehearsal Distro probe materialized runtime state")
+          PY
       - name: Assemble rehearsal-only evidence
         run: |
           set -euo pipefail
