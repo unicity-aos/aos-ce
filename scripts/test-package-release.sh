@@ -360,6 +360,82 @@ assert manifest["verifier"] == {
 }
 PY
 
+darwin_target=aarch64-apple-darwin
+darwin_runtime_root="$work/astrid-$runtime_version-$darwin_target"
+darwin_output="$work/darwin-output"
+mkdir -p "$darwin_runtime_root" "$darwin_output"
+for binary in \
+  astrid astrid-daemon astrid-build astrid-emit \
+  astrid-storage-provider-fskit
+do
+  source_binary=$binary
+  if [[ "$binary" == astrid-storage-provider-fskit ]]; then
+    source_binary=astrid
+  fi
+  cp "$runtime_root/$source_binary" "$darwin_runtime_root/$binary"
+  chmod 755 "$darwin_runtime_root/$binary"
+done
+COPYFILE_DISABLE=1 tar -czf "$work/darwin-runtime.tar.gz" \
+  -C "$work" "$(basename "$darwin_runtime_root")"
+
+bash "$repo_root/scripts/package-release.sh" \
+  "$darwin_target" \
+  "$work/aos" \
+  "$work/darwin-runtime.tar.gz" \
+  0000000000000000000000000000000000000000000000000000000000000000 \
+  "$work/capsules" \
+  "$darwin_output"
+
+darwin_archive="$darwin_output/unicity-aos-$product_version-$darwin_target.tar.gz"
+darwin_extract="$work/darwin-extract"
+mkdir "$darwin_extract"
+tar -xzf "$darwin_archive" -C "$darwin_extract"
+darwin_bundle="$darwin_extract/unicity-aos-$product_version-$darwin_target"
+darwin_provider="$darwin_bundle/runtime/bin/astrid-storage-provider-fskit"
+test -x "$darwin_provider"
+test "$(stat -c '%a' "$darwin_provider" 2>/dev/null || stat -f '%Lp' "$darwin_provider")" = 755
+python3 - "$darwin_bundle/release-manifest.json" "$darwin_provider" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+manifest_path, provider_path = map(pathlib.Path, sys.argv[1:])
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+provider = "runtime/bin/astrid-storage-provider-fskit"
+assert manifest["executables"] == [
+    "bin/aos",
+    "runtime/bin/astrid",
+    "runtime/bin/astrid-daemon",
+    "runtime/bin/astrid-build",
+    "runtime/bin/astrid-emit",
+    provider,
+]
+record = manifest["release_files"][provider]
+assert record["mode"] == 0o755
+assert record["blake3"] == subprocess.check_output(
+    ["b3sum", "--", provider_path], text=True
+).split()[0]
+PY
+
+missing_provider_root="$work/missing-provider/astrid-$runtime_version-$darwin_target"
+mkdir -p "$missing_provider_root" "$work/missing-provider-output"
+for binary in astrid astrid-daemon astrid-build astrid-emit; do
+  cp "$runtime_root/$binary" "$missing_provider_root/$binary"
+done
+COPYFILE_DISABLE=1 tar -czf "$work/missing-provider-runtime.tar.gz" \
+  -C "$work/missing-provider" "$(basename "$missing_provider_root")"
+if bash "$repo_root/scripts/package-release.sh" \
+  "$darwin_target" \
+  "$work/aos" \
+  "$work/missing-provider-runtime.tar.gz" \
+  0000000000000000000000000000000000000000000000000000000000000000 \
+  "$work/capsules" \
+  "$work/missing-provider-output" >/dev/null 2>&1; then
+  echo "Darwin release composer accepted a runtime without the FSKit provider" >&2
+  exit 1
+fi
+
 fixture_distro="$work/FixtureDistro.toml"
 python3 - "$bundle_root/Distro.toml" "$fixture_distro" <<'PY'
 import pathlib

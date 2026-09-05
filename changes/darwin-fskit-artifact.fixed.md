@@ -1,0 +1,1 @@
+- Include the authenticated FSKit storage provider in Darwin product archives and installations while retaining the portable four-binary runtime contract on Linux.

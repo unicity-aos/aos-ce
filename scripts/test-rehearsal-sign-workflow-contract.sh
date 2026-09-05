@@ -108,7 +108,8 @@ if grep -Fiq 'install\.sh' "$workflow"; then
   echo "rehearsal workflow must not consume the installer" >&2
   exit 1
 fi
-if grep -Fiq 'fskit' "$workflow"; then
+if grep -Fq 'manage-macos-fskit.sh' "$workflow" || \
+   grep -Fq -- '--astrid-provider-stdio-v1' "$workflow"; then
   echo "rehearsal workflow must not dispatch or exercise native FSKit" >&2
   exit 1
 fi
@@ -206,6 +207,16 @@ if 'ASTRID_RUNTIME_VERSION: &str = "0.10.4"' not in compose:
 if 'runtime["version"] != "2026.9.0"' not in compose:
     raise SystemExit("compose job must validate runtime-compatibility version")
 
+darwin_runtime = sections.get("build-astrid-darwin")
+if darwin_runtime is None:
+    raise SystemExit("rehearsal workflow is missing build-astrid-darwin")
+for marker in (
+    "-p astrid-storage-provider-fskit",
+    "astrid-storage-provider-fskit",
+):
+    if marker not in darwin_runtime:
+        raise SystemExit(f"Darwin runtime job is missing {marker}")
+
 validator_call = 'python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py"'
 for step_name in ("Compose the GNU native sealer source", "Compose the Darwin candidate"):
     step = re.search(
@@ -219,6 +230,11 @@ for step_name in ("Compose the GNU native sealer source", "Compose the Darwin ca
         raise SystemExit(f"{step_name} must invoke the runtime archive validator exactly once")
     if re.search(rf"(?m)^\s*{re.escape(validator_call)}\s+\\\s*$", body) is None:
         raise SystemExit(f"{step_name} must invoke the validator with python3 and continued arguments")
+    has_fskit = "astrid-storage-provider-fskit" in body
+    if step_name == "Compose the Darwin candidate" and not has_fskit:
+        raise SystemExit("Darwin composition must require the FSKit provider")
+    if step_name == "Compose the GNU native sealer source" and has_fskit:
+        raise SystemExit("GNU composition must retain the four portable runtime binaries")
 
 if re.search(r'(?m)^\s*"\$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive\.py"', compose):
     raise SystemExit("compose job must not direct-exec the runtime archive validator")

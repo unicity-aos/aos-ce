@@ -145,8 +145,8 @@ cp "$release_metadata" "$fixture/release-good.toml"
 cat > "$fake_bin/uname" <<'EOF'
 #!/bin/sh
 case "${1:-}" in
-  -s) echo Linux ;;
-  -m) echo x86_64 ;;
+  -s) echo "${AOS_TEST_UNAME_S:-Linux}" ;;
+  -m) echo "${AOS_TEST_UNAME_M:-x86_64}" ;;
   *) exit 2 ;;
 esac
 EOF
@@ -223,7 +223,9 @@ case "$1" in
     if [ "${AOS_TEST_BAD_COSIGN_DIGEST:-0}" = 1 ]; then
       printf '%064d  %s\n' 0 "$1"
     else
-      printf '%s  %s\n' ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc "$1"
+      printf '%s  %s\n' \
+        "${AOS_TEST_COSIGN_SHA256:-ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc}" \
+        "$1"
     fi
     ;;
   *) exec /usr/bin/shasum -a 256 "$1" ;;
@@ -268,6 +270,81 @@ test "$(stat -c '%a' "$work/home/.aos" 2>/dev/null || stat -f '%Lp' "$work/home/
 test "$(stat -c '%a' "$release_dir/release-manifest.json" 2>/dev/null || stat -f '%Lp' "$release_dir/release-manifest.json")" = 600
 test "$(stat -c '%a' "$release_dir/runtime/bin/astrid" 2>/dev/null || stat -f '%Lp' "$release_dir/runtime/bin/astrid")" = 700
 test "$(stat -c '%a' "$release_dir/capsules" 2>/dev/null || stat -f '%Lp' "$release_dir/capsules")" = 700
+
+darwin_fixture="$work/darwin-fixture"
+darwin_runtime_root="$work/astrid-$runtime_version-aarch64-apple-darwin"
+darwin_home="$work/darwin-home"
+mkdir "$darwin_fixture" "$darwin_runtime_root" "$darwin_home"
+for binary in \
+  astrid astrid-daemon astrid-build astrid-emit \
+  astrid-storage-provider-fskit
+do
+  source_binary=$binary
+  if [[ "$binary" == astrid-storage-provider-fskit ]]; then
+    source_binary=astrid
+  fi
+  cp "$runtime_root/$source_binary" "$darwin_runtime_root/$binary"
+  chmod 755 "$darwin_runtime_root/$binary"
+done
+COPYFILE_DISABLE=1 tar -czf "$work/darwin-runtime.tar.gz" \
+  -C "$work" "$(basename "$darwin_runtime_root")"
+bash "$repo_root/scripts/package-release.sh" \
+  aarch64-apple-darwin \
+  "$work/aos" \
+  "$work/darwin-runtime.tar.gz" \
+  0000000000000000000000000000000000000000000000000000000000000000 \
+  "$work/capsules" \
+  "$darwin_fixture" >/dev/null
+darwin_asset="$darwin_fixture/unicity-aos-2026.9.0-aarch64-apple-darwin.tar.gz"
+darwin_sha256=$(shasum -a 256 "$darwin_asset" | awk '{print $1}')
+darwin_blake3=$(b3sum "$darwin_asset" | awk '{print $1}')
+darwin_size=$(wc -c < "$darwin_asset" | tr -d ' ')
+python3 - \
+  "$release_metadata" \
+  "$darwin_fixture/unicity-aos-2026.9.0-release.toml" \
+  "$darwin_sha256" \
+  "$darwin_blake3" \
+  "$darwin_size" <<'PY'
+import pathlib
+import sys
+
+source, destination, sha256, blake3, size = sys.argv[1:]
+lines = pathlib.Path(source).read_text(encoding="utf-8").splitlines()
+inside = False
+for index, line in enumerate(lines):
+    if line.startswith("["):
+        inside = line == "[targets.aarch64-apple-darwin]"
+    if not inside:
+        continue
+    if line.startswith("sha256 = "):
+        lines[index] = f'sha256 = "{sha256}"'
+    elif line.startswith("blake3 = "):
+        lines[index] = f'blake3 = "{blake3}"'
+    elif line.startswith("size = "):
+        lines[index] = f"size = {size}"
+pathlib.Path(destination).write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+cp "$good_bundle" "$darwin_fixture/unicity-aos-2026.9.0-release.toml.sigstore.json"
+cp "$good_bundle" "$darwin_asset.sigstore.json"
+cp "$good_bundle" "$darwin_fixture/valid.sigstore.json"
+cp "$fixture/cosign-linux-amd64" "$darwin_fixture/cosign-darwin-arm64"
+chmod 755 "$darwin_fixture/cosign-darwin-arm64"
+PATH="$fake_bin:$PATH" \
+HOME="$darwin_home" \
+AOS_TEST_FIXTURE="$darwin_fixture" \
+AOS_TEST_UNAME_S=Darwin \
+AOS_TEST_UNAME_M=arm64 \
+AOS_TEST_COSIGN_SHA256=94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5 \
+AOS_VERSION=2026.9.0 \
+sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+darwin_release_dir="$darwin_home/.aos/releases/2026.9.0"
+for binary in \
+  astrid astrid-daemon astrid-build astrid-emit \
+  astrid-storage-provider-fskit
+do
+  test -x "$darwin_release_dir/runtime/bin/$binary"
+  test ! -e "$darwin_home/.aos/runtime/bin/$binary"
+done
 
 unsigned_asset="$work/unsigned-asset.tar.gz"
 unsigned_metadata="$work/release-unsigned.toml"

@@ -28,7 +28,16 @@ pub(crate) const RUNTIME_EXECUTABLE_NAMES: &[&str] = &[
     "astrid-emit.exe",
 ];
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub(crate) const RUNTIME_EXECUTABLE_NAMES: &[&str] = &[
+    "astrid",
+    "astrid-daemon",
+    "astrid-build",
+    "astrid-emit",
+    "astrid-storage-provider-fskit",
+];
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub(crate) const RUNTIME_EXECUTABLE_NAMES: &[&str] =
     &["astrid", "astrid-daemon", "astrid-build", "astrid-emit"];
 
@@ -799,8 +808,8 @@ fn materialize_manifest(capsule_dir: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AosHome, UNICITY_CE_MANIFEST, capsule_assets_from_manifest, materialize_manifest,
-        runtime_binary_name, runtime_daemon_binary_name,
+        AosHome, RUNTIME_EXECUTABLE_NAMES, UNICITY_CE_MANIFEST, capsule_assets_from_manifest,
+        materialize_manifest, runtime_binary_name, runtime_daemon_binary_name,
     };
     use std::ffi::OsString;
     use std::fs;
@@ -817,6 +826,30 @@ mod tests {
                 .expect("clock after epoch")
                 .as_nanos()
         ))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_inventory_includes_the_darwin_storage_provider() {
+        assert_eq!(
+            RUNTIME_EXECUTABLE_NAMES,
+            [
+                "astrid",
+                "astrid-daemon",
+                "astrid-build",
+                "astrid-emit",
+                "astrid-storage-provider-fskit",
+            ]
+        );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn runtime_inventory_keeps_the_portable_four_binary_contract() {
+        assert_eq!(
+            RUNTIME_EXECUTABLE_NAMES,
+            ["astrid", "astrid-daemon", "astrid-build", "astrid-emit"]
+        );
     }
 
     fn install_capsule_fixtures(root: &std::path::Path) -> PathBuf {
