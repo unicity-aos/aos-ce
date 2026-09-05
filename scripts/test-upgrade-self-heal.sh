@@ -387,6 +387,7 @@ test "$(find "$legacy/run" -type f | wc -l | tr -d ' ')" -eq 5
 install_candidate
 test -x "$aos_home/bin/aos"
 test -x "$aos_home/releases/2026.9.0/runtime/bin/astrid-daemon"
+test ! -e "$aos_home/releases/2026.9.0/runtime/bin/astrid-storage-provider-fuse"
 for name in $runtime_binaries; do
   test ! -e "$aos_home/runtime/bin/$name"
 done
@@ -516,3 +517,203 @@ test "$(b3sum -- "$receipt" | awk '{print $1}')" = "$receipt_before"
 test ! -e "$aos_home/runtime/run"
 
 echo "sanitized packaged migration, reinstall, and self-heal checks passed"
+
+# Keep the historical 0.10.4 GNU control above, then perform an upgrade to a
+# real 2026.9.0 GNU package composed through an isolated compatibility overlay.
+# The strict provider is included in the shipped-asset snapshot so the
+# self-heal reinstall proves its immutable persistence rather than merely
+# checking an assertion beside the fixture.
+fuse_repo="$work/aos-2026.9.0-contract"
+mkdir -p \
+  "$fuse_repo/scripts" \
+  "$fuse_repo/crates/unicity-aos-bootstrap" \
+  "$fuse_repo/distros/community/unicity-ce"
+cp "$repo_root/Cargo.toml" "$fuse_repo/Cargo.toml"
+cp "$repo_root/crates/unicity-aos-bootstrap/Cargo.toml" \
+  "$fuse_repo/crates/unicity-aos-bootstrap/Cargo.toml"
+cp -R "$repo_root/capsules" "$fuse_repo/"
+cp -R "$repo_root/release" "$fuse_repo/"
+cp "$repo_root/distros/community/unicity-ce/Distro.toml" \
+  "$fuse_repo/distros/community/unicity-ce/Distro.toml"
+cp "$repo_root/install.sh" "$repo_root/README.md" "$fuse_repo/"
+cp "$repo_root/scripts/capsule_release.py" \
+  "$repo_root/scripts/package-release.sh" \
+  "$repo_root/scripts/validate-runtime-archive.py" \
+  "$fuse_repo/scripts/"
+python3 - "$fuse_repo/release/runtime-compatibility.toml" \
+  "$fuse_repo/distros/community/unicity-ce/Distro.toml" <<'PY'
+import pathlib
+import sys
+
+runtime_path, distro_path = map(pathlib.Path, sys.argv[1:])
+runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
+replacements = {
+    "version": 'version = "2026.9.0"',
+    "tag": 'tag = "v2026.9.0"',
+    "version-requirement": 'version-requirement = "=2026.9.0"',
+    "release-workflow-identity": 'release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.0"',
+    "source-commit": 'source-commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"',
+    "release-metadata-asset": 'release-metadata-asset = "astrid-2026.9.0-release.toml"',
+    "release-metadata-blake3": 'release-metadata-blake3 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"',
+}
+in_runtime = False
+for index, line in enumerate(runtime_lines):
+    if line == "[runtime]":
+        in_runtime = True
+        continue
+    if line.startswith("["):
+        in_runtime = False
+    if in_runtime and "=" in line:
+        key = line.split("=", 1)[0].strip()
+        if key in replacements:
+            runtime_lines[index] = replacements[key]
+runtime_path.write_text("\n".join(runtime_lines) + "\n", encoding="utf-8")
+distro_text = distro_path.read_text(encoding="utf-8")
+distro_path.write_text(
+    distro_text.replace('astrid-version = "=0.10.4"', 'astrid-version = "=2026.9.0"'),
+    encoding="utf-8",
+)
+PY
+
+strict_provider=astrid-storage-provider-fuse
+if [[ "$target" == *-apple-darwin ]]; then
+  strict_provider=astrid-storage-provider-fskit
+fi
+fuse_runtime_root="$work/astrid-2026.9.0-$target"
+fuse_runtime_archive="$work/runtime-2026.9.0.tar.gz"
+fuse_output="$work/output-2026.9.0"
+mkdir -p "$fuse_runtime_root" "$fuse_output"
+for binary in \
+  astrid astrid-daemon astrid-build astrid-emit \
+  "$strict_provider"
+do
+  printf '#!/bin/sh\necho packaged-%s\n' "$binary" > "$fuse_runtime_root/$binary"
+  chmod 755 "$fuse_runtime_root/$binary"
+done
+COPYFILE_DISABLE=1 tar -czf "$fuse_runtime_archive" \
+  -C "$work" "$(basename "$fuse_runtime_root")"
+bash "$fuse_repo/scripts/package-release.sh" \
+  "$target" \
+  "$product_binary" \
+  "$fuse_runtime_archive" \
+  0000000000000000000000000000000000000000000000000000000000000000 \
+  "$capsules" \
+  "$fuse_output" >/dev/null
+fuse_asset_name="unicity-aos-2026.9.0-$target.tar.gz"
+fuse_asset="$fuse_output/$fuse_asset_name"
+fuse_asset_sha256=$(shasum -a 256 "$fuse_asset" | awk '{print $1}')
+fuse_asset_blake3=$(b3sum "$fuse_asset" | awk '{print $1}')
+fuse_asset_size=$(wc -c < "$fuse_asset" | tr -d ' ')
+fuse_fixture="$work/fuse-downloads"
+mkdir -p "$fuse_fixture"
+cp "$fuse_asset" "$fuse_fixture/$fuse_asset_name"
+cp "$fixture/valid.sigstore.json" "$fuse_fixture/valid.sigstore.json"
+cp "$fixture/$cosign_asset" "$fuse_fixture/$cosign_asset"
+cp "$fixture/valid.sigstore.json" "$fuse_fixture/$fuse_asset_name.sigstore.json"
+fuse_release_metadata="$fuse_fixture/unicity-aos-2026.9.0-release.toml"
+cat > "$fuse_release_metadata" <<EOF
+schema-version = 1
+kind = "aos-release"
+product = "unicity-aos-ce"
+version = "2026.9.0"
+tag = "2026.9.0"
+source-commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+published-at = "2026-07-16T10:00:00Z"
+release-workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/2026.9.0"
+
+[runtime]
+repository = "astrid-runtime/astrid"
+version = "2026.9.0"
+tag = "v2026.9.0"
+release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.0"
+release-metadata-available = true
+source-commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+release-metadata-asset = "astrid-2026.9.0-release.toml"
+release-metadata-blake3 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+[contracts]
+repository = "astrid-runtime/wit"
+commit = "278dbca3e32f327d0f2358644fc86559779ba0fd"
+sdk-rust-version = "0.7.1"
+sdk-rust-commit = "bbbc61c8821d6c536fb25d2068b6b646e759ad35"
+
+[gates]
+release-ready = true
+upgrade-self-heal-ready = true
+EOF
+for metadata_target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+  metadata_asset="unicity-aos-2026.9.0-${metadata_target}.tar.gz"
+  cat >> "$fuse_release_metadata" <<EOF
+
+[targets.${metadata_target}]
+asset = "${metadata_asset}"
+sha256 = "${fuse_asset_sha256}"
+blake3 = "${fuse_asset_blake3}"
+sigstore-bundle = "${metadata_asset}.sigstore.json"
+size = ${fuse_asset_size}
+EOF
+done
+cp "$fixture/valid.sigstore.json" "$fuse_fixture/unicity-aos-2026.9.0-release.toml.sigstore.json"
+
+fuse_runtime_binaries="astrid astrid-daemon astrid-build astrid-emit $strict_provider"
+fuse_install_candidate() {
+  PATH="$fake_bin:$PATH" \
+  HOME="$home" \
+  AOS_TEST_FIXTURE="$fuse_fixture" \
+  AOS_VERSION=2026.9.0 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+}
+
+fuse_install_candidate
+fuse_release="$aos_home/releases/2026.9.0"
+for name in $fuse_runtime_binaries; do
+  test -x "$fuse_release/runtime/bin/$name"
+  test ! -e "$aos_home/runtime/bin/$name"
+done
+test "$(find "$fuse_release/runtime/bin" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 5
+test "$(stat -c '%a' "$fuse_release/runtime/bin/$strict_provider" 2>/dev/null || stat -f '%Lp' "$fuse_release/runtime/bin/$strict_provider")" = 700
+
+runtime_binaries="$fuse_runtime_binaries"
+fuse_shipped_before=$work/fuse-shipped-before
+fuse_shipped_after=$work/fuse-shipped-after
+snapshot_shipped_assets "$aos_home" "$fuse_shipped_before"
+for name in aos $runtime_binaries; do
+  case "$name" in
+    aos) destination=$aos_home/bin/aos ;;
+    *) destination=$fuse_release/runtime/bin/$name ;;
+  esac
+  printf '#!/bin/sh\nexit 0\n' > "$destination"
+  chmod 755 "$destination"
+done
+while IFS= read -r capsule; do
+  printf 'tampered capsule\n' > "$fuse_release/capsules/$capsule"
+done < "$fuse_release/capsule-assets.txt"
+chmod 755 \
+  "$aos_home" \
+  "$aos_home/bin" \
+  "$aos_home/runtime" \
+  "$aos_home/releases" \
+  "$fuse_release" \
+  "$fuse_release/runtime" \
+  "$fuse_release/runtime/bin" \
+  "$fuse_release/capsules"
+
+fuse_install_candidate
+snapshot_shipped_assets "$aos_home" "$fuse_shipped_after"
+diff -u "$fuse_shipped_before" "$fuse_shipped_after"
+test -x "$fuse_release/runtime/bin/$strict_provider"
+test "$(stat -c '%a' "$fuse_release/runtime/bin/$strict_provider" 2>/dev/null || stat -f '%Lp' "$fuse_release/runtime/bin/$strict_provider")" = 700
+test ! -e "$aos_home/runtime/bin/$strict_provider"
+for directory in \
+  "$aos_home" \
+  "$aos_home/bin" \
+  "$aos_home/runtime" \
+  "$aos_home/releases" \
+  "$fuse_release" \
+  "$fuse_release/runtime" \
+  "$fuse_release/runtime/bin" \
+  "$fuse_release/capsules"; do
+  test "$(mode_of "$directory")" = 700
+done
+
+echo "historical 0.10.4 control and 2026.9.0 GNU FUSE self-heal checks passed"

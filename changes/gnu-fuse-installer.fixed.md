@@ -1,0 +1,1 @@
+- Select GNU runtime members from the signed runtime version during installation, persisting the `astrid-storage-provider-fuse` executable with immutable `0700` permissions for 2026.9.0 while preserving the 0.10.4 four-binary and Darwin FSKit contracts; installer and self-heal tests cover signed positives and fail-closed missing-provider transactions without activating a release.
