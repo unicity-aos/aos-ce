@@ -817,7 +817,19 @@ fi
 release_dir="$AOS_HOME/releases/$staged_version"
 release_stage="$AOS_HOME/releases/.${staged_version}.new.$$"
 release_backup="$AOS_HOME/releases/.${staged_version}.rollback.$$"
-for managed in "$AOS_HOME" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases" "$release_dir" "$release_dir/capsules" "$AOS_HOME/update" "$AOS_HOME/update/channels"; do
+for managed in \
+  "$AOS_HOME" \
+  "$AOS_HOME/libexec" \
+  "$AOS_HOME/runtime" \
+  "$AOS_HOME/runtime/bin" \
+  "$AOS_HOME/run" \
+  "$AOS_HOME/releases" \
+  "$release_dir" \
+  "$release_dir/runtime" \
+  "$release_dir/runtime/bin" \
+  "$release_dir/capsules" \
+  "$AOS_HOME/update" \
+  "$AOS_HOME/update/channels"; do
   [ ! -L "$managed" ] || { echo "refusing symlinked managed path: $managed" >&2; exit 1; }
 done
 if [ -e "$release_dir" ] && [ ! -d "$release_dir" ]; then
@@ -836,6 +848,17 @@ if [ -L "$AOS_BIN_DIR/aos" ] || { [ -e "$AOS_BIN_DIR/aos" ] && [ ! -f "$AOS_BIN_
   echo "refusing non-regular install destination: $AOS_BIN_DIR/aos" >&2
   exit 1
 fi
+for name in astrid astrid-daemon astrid-build astrid-emit; do
+  legacy="$AOS_HOME/runtime/bin/$name"
+  [ ! -L "$legacy" ] || {
+    echo "refusing symlinked legacy runtime executable: $legacy" >&2
+    exit 1
+  }
+  [ ! -e "$legacy" ] || [ -f "$legacy" ] || {
+    echo "refusing non-regular legacy runtime executable: $legacy" >&2
+    exit 1
+  }
+done
 
 if [ -x "$AOS_BIN_DIR/aos" ] && [ "$ASSUME_YES" -ne 1 ]; then
   answer=
@@ -853,8 +876,8 @@ if [ -x "$AOS_BIN_DIR/aos" ]; then
   "$AOS_BIN_DIR/aos" stop >/dev/null 2>&1 || true
 fi
 
-mkdir -p "$AOS_BIN_DIR" "$AOS_HOME/libexec" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases"
-chmod 700 "$AOS_HOME" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/runtime/bin" "$AOS_HOME/releases"
+mkdir -p "$AOS_BIN_DIR" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/run" "$AOS_HOME/releases"
+chmod 700 "$AOS_HOME" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/run" "$AOS_HOME/releases"
 if [ -n "$channel_root" ]; then
   mkdir -p "$channel_root/generations"
   chmod 700 "$AOS_HOME/update" "$AOS_HOME/update/channels" "$channel_root" "$channel_root/generations"
@@ -864,6 +887,13 @@ if [ "$AOS_BIN_DIR" = "$AOS_HOME/bin" ]; then
 fi
 rollback="$work/rollback"
 mkdir "$rollback"
+for name in astrid astrid-daemon astrid-build astrid-emit; do
+  legacy="$AOS_HOME/runtime/bin/$name"
+  if [ -f "$legacy" ]; then
+    cp -p "$legacy" "$rollback/$name"
+  fi
+  : > "$rollback/$name.touched"
+done
 
 install_one() {
   source=$1
@@ -962,13 +992,13 @@ restore() {
 installation_started=1
 if ! install_one "$bundle/bin/aos" "$AOS_BIN_DIR/aos" aos 755; then exit 1; fi
 if ! install_one "$bundle/libexec/install.sh" "$AOS_HOME/libexec/install.sh" installer 600; then exit 1; fi
-for name in astrid astrid-daemon astrid-build astrid-emit; do
-  if ! install_one "$bundle/runtime/bin/$name" "$AOS_HOME/runtime/bin/$name" "$name" 755; then exit 1; fi
-done
 mkdir "$release_stage"
 chmod 700 "$release_stage"
-mkdir "$release_stage/capsules"
-chmod 700 "$release_stage/capsules"
+mkdir "$release_stage/runtime" "$release_stage/runtime/bin" "$release_stage/capsules"
+chmod 700 "$release_stage/runtime" "$release_stage/runtime/bin" "$release_stage/capsules"
+for name in astrid astrid-daemon astrid-build astrid-emit; do
+  install -m 0700 "$bundle/runtime/bin/$name" "$release_stage/runtime/bin/$name"
+done
 install -m 0600 "$bundle/release-manifest.json" "$release_stage/release-manifest.json"
 install -m 0600 "$bundle/Distro.toml" "$release_stage/Distro.toml"
 install -m 0600 "$bundle/capsule-assets.txt" "$release_stage/capsule-assets.txt"
@@ -984,6 +1014,20 @@ if ! mv "$release_stage" "$release_dir"; then
 fi
 release_committed=1
 stage_channel_receipt
+# Older installations may have copied the bundled executables into the mutable
+# runtime home. They are no longer a valid launch location; remove only those
+# known managed files after the new immutable release is committed.
+if [ -d "$AOS_HOME/runtime/bin" ] && [ ! -L "$AOS_HOME/runtime/bin" ]; then
+  for name in astrid astrid-daemon astrid-build astrid-emit; do
+    legacy="$AOS_HOME/runtime/bin/$name"
+    [ ! -L "$legacy" ] || { echo "refusing symlinked legacy runtime executable: $legacy" >&2; exit 1; }
+    [ ! -e "$legacy" ] || [ -f "$legacy" ] || {
+      echo "refusing non-regular legacy runtime executable: $legacy" >&2
+      exit 1
+    }
+    rm -f "$legacy"
+  done
+fi
 installation_started=0
 rm -rf "$release_backup"
 release_install_lock

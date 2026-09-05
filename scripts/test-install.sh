@@ -246,8 +246,11 @@ AOS_VERSION=2026.9.0 \
 sh "$repo_root/install.sh" --yes --no-migrate-prompt
 
 test -x "$work/home/.aos/bin/aos"
-test -x "$work/home/.aos/runtime/bin/astrid-daemon"
 release_dir="$work/home/.aos/releases/2026.9.0"
+for binary in astrid astrid-daemon astrid-build astrid-emit; do
+  test -x "$release_dir/runtime/bin/$binary"
+  test ! -e "$work/home/.aos/runtime/bin/$binary"
+done
 test -f "$release_dir/release-manifest.json"
 test -f "$release_dir/Distro.toml"
 test -f "$release_dir/capsule-assets.txt"
@@ -263,6 +266,7 @@ test -f "$fixture/cosign-called"
 test ! -e "$fixture/path-cosign-called"
 test "$(stat -c '%a' "$work/home/.aos" 2>/dev/null || stat -f '%Lp' "$work/home/.aos")" = 700
 test "$(stat -c '%a' "$release_dir/release-manifest.json" 2>/dev/null || stat -f '%Lp' "$release_dir/release-manifest.json")" = 600
+test "$(stat -c '%a' "$release_dir/runtime/bin/astrid" 2>/dev/null || stat -f '%Lp' "$release_dir/runtime/bin/astrid")" = 700
 test "$(stat -c '%a' "$release_dir/capsules" 2>/dev/null || stat -f '%Lp' "$release_dir/capsules")" = 700
 
 python=${PYTHON3:-python3}
@@ -555,6 +559,25 @@ if PATH="$fake_bin:$PATH" HOME="$managed_symlink_home" AOS_TEST_FIXTURE="$fixtur
 fi
 test ! -e "$work/managed-symlink-executed"
 
+run_symlink_home="$work/run-symlink-home"
+mkdir -p "$run_symlink_home/.aos" "$work/run-symlink-target"
+ln -s "$work/run-symlink-target" "$run_symlink_home/.aos/run"
+if PATH="$fake_bin:$PATH" HOME="$run_symlink_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.9.0 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  echo "installer accepted a symlinked AOS run root" >&2
+  exit 1
+fi
+
+release_bin_symlink_home="$work/release-bin-symlink-home"
+mkdir -p "$release_bin_symlink_home/.aos/releases/2026.9.0/runtime" "$work/release-bin-symlink-target"
+ln -s "$work/release-bin-symlink-target" \
+  "$release_bin_symlink_home/.aos/releases/2026.9.0/runtime/bin"
+if PATH="$fake_bin:$PATH" HOME="$release_bin_symlink_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.9.0 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
+  echo "installer accepted a symlinked release runtime bin directory" >&2
+  exit 1
+fi
+
 directory_home="$work/directory-destination-home"
 mkdir -p "$directory_home/.aos/bin/aos"
 if PATH="$fake_bin:$PATH" HOME="$directory_home" AOS_TEST_FIXTURE="$fixture" AOS_VERSION=2026.9.0 \
@@ -567,11 +590,14 @@ test -d "$directory_home/.aos/bin/aos"
 for binary in aos astrid astrid-daemon astrid-build astrid-emit; do
   case "$binary" in
     aos) destination="$work/home/.aos/bin/aos" ;;
-    *) destination="$work/home/.aos/runtime/bin/$binary" ;;
+    *) destination="$release_dir/runtime/bin/$binary" ;;
   esac
   printf '#!/bin/sh\necho old-%s\n' "$binary" > "$destination"
   chmod 755 "$destination"
 done
+mkdir -p "$work/home/.aos/runtime/bin"
+printf '#!/bin/sh\necho stale-mutable-copy\n' > "$work/home/.aos/runtime/bin/astrid"
+chmod 755 "$work/home/.aos/runtime/bin/astrid"
 printf 'old-release-manifest\n' > "$release_dir/release-manifest.json"
 
 fail_bin="$work/fail-bin"
@@ -603,16 +629,25 @@ fi
 for binary in aos astrid astrid-daemon astrid-build astrid-emit; do
   case "$binary" in
     aos) destination="$work/home/.aos/bin/aos" ;;
-    *) destination="$work/home/.aos/runtime/bin/$binary" ;;
+    *) destination="$release_dir/runtime/bin/$binary" ;;
   esac
   test "$("$destination")" = "old-$binary"
 done
+test -x "$work/home/.aos/runtime/bin/astrid"
+test "$("$work/home/.aos/runtime/bin/astrid")" = stale-mutable-copy
 test "$(cat "$release_dir/release-manifest.json")" = old-release-manifest
 test "$(find "$release_dir/capsules" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 22
 while IFS= read -r capsule; do
   cmp "$work/capsules/$capsule" "$release_dir/capsules/$capsule"
 done < "$release_dir/capsule-assets.txt"
 test "$(cat "$work/home/.astrid/sentinel")" = standalone-runtime-state
+
+PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_VERSION=2026.9.0 sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+for binary in astrid astrid-daemon astrid-build astrid-emit; do
+  test ! -e "$work/home/.aos/runtime/bin/$binary"
+  test -x "$release_dir/runtime/bin/$binary"
+done
 
 cat > "$work/aos-mismatch" <<'EOF'
 #!/bin/sh

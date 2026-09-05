@@ -77,6 +77,10 @@
   validation when a runtime update adds or removes a verb before AOS classifies
   it as inherited, product-owned, or shared. Runtime verbs remain direct
   `aos <verb>` commands without a nested runtime namespace.
+- Launch bundled Astrid executables from the immutable versioned release
+  runtime/bin, keep `ASTRID_HOME` at the durable runtime home, and bind
+  `ASTRID_RUN_DIR` to the AOS-owned run root without copying shipped binaries
+  into mutable runtime state.
 
 - Keep agent Skills out of `Capsule.toml` and the generic capsule release
   contract. Host plugins may vendor trigger Skills, the AOS Skills service

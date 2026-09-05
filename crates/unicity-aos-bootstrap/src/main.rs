@@ -920,6 +920,7 @@ fn set_runtime_environment(home: &AosHome) {
     unsafe {
         std::env::set_var("ASTRID_HOME", home.runtime_home());
         std::env::set_var("ASTRID_WORKSPACE_STATE_DIR", AOS_WORKSPACE_STATE_DIR);
+        std::env::set_var("ASTRID_RUN_DIR", home.run_root());
     }
 }
 fn offer_first_run_migration() -> Option<ExitCode> {

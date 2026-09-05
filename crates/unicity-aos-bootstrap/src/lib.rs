@@ -1,9 +1,10 @@
 //! Product-owned runtime layout and launcher for Unicity AOS.
 //!
 //! Astrid Runtime keeps its standalone `ASTRID_HOME` and `.astrid` compatibility
-//! contract. AOS instead owns `~/.aos` and passes a private runtime home
-//! to the bundled runtime process only; it never changes the caller's process
-//! environment or rewrites a standalone runtime installation.
+//! contract. AOS instead owns `~/.aos`, executes the bundled runtime from the
+//! exact product-versioned release tree, and passes a private runtime home to
+//! the child process only. It never changes the caller's process environment
+//! or rewrites a standalone runtime installation.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -108,6 +109,24 @@ impl AosHome {
         self.root.join("runtime")
     }
 
+    /// The transient AOS process-coordination root reserved for the runtime.
+    #[must_use]
+    pub fn run_root(&self) -> PathBuf {
+        self.root.join("run")
+    }
+
+    /// The immutable assets installed for this exact AOS product version.
+    #[must_use]
+    pub fn release_dir(&self) -> PathBuf {
+        self.root.join("releases").join(PRODUCT_VERSION)
+    }
+
+    /// The release-owned directory containing the bundled Astrid executables.
+    #[must_use]
+    pub fn release_runtime_bin_dir(&self) -> PathBuf {
+        self.release_dir().join("runtime").join("bin")
+    }
+
     /// The receipt written only after a successful standalone-runtime import.
     #[must_use]
     pub fn migration_receipt(&self) -> PathBuf {
@@ -141,11 +160,7 @@ impl AosHome {
         let configured = get("UNICITY_AOS_CAPSULE_DIR");
         let path = match configured {
             Some(path) => Self::validated_environment_root(path, "UNICITY_AOS_CAPSULE_DIR")?,
-            None => self
-                .root
-                .join("releases")
-                .join(PRODUCT_VERSION)
-                .join("capsules"),
+            None => self.release_dir().join("capsules"),
         };
         validate_capsule_dir(&path, &capsule_assets_from_manifest()?)
     }
@@ -259,7 +274,7 @@ impl AosHome {
         {
             return path;
         }
-        self.runtime_home().join("bin").join(runtime_binary_name())
+        self.release_runtime_bin_dir().join(runtime_binary_name())
     }
 
     /// Import a standalone Astrid Runtime home into this product installation.
@@ -283,7 +298,7 @@ impl AosHome {
         migration::imported_legacy_distros(self)
     }
 
-    /// Create the product and bundled-runtime state directories.
+    /// Create the mutable product and bundled-runtime state directories.
     ///
     /// This intentionally creates neither a standalone Astrid home nor a
     /// project `.astrid` directory.
@@ -292,8 +307,7 @@ impl AosHome {
     /// Returns an error when the directories cannot be created.
     pub fn ensure_layout(&self) -> io::Result<()> {
         create_private_dir(&self.root)?;
-        create_private_dir(&self.runtime_home())?;
-        create_private_dir(&self.runtime_home().join("bin"))
+        create_private_dir(&self.runtime_home())
     }
 
     /// Build a command for the bundled runtime with a process-local home.
@@ -302,7 +316,7 @@ impl AosHome {
     /// therefore can bundle the neutral runtime without changing the host
     /// shell, another AOS install, or a standalone Astrid Runtime installation.
     /// # Errors
-    /// Returns an error when the private runtime bin or inherited host PATH
+    /// Returns an error when the release runtime bin or inherited host PATH
     /// cannot be represented safely as a child PATH.
     pub fn runtime_command(&self) -> io::Result<Command> {
         self.runtime_command_with_args(std::iter::empty::<&OsStr>())
@@ -314,7 +328,7 @@ impl AosHome {
     /// argument boundaries and leaves the runtime in charge of its established
     /// local socket, credentials, and operator protocol.
     /// # Errors
-    /// Returns an error when the private runtime bin or inherited host PATH
+    /// Returns an error when the release runtime bin or inherited host PATH
     /// cannot be represented safely as a child PATH.
     pub fn runtime_command_with_args<I, S>(&self, args: I) -> io::Result<Command>
     where
@@ -330,20 +344,30 @@ impl AosHome {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let runtime_bin = executable.parent().ok_or_else(|| {
+        let executable_parent = executable.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "bundled executable must have a parent directory",
             )
         })?;
+        // An explicit absolute package override points at a complete runtime
+        // bundle, so keep its sibling tools ahead of the host PATH as well.
+        let path_prefix = match std::env::var_os("UNICITY_AOS_RUNTIME_BIN").map(PathBuf::from) {
+            Some(path) if path.is_absolute() => path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| executable_parent.to_path_buf()),
+            _ => self.release_runtime_bin_dir(),
+        };
         let mut command = Command::new(executable);
         command
             .env("ASTRID_HOME", self.runtime_home())
             .env("ASTRID_WORKSPACE_STATE_DIR", AOS_WORKSPACE_STATE_DIR)
             .env("ASTRID_ENFORCED_DISTRO", self.unicity_ce_manifest_path())
+            .env("ASTRID_RUN_DIR", self.run_root())
             .env(
                 "PATH",
-                Self::runtime_child_path(runtime_bin, std::env::var_os("PATH"))?,
+                Self::runtime_child_path(&path_prefix, std::env::var_os("PATH"))?,
             );
         command.args(args);
         Ok(command)
@@ -808,23 +832,59 @@ mod tests {
     }
 
     #[test]
-    fn runtime_is_scoped_beneath_the_product_home() {
+    fn runtime_executes_from_the_exact_product_release() {
         let home = AosHome::from_root("/tmp/unicity-aos-test");
         assert_eq!(home.root(), PathBuf::from("/tmp/unicity-aos-test"));
         assert_eq!(
             home.runtime_home(),
             PathBuf::from("/tmp/unicity-aos-test/runtime")
         );
+        assert_eq!(home.run_root(), PathBuf::from("/tmp/unicity-aos-test/run"));
+        assert_ne!(home.run_root(), home.runtime_home());
+        assert!(!home.run_root().starts_with(home.runtime_home()));
+        assert!(!home.runtime_home().starts_with(home.run_root()));
+        assert_eq!(
+            home.release_dir(),
+            PathBuf::from(format!(
+                "/tmp/unicity-aos-test/releases/{}",
+                env!("CARGO_PKG_VERSION")
+            ))
+        );
         assert_eq!(
             home.runtime_binary(),
-            home.runtime_home().join("bin").join(runtime_binary_name())
+            home.release_runtime_bin_dir().join(runtime_binary_name())
         );
         assert_eq!(
             home.runtime_daemon_binary(),
-            home.runtime_home()
-                .join("bin")
+            home.release_runtime_bin_dir()
                 .join(runtime_daemon_binary_name())
         );
+    }
+
+    #[test]
+    fn mutable_runtime_copy_cannot_substitute_for_a_missing_release_binary() {
+        let fixture = temporary_home();
+        let home = AosHome::from_root(&fixture);
+        let mutable_binary = home.runtime_home().join("bin").join(runtime_binary_name());
+        fs::create_dir_all(mutable_binary.parent().expect("mutable binary parent"))
+            .expect("create mutable runtime bin");
+        fs::write(&mutable_binary, b"mutable compatibility copy")
+            .expect("write mutable compatibility copy");
+
+        let error = home
+            .ensure_runtime_available()
+            .expect_err("mutable compatibility copy must not satisfy release lookup");
+
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert!(
+            error.to_string().contains(
+                home.release_runtime_bin_dir()
+                    .join(runtime_binary_name())
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        fs::remove_dir_all(fixture).expect("remove mutable runtime fixture");
     }
 
     #[test]
@@ -832,7 +892,7 @@ mod tests {
         let home = AosHome::from_root("/tmp/unicity-aos-test");
         assert_eq!(
             home.runtime_binary_with(|_| Some(OsString::from("runtime/astrid"))),
-            home.runtime_home().join("bin").join(runtime_binary_name())
+            home.release_runtime_bin_dir().join(runtime_binary_name())
         );
         assert_eq!(
             home.runtime_binary_with(|_| Some(OsString::from("/opt/aos/runtime/bin/astrid"))),
@@ -855,10 +915,14 @@ mod tests {
 
         assert_eq!(env_value("ASTRID_HOME"), "/tmp/unicity-aos-test/runtime");
         assert_eq!(env_value("ASTRID_WORKSPACE_STATE_DIR"), ".aos");
+        assert_eq!(env_value("ASTRID_RUN_DIR"), "/tmp/unicity-aos-test/run");
         let path_entries: Vec<_> = std::env::split_paths(env_value("PATH")).collect();
         assert_eq!(
             path_entries.first(),
-            Some(&PathBuf::from("/tmp/unicity-aos-test/runtime/bin"))
+            Some(&PathBuf::from(format!(
+                "/tmp/unicity-aos-test/releases/{}/runtime/bin",
+                env!("CARGO_PKG_VERSION")
+            )))
         );
         assert_eq!(std::env::var_os("PATH"), caller_path);
     }
@@ -896,7 +960,7 @@ mod tests {
         let fixture = temporary_home();
         let home = AosHome::from_root(&fixture);
         install_capsule_fixtures(home.root());
-        let runtime_bin = home.runtime_home().join("bin");
+        let runtime_bin = home.release_runtime_bin_dir();
         fs::create_dir_all(&runtime_bin).expect("create runtime bin");
         fs::write(home.runtime_daemon_binary(), b"daemon").expect("write daemon fixture");
         #[cfg(unix)]
@@ -932,6 +996,7 @@ mod tests {
         };
         assert_eq!(env_value("ASTRID_HOME"), home.runtime_home());
         assert_eq!(env_value("ASTRID_WORKSPACE_STATE_DIR"), ".aos");
+        assert_eq!(env_value("ASTRID_RUN_DIR"), home.run_root());
         assert_eq!(env_value("ASTRID_DAEMON_LOG_TARGET"), "stderr");
         assert_eq!(
             env_value("ASTRID_ENFORCED_DISTRO"),
@@ -946,7 +1011,7 @@ mod tests {
         let fixture = temporary_home();
         let home = AosHome::from_root(&fixture);
         install_capsule_fixtures(home.root());
-        let runtime_bin = home.runtime_home().join("bin");
+        let runtime_bin = home.release_runtime_bin_dir();
         fs::create_dir_all(&runtime_bin).expect("create runtime bin");
         fs::write(home.runtime_daemon_binary(), b"daemon").expect("write daemon fixture");
 
@@ -1009,13 +1074,16 @@ mod tests {
         let home = AosHome::from_root("/tmp/unicity-aos-test");
         let host_entries = [PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")];
         let host_path = std::env::join_paths(&host_entries).expect("build host PATH");
-        let runtime_bin = home.runtime_home().join("bin");
+        let runtime_bin = home.release_runtime_bin_dir();
         let child_path =
             AosHome::runtime_child_path(&runtime_bin, Some(host_path)).expect("build child PATH");
         assert_eq!(
             std::env::split_paths(&child_path).collect::<Vec<_>>(),
             [
-                PathBuf::from("/tmp/unicity-aos-test/runtime/bin"),
+                PathBuf::from(format!(
+                    "/tmp/unicity-aos-test/releases/{}/runtime/bin",
+                    env!("CARGO_PKG_VERSION")
+                )),
                 PathBuf::from("/usr/local/bin"),
                 PathBuf::from("/usr/bin"),
             ]
@@ -1025,7 +1093,10 @@ mod tests {
             AosHome::runtime_child_path(&runtime_bin, None).expect("build private-only child PATH");
         assert_eq!(
             std::env::split_paths(&child_path).collect::<Vec<_>>(),
-            [PathBuf::from("/tmp/unicity-aos-test/runtime/bin")]
+            [PathBuf::from(format!(
+                "/tmp/unicity-aos-test/releases/{}/runtime/bin",
+                env!("CARGO_PKG_VERSION")
+            ))]
         );
     }
 
@@ -1084,7 +1155,6 @@ mod tests {
         for directory in [
             &root,
             &home.runtime_home(),
-            &home.runtime_home().join("bin"),
             &root.join("distributions"),
             &root.join("distributions/unicity-ce"),
         ] {

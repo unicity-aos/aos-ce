@@ -132,8 +132,8 @@ snapshot_shipped_assets() {
   : > "$output"
   printf '%s|bin/aos\n' "$(b3sum -- "$home/bin/aos" | awk '{print $1}')" >> "$output"
   for name in astrid astrid-daemon astrid-build astrid-emit; do
-    printf '%s|runtime/bin/%s\n' \
-      "$(b3sum -- "$home/runtime/bin/$name" | awk '{print $1}')" \
+    printf '%s|releases/2026.9.0/runtime/bin/%s\n' \
+      "$(b3sum -- "$release/runtime/bin/$name" | awk '{print $1}')" \
       "$name" >> "$output"
   done
   while IFS= read -r capsule; do
@@ -161,7 +161,11 @@ mkdir -p "$home" "$fixture" "$fake_bin" "$capsules"
 python3 "$repo_root/scripts/create-astrid-094-fixture.py" "$legacy"
 
 cargo build --locked -p unicity-aos-bootstrap --bin aos
-product_binary=$repo_root/target/debug/aos
+target_dir=$(
+  cargo metadata --locked --no-deps --format-version 1 |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+)
+product_binary=$target_dir/debug/aos
 test "$($product_binary --version)" = 'Unicity AOS 2026.9.0'
 
 PYTHONPATH="$repo_root/scripts" python3 - "$capsules" <<'PY'
@@ -355,7 +359,10 @@ test "$(find "$legacy/run" -type f | wc -l | tr -d ' ')" -eq 5
 
 install_candidate
 test -x "$aos_home/bin/aos"
-test -x "$aos_home/runtime/bin/astrid-daemon"
+test -x "$aos_home/releases/2026.9.0/runtime/bin/astrid-daemon"
+for name in astrid astrid-daemon astrid-build astrid-emit; do
+  test ! -e "$aos_home/runtime/bin/$name"
+done
 HOME="$home" "$aos_home/bin/aos" migrate runtime --from "$legacy" > "$work/migrate.log"
 grep -F 'imported the standalone runtime; the source was left unchanged' "$work/migrate.log" >/dev/null
 assert_imported_activation_layout "$aos_home/runtime"
@@ -413,7 +420,7 @@ snapshot_shipped_assets "$aos_home" "$shipped_before"
 for name in aos astrid astrid-daemon astrid-build astrid-emit; do
   case "$name" in
     aos) destination=$aos_home/bin/aos ;;
-    *) destination=$aos_home/runtime/bin/$name ;;
+    *) destination=$aos_home/releases/2026.9.0/runtime/bin/$name ;;
   esac
   printf '#!/bin/sh\nexit 0\n' > "$destination"
   chmod 755 "$destination"
@@ -425,9 +432,10 @@ chmod 755 \
   "$aos_home" \
   "$aos_home/bin" \
   "$aos_home/runtime" \
-  "$aos_home/runtime/bin" \
   "$aos_home/releases" \
   "$aos_home/releases/2026.9.0" \
+  "$aos_home/releases/2026.9.0/runtime" \
+  "$aos_home/releases/2026.9.0/runtime/bin" \
   "$aos_home/releases/2026.9.0/capsules"
 
 install_candidate
@@ -438,9 +446,10 @@ for directory in \
   "$aos_home" \
   "$aos_home/bin" \
   "$aos_home/runtime" \
-  "$aos_home/runtime/bin" \
   "$aos_home/releases" \
   "$aos_home/releases/2026.9.0" \
+  "$aos_home/releases/2026.9.0/runtime" \
+  "$aos_home/releases/2026.9.0/runtime/bin" \
   "$aos_home/releases/2026.9.0/capsules"; do
   test "$(mode_of "$directory")" = 700
 done
