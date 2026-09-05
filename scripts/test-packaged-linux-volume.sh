@@ -17,6 +17,8 @@ fi
 command -v tar >/dev/null || { echo "tar is required" >&2; exit 1; }
 command -v findmnt >/dev/null || { echo "findmnt is required" >&2; exit 1; }
 command -v awk >/dev/null || { echo "awk is required" >&2; exit 1; }
+command -v b3sum >/dev/null || { echo "b3sum is required to verify the signed rehearsal identity" >&2; exit 1; }
+fusermount3=$(command -v fusermount3) || { echo "fusermount3 is required" >&2; exit 1; }
 [[ -e /dev/fuse ]] || {
   echo "Linux packaged-volume rehearsal requires /dev/fuse" >&2
   exit 1
@@ -34,24 +36,106 @@ else
 fi
 
 work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/aos-packaged-linux-volume.XXXXXX")
-mounted=0
-daemon_started=0
 cleanup() {
+  local status=$?
+  local unsafe=0
   set +e
-  if (( mounted )); then
-    HOME="$work/home" AOS_HOME="$work/home/.aos" ASTRID_PRINCIPAL=operator-qa \
-      "$work/home/.aos/releases/2026.9.0/bin/aos" storage unmount "$work/mount" >/dev/null 2>&1
+  # Inspect the kernel's actual mount table instead of trusting our flags: a
+  # failed mount/unmount must never be hidden by an early shell exit.
+  if [[ -n "${mountpoint:-}" ]] && findmnt -n --target "$mountpoint" >/dev/null 2>&1; then
+    if [[ -x "${aos:-}" ]]; then
+      run_aos storage unmount "$mountpoint" >/dev/null 2>&1 || unsafe=1
+    else
+      unsafe=1
+    fi
+    findmnt -n --target "$mountpoint" >/dev/null 2>&1 && unsafe=1
   fi
-  if (( daemon_started )); then
-    HOME="$work/home" AOS_HOME="$work/home/.aos" ASTRID_PRINCIPAL=operator-qa \
-      "$work/home/.aos/releases/2026.9.0/bin/aos" stop >/dev/null 2>&1
+  if [[ -x "${aos:-}" ]]; then
+    # Stop is idempotent for a stopped disposable daemon.  A failure is only
+    # fatal when a process under this disposable AOS home is still alive.
+    local pid=''
+    if [[ -f "$work/home/.aos/run/system.pid" ]]; then
+      pid=$(<"$work/home/.aos/run/system.pid")
+    fi
+    run_aos stop >/dev/null 2>&1 || true
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null && unsafe=1
   fi
-  rm -rf "$work"
+  if (( unsafe )); then
+    echo "unsafe cleanup; preserving disposable evidence at $work" >&2
+    exit 1
+  fi
+  if ! rm -rf "$work"; then
+    echo "unable to remove disposable evidence; preserving $work" >&2
+    exit 1
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
 
 mkdir -m 0700 "$work/home" "$work/extract"
+{
+  printf 'runner_image=%s\n' "${ImageOS:-unknown}"
+  printf 'runner_version=%s\n' "${ImageVersion:-unknown}"
+  printf 'uname=%s\n' "$(uname -a)"
+  printf 'fusermount3=%s\n' "$fusermount3"
+  printf 'fusermount3_mode=%s\n' "$(stat -c '%a' "$fusermount3" 2>/dev/null || stat -f '%Lp' "$fusermount3")"
+  "$fusermount3" --version 2>&1 || true
+} | tee "$work/runner-fuse.txt"
 expected_root=unicity-aos-2026.9.0-x86_64-unknown-linux-gnu
+# Bind the exact package bytes to the REHEARSAL-ONLY identity and checksum
+# manifests emitted by compose-and-sign.  Downloading an artifact is not an
+# identity check: reject renamed archives, mismatched hashes, and malformed
+# manifest records before extraction or execution.
+artifact_dir=$(dirname "$archive")
+identity="$artifact_dir/REHEARSAL-ONLY-identity.json"
+blake_manifest="$artifact_dir/REHEARSAL-BLAKE3SUMS.txt"
+sha_manifest="$artifact_dir/REHEARSAL-SHA256SUMS.txt"
+for manifest in "$identity" "$blake_manifest" "$sha_manifest"; do
+  [[ -f "$manifest" && ! -L "$manifest" ]] || {
+    echo "signed rehearsal artifact is missing identity/checksum manifest: $manifest" >&2
+    exit 1
+  }
+done
+python3 - "$identity" "$blake_manifest" "$sha_manifest" "$archive" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+identity_path, blake_path, sha_path, archive = map(pathlib.Path, sys.argv[1:])
+name = archive.name
+identity = json.loads(identity_path.read_text(encoding="utf-8"))
+if identity.get("scope") != "REHEARSAL-ONLY" or identity.get("publication_allowed") is not False:
+    raise SystemExit("archive identity is not explicitly rehearsal-only")
+expected_source = os.environ.get("GITHUB_SHA", "")
+if expected_source and identity.get("aos", {}).get("source_commit") != expected_source:
+    raise SystemExit("archive identity does not bind the exact AOS workflow commit")
+record = identity.get("signed_archive_digests", {}).get("x86_64-unknown-linux-gnu")
+if not isinstance(record, dict) or record.get("archive") != name:
+    raise SystemExit("archive name does not match the signed rehearsal identity")
+expected_blake = record.get("blake3_rehearsal_only", "")
+expected_sha = record.get("sha256_rehearsal_only", "")
+if not expected_blake.startswith("blake3:") or not expected_sha.startswith("sha256:"):
+    raise SystemExit("identity is missing canonical archive digests")
+def manifest_digest(path, expected_name):
+    rows = [line.split() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    matches = [row[0] for row in rows if len(row) == 2 and row[1] == expected_name]
+    if len(matches) != 1:
+        raise SystemExit(f"checksum manifest does not contain exactly one {expected_name} record")
+    return matches[0]
+if manifest_digest(blake_path, name) != expected_blake.removeprefix("blake3:"):
+    raise SystemExit("BLAKE3 manifest disagrees with signed identity")
+if manifest_digest(sha_path, name) != expected_sha.removeprefix("sha256:"):
+    raise SystemExit("SHA256 manifest disagrees with signed identity")
+actual_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+if actual_sha != expected_sha.removeprefix("sha256:"):
+    raise SystemExit("archive SHA256 does not match signed identity")
+actual_blake = subprocess.check_output(["b3sum", "--", str(archive)], text=True).split()[0]
+if actual_blake != expected_blake.removeprefix("blake3:"):
+    raise SystemExit("archive BLAKE3 does not match signed identity")
+PY
 python3 - "$archive" "$work/extract" "$expected_root" <<'PY'
 import pathlib
 import sys
@@ -76,6 +160,20 @@ PY
 
 bundle="$work/extract/$expected_root"
 release="$work/home/.aos/releases/2026.9.0"
+python3 - "$bundle/Distro.toml" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+manifest = pathlib.Path(sys.argv[1])
+try:
+    capsules = tomllib.loads(manifest.read_text(encoding="utf-8")).get("capsule", [])
+except (OSError, tomllib.TOMLDecodeError) as error:
+    raise SystemExit(f"unable to parse packaged Distro.toml: {error}")
+names = [item.get("name") for item in capsules]
+if len(names) != 22 or len(set(names)) != 22 or any(not name for name in names):
+    raise SystemExit("packaged Distro.toml must declare exactly 22 unique capsules")
+PY
 mkdir -p "$work/home/.aos/releases"
 chmod 0700 "$work/home/.aos" "$work/home/.aos/releases"
 mv "$bundle" "$release"
@@ -96,14 +194,88 @@ done
 
 aos="$release/bin/aos"
 run_aos() {
-  HOME="$work/home" AOS_HOME="$work/home/.aos" ASTRID_PRINCIPAL=operator-qa \
+  HOME="$work/home" AOS_HOME="$work/home/.aos" \
+    ASTRID_PRINCIPAL=operator-qa ASTRID_VAR_OPENAI_API_KEY=release-gate-not-a-real-key \
     "$aos" "$@"
+}
+run_default() {
+  HOME="$work/home" AOS_HOME="$work/home/.aos" ASTRID_PRINCIPAL=default \
+    "$aos" --principal default "$@"
 }
 
 # This uses the package's own product binary and signed Distro files. A
 # non-admin QA identity is explicit; no unsigned or source checkout fallback is
 # permitted.
-run_aos distro apply --principal operator-qa --yes --offline
+# Start the packaged runtime first, then have the authenticated default
+# principal mint the explicit non-admin operator-qa key/profile.  This proves
+# that Distro Apply cannot silently fall back to an anonymous identity.
+run_default start
+run_default agent create operator-qa --group agent --yes
+operator_show=$(run_aos agent show operator-qa --format json)
+python3 - "$operator_show" <<'PY'
+import json
+import sys
+
+try:
+    record = json.loads(sys.argv[1])
+except (IndexError, json.JSONDecodeError) as error:
+    raise SystemExit(f"operator-qa identity output is not JSON: {error}")
+if not isinstance(record, dict):
+    raise SystemExit("operator-qa identity output is not an object")
+principal = record.get("principal", record.get("id", record.get("name")))
+if principal != "operator-qa":
+    raise SystemExit(f"authenticated agent show returned unexpected principal: {principal!r}")
+PY
+
+# A partial install is the only expected nonzero result.  Retry at most three
+# bounded passes (the documented 10+10+2 convergence) and reject every other
+# failure.  A partial pass must leave no activation receipt/lock, so the next
+# pass cannot be mistaken for a fresh completed install.
+apply_succeeded=0
+for pass in 1 2 3; do
+  apply_output="$work/distro-apply-${pass}.log"
+  set +e
+  run_aos distro apply --principal operator-qa --yes --offline >"$apply_output" 2>&1
+  apply_status=$?
+  set -e
+  if (( apply_status == 0 )); then
+    apply_succeeded=1
+    break
+  fi
+  cat "$apply_output" >&2
+  if ! grep -Fq 'Installation incomplete:' "$apply_output"; then
+    echo "Distro Apply failed without the documented partial-install marker" >&2
+    exit "$apply_status"
+  fi
+  if find "$work/home/.aos" -type f -name 'Distro.lock' -o -name 'distro.lock' | grep -q .; then
+    echo "partial Distro Apply wrote a lock; refusing to retry" >&2
+    exit 1
+  fi
+  [[ ! -e "$work/home/.aos/receipts/unicity-ce.active.json" ]] || {
+    echo "partial Distro Apply wrote an activation receipt" >&2
+    exit 1
+  }
+done
+(( apply_succeeded == 1 )) || {
+  echo "Distro Apply did not converge after the bounded 10+10+2 passes" >&2
+  exit 1
+}
+receipt="$work/home/.aos/receipts/unicity-ce.active.json"
+[[ -f "$receipt" && ! -L "$receipt" ]] || {
+  echo "Distro Apply did not persist its success receipt" >&2
+  exit 1
+}
+python3 - "$receipt" <<'PY'
+import json
+import pathlib
+import sys
+
+receipt = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if receipt.get("active") is not True or receipt.get("cutover_complete") is not True:
+    raise SystemExit("Distro Apply receipt is not an active completed receipt")
+if receipt.get("distro_id") != "unicity-ce" or receipt.get("principal") != "operator-qa":
+    raise SystemExit("Distro Apply receipt is bound to the wrong distro or principal")
+PY
 volume="$work/home/.aos/runtime/astrid.volume"
 [[ -f "$volume" && ! -L "$volume" && -s "$volume" ]] || {
   echo "Distro Apply did not leave a non-empty stopped astrid.volume" >&2
@@ -120,7 +292,6 @@ entries=$(find "$work/home/.aos/runtime" -mindepth 1 -maxdepth 1 -printf '%f\n' 
 }
 
 run_aos start
-daemon_started=1
 for _ in $(seq 1 100); do
   if run_aos status --principal operator-qa --json >"$work/status.out" 2>"$work/status.err"; then
     grep -Eq 'running|Running' "$work/status.out" && break
@@ -132,11 +303,28 @@ grep -Eq 'running|Running' "$work/status.out" || {
   echo "packaged Astrid daemon did not reach running state" >&2
   exit 1
 }
+# The running projection is the authority for the final 22-member lock and
+# grants.  `ps` is queried through the packaged CLI, never by reading an
+# untrusted manifest or synthesizing a grant set in the harness.
+capsules_json=$(run_aos ps --format json)
+python3 - "$capsules_json" <<'PY'
+import json
+import sys
+
+rows = json.loads(sys.argv[1])
+if not isinstance(rows, list) or len(rows) != 22:
+    raise SystemExit(f"expected exactly 22 ready capsules, got {len(rows) if isinstance(rows, list) else type(rows)}")
+if any(row.get("state") != "ready" for row in rows):
+    raise SystemExit("one or more Distro capsules is not ready")
+PY
+if ! find "$work/home/.aos" -type f -name 'distro.lock' -o -name 'Distro.lock' | grep -q .; then
+  echo "completed Distro Apply did not leave a durable Distro.lock" >&2
+  exit 1
+fi
 
 mountpoint="$work/mount"
 mkdir -m 0700 "$mountpoint"
 run_aos storage mount --as operator-qa --read-write "$mountpoint"
-mounted=1
 mount_fstype=$(findmnt -n -o FSTYPE --target "$mountpoint" || true)
 [[ "$mount_fstype" == fuse* ]] || {
   echo "mountpoint is not a FUSE filesystem (type=$mount_fstype)" >&2
@@ -178,7 +366,6 @@ run_aos storage sync "$mountpoint"
 await_dirty false
 
 run_aos storage unmount "$mountpoint"
-mounted=0
 if findmnt -n --target "$mountpoint" >/dev/null 2>&1; then
   echo "FUSE mount survived unmount" >&2
   exit 1
@@ -190,8 +377,21 @@ if find "$registry" -type f \( -name '*.json' -o -name '*.sock' \) -print -quit 
   echo "FUSE unmount left runtime registry/lease state" >&2
   exit 1
 fi
+daemon_pid=''
+if [[ -f "$work/home/.aos/run/system.pid" ]]; then
+  daemon_pid=$(<"$work/home/.aos/run/system.pid")
+fi
 run_aos stop
-daemon_started=0
+if [[ "$daemon_pid" =~ ^[1-9][0-9]*$ ]]; then
+  for _ in $(seq 1 100); do
+    kill -0 "$daemon_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$daemon_pid" 2>/dev/null; then
+    echo "packaged Astrid daemon remained alive after stop" >&2
+    exit 1
+  fi
+fi
 [[ "$(find "$work/home/.aos/runtime" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" == astrid.volume ]] || {
   echo "final stopped runtime is not exactly astrid.volume" >&2
   exit 1

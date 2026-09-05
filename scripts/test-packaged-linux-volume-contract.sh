@@ -17,7 +17,9 @@ for required in \
   'mapfile -d' \
   'bash scripts/test-packaged-linux-volume.sh' \
   'sudo apt-get install -y --no-install-recommends fuse3 util-linux' \
-  'test -e /dev/fuse'
+  'test -e /dev/fuse' \
+  'cargo install b3sum --locked --version "$B3SUM_VERSION"' \
+  'b3sum'
 do
   grep -Fq -- "$required" "$workflow" || {
     echo "packaged Linux volume workflow is missing: $required" >&2
@@ -27,8 +29,21 @@ done
 
 for required in \
   'expected_root=unicity-aos-2026.9.0-x86_64-unknown-linux-gnu' \
+  'REHEARSAL-ONLY-identity.json' \
+  'REHEARSAL-BLAKE3SUMS.txt' \
+  'REHEARSAL-SHA256SUMS.txt' \
+  'signed rehearsal artifact is missing identity/checksum manifest' \
+  'GITHUB_SHA' \
+  'archive identity does not bind the exact AOS workflow commit' \
   'stream.extractall(destination, filter="data")' \
+  'agent create operator-qa --group agent --yes' \
+  'agent show operator-qa --format json' \
   'distro apply --principal operator-qa --yes --offline' \
+  'Installation incomplete:' \
+  'exactly 22 ready capsules' \
+  'unsafe cleanup; preserving disposable evidence' \
+  'runner_image=' \
+  'command -v fusermount3' \
   'storage mount --as operator-qa --read-write' \
   'findmnt -n -o FSTYPE --target' \
   '/proc/self/mountinfo' \
