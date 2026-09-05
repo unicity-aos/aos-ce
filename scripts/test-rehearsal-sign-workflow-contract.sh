@@ -50,6 +50,19 @@ for scalar_binding in \
 do
   grep -Fq "$scalar_binding" "$workflow"
 done
+grep -Fq 'bash scripts/bind-rehearsal-consumed-artifacts.sh' "$workflow"
+bash -n "$repo_root/scripts/bind-rehearsal-consumed-artifacts.sh"
+grep -Fq 'print_stat' "$repo_root/scripts/bind-rehearsal-consumed-artifacts.sh"
+grep -Fq 'chmod 0755' "$repo_root/scripts/bind-rehearsal-consumed-artifacts.sh"
+bash "$repo_root/scripts/test-bind-rehearsal-consumed-artifacts.sh"
+if grep -Fq '[[ -f "$DARWIN_AOS_BINARY" && -x "$DARWIN_AOS_BINARY" ]]' "$workflow"; then
+  echo "rehearsal workflow must not assert execute bits before chmod" >&2
+  exit 1
+fi
+if grep -Fq '[[ -f "$LINUX_AOS_BINARY" && -x "$LINUX_AOS_BINARY" ]]' "$workflow"; then
+  echo "rehearsal workflow must not assert execute bits before chmod" >&2
+  exit 1
+fi
 grep -Fq 'QA_SEED_FILE="$RUNNER_TEMP/rehearsal-qa-seed"' "$workflow"
 [[ $(grep -Fc 'QA_SEED_FILE' "$workflow") -ge 4 ]]
 grep -Fq 'actions/upload-artifact@' "$workflow"
