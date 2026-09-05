@@ -103,6 +103,7 @@ jobs:
       - run: python3 scripts/test_runtime_command_surface.py
       - run: bash scripts/test-pinned-runtime-command-surface.sh
       - run: bash scripts/test-channel-workflow-contract.sh
+      - run: bash scripts/test-rehearsal-sign-workflow-contract.sh
       - run: python3 scripts/test_create_astrid_094_fixture.py
       - run: bash scripts/test-package-release.sh
       - run: bash scripts/test-install.sh

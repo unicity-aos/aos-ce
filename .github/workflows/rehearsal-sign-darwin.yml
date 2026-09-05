@@ -1,0 +1,887 @@
+name: Rehearse Darwin release signing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rehearsal-sign-darwin-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  B3SUM_VERSION: 1.8.5
+  AOS_PRODUCT_VERSION: '2026.9.0'
+  ASTRID_REPOSITORY: astrid-runtime/astrid
+  ASTRID_SOURCE_COMMIT: 3de333f1b39d41bacfb535b49d83198212bf2403
+  ASTRID_RUNTIME_VERSION: '2026.9.0'
+  ASTRID_RUNTIME_TARGET: aarch64-apple-darwin
+  LINUX_BUILD_IMAGE: docker.io/library/rust:1.95.0-bullseye@sha256:646e8ceea789b00c5cfa339816a3ed44940dbf1651dc167b78f3c0aefcae0025
+
+jobs:
+  verify-source:
+    name: Verify rehearsal source
+    runs-on: ubuntu-latest
+    outputs:
+      source-commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Bind AOS to protected main
+        id: source
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          COMMIT=$(git rev-parse 'HEAD^{commit}')
+          [[ "$COMMIT" == "${{ github.sha }}" ]]
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$COMMIT" origin/main
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+
+  prepare-rehearsal-identity:
+    name: Prepare ephemeral QA identity and overlays
+    needs: verify-source
+    runs-on: ubuntu-latest
+    outputs:
+      pubkey: ${{ steps.identity.outputs.pubkey }}
+    env:
+      SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Generate ephemeral QA identity
+        id: identity
+        env:
+          ASTRID_SOURCE_COMMIT: ${{ env.ASTRID_SOURCE_COMMIT }}
+        run: |
+          set -euo pipefail
+          QA_SEED_FILE="$RUNNER_TEMP/rehearsal-qa-seed"
+          QA_SEED=$(python3 -c 'import secrets; value=secrets.token_hex(32); assert len(value) == 64 and all(byte in "0123456789abcdef" for byte in value); print(value)')
+          PUBKEY=$(QA_SEED="$QA_SEED" ASTRID_SOURCE_COMMIT="$ASTRID_SOURCE_COMMIT" python3 - <<'PY'
+          import base64
+          import os
+          import subprocess
+
+          seed = os.environ["QA_SEED"]
+          if len(seed) != 64 or any(byte not in "0123456789abcdef" for byte in seed):
+              raise SystemExit("ephemeral QA seed is malformed")
+          private_der = bytes.fromhex("302e020100300506032b657004220420") + bytes.fromhex(seed)
+          public_der = subprocess.check_output(
+              ["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+              input=private_der,
+              stderr=subprocess.DEVNULL,
+          )
+          prefix = bytes.fromhex("302a300506032b6570032100")
+          if len(public_der) != 44 or not public_der.startswith(prefix):
+              raise SystemExit("openssl produced an unexpected Ed25519 public-key encoding")
+          encoded = base64.b64encode(public_der[len(prefix):]).decode("ascii")
+          print(f"ed25519:{encoded}")
+          PY
+          )
+          [[ "$PUBKEY" == ed25519:* ]]
+          python3 - "$QA_SEED_FILE" "$QA_SEED" <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          seed = sys.argv[2]
+          if len(seed) != 64 or any(byte not in "0123456789abcdef" for byte in seed):
+              raise SystemExit("refusing to persist a malformed QA seed")
+          descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(descriptor, "wb") as file:
+              file.write(bytes.fromhex(seed))
+              file.flush()
+              os.fsync(file.fileno())
+          PY
+          echo "pubkey=$PUBKEY" >> "$GITHUB_OUTPUT"
+      - name: Materialize exact source overlays
+        run: |
+          set -euo pipefail
+          CHECKOUT="$RUNNER_TEMP/rehearsal-source"
+          overlays="$RUNNER_TEMP/rehearsal-overlays"
+          git worktree add --detach "$CHECKOUT" "$SOURCE_COMMIT"
+          mkdir "$overlays"
+          python3 - "$CHECKOUT/release/runtime-compatibility.toml" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          lines = path.read_text(encoding="utf-8").splitlines()
+          replacements = {
+              "version": 'version = "2026.9.0"',
+              "tag": 'tag = "rehearsal-only-3de333f1b39d41bacfb535b49d83198212bf2403"',
+              "version-requirement": 'version-requirement = "=2026.9.0"',
+              "release-workflow-identity": (
+                  'release-workflow-identity = "rehearsal-only:'
+                  'unicity-aos/aos-ce/.github/workflows/rehearsal-sign-darwin.yml'
+                  '@workflow_dispatch/3de333f1b39d41bacfb535b49d83198212bf2403"'
+              ),
+              "source-commit": (
+                  'source-commit = "3de333f1b39d41bacfb535b49d83198212bf2403"'
+              ),
+              "release-metadata-available": "release-metadata-available = false",
+              "release-metadata-asset": (
+                  'release-metadata-asset = "REHEARSAL-ONLY-no-metadata"'
+              ),
+              "release-metadata-blake3": (
+                  'release-metadata-blake3 = "'
+                  + "0" * 64
+                  + '"'
+              ),
+          }
+          in_runtime = False
+          replaced = set()
+          for index, line in enumerate(lines):
+              if line == "[runtime]":
+                  in_runtime = True
+                  continue
+              if line.startswith("["):
+                  in_runtime = False
+              if not in_runtime or "=" not in line:
+                  continue
+              key = line.split("=", 1)[0].strip()
+              if key in replacements:
+                  lines[index] = replacements[key]
+                  replaced.add(key)
+          if replaced != set(replacements):
+              raise SystemExit(f"runtime overlay did not consume: {set(replacements) - replaced}")
+          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+          python3 - "$CHECKOUT/distros/community/unicity-ce/Distro.toml" \
+            "${{ steps.identity.outputs.pubkey }}" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          pubkey = sys.argv[2]
+          lines = path.read_text(encoding="utf-8").splitlines()
+          in_distro = False
+          in_signing = False
+          replaced = set()
+          for index, line in enumerate(lines):
+              if line == "[distro]":
+                  in_distro = True
+                  continue
+              if line == "[distro.signing]":
+                  in_signing = True
+                  continue
+              if line.startswith("["):
+                  in_distro = False
+                  in_signing = False
+              if "=" not in line:
+                  continue
+              key = line.split("=", 1)[0].strip()
+              if in_distro and key == "astrid-version":
+                  lines[index] = 'astrid-version = "=2026.9.0"'
+                  replaced.add("astrid-version")
+              if in_signing and key == "pubkey":
+                  lines[index] = f'pubkey = "{pubkey}"'
+                  replaced.add("pubkey")
+          if replaced != {"astrid-version", "pubkey"}:
+              raise SystemExit("distro overlay did not consume both rehearsal values")
+          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+          python3 - "$CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+          old = 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "0.10.4";'
+          new = 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "2026.9.0";'
+          if text.count(old) != 1:
+              raise SystemExit("rehearsal runtime-version overlay did not find a unique production constant")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+          install -m 0644 \
+            "$CHECKOUT/release/runtime-compatibility.toml" \
+            "$overlays/runtime-compatibility.toml"
+          install -m 0644 \
+            "$CHECKOUT/distros/community/unicity-ce/Distro.toml" \
+            "$overlays/Distro.toml"
+          install -m 0644 \
+            "$CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs" \
+            "$overlays/distro_trust.rs"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rehearsal-overlays
+          path: ${{ runner.temp }}/rehearsal-overlays/**
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rehearsal-qa-seed
+          path: ${{ runner.temp }}/rehearsal-qa-seed
+
+  build-astrid-darwin:
+    name: Build Astrid Darwin runtime
+    needs: verify-source
+    runs-on: macos-latest
+    env:
+      SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ env.ASTRID_REPOSITORY }}
+          ref: ${{ env.ASTRID_SOURCE_COMMIT }}
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          targets: ${{ env.ASTRID_RUNTIME_TARGET }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: rehearsal-astrid-${{ env.ASTRID_SOURCE_COMMIT }}-darwin
+      - name: Build the four runtime binaries
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          [[ "$VERSION" == "$ASTRID_RUNTIME_VERSION" ]]
+          cargo build --locked --release --target "$ASTRID_RUNTIME_TARGET" -p astrid
+      - name: Package the rehearsal runtime archive
+        run: |
+          root="astrid-${ASTRID_RUNTIME_VERSION}-${ASTRID_RUNTIME_TARGET}"
+          mkdir -p "$RUNNER_TEMP/runtime-stage/$root"
+          for binary in astrid astrid-daemon astrid-build astrid-emit; do
+            install -m 0755 \
+              "target/${ASTRID_RUNTIME_TARGET}/release/$binary" \
+              "$RUNNER_TEMP/runtime-stage/$root/$binary"
+          done
+          MTIME=$(git log -1 --format=%ct)
+          [[ "$MTIME" =~ ^[0-9]+$ ]]
+          python3 scripts/package_release_archive.py \
+            --root "$RUNNER_TEMP/runtime-stage/$root" \
+            --output "$RUNNER_TEMP/runtime-stage/$root.tar.gz" \
+            --mtime "$MTIME"
+          echo "ASTRID_ARCHIVE=$RUNNER_TEMP/runtime-stage/$root.tar.gz" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: astrid-${{ env.ASTRID_RUNTIME_TARGET }}
+          path: ${{ env.ASTRID_ARCHIVE }}
+
+  build-astrid-linux-gnu:
+    name: Build Astrid GNU runtime
+    needs: verify-source
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ env.ASTRID_REPOSITORY }}
+          ref: ${{ env.ASTRID_SOURCE_COMMIT }}
+          submodules: recursive
+      - name: Build against the GNU glibc 2.31 baseline
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          [[ "$VERSION" == "$ASTRID_RUNTIME_VERSION" ]]
+          SOURCE_SHA=$(git rev-parse --short=12 HEAD)
+          docker run --rm \
+            --env CARGO_TERM_COLOR=always \
+            --env SOURCE_SHA="$SOURCE_SHA" \
+            --env TARGET \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            "$LINUX_BUILD_IMAGE" \
+            bash -ceu '
+              packages=(cmake)
+              apt-get update
+              apt-get install -y --no-install-recommends "${packages[@]}"
+              git config --global --add safe.directory /workspace
+              [[ "$(git rev-parse --short=12 HEAD)" == "$SOURCE_SHA" ]]
+              cargo build \
+                --locked \
+                --release \
+                --target "$TARGET" \
+                --target-dir target/glibc-2.31 \
+                -p astrid
+            '
+      - name: Package the rehearsal runtime archive
+        run: |
+          root="astrid-${ASTRID_RUNTIME_VERSION}-${TARGET}"
+          mkdir -p "$RUNNER_TEMP/runtime-stage/$root"
+          for binary in astrid astrid-daemon astrid-build astrid-emit; do
+            install -m 0755 \
+              "target/glibc-2.31/${TARGET}/release/$binary" \
+              "$RUNNER_TEMP/runtime-stage/$root/$binary"
+          done
+          python3 scripts/check_glibc.py --max-version 2.34 \
+            "$RUNNER_TEMP/runtime-stage/$root/astrid" \
+            "$RUNNER_TEMP/runtime-stage/$root/astrid-daemon" \
+            "$RUNNER_TEMP/runtime-stage/$root/astrid-build" \
+            "$RUNNER_TEMP/runtime-stage/$root/astrid-emit"
+          MTIME=$(git log -1 --format=%ct)
+          python3 scripts/package_release_archive.py \
+            --root "$RUNNER_TEMP/runtime-stage/$root" \
+            --output "$RUNNER_TEMP/runtime-stage/$root.tar.gz" \
+            --mtime "$MTIME"
+          echo "ASTRID_ARCHIVE=$RUNNER_TEMP/runtime-stage/$root.tar.gz" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: astrid-${{ env.TARGET }}
+          path: ${{ env.ASTRID_ARCHIVE }}
+
+  build-aos-darwin-binary:
+    name: Build AOS Darwin binary
+    needs:
+      - verify-source
+      - prepare-rehearsal-identity
+    runs-on: macos-latest
+    env:
+      SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rehearsal-overlays
+          path: rehearsal-overlays
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: rehearsal-aos-${{ env.SOURCE_COMMIT }}-${{ env.TARGET }}
+      - name: Build the product binary
+        run: |
+          BUILD_CHECKOUT="$RUNNER_TEMP/aos-overlaid-source"
+          git worktree add --detach "$BUILD_CHECKOUT" "$SOURCE_COMMIT"
+          install -m 0644 \
+            rehearsal-overlays/runtime-compatibility.toml \
+            "$BUILD_CHECKOUT/release/runtime-compatibility.toml"
+          install -m 0644 \
+            rehearsal-overlays/Distro.toml \
+            "$BUILD_CHECKOUT/distros/community/unicity-ce/Distro.toml"
+          install -m 0644 \
+            rehearsal-overlays/distro_trust.rs \
+            "$BUILD_CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs"
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/unicity-aos-bootstrap/Cargo.toml", "rb"))["package"]["version"])')
+          [[ "$VERSION" == "$AOS_PRODUCT_VERSION" ]]
+          cargo build \
+            --manifest-path "$BUILD_CHECKOUT/Cargo.toml" \
+            --target-dir "$BUILD_CHECKOUT/target" \
+            --locked --release --target "$TARGET" -p unicity-aos-bootstrap
+          echo "AOS_BINARY=$BUILD_CHECKOUT/target/$TARGET/release/aos" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aos-${{ env.TARGET }}-binary
+          path: ${{ env.AOS_BINARY }}
+
+  build-aos-linux-gnu-binary:
+    name: Build AOS GNU binary
+    needs:
+      - verify-source
+      - prepare-rehearsal-identity
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rehearsal-overlays
+          path: rehearsal-overlays
+      - name: Build against the Linux release baseline
+        run: |
+          BUILD_CHECKOUT="$RUNNER_TEMP/aos-overlaid-source"
+          git worktree add --detach "$BUILD_CHECKOUT" "$SOURCE_COMMIT"
+          install -m 0644 \
+            rehearsal-overlays/runtime-compatibility.toml \
+            "$BUILD_CHECKOUT/release/runtime-compatibility.toml"
+          install -m 0644 \
+            rehearsal-overlays/Distro.toml \
+            "$BUILD_CHECKOUT/distros/community/unicity-ce/Distro.toml"
+          install -m 0644 \
+            rehearsal-overlays/distro_trust.rs \
+            "$BUILD_CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs"
+          docker run --rm \
+            --env TARGET \
+            --volume "$BUILD_CHECKOUT:/workspace" \
+            --workdir /workspace \
+            "$LINUX_BUILD_IMAGE" \
+            bash -euxo pipefail -c '
+              export CARGO_TARGET_DIR=/workspace/target/glibc-2.31
+              cargo build --locked --release --target "$TARGET" -p unicity-aos-bootstrap
+            '
+          echo "AOS_BINARY=$BUILD_CHECKOUT/target/glibc-2.31/$TARGET/release/aos" >> "$GITHUB_ENV"
+      - name: Enforce the Linux glibc compatibility ceiling
+        run: |
+          python3 scripts/check_glibc.py --max-version 2.34 \
+            "$AOS_BINARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aos-${{ env.TARGET }}-binary
+          path: ${{ env.AOS_BINARY }}
+
+  build-capsules:
+    name: Build rehearsal capsules
+    needs: [verify-source, build-astrid-linux-gnu]
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: rehearsal-aos-capsules-${{ env.SOURCE_COMMIT }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: astrid-${{ env.TARGET }}
+          path: astrid-runtime
+      - name: Build the 22 Community capsules
+        run: |
+          mapfile -d '' archives < <(
+            find astrid-runtime -maxdepth 1 -type f \
+              -name "astrid-${ASTRID_RUNTIME_VERSION}-${TARGET}.tar.gz" -print0
+          )
+          [[ ${#archives[@]} -eq 1 ]]
+          scripts/extract-runtime-tool.sh \
+            "${archives[0]}" \
+            "$ASTRID_RUNTIME_VERSION" \
+            "$TARGET" \
+            astrid-build \
+            "$RUNNER_TEMP/astrid-build"
+          scripts/build-capsule-assets.sh "$RUNNER_TEMP/astrid-build" artifacts
+          COUNT=$(find artifacts -maxdepth 1 -type f -name '*.capsule' | wc -l)
+          [[ "$COUNT" -eq 22 ]]
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aos-community-capsules
+          path: artifacts/*.capsule
+
+  compose-and-sign:
+    name: Compose and sign Darwin rehearsal
+    needs:
+      - verify-source
+      - prepare-rehearsal-identity
+      - build-astrid-darwin
+      - build-astrid-linux-gnu
+      - build-aos-darwin-binary
+      - build-aos-linux-gnu-binary
+      - build-capsules
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
+      DARWIN_TARGET: aarch64-apple-darwin
+      LINUX_TARGET: x86_64-unknown-linux-gnu
+      QA_PUBKEY: ${{ needs.prepare-rehearsal-identity.outputs.pubkey }}
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+      - name: Install pinned BLAKE3 checksum tool
+        run: cargo install b3sum --locked --version "$B3SUM_VERSION"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: astrid-${{ env.DARWIN_TARGET }}
+          path: astrid-darwin
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: astrid-${{ env.LINUX_TARGET }}
+          path: astrid-linux
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: aos-${{ env.DARWIN_TARGET }}-binary
+          path: aos-darwin-binary
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: aos-${{ env.LINUX_TARGET }}-binary
+          path: aos-linux-binary
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: aos-community-capsules
+          path: capsule-artifacts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rehearsal-overlays
+          path: rehearsal-overlays
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rehearsal-qa-seed
+          path: qa-seed-download
+      - name: Bind exact consumed artifacts
+        run: |
+          set -euo pipefail
+          DARWIN_RUNTIME_ARCHIVE="astrid-darwin/astrid-${ASTRID_RUNTIME_VERSION}-${DARWIN_TARGET}.tar.gz"
+          LINUX_RUNTIME_ARCHIVE="astrid-linux/astrid-${ASTRID_RUNTIME_VERSION}-${LINUX_TARGET}.tar.gz"
+          DARWIN_AOS_BINARY="aos-darwin-binary/aos"
+          LINUX_AOS_BINARY="aos-linux-binary/aos"
+          [[ -f "$DARWIN_RUNTIME_ARCHIVE" && -f "$LINUX_RUNTIME_ARCHIVE" ]]
+          [[ -f "$DARWIN_AOS_BINARY" && -x "$DARWIN_AOS_BINARY" ]]
+          [[ -f "$LINUX_AOS_BINARY" && -x "$LINUX_AOS_BINARY" ]]
+          chmod 0755 "$DARWIN_AOS_BINARY" "$LINUX_AOS_BINARY"
+          {
+            echo "DARWIN_RUNTIME_ARCHIVE=$DARWIN_RUNTIME_ARCHIVE"
+            echo "LINUX_RUNTIME_ARCHIVE=$LINUX_RUNTIME_ARCHIVE"
+            echo "DARWIN_AOS_BINARY=$DARWIN_AOS_BINARY"
+            echo "LINUX_AOS_BINARY=$LINUX_AOS_BINARY"
+          } >> "$GITHUB_ENV"
+      - name: Create disposable rehearsal checkout and overlays
+        run: |
+          set -euo pipefail
+          CHECKOUT="$RUNNER_TEMP/rehearsal-checkout"
+          git worktree add --detach "$CHECKOUT" "$SOURCE_COMMIT"
+          install -m 0644 \
+            rehearsal-overlays/runtime-compatibility.toml \
+            "$CHECKOUT/release/runtime-compatibility.toml"
+          install -m 0644 \
+            rehearsal-overlays/Distro.toml \
+            "$CHECKOUT/distros/community/unicity-ce/Distro.toml"
+          install -m 0644 \
+            rehearsal-overlays/distro_trust.rs \
+            "$CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs"
+          python3 - "$CHECKOUT/distros/community/unicity-ce/Distro.toml" \
+            "$CHECKOUT/crates/unicity-aos-bootstrap/src/distro_trust.rs" \
+            "$CHECKOUT/release/runtime-compatibility.toml" \
+            "$QA_PUBKEY" <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          distro_path = pathlib.Path(sys.argv[1])
+          trust_path = pathlib.Path(sys.argv[2])
+          runtime_path = pathlib.Path(sys.argv[3])
+          expected_pubkey = sys.argv[4]
+          metadata = tomllib.loads(distro_path.read_text(encoding="utf-8"))["distro"]
+          if metadata["astrid-version"] != "=2026.9.0":
+              raise SystemExit("rehearsal Distro astrid-version does not match the runtime overlay")
+          if metadata["signing"]["pubkey"] != expected_pubkey:
+              raise SystemExit("rehearsal Distro pubkey does not match the upstream identity")
+          trust = trust_path.read_text(encoding="utf-8")
+          if 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "2026.9.0";' not in trust:
+              raise SystemExit("rehearsal AOS compile overlay is missing ASTRID_RUNTIME_VERSION 2026.9.0")
+          if 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "0.10.4";' in trust:
+              raise SystemExit("rehearsal AOS compile overlay still pins ASTRID_RUNTIME_VERSION 0.10.4")
+          runtime = tomllib.loads(runtime_path.read_text(encoding="utf-8"))["runtime"]
+          if runtime["version"] != "2026.9.0":
+              raise SystemExit("rehearsal runtime-compatibility version does not match 2026.9.0")
+          PY
+          echo "REHEARSAL_CHECKOUT=$CHECKOUT" >> "$GITHUB_ENV"
+      - name: Bind private QA seed
+        run: |
+          set -euo pipefail
+          QA_SEED_FILE="$RUNNER_TEMP/rehearsal-qa-seed"
+          python3 - qa-seed-download/rehearsal-qa-seed "$QA_SEED_FILE" <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          source = pathlib.Path(sys.argv[1])
+          destination = pathlib.Path(sys.argv[2])
+          seed = source.read_bytes().hex()
+          if len(seed) != 64 or any(byte not in "0123456789abcdef" for byte in seed):
+              raise SystemExit("refusing to bind a malformed QA seed")
+          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(descriptor, "wb") as file:
+              file.write(bytes.fromhex(seed))
+              file.flush()
+              os.fsync(file.fileno())
+          source.chmod(0o000)
+          source.unlink()
+          PY
+      - name: Compose the GNU native sealer source
+        run: |
+          set -euo pipefail
+          "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py" \
+            "$LINUX_RUNTIME_ARCHIVE" \
+            "astrid-${ASTRID_RUNTIME_VERSION}-${LINUX_TARGET}" \
+            astrid astrid-daemon astrid-build astrid-emit
+          python3 scripts/capsule_release.py --artifacts capsule-artifacts
+          "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
+            "$LINUX_TARGET" \
+            "$LINUX_AOS_BINARY" \
+            "$LINUX_RUNTIME_ARCHIVE" \
+            "$(b3sum -- "$LINUX_RUNTIME_ARCHIVE" | awk '{print $1}')" \
+            capsule-artifacts \
+            linux-artifacts
+          mapfile -d '' candidates < <(
+            find linux-artifacts -maxdepth 1 -type f \
+              -name "unicity-aos-${AOS_PRODUCT_VERSION}-${LINUX_TARGET}.tar.gz" -print0
+          )
+          [[ ${#candidates[@]} -eq 1 ]]
+          sealer="$RUNNER_TEMP/aos-rehearsal-native-sealer"
+          "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
+            --extract-release-sealer "${candidates[0]}" "$sealer"
+          {
+            echo "NATIVE_SEALER=$sealer"
+            echo "NATIVE_SEALER_ARCHIVE=${candidates[0]}"
+          } >> "$GITHUB_ENV"
+      - name: Compose the Darwin candidate
+        run: |
+          set -euo pipefail
+          "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py" \
+            "$DARWIN_RUNTIME_ARCHIVE" \
+            "astrid-${ASTRID_RUNTIME_VERSION}-${DARWIN_TARGET}" \
+            astrid astrid-daemon astrid-build astrid-emit
+          python3 scripts/capsule_release.py --artifacts capsule-artifacts
+          "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
+            "$DARWIN_TARGET" \
+            "$DARWIN_AOS_BINARY" \
+            "$DARWIN_RUNTIME_ARCHIVE" \
+            "$(b3sum -- "$DARWIN_RUNTIME_ARCHIVE" | awk '{print $1}')" \
+            capsule-artifacts \
+            darwin-artifacts
+          mapfile -d '' candidates < <(
+            find darwin-artifacts -maxdepth 1 -type f \
+              -name "unicity-aos-${AOS_PRODUCT_VERSION}-${DARWIN_TARGET}.tar.gz" -print0
+          )
+          [[ ${#candidates[@]} -eq 1 ]]
+          echo "DARWIN_ARCHIVE=${candidates[0]}" >> "$GITHUB_ENV"
+      - name: Sign the Darwin rehearsal candidate
+        id: sign
+        env:
+          ASTRID_SOURCE_COMMIT: ${{ env.ASTRID_SOURCE_COMMIT }}
+        run: |
+          set -euo pipefail
+          QA_SEED_FILE="$RUNNER_TEMP/rehearsal-qa-seed"
+          write_tar_listing() {
+            local archive=$1
+            local listing=$2
+            tar -tzf "$archive" > "$listing"
+          }
+          QA_SEED=$(python3 - "$QA_SEED_FILE" <<'PY'
+          import pathlib
+          import sys
+
+          seed = pathlib.Path(sys.argv[1]).read_bytes().hex()
+          if len(seed) != 64 or any(byte not in "0123456789abcdef" for byte in seed):
+              raise SystemExit("persisted QA seed is malformed")
+          print(seed)
+          PY
+          )
+          [[ "$QA_PUBKEY" == ed25519:* ]]
+          DERIVED_PUBKEY=$(QA_SEED="$QA_SEED" python3 - <<'PY'
+          import base64
+          import os
+          import subprocess
+
+          seed = os.environ["QA_SEED"]
+          private_der = bytes.fromhex("302e020100300506032b657004220420") + bytes.fromhex(seed)
+          public_der = subprocess.check_output(
+              ["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+              input=private_der,
+              stderr=subprocess.DEVNULL,
+          )
+          prefix = bytes.fromhex("302a300506032b6570032100")
+          if len(public_der) != 44 or not public_der.startswith(prefix):
+              raise SystemExit("persisted QA seed produced an invalid public key")
+          print("ed25519:" + base64.b64encode(public_der[len(prefix):]).decode("ascii"))
+          PY
+          )
+          [[ "$DERIVED_PUBKEY" == "$QA_PUBKEY" ]]
+          signed="$RUNNER_TEMP/$(basename "$DARWIN_ARCHIVE")"
+          AOS_DISTRO_ED25519_SEED="$QA_SEED" \
+            "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
+            --sign-release-archive \
+            "$DARWIN_ARCHIVE" \
+            "$signed" \
+            "$NATIVE_SEALER" \
+            "$NATIVE_SEALER_ARCHIVE"
+          SIGNED_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-tar-listing.XXXXXX")
+          write_tar_listing "$signed" "$SIGNED_TAR_LISTING"
+          if ! grep -q '/Distro.sig$' "$SIGNED_TAR_LISTING"; then
+            echo "signed rehearsal archive has no Distro signature" >&2
+            exit 1
+          fi
+          unlink "$SIGNED_TAR_LISTING"
+          python3 - "$QA_SEED_FILE" <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          with path.open("rb+") as file:
+              file.write(b"\0" * 32)
+              file.flush()
+              os.fsync(file.fileno())
+          path.unlink()
+          PY
+          echo "SIGNED_ARCHIVE=$signed" >> "$GITHUB_ENV"
+      - name: Prove overlay-built GNU AOS accepts the signed Distro
+        run: |
+          set -euo pipefail
+          user_home="$RUNNER_TEMP/rehearsal-consume-user"
+          aos_home="$RUNNER_TEMP/rehearsal-consume-aos"
+          extract="$RUNNER_TEMP/signed-consume-extract"
+          mkdir -m 0700 "$user_home" "$aos_home" "$extract"
+          mkdir -m 0700 "$aos_home/releases"
+          release_dir="$aos_home/releases/${AOS_PRODUCT_VERSION}"
+          mkdir -m 0700 "$release_dir"
+          tar -xzf "$SIGNED_ARCHIVE" -C "$extract"
+          bundle="$extract/unicity-aos-${AOS_PRODUCT_VERSION}-${DARWIN_TARGET}"
+          for member in Distro.toml Distro.lock Distro.sig release-manifest.json
+          do
+            [[ -f "$bundle/$member" && ! -L "$bundle/$member" ]]
+            install -m 0600 "$bundle/$member" "$release_dir/$member"
+          done
+          python3 - "$release_dir" <<'PY'
+          import pathlib
+          import stat
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          for name in (
+              "Distro.toml",
+              "Distro.lock",
+              "Distro.sig",
+              "release-manifest.json",
+          ):
+              path = root / name
+              metadata = path.lstat()
+              if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                  raise SystemExit(f"{name} must be a regular file")
+              if metadata.st_mode & 0o7777 != 0o600:
+                  raise SystemExit(f"{name} must use private mode 0600")
+          PY
+          stderr="$RUNNER_TEMP/rehearsal-consume.err"
+          set +e
+          HOME="$user_home" AOS_HOME="$aos_home" \
+            "$LINUX_AOS_BINARY" distro apply --principal operator-qa --yes \
+            >"$RUNNER_TEMP/rehearsal-consume.out" 2>"$stderr"
+          status=$?
+          set -e
+          python3 - "$stderr" "$status" "$aos_home" <<'PY'
+          import pathlib
+          import sys
+
+          stderr = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          status = int(sys.argv[2])
+          home = pathlib.Path(sys.argv[3])
+          if status == 0:
+              raise SystemExit("overlay-built AOS completed Distro Apply; rehearsal probe must stop before runtime")
+          if "bundled Distro Apply verification failed" in stderr:
+              raise SystemExit("overlay-built AOS rejected the signed Distro before runtime")
+          if "failed to start bundled runtime for Distro Apply" not in stderr:
+              raise SystemExit(
+                  "overlay-built AOS did not prove verify_selected_release before runtime:\n"
+                  f"{stderr}"
+              )
+          receipt = home / "receipts" / "unicity-ce.active.json"
+          if receipt.exists():
+              raise SystemExit("rehearsal Distro probe wrote an activation receipt")
+          runtime = home / "runtime"
+          if runtime.exists():
+              raise SystemExit("rehearsal Distro probe materialized runtime state")
+          PY
+      - name: Assemble rehearsal-only evidence
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/rehearsal-darwin"
+          mkdir -p "$output"
+          cp "$SIGNED_ARCHIVE" "$output/"
+          extract="$RUNNER_TEMP/signed-extract"
+          mkdir "$extract"
+          tar -xzf "$SIGNED_ARCHIVE" -C "$extract"
+          bundle="$extract/unicity-aos-${AOS_PRODUCT_VERSION}-${DARWIN_TARGET}"
+          cp "$bundle/release-manifest.json" "$output/"
+          cp "$bundle/runtime-compatibility.toml" "$output/"
+          cp "$bundle/Distro.toml" "$output/"
+          cp "$bundle/Distro.lock" "$output/"
+          cp "$bundle/Distro.sig" "$output/"
+          cd "$output"
+          asset=$(basename "$SIGNED_ARCHIVE")
+          BLAKE3=$(b3sum -- "$asset" | awk '{print $1}')
+          SHA256=$(sha256sum -- "$asset" | awk '{print $1}')
+          {
+            echo "# REHEARSAL-ONLY digests; not publication checksums"
+            b3sum -- "$asset"
+          } > REHEARSAL-BLAKE3SUMS.txt
+          {
+            echo "# REHEARSAL-ONLY digests; not publication checksums"
+            sha256sum -- "$asset"
+          } > REHEARSAL-SHA256SUMS.txt
+          python3 - "$output/REHEARSAL-ONLY-identity.json" \
+            "$SOURCE_COMMIT" \
+            "$ASTRID_SOURCE_COMMIT" \
+            "$QA_PUBKEY" \
+            "$BLAKE3" \
+            "$SHA256" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          output, aos_commit, astrid_commit, pubkey, blake3, sha256 = sys.argv[1:]
+          identity = {
+              "schema_version": 1,
+              "scope": "REHEARSAL-ONLY",
+              "digest_scope": "REHEARSAL-ONLY",
+              "publication_allowed": False,
+              "aos": {
+                  "repository": "unicity-aos/aos-ce",
+                  "source_commit": aos_commit,
+              },
+              "astrid": {
+                  "repository": "astrid-runtime/astrid",
+                  "source_commit": astrid_commit,
+                  "runtime_version": "2026.9.0",
+                  "runtime_target": "aarch64-apple-darwin",
+              },
+              "distro_signing": {
+                  "key_scope": "ephemeral-per-run-qa",
+                  "public_key": pubkey,
+              },
+              "signed_archive_digests": {
+                  "blake3_rehearsal_only": f"blake3:{blake3}",
+                  "sha256_rehearsal_only": f"sha256:{sha256}",
+              },
+          }
+          pathlib.Path(output).write_text(
+              json.dumps(identity, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rehearsal-sign-darwin
+          path: ${{ runner.temp }}/rehearsal-darwin/**
