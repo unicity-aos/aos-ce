@@ -875,15 +875,15 @@ jobs:
           GNU_BLAKE3=$(b3sum -- "$gnu_asset" | awk '{print $1}')
           GNU_SHA256=$(sha256sum -- "$gnu_asset" | awk '{print $1}')
           {
-            echo "# REHEARSAL-ONLY digests; not publication checksums"
             b3sum -- "$darwin_asset"
             b3sum -- "$gnu_asset"
           } > REHEARSAL-BLAKE3SUMS.txt
+          b3sum --check REHEARSAL-BLAKE3SUMS.txt
           {
-            echo "# REHEARSAL-ONLY digests; not publication checksums"
             sha256sum -- "$darwin_asset"
             sha256sum -- "$gnu_asset"
           } > REHEARSAL-SHA256SUMS.txt
+          sha256sum --check REHEARSAL-SHA256SUMS.txt
           python3 - "$output/REHEARSAL-ONLY-identity.json" \
             "$SOURCE_COMMIT" \
             "$ASTRID_SOURCE_COMMIT" \
@@ -914,6 +914,10 @@ jobs:
               "schema_version": 1,
               "scope": "REHEARSAL-ONLY",
               "digest_scope": "REHEARSAL-ONLY",
+              "checksum_manifest_note": (
+                  "REHEARSAL-ONLY digests; not publication checksums. "
+                  "Checksum manifests contain machine-readable records only."
+              ),
               "publication_allowed": False,
               "aos": {
                   "repository": "unicity-aos/aos-ce",

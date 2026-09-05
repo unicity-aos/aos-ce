@@ -99,6 +99,37 @@ grep -Fq 'QA_SEED_FILE="$RUNNER_TEMP/rehearsal-qa-seed"' "$workflow"
 grep -Fq 'actions/upload-artifact@' "$workflow"
 grep -Fq 'REHEARSAL-ONLY' "$workflow"
 
+# The uploaded checksum manifest is consumed by b3sum itself. Keep the
+# manifest records-only: b3sum does not accept the explanatory comment that
+# older rehearsal output prepended. Exercise the real verifier rather than
+# relying on a text-only workflow assertion.
+checksum_fixture=$(mktemp -d "${TMPDIR:-/tmp}/rehearsal-checksum.XXXXXX")
+printf 'darwin rehearsal archive\n' > "$checksum_fixture/aarch64-apple-darwin.tar.gz"
+printf 'gnu rehearsal archive\n' > "$checksum_fixture/x86_64-unknown-linux-gnu.tar.gz"
+(
+  cd "$checksum_fixture"
+  b3sum -- aarch64-apple-darwin.tar.gz x86_64-unknown-linux-gnu.tar.gz > \
+    REHEARSAL-BLAKE3SUMS.txt
+  b3sum --check REHEARSAL-BLAKE3SUMS.txt
+)
+grep -Fq 'b3sum --check REHEARSAL-BLAKE3SUMS.txt' "$workflow"
+grep -Fq 'sha256sum --check REHEARSAL-SHA256SUMS.txt' "$workflow"
+if grep -Fq 'echo "# REHEARSAL-ONLY digests; not publication checksums"' "$workflow"; then
+  echo "rehearsal checksum manifests must contain records only; keep notes in identity JSON" >&2
+  exit 1
+fi
+
+python3 - "$workflow" <<'PY'
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+if '"checksum_manifest_note": (' not in text:
+    raise SystemExit("rehearsal identity must explain the records-only checksum scope")
+if '"Checksum manifests contain machine-readable records only."' not in text:
+    raise SystemExit("rehearsal identity must preserve the checksum format explanation")
+PY
+
 if grep -Eq '^(  )?(push|pull_request|schedule|workflow_call):' "$workflow"; then
   echo "rehearsal workflow must be dispatch-only" >&2
   exit 1
