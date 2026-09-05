@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct Fixture {
     root: PathBuf,
@@ -394,6 +394,174 @@ exit 1
     assert_eq!(
         String::from_utf8(output.stdout).expect("utf8 stop output"),
         "Unicity AOS stopped.\n"
+    );
+}
+
+#[test]
+fn inherited_exit_zero_stop_waits_for_confirmation() {
+    let fixture = Fixture::new("confirmed-zero-stop");
+    fixture.install_runtime(
+        r#"#!/bin/sh
+echo 'runtime stop complete'
+exit 0
+"#,
+    );
+
+    let ready_marker = fixture.home.join("runtime/run/system.ready");
+    fs::create_dir_all(ready_marker.parent().expect("runtime run directory"))
+        .expect("create runtime run directory");
+    fs::write(&ready_marker, []).expect("create runtime ready marker");
+    let marker_to_remove = ready_marker.clone();
+    let run_dir = fixture.home.join("runtime/run");
+    let volume = fixture.home.join("runtime/astrid.volume");
+    let shutdown = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        fs::write(&volume, b"volume-state").expect("create private runtime volume");
+        let mut permissions = fs::metadata(&volume)
+            .expect("inspect private runtime volume")
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&volume, permissions).expect("make runtime volume private");
+        fs::remove_file(marker_to_remove).expect("remove runtime ready marker");
+        fs::remove_dir_all(run_dir).expect("remove runtime run directory");
+    });
+
+    let output = fixture
+        .command()
+        .arg("stop")
+        .output()
+        .expect("run successful inherited stop");
+    shutdown.join().expect("finish runtime shutdown");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("utf8 stop output"),
+        "runtime stop complete\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!ready_marker.exists());
+    let runtime = fixture.home.join("runtime");
+    let entries: Vec<_> = fs::read_dir(&runtime)
+        .expect("read stopped runtime state")
+        .map(|entry| {
+            entry
+                .expect("read stopped runtime entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(entries, vec!["astrid.volume"]);
+}
+
+#[test]
+fn inherited_exit_zero_stop_fails_while_the_runtime_token_remains() {
+    let fixture = Fixture::new("unconfirmed-zero-stop");
+    fixture.install_runtime(
+        r#"#!/bin/sh
+echo 'runtime claimed stop complete'
+exit 0
+"#,
+    );
+
+    let token = fixture.home.join("runtime/run/system.token");
+    fs::create_dir_all(token.parent().expect("runtime run directory"))
+        .expect("create runtime run directory");
+    fs::write(&token, b"stale token").expect("create stale runtime token");
+
+    let started = Instant::now();
+    let output = fixture
+        .command()
+        .arg("stop")
+        .output()
+        .expect("run unconfirmed inherited stop");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "stop confirmation must remain bounded"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("utf8 stop output"),
+        "runtime claimed stop complete\n"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stop error");
+    assert!(stderr.contains("aos: shutdown confirmation failed:"));
+    assert!(stderr.contains("system.token"));
+    assert!(token.exists(), "confirmation must not hide a stale marker");
+}
+
+#[test]
+fn inherited_stop_preserves_the_primary_failure_before_confirmation_failure() {
+    let fixture = Fixture::new("primary-and-confirmation-failure");
+    fixture.install_runtime(
+        r#"#!/bin/sh
+echo 'primary runtime stop failure' >&2
+exit 23
+"#,
+    );
+
+    let gateway = fixture.home.join("runtime/run/mcp-gateway.ready");
+    fs::create_dir_all(gateway.parent().expect("runtime run directory"))
+        .expect("create runtime run directory");
+    fs::write(&gateway, b"stale gateway").expect("create stale gateway marker");
+
+    let output = fixture
+        .command()
+        .arg("stop")
+        .output()
+        .expect("run failed inherited stop");
+
+    assert_eq!(output.status.code(), Some(23));
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stop error");
+    let primary = stderr
+        .find("primary runtime stop failure")
+        .expect("primary failure must be retained");
+    let confirmation = stderr
+        .find("aos: shutdown confirmation failed:")
+        .expect("confirmation failure must be reported separately");
+    assert!(primary < confirmation);
+    assert!(stderr.contains("mcp-gateway.ready"));
+    assert!(
+        gateway.exists(),
+        "confirmation must not hide a stale gateway marker"
+    );
+}
+
+#[test]
+fn expected_disconnect_is_not_suppressed_when_confirmation_fails() {
+    let fixture = Fixture::new("disconnect-and-confirmation-failure");
+    fixture.install_runtime(
+        r#"#!/bin/sh
+echo 'error: connection lost waiting on astrid.v1.response.shutdown.test: connection lost: connection closed before astrid.v1.response.shutdown.test' >&2
+exit 1
+"#,
+    );
+
+    let gateway = fixture.home.join("runtime/run/mcp-gateway.sock");
+    fs::create_dir_all(gateway.parent().expect("runtime run directory"))
+        .expect("create runtime run directory");
+    fs::write(&gateway, b"stale gateway endpoint").expect("create stale gateway endpoint");
+
+    let output = fixture
+        .command()
+        .arg("stop")
+        .output()
+        .expect("run disconnected inherited stop");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stop error");
+    let disconnect = stderr
+        .find("connection lost waiting on astrid.v1.response.shutdown.test")
+        .expect("disconnect must remain visible when confirmation fails");
+    let confirmation = stderr
+        .find("aos: shutdown confirmation failed:")
+        .expect("confirmation failure must be reported separately");
+    assert!(disconnect < confirmation);
+    assert!(stderr.contains("mcp-gateway.sock"));
+    assert!(
+        gateway.exists(),
+        "confirmation must not hide a stale gateway endpoint"
     );
 }
 

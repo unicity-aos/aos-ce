@@ -532,24 +532,33 @@ fn handle_runtime_stop(args: &[OsString]) -> ExitCode {
         }
     };
 
-    if output.status.success() {
+    let expected_disconnect = expected_shutdown_disconnect(&output);
+    let confirmation = wait_for_confirmed_stop(&home);
+    if confirmation.is_ok() && (output.status.success() || expected_disconnect) {
+        if expected_disconnect {
+            if let Err(error) = std::io::stdout().write_all(&output.stdout) {
+                return runtime_output_error(error);
+            }
+            if output.stdout.is_empty() {
+                println!("Unicity AOS stopped.");
+            }
+            return ExitCode::SUCCESS;
+        }
         return emit_runtime_output(&output)
             .map_or_else(runtime_output_error, |()| ExitCode::SUCCESS);
     }
 
-    if expected_shutdown_disconnect(&output) && wait_for_confirmed_stop(&home) {
-        if let Err(error) = std::io::stdout().write_all(&output.stdout) {
-            return runtime_output_error(error);
-        }
-        if output.stdout.is_empty() {
-            println!("Unicity AOS stopped.");
-        }
-        return ExitCode::SUCCESS;
+    let output_result = emit_runtime_output(&output);
+    if let Err(error) = confirmation {
+        eprintln!("aos: shutdown confirmation failed: {error}");
     }
-
-    match emit_runtime_output(&output) {
-        Ok(()) => child_exit_code(output.status),
-        Err(error) => runtime_output_error(error),
+    if let Err(error) = output_result {
+        return runtime_output_error(error);
+    }
+    if output.status.success() {
+        ExitCode::FAILURE
+    } else {
+        child_exit_code(output.status)
     }
 }
 
@@ -562,21 +571,29 @@ fn expected_shutdown_disconnect(output: &std::process::Output) -> bool {
         && stderr.contains("connection closed before astrid.v1.response.shutdown.")
 }
 
-fn wait_for_confirmed_stop(home: &AosHome) -> bool {
+fn wait_for_confirmed_stop(home: &AosHome) -> Result<(), String> {
     const ATTEMPTS: usize = 100;
     const INTERVAL: Duration = Duration::from_millis(50);
 
+    let mut last_failure = "runtime stopped-state confirmation returned no result".to_owned();
     for attempt in 0..ATTEMPTS {
-        if unicity_aos_bootstrap::status::confirm_stopped(home)
-            .is_ok_and(|status| status.state == "stopped")
-        {
-            return true;
+        match unicity_aos_bootstrap::status::confirm_stopped(home) {
+            Ok(status) if status.state == "stopped" => return Ok(()),
+            Ok(status) => {
+                last_failure = format!(
+                    "runtime stopped-state confirmation returned '{}'",
+                    status.state
+                );
+            }
+            Err(error) => last_failure = error,
         }
         if attempt + 1 < ATTEMPTS {
             std::thread::sleep(INTERVAL);
         }
     }
-    false
+    Err(format!(
+        "runtime did not reach a confirmed stopped state within 5 seconds: {last_failure}"
+    ))
 }
 
 fn emit_runtime_output(output: &std::process::Output) -> io::Result<()> {

@@ -18,6 +18,14 @@ use crate::AosHome;
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_COMPATIBILITY: &str = include_str!("../../../release/runtime-compatibility.toml");
+const COORDINATION_MARKERS: [&str; 6] = [
+    "system.sock",
+    "system.pid",
+    "system.ready",
+    "system.token",
+    "mcp-gateway.sock",
+    "mcp-gateway.ready",
+];
 
 /// Product status derived from the typed runtime status response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -114,7 +122,7 @@ pub async fn read_for_principal(
 /// materialized runtime state is an exclusive private volume.
 pub fn confirm_stopped(home: &AosHome) -> Result<AosStatus, String> {
     let run_dir = home.runtime_home().join("run");
-    for marker in ["system.sock", "system.pid", "system.ready", "system.token"] {
+    for marker in COORDINATION_MARKERS {
         match fs::symlink_metadata(run_dir.join(marker)) {
             Ok(_) => {
                 return Err(format!(
@@ -350,6 +358,22 @@ mod tests {
 
         fs2::FileExt::unlock(&lock).expect("release runtime lock");
         fs::remove_dir_all(root).expect("remove running status fixture");
+    }
+
+    #[test]
+    fn mcp_gateway_markers_block_stopped_status() {
+        for marker in ["mcp-gateway.sock", "mcp-gateway.ready"] {
+            let root = temporary_status_home(marker);
+            let home = AosHome::from_root(&root);
+            let run_dir = home.runtime_home().join("run");
+            fs::create_dir_all(&run_dir).expect("create runtime run dir");
+            fs::write(run_dir.join(marker), []).expect("create gateway marker");
+
+            let error = confirm_stopped(&home).expect_err("gateway marker must block stopped");
+            assert!(error.contains(marker), "{marker} was not named in: {error}");
+
+            fs::remove_dir_all(root).expect("remove gateway marker fixture");
+        }
     }
 
     #[cfg(unix)]

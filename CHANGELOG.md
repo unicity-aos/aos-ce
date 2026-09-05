@@ -119,6 +119,8 @@
   `aos stop` only after every coordination marker is gone and the singleton
   lock is available; all other inherited runtime failures retain their output
   and exit status.
+- Confirm every delegated runtime shutdown before reporting success, preserving
+  child output and exit status when stopped-state confirmation fails.
 
 ### Fixed
 
