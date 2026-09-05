@@ -15,7 +15,7 @@ env:
   B3SUM_VERSION: 1.8.5
   AOS_PRODUCT_VERSION: '2026.9.0'
   ASTRID_REPOSITORY: astrid-runtime/astrid
-  ASTRID_SOURCE_COMMIT: 1897e086549ac447c6b6cc47ad264a500ebe9fcb
+  ASTRID_SOURCE_COMMIT: 220c692336aac89f035134c1399e1d91fab3b3d5
   ASTRID_RUNTIME_VERSION: '2026.9.0'
   ASTRID_RUNTIME_TARGET: aarch64-apple-darwin
   LINUX_BUILD_IMAGE: docker.io/library/rust:1.95.0-bullseye@sha256:646e8ceea789b00c5cfa339816a3ed44940dbf1651dc167b78f3c0aefcae0025
@@ -123,15 +123,15 @@ jobs:
           lines = path.read_text(encoding="utf-8").splitlines()
           replacements = {
               "version": 'version = "2026.9.0"',
-              "tag": 'tag = "rehearsal-only-1897e086549ac447c6b6cc47ad264a500ebe9fcb"',
+              "tag": 'tag = "rehearsal-only-220c692336aac89f035134c1399e1d91fab3b3d5"',
               "version-requirement": 'version-requirement = "=2026.9.0"',
               "release-workflow-identity": (
                   'release-workflow-identity = "rehearsal-only:'
                   'unicity-aos/aos-ce/.github/workflows/rehearsal-sign-darwin.yml'
-                  '@workflow_dispatch/1897e086549ac447c6b6cc47ad264a500ebe9fcb"'
+                  '@workflow_dispatch/220c692336aac89f035134c1399e1d91fab3b3d5"'
               ),
               "source-commit": (
-                  'source-commit = "1897e086549ac447c6b6cc47ad264a500ebe9fcb"'
+                  'source-commit = "220c692336aac89f035134c1399e1d91fab3b3d5"'
               ),
               "release-metadata-available": "release-metadata-available = false",
               "release-metadata-asset": (
