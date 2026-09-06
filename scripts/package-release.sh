@@ -227,16 +227,23 @@ require_native_release_sealer() {
     echo "native sealer output already exists: $output" >&2
     exit 1
   }
-  # The sealer target is bound by the operator-provided candidate filename,
-  # constrained to the supported GNU target allowlist. Archive contents can
-  # never choose the platform, root name, or a traversal path.
-  expected_target=$(printf '%s\n' "$(basename "$archive")" | sed -nE \
-    's/^unicity-aos-[0-9][0-9a-zA-Z.+_-]*-(x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)\.tar\.gz$/\1/p')
-  [[ -n "$expected_target" ]] || {
-    echo "native sealer candidate filename does not bind a supported GNU target" >&2
-    exit 1
-  }
   product_version=$(toml_value "$repo_root/crates/unicity-aos-bootstrap/Cargo.toml" package version)
+  # The sealer target is bound by the operator-provided candidate filename:
+  # a whole-string case match against the checkout's exact product version and
+  # the supported GNU targets. Archive contents can never choose the platform,
+  # root name, or a traversal path, and multiline/junk names cannot match.
+  case "$(basename "$archive")" in
+    "unicity-aos-${product_version}-x86_64-unknown-linux-gnu.tar.gz")
+      expected_target=x86_64-unknown-linux-gnu
+      ;;
+    "unicity-aos-${product_version}-aarch64-unknown-linux-gnu.tar.gz")
+      expected_target=aarch64-unknown-linux-gnu
+      ;;
+    *)
+      echo "native sealer candidate filename does not bind this checkout's version and a supported GNU target" >&2
+      exit 1
+      ;;
+  esac
   runtime_version=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime version)
   runtime_tag=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime tag)
   runtime_repository=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime repository)

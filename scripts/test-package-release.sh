@@ -623,6 +623,22 @@ PY
   fi
 done
 
+for bad_name in \
+  $'unicity-aos-2026.9.0-riscv64-unknown-elf.tar.gz\nunicity-aos-2026.9.0-x86_64-unknown-linux-gnu.tar.gz' \
+  'junk-before-unicity-aos-2026.9.0-x86_64-unknown-linux-gnu.tar.gz' \
+  'unicity-aos-0.0.1-evil-x86_64-unknown-linux-gnu.tar.gz' \
+  'unicity-aos-2026.9.0-aarch64-unknown-linux-gnu-x86_64-unknown-linux-gnu.tar.gz'
+do
+  bad_archive="$work/$bad_name"
+  cp "$fixture_archive" "$bad_archive"
+  if bash "$repo_root/scripts/package-release.sh" \
+    --extract-release-sealer "$bad_archive" "$work/bad-native-sealer" >/dev/null 2>&1; then
+    echo "release sealer extraction accepted a non-canonical candidate filename: $bad_name" >&2
+    exit 1
+  fi
+  rm -f "$work/bad-native-sealer"
+done
+
 fixture_signed="$work/fixture-aos-signed.tar.gz"
 native_sealer="$work/native-distro-sealer"
 bash "$repo_root/scripts/package-release.sh" \
