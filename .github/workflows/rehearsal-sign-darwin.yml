@@ -287,9 +287,15 @@ jobs:
     name: Build Astrid GNU runtime
     needs: verify-source
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
     env:
       SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
-      TARGET: x86_64-unknown-linux-gnu
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -313,10 +319,17 @@ jobs:
             "$LINUX_BUILD_IMAGE" \
             bash -ceu '
               packages=(cmake)
+              if [[ "$TARGET" == aarch64-unknown-linux-gnu ]]; then
+                rustup target add aarch64-unknown-linux-gnu
+                packages+=(gcc-aarch64-linux-gnu libc6-dev-arm64-cross)
+              fi
               apt-get update
               apt-get install -y --no-install-recommends "${packages[@]}"
               git config --global --add safe.directory /workspace
               [[ "$(git rev-parse --short=12 HEAD)" == "$SOURCE_SHA" ]]
+              if [[ "$TARGET" == aarch64-unknown-linux-gnu ]]; then
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+              fi
               cargo build \
                 --locked \
                 --release \
@@ -418,9 +431,15 @@ jobs:
       - verify-source
       - prepare-rehearsal-identity
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
     env:
       SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
-      TARGET: x86_64-unknown-linux-gnu
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -457,6 +476,14 @@ jobs:
             --workdir /workspace \
             "$LINUX_BUILD_IMAGE" \
             bash -euxo pipefail -c '
+              if [[ "$TARGET" == aarch64-unknown-linux-gnu ]]; then
+                rustup target add aarch64-unknown-linux-gnu
+                apt-get update
+                apt-get install -y --no-install-recommends \
+                  gcc-aarch64-linux-gnu \
+                  libc6-dev-arm64-cross
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+              fi
               export CARGO_TARGET_DIR=/workspace/target/glibc-2.31
               cargo build --locked --release --target "$TARGET" -p unicity-aos-bootstrap
             '
@@ -533,7 +560,8 @@ jobs:
     env:
       SOURCE_COMMIT: ${{ needs.verify-source.outputs.source-commit }}
       DARWIN_TARGET: aarch64-apple-darwin
-      LINUX_TARGET: x86_64-unknown-linux-gnu
+      X86_64_GNU_TARGET: x86_64-unknown-linux-gnu
+      AARCH64_GNU_TARGET: aarch64-unknown-linux-gnu
       QA_PUBKEY: ${{ needs.prepare-rehearsal-identity.outputs.pubkey }}
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -556,16 +584,24 @@ jobs:
           path: astrid-darwin
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: astrid-${{ env.LINUX_TARGET }}
-          path: astrid-linux
+          name: astrid-${{ env.X86_64_GNU_TARGET }}
+          path: astrid-x86_64-gnu
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: astrid-${{ env.AARCH64_GNU_TARGET }}
+          path: astrid-aarch64-gnu
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: aos-${{ env.DARWIN_TARGET }}-binary
           path: aos-darwin-binary
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: aos-${{ env.LINUX_TARGET }}-binary
-          path: aos-linux-binary
+          name: aos-${{ env.X86_64_GNU_TARGET }}-binary
+          path: aos-x86_64-gnu-binary
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: aos-${{ env.AARCH64_GNU_TARGET }}-binary
+          path: aos-aarch64-gnu-binary
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: aos-community-capsules
@@ -582,19 +618,25 @@ jobs:
         run: |
           set -euo pipefail
           DARWIN_RUNTIME_ARCHIVE="astrid-darwin/astrid-${ASTRID_RUNTIME_VERSION}-${DARWIN_TARGET}.tar.gz"
-          LINUX_RUNTIME_ARCHIVE="astrid-linux/astrid-${ASTRID_RUNTIME_VERSION}-${LINUX_TARGET}.tar.gz"
+          X86_64_RUNTIME_ARCHIVE="astrid-x86_64-gnu/astrid-${ASTRID_RUNTIME_VERSION}-${X86_64_GNU_TARGET}.tar.gz"
+          AARCH64_RUNTIME_ARCHIVE="astrid-aarch64-gnu/astrid-${ASTRID_RUNTIME_VERSION}-${AARCH64_GNU_TARGET}.tar.gz"
           DARWIN_AOS_BINARY="aos-darwin-binary/aos"
-          LINUX_AOS_BINARY="aos-linux-binary/aos"
+          X86_64_AOS_BINARY="aos-x86_64-gnu-binary/aos"
+          AARCH64_AOS_BINARY="aos-aarch64-gnu-binary/aos"
           bash scripts/bind-rehearsal-consumed-artifacts.sh \
             "$DARWIN_RUNTIME_ARCHIVE" \
-            "$LINUX_RUNTIME_ARCHIVE" \
+            "$X86_64_RUNTIME_ARCHIVE" \
+            "$AARCH64_RUNTIME_ARCHIVE" \
             "$DARWIN_AOS_BINARY" \
-            "$LINUX_AOS_BINARY"
+            "$X86_64_AOS_BINARY" \
+            "$AARCH64_AOS_BINARY"
           {
             echo "DARWIN_RUNTIME_ARCHIVE=$DARWIN_RUNTIME_ARCHIVE"
-            echo "LINUX_RUNTIME_ARCHIVE=$LINUX_RUNTIME_ARCHIVE"
+            echo "X86_64_RUNTIME_ARCHIVE=$X86_64_RUNTIME_ARCHIVE"
+            echo "AARCH64_RUNTIME_ARCHIVE=$AARCH64_RUNTIME_ARCHIVE"
             echo "DARWIN_AOS_BINARY=$DARWIN_AOS_BINARY"
-            echo "LINUX_AOS_BINARY=$LINUX_AOS_BINARY"
+            echo "X86_64_AOS_BINARY=$X86_64_AOS_BINARY"
+            echo "AARCH64_AOS_BINARY=$AARCH64_AOS_BINARY"
           } >> "$GITHUB_ENV"
       - name: Create disposable rehearsal checkout and overlays
         run: |
@@ -663,31 +705,53 @@ jobs:
         run: |
           set -euo pipefail
           python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py" \
-            "$LINUX_RUNTIME_ARCHIVE" \
-            "astrid-${ASTRID_RUNTIME_VERSION}-${LINUX_TARGET}" \
+            "$X86_64_RUNTIME_ARCHIVE" \
+            "astrid-${ASTRID_RUNTIME_VERSION}-${X86_64_GNU_TARGET}" \
             astrid astrid-daemon astrid-build astrid-emit \
             astrid-storage-provider-fuse
           python3 scripts/capsule_release.py --artifacts capsule-artifacts
           "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
-            "$LINUX_TARGET" \
-            "$LINUX_AOS_BINARY" \
-            "$LINUX_RUNTIME_ARCHIVE" \
-            "$(b3sum -- "$LINUX_RUNTIME_ARCHIVE" | awk '{print $1}')" \
+            "$X86_64_GNU_TARGET" \
+            "$X86_64_AOS_BINARY" \
+            "$X86_64_RUNTIME_ARCHIVE" \
+            "$(b3sum -- "$X86_64_RUNTIME_ARCHIVE" | awk '{print $1}')" \
             capsule-artifacts \
             linux-artifacts
           mapfile -d '' candidates < <(
             find linux-artifacts -maxdepth 1 -type f \
-              -name "unicity-aos-${AOS_PRODUCT_VERSION}-${LINUX_TARGET}.tar.gz" -print0
+              -name "unicity-aos-${AOS_PRODUCT_VERSION}-${X86_64_GNU_TARGET}.tar.gz" -print0
           )
           [[ ${#candidates[@]} -eq 1 ]]
           sealer="$RUNNER_TEMP/aos-rehearsal-native-sealer"
           "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
             --extract-release-sealer "${candidates[0]}" "$sealer"
           {
-            echo "LINUX_ARCHIVE=${candidates[0]}"
+            echo "X86_64_GNU_ARCHIVE=${candidates[0]}"
             echo "NATIVE_SEALER=$sealer"
             echo "NATIVE_SEALER_ARCHIVE=${candidates[0]}"
           } >> "$GITHUB_ENV"
+      - name: Compose the additional GNU candidate
+        run: |
+          set -euo pipefail
+          python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py" \
+            "$AARCH64_RUNTIME_ARCHIVE" \
+            "astrid-${ASTRID_RUNTIME_VERSION}-${AARCH64_GNU_TARGET}" \
+            astrid astrid-daemon astrid-build astrid-emit \
+            astrid-storage-provider-fuse
+          python3 scripts/capsule_release.py --artifacts capsule-artifacts
+          "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
+            "$AARCH64_GNU_TARGET" \
+            "$AARCH64_AOS_BINARY" \
+            "$AARCH64_RUNTIME_ARCHIVE" \
+            "$(b3sum -- "$AARCH64_RUNTIME_ARCHIVE" | awk '{print $1}')" \
+            capsule-artifacts \
+            aarch64-gnu-artifacts
+          mapfile -d '' candidates < <(
+            find aarch64-gnu-artifacts -maxdepth 1 -type f \
+              -name "unicity-aos-${AOS_PRODUCT_VERSION}-${AARCH64_GNU_TARGET}.tar.gz" -print0
+          )
+          [[ ${#candidates[@]} -eq 1 ]]
+          echo "AARCH64_GNU_ARCHIVE=${candidates[0]}" >> "$GITHUB_ENV"
       - name: Compose the Darwin candidate
         run: |
           set -euo pipefail
@@ -710,7 +774,7 @@ jobs:
           )
           [[ ${#candidates[@]} -eq 1 ]]
           echo "DARWIN_ARCHIVE=${candidates[0]}" >> "$GITHUB_ENV"
-      - name: Sign the Darwin and GNU rehearsal candidates
+      - name: Sign the Darwin and both GNU rehearsal candidates
         id: sign
         env:
           ASTRID_SOURCE_COMMIT: ${{ env.ASTRID_SOURCE_COMMIT }}
@@ -767,22 +831,37 @@ jobs:
             exit 1
           fi
           unlink "$SIGNED_DARWIN_TAR_LISTING"
-          signed_gnu="$RUNNER_TEMP/$(basename "$LINUX_ARCHIVE")"
+          signed_x86_gnu="$RUNNER_TEMP/$(basename "$X86_64_GNU_ARCHIVE")"
           AOS_DISTRO_ED25519_SEED="$QA_SEED" \
             "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
             --sign-release-archive \
-            "$LINUX_ARCHIVE" \
-            "$signed_gnu" \
+            "$X86_64_GNU_ARCHIVE" \
+            "$signed_x86_gnu" \
             "$NATIVE_SEALER" \
             "$NATIVE_SEALER_ARCHIVE"
-          SIGNED_GNU_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-gnu-tar-listing.XXXXXX")
-          write_tar_listing "$signed_gnu" "$SIGNED_GNU_TAR_LISTING"
-          if ! grep -q '/Distro.sig$' "$SIGNED_GNU_TAR_LISTING"; then
-            echo "signed GNU rehearsal archive has no Distro signature" >&2
+          SIGNED_X86_64_GNU_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-x86_64-gnu-tar-listing.XXXXXX")
+          write_tar_listing "$signed_x86_gnu" "$SIGNED_X86_64_GNU_TAR_LISTING"
+          if ! grep -q '/Distro.sig$' "$SIGNED_X86_64_GNU_TAR_LISTING"; then
+            echo "signed x86_64 GNU rehearsal archive has no Distro signature" >&2
             exit 1
           fi
-          unlink "$SIGNED_GNU_TAR_LISTING"
-          # Destroy the persistent QA seed only after both signed archives were verified.
+          unlink "$SIGNED_X86_64_GNU_TAR_LISTING"
+          signed_aarch64_gnu="$RUNNER_TEMP/$(basename "$AARCH64_GNU_ARCHIVE")"
+          AOS_DISTRO_ED25519_SEED="$QA_SEED" \
+            "$REHEARSAL_CHECKOUT/scripts/package-release.sh" \
+            --sign-release-archive \
+            "$AARCH64_GNU_ARCHIVE" \
+            "$signed_aarch64_gnu" \
+            "$NATIVE_SEALER" \
+            "$NATIVE_SEALER_ARCHIVE"
+          SIGNED_AARCH64_GNU_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-aarch64-gnu-tar-listing.XXXXXX")
+          write_tar_listing "$signed_aarch64_gnu" "$SIGNED_AARCH64_GNU_TAR_LISTING"
+          if ! grep -q '/Distro.sig$' "$SIGNED_AARCH64_GNU_TAR_LISTING"; then
+            echo "signed aarch64 GNU rehearsal archive has no Distro signature" >&2
+            exit 1
+          fi
+          unlink "$SIGNED_AARCH64_GNU_TAR_LISTING"
+          # Destroy the persistent QA seed only after all signed archives were verified.
           python3 - "$QA_SEED_FILE" <<'PY'
           import os
           import pathlib
@@ -796,10 +875,11 @@ jobs:
           path.unlink()
           PY
           [[ ! -e "$QA_SEED_FILE" ]]
-          echo "ephemeral QA seed destroyed after both signed archive verifications"
+          echo "ephemeral QA seed destroyed after all signed archive verifications"
           {
             echo "SIGNED_DARWIN_ARCHIVE=$signed_darwin"
-            echo "SIGNED_GNU_ARCHIVE=$signed_gnu"
+            echo "SIGNED_X86_64_GNU_ARCHIVE=$signed_x86_gnu"
+            echo "SIGNED_AARCH64_GNU_ARCHIVE=$signed_aarch64_gnu"
           } >> "$GITHUB_ENV"
       - name: Prove overlay-built GNU AOS accepts the signed Distro
         run: |
@@ -811,8 +891,8 @@ jobs:
           mkdir -m 0700 "$aos_home/releases"
           release_dir="$aos_home/releases/${AOS_PRODUCT_VERSION}"
           mkdir -m 0700 "$release_dir"
-          tar -xzf "$SIGNED_GNU_ARCHIVE" -C "$extract"
-          bundle="$extract/unicity-aos-${AOS_PRODUCT_VERSION}-${LINUX_TARGET}"
+          tar -xzf "$SIGNED_X86_64_GNU_ARCHIVE" -C "$extract"
+          bundle="$extract/unicity-aos-${AOS_PRODUCT_VERSION}-${X86_64_GNU_TARGET}"
           for member in Distro.toml Distro.lock Distro.sig release-manifest.json
           do
             [[ -f "$bundle/$member" && ! -L "$bundle/$member" ]]
@@ -840,7 +920,7 @@ jobs:
           stderr="$RUNNER_TEMP/rehearsal-consume.err"
           set +e
           HOME="$user_home" AOS_HOME="$aos_home" \
-            "$LINUX_AOS_BINARY" distro apply --principal operator-qa --yes \
+            "$X86_64_AOS_BINARY" distro apply --principal operator-qa --yes \
             >"$RUNNER_TEMP/rehearsal-consume.out" 2>"$stderr"
           status=$?
           set -e
@@ -873,39 +953,53 @@ jobs:
           output="$RUNNER_TEMP/rehearsal-darwin"
           mkdir -p "$output"
           cp "$SIGNED_DARWIN_ARCHIVE" "$output/"
-          cp "$SIGNED_GNU_ARCHIVE" "$output/"
+          cp "$SIGNED_X86_64_GNU_ARCHIVE" "$output/"
+          cp "$SIGNED_AARCH64_GNU_ARCHIVE" "$output/"
           darwin_extract="$RUNNER_TEMP/signed-darwin-extract"
-          gnu_extract="$RUNNER_TEMP/signed-gnu-extract"
-          mkdir "$darwin_extract" "$gnu_extract"
+          x86_gnu_extract="$RUNNER_TEMP/signed-x86_64-gnu-extract"
+          aarch64_gnu_extract="$RUNNER_TEMP/signed-aarch64-gnu-extract"
+          mkdir "$darwin_extract" "$x86_gnu_extract" "$aarch64_gnu_extract"
           tar -xzf "$SIGNED_DARWIN_ARCHIVE" -C "$darwin_extract"
-          tar -xzf "$SIGNED_GNU_ARCHIVE" -C "$gnu_extract"
+          tar -xzf "$SIGNED_X86_64_GNU_ARCHIVE" -C "$x86_gnu_extract"
+          tar -xzf "$SIGNED_AARCH64_GNU_ARCHIVE" -C "$aarch64_gnu_extract"
           darwin_bundle="$darwin_extract/unicity-aos-${AOS_PRODUCT_VERSION}-${DARWIN_TARGET}"
-          gnu_bundle="$gnu_extract/unicity-aos-${AOS_PRODUCT_VERSION}-${LINUX_TARGET}"
+          x86_gnu_bundle="$x86_gnu_extract/unicity-aos-${AOS_PRODUCT_VERSION}-${X86_64_GNU_TARGET}"
+          aarch64_gnu_bundle="$aarch64_gnu_extract/unicity-aos-${AOS_PRODUCT_VERSION}-${AARCH64_GNU_TARGET}"
           cp "$darwin_bundle/release-manifest.json" "$output/"
           cp "$darwin_bundle/runtime-compatibility.toml" "$output/"
           cp "$darwin_bundle/Distro.toml" "$output/"
           cp "$darwin_bundle/Distro.lock" "$output/"
           cp "$darwin_bundle/Distro.sig" "$output/"
-          cp "$gnu_bundle/release-manifest.json" "$output/release-manifest-${LINUX_TARGET}.json"
-          cp "$gnu_bundle/runtime-compatibility.toml" "$output/runtime-compatibility-${LINUX_TARGET}.toml"
-          cp "$gnu_bundle/Distro.toml" "$output/Distro-${LINUX_TARGET}.toml"
-          cp "$gnu_bundle/Distro.lock" "$output/Distro-${LINUX_TARGET}.lock"
-          cp "$gnu_bundle/Distro.sig" "$output/Distro-${LINUX_TARGET}.sig"
+          cp "$x86_gnu_bundle/release-manifest.json" "$output/release-manifest-${X86_64_GNU_TARGET}.json"
+          cp "$x86_gnu_bundle/runtime-compatibility.toml" "$output/runtime-compatibility-${X86_64_GNU_TARGET}.toml"
+          cp "$x86_gnu_bundle/Distro.toml" "$output/Distro-${X86_64_GNU_TARGET}.toml"
+          cp "$x86_gnu_bundle/Distro.lock" "$output/Distro-${X86_64_GNU_TARGET}.lock"
+          cp "$x86_gnu_bundle/Distro.sig" "$output/Distro-${X86_64_GNU_TARGET}.sig"
+          cp "$aarch64_gnu_bundle/release-manifest.json" "$output/release-manifest-${AARCH64_GNU_TARGET}.json"
+          cp "$aarch64_gnu_bundle/runtime-compatibility.toml" "$output/runtime-compatibility-${AARCH64_GNU_TARGET}.toml"
+          cp "$aarch64_gnu_bundle/Distro.toml" "$output/Distro-${AARCH64_GNU_TARGET}.toml"
+          cp "$aarch64_gnu_bundle/Distro.lock" "$output/Distro-${AARCH64_GNU_TARGET}.lock"
+          cp "$aarch64_gnu_bundle/Distro.sig" "$output/Distro-${AARCH64_GNU_TARGET}.sig"
           cd "$output"
           darwin_asset=$(basename "$SIGNED_DARWIN_ARCHIVE")
-          gnu_asset=$(basename "$SIGNED_GNU_ARCHIVE")
+          x86_gnu_asset=$(basename "$SIGNED_X86_64_GNU_ARCHIVE")
+          aarch64_gnu_asset=$(basename "$SIGNED_AARCH64_GNU_ARCHIVE")
           DARWIN_BLAKE3=$(b3sum -- "$darwin_asset" | awk '{print $1}')
           DARWIN_SHA256=$(sha256sum -- "$darwin_asset" | awk '{print $1}')
-          GNU_BLAKE3=$(b3sum -- "$gnu_asset" | awk '{print $1}')
-          GNU_SHA256=$(sha256sum -- "$gnu_asset" | awk '{print $1}')
+          X86_64_GNU_BLAKE3=$(b3sum -- "$x86_gnu_asset" | awk '{print $1}')
+          X86_64_GNU_SHA256=$(sha256sum -- "$x86_gnu_asset" | awk '{print $1}')
+          AARCH64_GNU_BLAKE3=$(b3sum -- "$aarch64_gnu_asset" | awk '{print $1}')
+          AARCH64_GNU_SHA256=$(sha256sum -- "$aarch64_gnu_asset" | awk '{print $1}')
           {
             b3sum -- "$darwin_asset"
-            b3sum -- "$gnu_asset"
+            b3sum -- "$x86_gnu_asset"
+            b3sum -- "$aarch64_gnu_asset"
           } > REHEARSAL-BLAKE3SUMS.txt
           b3sum --check REHEARSAL-BLAKE3SUMS.txt
           {
             sha256sum -- "$darwin_asset"
-            sha256sum -- "$gnu_asset"
+            sha256sum -- "$x86_gnu_asset"
+            sha256sum -- "$aarch64_gnu_asset"
           } > REHEARSAL-SHA256SUMS.txt
           sha256sum --check REHEARSAL-SHA256SUMS.txt
           python3 - "$output/REHEARSAL-ONLY-identity.json" \
@@ -915,9 +1009,12 @@ jobs:
             "$darwin_asset" \
             "$DARWIN_BLAKE3" \
             "$DARWIN_SHA256" \
-            "$gnu_asset" \
-            "$GNU_BLAKE3" \
-            "$GNU_SHA256" <<'PY'
+            "$x86_gnu_asset" \
+            "$X86_64_GNU_BLAKE3" \
+            "$X86_64_GNU_SHA256" \
+            "$aarch64_gnu_asset" \
+            "$AARCH64_GNU_BLAKE3" \
+            "$AARCH64_GNU_SHA256" <<'PY'
           import json
           import pathlib
           import sys
@@ -930,9 +1027,12 @@ jobs:
               darwin_archive,
               darwin_blake3,
               darwin_sha256,
-              gnu_archive,
-              gnu_blake3,
-              gnu_sha256,
+              x86_gnu_archive,
+              x86_gnu_blake3,
+              x86_gnu_sha256,
+              aarch64_gnu_archive,
+              aarch64_gnu_blake3,
+              aarch64_gnu_sha256,
           ) = sys.argv[1:]
           identity = {
               "schema_version": 1,
@@ -955,6 +1055,7 @@ jobs:
                   "runtime_targets": [
                       "aarch64-apple-darwin",
                       "x86_64-unknown-linux-gnu",
+                      "aarch64-unknown-linux-gnu",
                   ],
               },
               "distro_signing": {
@@ -970,9 +1071,16 @@ jobs:
                       "public_key": pubkey,
                   },
                   "x86_64-unknown-linux-gnu": {
-                      "archive": gnu_archive,
-                      "blake3_rehearsal_only": f"blake3:{gnu_blake3}",
-                      "sha256_rehearsal_only": f"sha256:{gnu_sha256}",
+                      "archive": x86_gnu_archive,
+                      "blake3_rehearsal_only": f"blake3:{x86_gnu_blake3}",
+                      "sha256_rehearsal_only": f"sha256:{x86_gnu_sha256}",
+                      "key_scope": "ephemeral-per-run-qa",
+                      "public_key": pubkey,
+                  },
+                  "aarch64-unknown-linux-gnu": {
+                      "archive": aarch64_gnu_archive,
+                      "blake3_rehearsal_only": f"blake3:{aarch64_gnu_blake3}",
+                      "sha256_rehearsal_only": f"sha256:{aarch64_gnu_sha256}",
                       "key_scope": "ephemeral-per-run-qa",
                       "public_key": pubkey,
                   },
@@ -988,9 +1096,20 @@ jobs:
           path: ${{ runner.temp }}/rehearsal-darwin/**
 
   packaged-linux-volume:
-    name: Exercise packaged GNU FUSE volume
+    name: Exercise packaged GNU FUSE volume (${{ matrix.target }})
     needs: compose-and-sign
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -1026,7 +1145,7 @@ jobs:
           set -euo pipefail
           mapfile -d '' archives < <(
             find signed-rehearsal -type f \
-              -name 'unicity-aos-2026.9.0-x86_64-unknown-linux-gnu.tar.gz' -print0
+              -name "unicity-aos-2026.9.0-${{ matrix.target }}.tar.gz" -print0
           )
           [[ ${#archives[@]} -eq 1 ]]
           archive=${archives[0]}

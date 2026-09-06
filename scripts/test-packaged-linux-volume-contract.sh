@@ -12,8 +12,15 @@ for required in \
   'packaged-linux-volume:' \
   'needs: compose-and-sign' \
   'runs-on: ubuntu-latest' \
+  'runs-on: ${{ matrix.runner }}' \
+  'strategy:' \
+  'fail-fast: false' \
+  '- x86_64-unknown-linux-gnu' \
+  '- aarch64-unknown-linux-gnu' \
+  'runner: ubuntu-latest' \
+  'runner: ubuntu-24.04-arm' \
   'name: rehearsal-sign-darwin' \
-  "-name 'unicity-aos-2026.9.0-x86_64-unknown-linux-gnu.tar.gz'" \
+  '-name "unicity-aos-2026.9.0-${{ matrix.target }}.tar.gz"' \
   'mapfile -d' \
   'bash scripts/test-packaged-linux-volume.sh' \
   'sudo apt-get install -y --no-install-recommends fuse3 util-linux' \
@@ -26,6 +33,48 @@ do
     exit 1
   }
 done
+
+python3 - "$workflow" <<'PY'
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+matches = list(re.finditer(r"(?m)^  ([A-Za-z0-9_-]+):\n", text))
+sections = {
+    match.group(1): text[match.start(): (
+        matches[index + 1].start() if index + 1 < len(matches) else len(text)
+    )]
+    for index, match in enumerate(matches)
+}
+job = sections.get("packaged-linux-volume")
+if job is None:
+    raise SystemExit("packaged Linux volume job is missing")
+
+matrix_match = re.search(r"(?ms)^    strategy:\n.*?^    steps:\n", job)
+if matrix_match is None:
+    raise SystemExit("packaged Linux volume job is not matrixed")
+matrix = matrix_match.group(0)
+for required in (
+    "fail-fast: false",
+    "target:",
+    "- x86_64-unknown-linux-gnu",
+    "- aarch64-unknown-linux-gnu",
+    "include:",
+    "- target: x86_64-unknown-linux-gnu",
+    "runner: ubuntu-latest",
+    "- target: aarch64-unknown-linux-gnu",
+    "runner: ubuntu-24.04-arm",
+):
+    if required not in matrix:
+        raise SystemExit(f"packaged Linux volume matrix is missing: {required}")
+for required in (
+    "runs-on: ${{ matrix.runner }}",
+    '-name "unicity-aos-2026.9.0-${{ matrix.target }}.tar.gz"',
+):
+    if required not in job:
+        raise SystemExit(f"packaged Linux volume job is missing: {required}")
+PY
 
 for required in \
   'x86_64) target=x86_64-unknown-linux-gnu ;;' \

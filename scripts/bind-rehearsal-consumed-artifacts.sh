@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 4 ]]; then
-  echo "usage: bind-rehearsal-consumed-artifacts.sh DARWIN_RUNTIME LINUX_RUNTIME DARWIN_AOS LINUX_AOS" >&2
+if [[ $# -ne 6 ]]; then
+  echo "usage: bind-rehearsal-consumed-artifacts.sh DARWIN_RUNTIME X86_64_GNU_RUNTIME AARCH64_GNU_RUNTIME DARWIN_AOS X86_64_GNU_AOS AARCH64_GNU_AOS" >&2
   exit 1
 fi
 
@@ -29,24 +29,34 @@ print_stat() {
 }
 
 DARWIN_RUNTIME_ARCHIVE="$1"
-LINUX_RUNTIME_ARCHIVE="$2"
-DARWIN_AOS_BINARY="$3"
-LINUX_AOS_BINARY="$4"
+X86_64_GNU_RUNTIME_ARCHIVE="$2"
+AARCH64_GNU_RUNTIME_ARCHIVE="$3"
+DARWIN_AOS_BINARY="$4"
+X86_64_GNU_AOS_BINARY="$5"
+AARCH64_GNU_AOS_BINARY="$6"
 
 require_regular_file "$DARWIN_RUNTIME_ARCHIVE"
-require_regular_file "$LINUX_RUNTIME_ARCHIVE"
+require_regular_file "$X86_64_GNU_RUNTIME_ARCHIVE"
+require_regular_file "$AARCH64_GNU_RUNTIME_ARCHIVE"
 require_regular_file "$DARWIN_AOS_BINARY"
-require_regular_file "$LINUX_AOS_BINARY"
+require_regular_file "$X86_64_GNU_AOS_BINARY"
+require_regular_file "$AARCH64_GNU_AOS_BINARY"
 echo "rehearsal consumed artifacts before chmod"
 print_stat "$DARWIN_RUNTIME_ARCHIVE"
-print_stat "$LINUX_RUNTIME_ARCHIVE"
+print_stat "$X86_64_GNU_RUNTIME_ARCHIVE"
+print_stat "$AARCH64_GNU_RUNTIME_ARCHIVE"
 print_stat "$DARWIN_AOS_BINARY"
-print_stat "$LINUX_AOS_BINARY"
-chmod 0755 "$DARWIN_AOS_BINARY" "$LINUX_AOS_BINARY"
+print_stat "$X86_64_GNU_AOS_BINARY"
+print_stat "$AARCH64_GNU_AOS_BINARY"
+chmod 0755 \
+  "$DARWIN_AOS_BINARY" \
+  "$X86_64_GNU_AOS_BINARY" \
+  "$AARCH64_GNU_AOS_BINARY"
 echo "rehearsal AOS binaries after chmod 0755"
 print_stat "$DARWIN_AOS_BINARY"
-print_stat "$LINUX_AOS_BINARY"
-if [[ ! -x "$DARWIN_AOS_BINARY" || ! -x "$LINUX_AOS_BINARY" ]]; then
+print_stat "$X86_64_GNU_AOS_BINARY"
+print_stat "$AARCH64_GNU_AOS_BINARY"
+if [[ ! -x "$DARWIN_AOS_BINARY" || ! -x "$X86_64_GNU_AOS_BINARY" || ! -x "$AARCH64_GNU_AOS_BINARY" ]]; then
   echo "rehearsal AOS binaries are not executable after chmod 0755" >&2
   exit 1
 fi
