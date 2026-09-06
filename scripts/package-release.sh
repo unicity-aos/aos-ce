@@ -215,7 +215,6 @@ PY
 require_native_release_sealer() {
   local archive=$1
   local output=$2
-  local expected_target=x86_64-unknown-linux-gnu
   local work=$3
   local extracted="$work/native-sealer-extract"
   local product_version runtime_version runtime_tag runtime_repository runtime_identity
@@ -234,7 +233,29 @@ require_native_release_sealer() {
   runtime_repository=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime repository)
   runtime_identity=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime release-workflow-identity)
   mkdir -p "$extracted"
-  extract_safe_tar "$archive" "$extracted" "unicity-aos-${product_version}-${expected_target}"
+  extract_safe_tar "$archive" "$extracted" ""
+  expected_target=$(python3 - "$extracted" "$product_version" <<'PY'
+import json
+import pathlib
+import sys
+
+root, product_version = sys.argv[1:]
+entries = list(pathlib.Path(root).iterdir())
+if len(entries) != 1 or entries[0].is_symlink() or not entries[0].is_dir():
+    raise SystemExit("native sealer archive does not contain exactly one product root")
+manifest_path = entries[0] / "release-manifest.json"
+if manifest_path.is_symlink() or not manifest_path.is_file():
+    raise SystemExit("native sealer archive is missing a regular release-manifest.json")
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"native sealer release manifest is unreadable: {error}")
+target = manifest.get("target")
+if not isinstance(target, str) or not target:
+    raise SystemExit("native sealer release manifest target is missing")
+print(target)
+PY
+)
   validate_schema_v2_membership \
     "$extracted/unicity-aos-${product_version}-${expected_target}/release-manifest.json" \
     "$extracted/unicity-aos-${product_version}-${expected_target}"
@@ -266,7 +287,7 @@ except (OSError, json.JSONDecodeError) as error:
 if manifest.get("schema_version") != 2:
     raise SystemExit("native sealer release manifest schema is not supported")
 if manifest.get("target") != target:
-    raise SystemExit("native sealer release manifest target does not match x86_64-unknown-linux-gnu")
+    raise SystemExit(f"native sealer release manifest target does not match {target}")
 if manifest.get("product", {}).get("version") != product_version:
     raise SystemExit("native sealer release manifest product version does not match the checkout")
 runtime = manifest.get("runtime")
