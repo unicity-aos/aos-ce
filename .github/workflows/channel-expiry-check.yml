@@ -18,18 +18,25 @@ jobs:
           python3 - <<'PY'
           import datetime as dt
           import urllib.request
-          import xml.etree.ElementTree as ET
 
           WARNING_DAYS = 7
           BASE = "https://github.com/unicity-aos/aos-ce/releases/download/channel-{}/channel.toml"
           now = dt.datetime.now(dt.timezone.utc)
           failures = []
+          warnings = []
+          # stable and dev gate installs and must stay fresh. Nightly is
+          # optional until its promotion pipeline actually publishes; a
+          # missing nightly warns without training operators to ignore red.
           for channel in ("stable", "dev", "nightly"):
               url = BASE.format(channel)
               try:
                   body = urllib.request.urlopen(url, timeout=30).read().decode()
               except Exception as error:
-                  failures.append(f"{channel}: channel metadata is unreachable: {error}")
+                  message = f"{channel}: channel metadata is unreachable: {error}"
+                  if channel == "nightly":
+                      warnings.append(message + " (nightly not yet published; start the nightly pipeline)")
+                  else:
+                      failures.append(message)
                   continue
               fields = dict(
                   line.split(" = ", 1)
@@ -57,6 +64,10 @@ jobs:
               print("::error::Signed channel freshness check failed")
               for failure in failures:
                   print(f"::error file=install.sh::{failure}")
+              for warning in warnings:
+                  print(f"::warning file=install.sh::{warning}")
               raise SystemExit("\n".join(failures))
+          for warning in warnings:
+              print(f"::warning file=install.sh::{warning}")
           print("All signed channels are inside their freshness windows.")
           PY
