@@ -177,7 +177,7 @@ if not isinstance(release_files, dict):
     raise SystemExit("release manifest release_files inventory is missing")
 for relative in expected_executables:
     record = release_files.get(relative)
-    if not isinstance(record, dict) or set(record) != {"blake3", "mode"}:
+    if not isinstance(record, dict) or set(record) != {"blake3", "mode", "sha256"}:
         raise SystemExit(f"release manifest executable inventory record is invalid: {relative}")
     if not isinstance(record["blake3"], str) or re.fullmatch(r"[0-9a-f]{64}", record["blake3"]) is None:
         raise SystemExit(f"release manifest executable digest is malformed: {relative}")
@@ -215,10 +215,9 @@ PY
 require_native_release_sealer() {
   local archive=$1
   local output=$2
-  local expected_target=x86_64-unknown-linux-gnu
   local work=$3
   local extracted="$work/native-sealer-extract"
-  local product_version runtime_version runtime_tag runtime_repository runtime_identity
+  local product_version runtime_version runtime_tag runtime_repository runtime_identity expected_target
 
   [[ -f "$archive" && ! -L "$archive" ]] || {
     echo "native sealer candidate is missing or not a regular file: $archive" >&2
@@ -229,6 +228,22 @@ require_native_release_sealer() {
     exit 1
   }
   product_version=$(toml_value "$repo_root/crates/unicity-aos-bootstrap/Cargo.toml" package version)
+  # The sealer target is bound by the operator-provided candidate filename:
+  # a whole-string case match against the checkout's exact product version and
+  # the supported GNU targets. Archive contents can never choose the platform,
+  # root name, or a traversal path, and multiline/junk names cannot match.
+  case "$(basename "$archive")" in
+    "unicity-aos-${product_version}-x86_64-unknown-linux-gnu.tar.gz")
+      expected_target=x86_64-unknown-linux-gnu
+      ;;
+    "unicity-aos-${product_version}-aarch64-unknown-linux-gnu.tar.gz")
+      expected_target=aarch64-unknown-linux-gnu
+      ;;
+    *)
+      echo "native sealer candidate filename does not bind this checkout's version and a supported GNU target" >&2
+      exit 1
+      ;;
+  esac
   runtime_version=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime version)
   runtime_tag=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime tag)
   runtime_repository=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime repository)
@@ -266,7 +281,7 @@ except (OSError, json.JSONDecodeError) as error:
 if manifest.get("schema_version") != 2:
     raise SystemExit("native sealer release manifest schema is not supported")
 if manifest.get("target") != target:
-    raise SystemExit("native sealer release manifest target does not match x86_64-unknown-linux-gnu")
+    raise SystemExit(f"native sealer release manifest target does not match {target}")
 if manifest.get("product", {}).get("version") != product_version:
     raise SystemExit("native sealer release manifest product version does not match the checkout")
 runtime = manifest.get("runtime")
@@ -283,7 +298,7 @@ digest = runtime["digest"]
 if not isinstance(digest, str) or re.fullmatch(r"blake3:[0-9a-f]{64}", digest) is None:
     raise SystemExit("native sealer runtime digest is malformed")
 record = manifest.get("release_files", {}).get("runtime/bin/astrid")
-if not isinstance(record, dict) or set(record) != {"blake3", "mode"}:
+if not isinstance(record, dict) or set(record) != {"blake3", "mode", "sha256"}:
     raise SystemExit("native sealer release manifest lacks an exact astrid inventory record")
 if not isinstance(record["blake3"], str) or re.fullmatch(r"[0-9a-f]{64}", record["blake3"]) is None:
     raise SystemExit("native sealer astrid inventory digest is malformed")
@@ -390,18 +405,28 @@ PY
 
 record_signed_distro_inventory() {
   local manifest=$1
-  local lock_digest signature_digest
-  lock_digest=$(b3sum -- "$(dirname "$manifest")/Distro.lock" | awk '{print $1}')
-  signature_digest=$(b3sum -- "$(dirname "$manifest")/Distro.sig" | awk '{print $1}')
-  python3 - "$manifest" "$lock_digest" "$signature_digest" <<'PY'
+  local lock_blake3 lock_sha256 signature_blake3 signature_sha256
+  lock_blake3=$(b3sum -- "$(dirname "$manifest")/Distro.lock" | awk '{print $1}')
+  lock_sha256=$(sha256sum -- "$(dirname "$manifest")/Distro.lock" | awk '{print $1}')
+  signature_blake3=$(b3sum -- "$(dirname "$manifest")/Distro.sig" | awk '{print $1}')
+  signature_sha256=$(sha256sum -- "$(dirname "$manifest")/Distro.sig" | awk '{print $1}')
+  python3 - "$manifest" "$lock_blake3" "$lock_sha256" "$signature_blake3" "$signature_sha256" <<'PY'
 import json
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
 manifest = json.loads(path.read_text(encoding="utf-8"))
-manifest["release_files"]["Distro.lock"] = {"blake3": sys.argv[2], "mode": 384}
-manifest["release_files"]["Distro.sig"] = {"blake3": sys.argv[3], "mode": 384}
+manifest["release_files"]["Distro.lock"] = {
+    "blake3": sys.argv[2],
+    "mode": 384,
+    "sha256": sys.argv[3],
+}
+manifest["release_files"]["Distro.sig"] = {
+    "blake3": sys.argv[4],
+    "mode": 384,
+    "sha256": sys.argv[5],
+}
 path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
 }
@@ -449,6 +474,7 @@ if [[ "${1:-}" == "--sign-release-archive" ]]; then
   unset seed_value
   sign_staged_distro "$archive_root" "$signing_seed" "$native_sealer"
   record_signed_distro_inventory "$archive_root/release-manifest.json"
+  chmod 0600 "$archive_root/release-manifest.json"
   mkdir -p "$(dirname "$signed_output")"
   COPYFILE_DISABLE=1 tar -czf "$work/signed.tar.gz" -C "$work/extracted" "$(basename "$archive_root")"
   mv "$work/signed.tar.gz" "$signed_output"
@@ -531,7 +557,7 @@ if [[ ! -d "$runtime_root" ]]; then
 fi
 
 install -m 0755 "$aos_binary" "$work/$root/bin/aos"
-install -m 0644 "$repo_root/install.sh" "$work/$root/libexec/install.sh"
+install -m 0600 "$repo_root/install.sh" "$work/$root/libexec/install.sh"
 for binary in "${runtime_binaries[@]}"; do
   if [[ ! -x "$runtime_root/$binary" ]]; then
     echo "runtime archive is missing $binary" >&2
@@ -541,15 +567,16 @@ for binary in "${runtime_binaries[@]}"; do
 done
 
 python3 "$repo_root/scripts/capsule_release.py" --print-assets > "$work/$root/capsule-assets.txt"
+chmod 0600 "$work/$root/capsule-assets.txt"
 while IFS= read -r capsule; do
   [[ "$capsule" =~ ^aos-[a-z0-9-]+\.capsule$ ]]
-  install -m 0644 "$capsule_artifacts/$capsule" "$work/$root/capsules/$capsule"
+  install -m 0600 "$capsule_artifacts/$capsule" "$work/$root/capsules/$capsule"
 done < "$work/$root/capsule-assets.txt"
 python3 "$repo_root/scripts/capsule_release.py" --artifacts "$work/$root/capsules"
 
-install -m 0644 "$repo_root/release/runtime-compatibility.toml" "$work/$root/runtime-compatibility.toml"
-install -m 0644 "$repo_root/distros/community/unicity-ce/Distro.toml" "$work/$root/Distro.toml"
-install -m 0644 "$repo_root/README.md" "$work/$root/README.md"
+install -m 0600 "$repo_root/release/runtime-compatibility.toml" "$work/$root/runtime-compatibility.toml"
+install -m 0600 "$repo_root/distros/community/unicity-ce/Distro.toml" "$work/$root/Distro.toml"
+install -m 0600 "$repo_root/README.md" "$work/$root/README.md"
 
 distro_signing=no
 if [[ -n "${AOS_DISTRO_ED25519_SEED:-}" ]]; then
@@ -562,9 +589,12 @@ release_inventory="$work/release-files.tsv"
 record_release_file() {
   local relative=$1
   local mode=$2
-  local digest
-  digest=$(b3sum -- "$work/$root/$relative")
-  printf '%s\t%s\t%s\n' "$relative" "$mode" "$(awk '{print $1}' <<<"$digest")" \
+  local blake3_digest sha256_digest
+  blake3_digest=$(b3sum -- "$work/$root/$relative")
+  sha256_digest=$(sha256sum -- "$work/$root/$relative")
+  printf '%s\t%s\t%s\t%s\n' "$relative" "$mode" \
+    "$(awk '{print $1}' <<<"$blake3_digest")" \
+    "$(awk '{print $1}' <<<"$sha256_digest")" \
     >> "$release_inventory"
 }
 record_release_file bin/aos 755
@@ -593,8 +623,12 @@ path, capsule_list, inventory_path, product, target, runtime_repo, runtime, tag,
 capsules = pathlib.Path(capsule_list).read_text(encoding="utf-8").splitlines()
 release_files = {}
 for line in pathlib.Path(inventory_path).read_text(encoding="utf-8").splitlines():
-    relative, mode, file_digest = line.split("\t")
-    release_files[relative] = {"blake3": file_digest, "mode": int(mode, 8)}
+    relative, mode, blake3_digest, sha256_digest = line.split("\t")
+    release_files[relative] = {
+        "blake3": blake3_digest,
+        "mode": int(mode, 8),
+        "sha256": sha256_digest,
+    }
 runtime_executables = [
     "bin/aos",
     "runtime/bin/astrid",
@@ -662,6 +696,7 @@ pathlib.Path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="u
 PY
 
 validate_schema_v2_membership "$work/$root/release-manifest.json" "$work/$root"
+chmod 0600 "$work/$root/release-manifest.json"
 
 tar -czf "$output_dir/$asset" -C "$work" "$root"
 echo "$output_dir/$asset"

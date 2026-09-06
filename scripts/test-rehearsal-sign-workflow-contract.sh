@@ -3,8 +3,14 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 workflow="$repo_root/.github/workflows/rehearsal-sign-darwin.yml"
+rehearsal_cargo="$repo_root/.github/rehearsal/astrid-4fe0cfd64aac7f7d0a8a88284f887ef2788d7a94"
 
 [[ -f "$workflow" ]]
+[[ -f "$rehearsal_cargo/Cargo.toml" && -f "$rehearsal_cargo/Cargo.lock" ]]
+for dependency in astrid-core astrid-crypto astrid-types astrid-uplink; do
+  grep -Fq "$dependency = { git = \"https://github.com/astrid-runtime/astrid.git\", rev = \"4fe0cfd64aac7f7d0a8a88284f887ef2788d7a94\"" \
+    "$rehearsal_cargo/Cargo.toml"
+done
 bash -n "$repo_root/scripts/test-rehearsal-sign-workflow-contract.sh"
 grep -Fq 'sealer_pubkey_equals_manifest' "$repo_root/scripts/package-release.sh"
 grep -Fq 'if [[ "$sealed" != "$declared" ]]; then' "$repo_root/scripts/package-release.sh"
@@ -195,6 +201,8 @@ if "$overlays/Distro.toml" not in identity:
     raise SystemExit("identity job must publish Distro.toml")
 if "$overlays/distro_trust.rs" not in identity:
     raise SystemExit("identity job must publish the ASTRID_RUNTIME_VERSION overlay")
+if "$overlays/Cargo.toml" not in identity or "$overlays/Cargo.lock" not in identity:
+    raise SystemExit("identity job must publish the exact Astrid client dependency overlay")
 if 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "0.10.4";' not in identity:
     raise SystemExit("identity job must bind the production ASTRID_RUNTIME_VERSION constant")
 if 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "2026.9.0";' not in identity:
@@ -229,6 +237,8 @@ for job_name in ("build-aos-darwin-binary", "build-aos-linux-gnu-binary"):
         "rehearsal-overlays/runtime-compatibility.toml",
         "rehearsal-overlays/Distro.toml",
         "rehearsal-overlays/distro_trust.rs",
+        "rehearsal-overlays/Cargo.toml",
+        "rehearsal-overlays/Cargo.lock",
         "cargo build",
     ):
         if marker not in job:
@@ -238,9 +248,11 @@ for job_name in ("build-aos-darwin-binary", "build-aos-linux-gnu-binary"):
         < job.index("rehearsal-overlays/runtime-compatibility.toml")
         < job.index("rehearsal-overlays/Distro.toml")
         < job.index("rehearsal-overlays/distro_trust.rs")
+        < job.index("rehearsal-overlays/Cargo.toml")
+        < job.index("rehearsal-overlays/Cargo.lock")
         < job.index("cargo build")
     ):
-        raise SystemExit(f"{job_name} must install runtime, Distro, and ASTRID_RUNTIME_VERSION overlays before compiling AOS")
+        raise SystemExit(f"{job_name} must install runtime, Distro, Astrid client, and ASTRID_RUNTIME_VERSION overlays before compiling AOS")
 
 compose = sections.get("compose-and-sign")
 if compose is None:

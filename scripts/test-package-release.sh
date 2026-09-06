@@ -342,6 +342,10 @@ assert set(manifest["release_files"]) == expected_inventory, (
 assert manifest["release_files"]["bin/aos"]["mode"] == 0o755
 assert manifest["release_files"]["libexec/install.sh"]["mode"] == 0o600
 assert manifest["release_files"]["runtime/bin/astrid-daemon"]["mode"] == 0o755
+assert all(
+    set(record) == {"blake3", "mode", "sha256"}
+    for record in manifest["release_files"].values()
+)
 assert all(manifest["release_files"][path]["mode"] == 0o755 for path in expected_executables)
 assert manifest["runtime"]["version"] == runtime_version
 assert manifest["runtime"]["digest"] == "blake3:" + "0" * 64
@@ -464,6 +468,9 @@ record = manifest["release_files"][provider]
 assert record == {
     "blake3": subprocess.check_output(["b3sum", "--", str(provider_path)], text=True).split()[0],
     "mode": 0o755,
+    "sha256": subprocess.check_output(
+        ["sha256sum", "--", str(provider_path)], text=True
+    ).split()[0],
 }
 PY
 
@@ -575,7 +582,7 @@ if source.count(official) != 1:
 pathlib.Path(sys.argv[2]).write_text(source.replace(official, fixture), encoding="utf-8")
 PY
 cp "$fixture_distro" "$bundle_root/Distro.toml"
-fixture_archive="$work/fixture-aos.tar.gz"
+fixture_archive="$work/unicity-aos-2026.9.0-x86_64-unknown-linux-gnu.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$fixture_archive" -C "$work" "$(basename "$bundle_root")"
 
 membership_mutations="$work/membership-mutations"
@@ -607,13 +614,29 @@ else:
     raise SystemExit(f"unknown mutation: {mutation}")
 pathlib.Path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
-  mutation_archive="$mutation_dir/$mutation.tar.gz"
+  mutation_archive="$mutation_dir/unicity-aos-2026.9.0-x86_64-unknown-linux-gnu.tar.gz"
   COPYFILE_DISABLE=1 tar -czf "$mutation_archive" -C "$mutation_dir" "$(basename "$mutation_root")"
   if bash "$repo_root/scripts/package-release.sh" \
     --extract-release-sealer "$mutation_archive" "$mutation_dir/native-sealer" >/dev/null 2>&1; then
     echo "release sealer extraction accepted the $mutation manifest mutation" >&2
     exit 1
   fi
+done
+
+for bad_name in \
+  $'unicity-aos-2026.9.0-riscv64-unknown-elf.tar.gz\nunicity-aos-2026.9.0-x86_64-unknown-linux-gnu.tar.gz' \
+  'junk-before-unicity-aos-2026.9.0-x86_64-unknown-linux-gnu.tar.gz' \
+  'unicity-aos-0.0.1-evil-x86_64-unknown-linux-gnu.tar.gz' \
+  'unicity-aos-2026.9.0-aarch64-unknown-linux-gnu-x86_64-unknown-linux-gnu.tar.gz'
+do
+  bad_archive="$work/$bad_name"
+  cp "$fixture_archive" "$bad_archive"
+  if bash "$repo_root/scripts/package-release.sh" \
+    --extract-release-sealer "$bad_archive" "$work/bad-native-sealer" >/dev/null 2>&1; then
+    echo "release sealer extraction accepted a non-canonical candidate filename: $bad_name" >&2
+    exit 1
+  fi
+  rm -f "$work/bad-native-sealer"
 done
 
 fixture_signed="$work/fixture-aos-signed.tar.gz"
