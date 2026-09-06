@@ -81,7 +81,15 @@ mkdir -m 0700 "$work/home" "$work/extract"
   printf 'fusermount3_mode=%s\n' "$(stat -c '%a' "$fusermount3" 2>/dev/null || stat -f '%Lp' "$fusermount3")"
   "$fusermount3" --version 2>&1 || true
 } | tee "$work/runner-fuse.txt"
-expected_root=unicity-aos-2026.9.0-x86_64-unknown-linux-gnu
+case "$(uname -m)" in
+  x86_64) target=x86_64-unknown-linux-gnu ;;
+  aarch64) target=aarch64-unknown-linux-gnu ;;
+  *)
+    echo "unsupported packaged-volume architecture: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+expected_root=unicity-aos-2026.9.0-${target}
 # Bind the exact package bytes to the REHEARSAL-ONLY identity and checksum
 # manifests emitted by compose-and-sign.  Downloading an artifact is not an
 # identity check: reject renamed archives, mismatched hashes, and malformed
@@ -96,7 +104,7 @@ for manifest in "$identity" "$blake_manifest" "$sha_manifest"; do
     exit 1
   }
 done
-python3 - "$identity" "$blake_manifest" "$sha_manifest" "$archive" <<'PY'
+REHEARSAL_TARGET=$target python3 - "$identity" "$blake_manifest" "$sha_manifest" "$archive" <<'PY'
 import hashlib
 import json
 import os
@@ -105,6 +113,7 @@ import subprocess
 import sys
 
 identity_path, blake_path, sha_path, archive = map(pathlib.Path, sys.argv[1:])
+target = os.environ["REHEARSAL_TARGET"]
 name = archive.name
 identity = json.loads(identity_path.read_text(encoding="utf-8"))
 if identity.get("scope") != "REHEARSAL-ONLY" or identity.get("publication_allowed") is not False:
@@ -112,7 +121,7 @@ if identity.get("scope") != "REHEARSAL-ONLY" or identity.get("publication_allowe
 expected_source = os.environ.get("GITHUB_SHA", "")
 if expected_source and identity.get("aos", {}).get("source_commit") != expected_source:
     raise SystemExit("archive identity does not bind the exact AOS workflow commit")
-record = identity.get("signed_archive_digests", {}).get("x86_64-unknown-linux-gnu")
+record = identity.get("signed_archive_digests", {}).get(target)
 if not isinstance(record, dict) or record.get("archive") != name:
     raise SystemExit("archive name does not match the signed rehearsal identity")
 expected_blake = record.get("blake3_rehearsal_only", "")

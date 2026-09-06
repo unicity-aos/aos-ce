@@ -28,7 +28,10 @@ do
 done
 
 for required in \
-  'expected_root=unicity-aos-2026.9.0-x86_64-unknown-linux-gnu' \
+  'x86_64) target=x86_64-unknown-linux-gnu ;;' \
+  'aarch64) target=aarch64-unknown-linux-gnu ;;' \
+  'expected_root=unicity-aos-2026.9.0-${target}' \
+  'REHEARSAL_TARGET=$target' \
   'REHEARSAL-ONLY-identity.json' \
   'REHEARSAL-BLAKE3SUMS.txt' \
   'REHEARSAL-SHA256SUMS.txt' \
