@@ -217,7 +217,7 @@ require_native_release_sealer() {
   local output=$2
   local work=$3
   local extracted="$work/native-sealer-extract"
-  local product_version runtime_version runtime_tag runtime_repository runtime_identity
+  local product_version runtime_version runtime_tag runtime_repository runtime_identity expected_target
 
   [[ -f "$archive" && ! -L "$archive" ]] || {
     echo "native sealer candidate is missing or not a regular file: $archive" >&2
@@ -227,35 +227,22 @@ require_native_release_sealer() {
     echo "native sealer output already exists: $output" >&2
     exit 1
   }
+  # The sealer target is bound by the operator-provided candidate filename,
+  # constrained to the supported GNU target allowlist. Archive contents can
+  # never choose the platform, root name, or a traversal path.
+  expected_target=$(printf '%s\n' "$(basename "$archive")" | sed -nE \
+    's/^unicity-aos-[0-9][0-9a-zA-Z.+_-]*-(x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)\.tar\.gz$/\1/p')
+  [[ -n "$expected_target" ]] || {
+    echo "native sealer candidate filename does not bind a supported GNU target" >&2
+    exit 1
+  }
   product_version=$(toml_value "$repo_root/crates/unicity-aos-bootstrap/Cargo.toml" package version)
   runtime_version=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime version)
   runtime_tag=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime tag)
   runtime_repository=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime repository)
   runtime_identity=$(toml_value "$repo_root/release/runtime-compatibility.toml" runtime release-workflow-identity)
   mkdir -p "$extracted"
-  extract_safe_tar "$archive" "$extracted" ""
-  expected_target=$(python3 - "$extracted" "$product_version" <<'PY'
-import json
-import pathlib
-import sys
-
-root, product_version = sys.argv[1:]
-entries = list(pathlib.Path(root).iterdir())
-if len(entries) != 1 or entries[0].is_symlink() or not entries[0].is_dir():
-    raise SystemExit("native sealer archive does not contain exactly one product root")
-manifest_path = entries[0] / "release-manifest.json"
-if manifest_path.is_symlink() or not manifest_path.is_file():
-    raise SystemExit("native sealer archive is missing a regular release-manifest.json")
-try:
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-except (OSError, json.JSONDecodeError) as error:
-    raise SystemExit(f"native sealer release manifest is unreadable: {error}")
-target = manifest.get("target")
-if not isinstance(target, str) or not target:
-    raise SystemExit("native sealer release manifest target is missing")
-print(target)
-PY
-)
+  extract_safe_tar "$archive" "$extracted" "unicity-aos-${product_version}-${expected_target}"
   validate_schema_v2_membership \
     "$extracted/unicity-aos-${product_version}-${expected_target}/release-manifest.json" \
     "$extracted/unicity-aos-${product_version}-${expected_target}"

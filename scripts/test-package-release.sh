@@ -582,7 +582,7 @@ if source.count(official) != 1:
 pathlib.Path(sys.argv[2]).write_text(source.replace(official, fixture), encoding="utf-8")
 PY
 cp "$fixture_distro" "$bundle_root/Distro.toml"
-fixture_archive="$work/fixture-aos.tar.gz"
+fixture_archive="$work/unicity-aos-2026.9.0-x86_64-unknown-linux-gnu.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$fixture_archive" -C "$work" "$(basename "$bundle_root")"
 
 membership_mutations="$work/membership-mutations"
@@ -614,7 +614,7 @@ else:
     raise SystemExit(f"unknown mutation: {mutation}")
 pathlib.Path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
-  mutation_archive="$mutation_dir/$mutation.tar.gz"
+  mutation_archive="$mutation_dir/unicity-aos-2026.9.0-x86_64-unknown-linux-gnu.tar.gz"
   COPYFILE_DISABLE=1 tar -czf "$mutation_archive" -C "$mutation_dir" "$(basename "$mutation_root")"
   if bash "$repo_root/scripts/package-release.sh" \
     --extract-release-sealer "$mutation_archive" "$mutation_dir/native-sealer" >/dev/null 2>&1; then
