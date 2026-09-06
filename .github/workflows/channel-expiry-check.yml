@@ -1,0 +1,62 @@
+name: Check channel freshness
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Warn before signed channels expire
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check expires-at on every published channel
+        run: |
+          python3 - <<'PY'
+          import datetime as dt
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          WARNING_DAYS = 7
+          BASE = "https://github.com/unicity-aos/aos-ce/releases/download/channel-{}/channel.toml"
+          now = dt.datetime.now(dt.timezone.utc)
+          failures = []
+          for channel in ("stable", "dev", "nightly"):
+              url = BASE.format(channel)
+              try:
+                  body = urllib.request.urlopen(url, timeout=30).read().decode()
+              except Exception as error:
+                  failures.append(f"{channel}: channel metadata is unreachable: {error}")
+                  continue
+              fields = dict(
+                  line.split(" = ", 1)
+                  for line in body.splitlines()
+                  if " = " in line and not line.startswith("[")
+              )
+              expires = fields.get("expires-at", "").strip('"')
+              try:
+                  expiry = dt.datetime.strptime(expires, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+              except ValueError:
+                  failures.append(f"{channel}: expires-at is missing or malformed: {expires!r}")
+                  continue
+              remaining = (expiry - now).total_seconds() / 86400
+              if remaining <= 0:
+                  failures.append(
+                      f"{channel}: EXPIRED {abs(remaining):.1f} days ago ({expires}). "
+                      "Run the 'Promote AOS channel' workflow now; this is anti-rollback protection, not a bug."
+                  )
+              elif remaining <= WARNING_DAYS:
+                  failures.append(
+                      f"{channel}: expires in {remaining:.1f} days ({expires}). "
+                      "Re-run 'Promote AOS channel' before it lapses."
+                  )
+          if failures:
+              print("::error::Signed channel freshness check failed")
+              for failure in failures:
+                  print(f"::error file=install.sh::{failure}")
+              raise SystemExit("\n".join(failures))
+          print("All signed channels are inside their freshness windows.")
+          PY
