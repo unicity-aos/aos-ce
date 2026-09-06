@@ -459,6 +459,7 @@ if [[ "${1:-}" == "--sign-release-archive" ]]; then
   unset seed_value
   sign_staged_distro "$archive_root" "$signing_seed" "$native_sealer"
   record_signed_distro_inventory "$archive_root/release-manifest.json"
+  chmod 0600 "$archive_root/release-manifest.json"
   mkdir -p "$(dirname "$signed_output")"
   COPYFILE_DISABLE=1 tar -czf "$work/signed.tar.gz" -C "$work/extracted" "$(basename "$archive_root")"
   mv "$work/signed.tar.gz" "$signed_output"
@@ -541,7 +542,7 @@ if [[ ! -d "$runtime_root" ]]; then
 fi
 
 install -m 0755 "$aos_binary" "$work/$root/bin/aos"
-install -m 0644 "$repo_root/install.sh" "$work/$root/libexec/install.sh"
+install -m 0600 "$repo_root/install.sh" "$work/$root/libexec/install.sh"
 for binary in "${runtime_binaries[@]}"; do
   if [[ ! -x "$runtime_root/$binary" ]]; then
     echo "runtime archive is missing $binary" >&2
@@ -551,15 +552,16 @@ for binary in "${runtime_binaries[@]}"; do
 done
 
 python3 "$repo_root/scripts/capsule_release.py" --print-assets > "$work/$root/capsule-assets.txt"
+chmod 0600 "$work/$root/capsule-assets.txt"
 while IFS= read -r capsule; do
   [[ "$capsule" =~ ^aos-[a-z0-9-]+\.capsule$ ]]
-  install -m 0644 "$capsule_artifacts/$capsule" "$work/$root/capsules/$capsule"
+  install -m 0600 "$capsule_artifacts/$capsule" "$work/$root/capsules/$capsule"
 done < "$work/$root/capsule-assets.txt"
 python3 "$repo_root/scripts/capsule_release.py" --artifacts "$work/$root/capsules"
 
-install -m 0644 "$repo_root/release/runtime-compatibility.toml" "$work/$root/runtime-compatibility.toml"
-install -m 0644 "$repo_root/distros/community/unicity-ce/Distro.toml" "$work/$root/Distro.toml"
-install -m 0644 "$repo_root/README.md" "$work/$root/README.md"
+install -m 0600 "$repo_root/release/runtime-compatibility.toml" "$work/$root/runtime-compatibility.toml"
+install -m 0600 "$repo_root/distros/community/unicity-ce/Distro.toml" "$work/$root/Distro.toml"
+install -m 0600 "$repo_root/README.md" "$work/$root/README.md"
 
 distro_signing=no
 if [[ -n "${AOS_DISTRO_ED25519_SEED:-}" ]]; then
@@ -679,6 +681,7 @@ pathlib.Path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="u
 PY
 
 validate_schema_v2_membership "$work/$root/release-manifest.json" "$work/$root"
+chmod 0600 "$work/$root/release-manifest.json"
 
 tar -czf "$output_dir/$asset" -C "$work" "$root"
 echo "$output_dir/$asset"

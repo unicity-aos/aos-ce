@@ -57,7 +57,7 @@ cleanup() {
     if [[ -f "$work/home/.aos/run/system.pid" ]]; then
       pid=$(<"$work/home/.aos/run/system.pid")
     fi
-    run_aos stop >/dev/null 2>&1 || true
+    run_default stop >/dev/null 2>&1 || true
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null && unsafe=1
   fi
   if (( unsafe )); then
@@ -203,7 +203,6 @@ run_default() {
     "$aos" --principal default "$@"
 }
 active_receipt="$work/home/.aos/receipts/unicity-ce.active.json"
-runtime_distro_lock="$work/home/.aos/runtime/home/operator-qa/.config/distro.lock"
 mount_is_active() {
   [[ -n "${mountpoint:-}" ]] && findmnt -n --mountpoint "$mountpoint" >/dev/null 2>&1
 }
@@ -240,7 +239,9 @@ apply_succeeded=0
 for pass in 1 2 3; do
   apply_output="$work/distro-apply-${pass}.log"
   set +e
-  run_aos distro apply --principal operator-qa --yes --offline >"$apply_output" 2>&1
+  HOME="$work/home" AOS_HOME="$work/home/.aos" \
+    ASTRID_PRINCIPAL=default ASTRID_VAR_OPENAI_API_KEY=release-gate-not-a-real-key \
+    "$aos" distro apply --principal operator-qa --yes --offline >"$apply_output" 2>&1
   apply_status=$?
   set -e
   if (( apply_status == 0 )); then
@@ -253,15 +254,19 @@ for pass in 1 2 3; do
     exit "$apply_status"
   fi
   # Sealed release/Distro.lock is package input, not installation progress.
-  # Probe the exact principal runtime lock and completion receipt instead.
-  if [[ -e "$runtime_distro_lock" || -L "$runtime_distro_lock" ]]; then
-    echo "partial Distro Apply wrote a lock; refusing to retry" >&2
-    exit 1
-  fi
+  # The runtime lock is daemon-owned KV; Apply's successful self-grant is
+  # gated on that fresh lock, and `ps` below proves the 22 ready members.
+  # A partial pass must still leave no activation receipt.
   [[ ! -e "$active_receipt" && ! -L "$active_receipt" ]] || {
     echo "partial Distro Apply wrote an activation receipt" >&2
     exit 1
   }
+  # InstallCapsule is limited to ten requests per minute. The documented
+  # 10+10+2 convergence therefore requires spacing partial passes by a full
+  # limiter window; an immediate retry stays inside the same window.
+  if (( pass < 3 )); then
+    sleep 61
+  fi
 done
 (( apply_succeeded == 1 )) || {
   echo "Distro Apply did not converge after the bounded 10+10+2 passes" >&2
@@ -300,7 +305,7 @@ entries=$(find "$work/home/.aos/runtime" -mindepth 1 -maxdepth 1 -printf '%f\n' 
 
 run_aos start
 for _ in $(seq 1 100); do
-  if run_aos status --principal operator-qa --json >"$work/status.out" 2>"$work/status.err"; then
+  if run_default status --json >"$work/status.out" 2>"$work/status.err"; then
     grep -Eq 'running|Running' "$work/status.out" && break
   fi
   sleep 0.1
@@ -324,10 +329,9 @@ if not isinstance(rows, list) or len(rows) != 22:
 if any(row.get("state") != "ready" for row in rows):
     raise SystemExit("one or more Distro capsules is not ready")
 PY
-if [[ ! -f "$runtime_distro_lock" || -L "$runtime_distro_lock" ]]; then
-  echo "completed Distro Apply did not leave a durable Distro.lock" >&2
-  exit 1
-fi
+# The durable Distro.lock lives in the daemon's principal-scoped control KV.
+# Apply's successful self-grant already required that fresh lock; the `ps`
+# projection below re-verifies all 22 locked capsules are ready.
 
 mountpoint="$work/mount"
 mkdir -m 0700 "$mountpoint"
@@ -388,7 +392,7 @@ daemon_pid=''
 if [[ -f "$work/home/.aos/run/system.pid" ]]; then
   daemon_pid=$(<"$work/home/.aos/run/system.pid")
 fi
-run_aos stop
+run_default stop
 if [[ "$daemon_pid" =~ ^[1-9][0-9]*$ ]]; then
   for _ in $(seq 1 100); do
     kill -0 "$daemon_pid" 2>/dev/null || break

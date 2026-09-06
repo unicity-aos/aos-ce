@@ -42,7 +42,10 @@ for required in \
   'Installation incomplete:' \
   'for pass in 1 2 3; do' \
   'active_receipt="$work/home/.aos/receipts/unicity-ce.active.json"' \
-  'runtime_distro_lock="$work/home/.aos/runtime/home/operator-qa/.config/distro.lock"' \
+  'ASTRID_PRINCIPAL=default ASTRID_VAR_OPENAI_API_KEY=' \
+  'sleep 61' \
+  'run_default status --json' \
+  'run_default stop' \
   'exactly 22 ready capsules' \
   'unsafe cleanup; preserving disposable evidence' \
   'runner_image=' \
