@@ -28,30 +28,34 @@ grep -Fq 'ASTRID_RUNTIME_TARGET: aarch64-apple-darwin' "$workflow"
 grep -Fq 'submodules: recursive' "$workflow"
 grep -Fq -- '--extract-release-sealer' "$workflow"
 grep -Fq -- '--sign-release-archive' "$workflow"
-if [[ $(grep -Fc -- '--sign-release-archive' "$workflow") -ne 2 ]]; then
-  echo "rehearsal workflow must sign exactly one Darwin and one GNU archive" >&2
+if [[ $(grep -Fc -- '--sign-release-archive' "$workflow") -ne 3 ]]; then
+  echo "rehearsal workflow must sign exactly one Darwin and two GNU archives" >&2
   exit 1
 fi
-if [[ $(grep -Fc 'AOS_DISTRO_ED25519_SEED="$QA_SEED"' "$workflow") -ne 2 ]]; then
-  echo "Darwin and GNU rehearsal archives must share one ephemeral QA seed" >&2
+if [[ $(grep -Fc 'AOS_DISTRO_ED25519_SEED="$QA_SEED"' "$workflow") -ne 3 ]]; then
+  echo "Darwin and both GNU rehearsal archives must share one ephemeral QA seed" >&2
   exit 1
 fi
-if [[ $(grep -Fc '"$NATIVE_SEALER" \' "$workflow") -ne 2 ]] || \
-   [[ $(grep -Fc '"$NATIVE_SEALER_ARCHIVE"' "$workflow") -ne 2 ]]; then
-  echo "Darwin and GNU rehearsal archives must share the authenticated GNU native sealer" >&2
+if [[ $(grep -Fc '"$NATIVE_SEALER" \' "$workflow") -ne 3 ]] || \
+   [[ $(grep -Fc '"$NATIVE_SEALER_ARCHIVE"' "$workflow") -ne 3 ]]; then
+  echo "Darwin and both GNU rehearsal archives must share the authenticated GNU native sealer" >&2
   exit 1
 fi
 grep -Fq 'secrets.token_hex(32)' "$workflow"
 grep -Fq 'write_tar_listing' "$workflow"
 grep -Fq 'tar -tzf "$archive" > "$listing"' "$workflow"
 grep -Fq 'SIGNED_DARWIN_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-darwin-tar-listing.XXXXXX")' "$workflow"
-grep -Fq 'SIGNED_GNU_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-gnu-tar-listing.XXXXXX")' "$workflow"
+grep -Fq 'SIGNED_X86_64_GNU_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-x86_64-gnu-tar-listing.XXXXXX")' "$workflow"
+grep -Fq 'SIGNED_AARCH64_GNU_TAR_LISTING=$(mktemp "$RUNNER_TEMP/rehearsal-aarch64-gnu-tar-listing.XXXXXX")' "$workflow"
 grep -Fq "grep -q '/Distro.sig$' \"\$SIGNED_DARWIN_TAR_LISTING\"" "$workflow"
-grep -Fq "grep -q '/Distro.sig$' \"\$SIGNED_GNU_TAR_LISTING\"" "$workflow"
+grep -Fq "grep -q '/Distro.sig$' \"\$SIGNED_X86_64_GNU_TAR_LISTING\"" "$workflow"
+grep -Fq "grep -q '/Distro.sig$' \"\$SIGNED_AARCH64_GNU_TAR_LISTING\"" "$workflow"
 grep -Fq 'SIGNED_DARWIN_ARCHIVE=$signed_darwin' "$workflow"
-grep -Fq 'SIGNED_GNU_ARCHIVE=$signed_gnu' "$workflow"
-grep -Fq 'LINUX_ARCHIVE=${candidates[0]}' "$workflow"
-grep -Fq 'ephemeral QA seed destroyed after both signed archive verifications' "$workflow"
+grep -Fq 'SIGNED_X86_64_GNU_ARCHIVE=$signed_x86_gnu' "$workflow"
+grep -Fq 'SIGNED_AARCH64_GNU_ARCHIVE=$signed_aarch64_gnu' "$workflow"
+grep -Fq 'X86_64_GNU_ARCHIVE=${candidates[0]}' "$workflow"
+grep -Fq 'AARCH64_GNU_ARCHIVE=${candidates[0]}' "$workflow"
+grep -Fq 'ephemeral QA seed destroyed after all signed archive verifications' "$workflow"
 if grep -Eq 'tar[[:space:]][^|]*\|[[:space:]]*grep[[:space:]]+(-q|--quiet)' "$workflow"; then
   echo "rehearsal workflow must not pipe tar into grep -q" >&2
   exit 1
@@ -69,9 +73,11 @@ do
 done
 for scalar_binding in \
   'DARWIN_RUNTIME_ARCHIVE=$DARWIN_RUNTIME_ARCHIVE' \
-  'LINUX_RUNTIME_ARCHIVE=$LINUX_RUNTIME_ARCHIVE' \
+  'X86_64_RUNTIME_ARCHIVE=$X86_64_RUNTIME_ARCHIVE' \
+  'AARCH64_RUNTIME_ARCHIVE=$AARCH64_RUNTIME_ARCHIVE' \
   'DARWIN_AOS_BINARY=$DARWIN_AOS_BINARY' \
-  'LINUX_AOS_BINARY=$LINUX_AOS_BINARY'
+  'X86_64_AOS_BINARY=$X86_64_AOS_BINARY' \
+  'AARCH64_AOS_BINARY=$AARCH64_AOS_BINARY'
 do
   grep -Fq "$scalar_binding" "$workflow"
 done
@@ -84,8 +90,8 @@ validator_harness="$repo_root/scripts/test-invoke-runtime-archive-validator.sh"
 [[ -f "$validator_harness" ]]
 bash -n "$validator_harness"
 bash "$validator_harness"
-if [[ $(grep -Fc 'python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py"' "$workflow") -ne 2 ]]; then
-  echo "rehearsal workflow must invoke the runtime archive validator with python3 at both compose sites" >&2
+if [[ $(grep -Fc 'python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py"' "$workflow") -ne 3 ]]; then
+  echo "rehearsal workflow must invoke the runtime archive validator with python3 at all three compose sites" >&2
   exit 1
 fi
 if grep -Eq '^[[:space:]]*"\$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive\.py"' "$workflow"; then
@@ -96,7 +102,8 @@ if grep -Fq '[[ -f "$DARWIN_AOS_BINARY" && -x "$DARWIN_AOS_BINARY" ]]' "$workflo
   echo "rehearsal workflow must not assert execute bits before chmod" >&2
   exit 1
 fi
-if grep -Fq '[[ -f "$LINUX_AOS_BINARY" && -x "$LINUX_AOS_BINARY" ]]' "$workflow"; then
+if grep -Fq '[[ -f "$X86_64_AOS_BINARY" && -x "$X86_64_AOS_BINARY" ]]' "$workflow" || \
+   grep -Fq '[[ -f "$AARCH64_AOS_BINARY" && -x "$AARCH64_AOS_BINARY" ]]'; then
   echo "rehearsal workflow must not assert execute bits before chmod" >&2
   exit 1
 fi
@@ -112,9 +119,12 @@ grep -Fq 'REHEARSAL-ONLY' "$workflow"
 checksum_fixture=$(mktemp -d "${TMPDIR:-/tmp}/rehearsal-checksum.XXXXXX")
 printf 'darwin rehearsal archive\n' > "$checksum_fixture/aarch64-apple-darwin.tar.gz"
 printf 'gnu rehearsal archive\n' > "$checksum_fixture/x86_64-unknown-linux-gnu.tar.gz"
+printf 'aarch64 GNU rehearsal archive\n' > \
+  "$checksum_fixture/aarch64-unknown-linux-gnu.tar.gz"
 (
   cd "$checksum_fixture"
-  b3sum -- aarch64-apple-darwin.tar.gz x86_64-unknown-linux-gnu.tar.gz > \
+  b3sum -- aarch64-apple-darwin.tar.gz x86_64-unknown-linux-gnu.tar.gz \
+    aarch64-unknown-linux-gnu.tar.gz > \
     REHEARSAL-BLAKE3SUMS.txt
   b3sum --check REHEARSAL-BLAKE3SUMS.txt
 )
@@ -254,6 +264,28 @@ for job_name in ("build-aos-darwin-binary", "build-aos-linux-gnu-binary"):
     ):
         raise SystemExit(f"{job_name} must install runtime, Distro, Astrid client, and ASTRID_RUNTIME_VERSION overlays before compiling AOS")
 
+aos_gnu_matrix = re.search(
+    r"(?ms)^    strategy:\n.*?^    steps:\n",
+    sections["build-aos-linux-gnu-binary"],
+)
+if aos_gnu_matrix is None:
+    raise SystemExit("GNU AOS job is missing its target matrix")
+for marker in (
+    "fail-fast: false",
+    "- x86_64-unknown-linux-gnu",
+    "- aarch64-unknown-linux-gnu",
+    "TARGET: ${{ matrix.target }}",
+):
+    if marker not in aos_gnu_matrix.group(0):
+        raise SystemExit(f"GNU AOS job matrix is missing {marker}")
+for marker in (
+    "rustup target add aarch64-unknown-linux-gnu",
+    "gcc-aarch64-linux-gnu",
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
+):
+    if marker not in sections["build-aos-linux-gnu-binary"]:
+        raise SystemExit(f"GNU AOS job is missing {marker}")
+
 compose = sections.get("compose-and-sign")
 if compose is None:
     raise SystemExit("rehearsal workflow is missing compose-and-sign")
@@ -272,25 +304,28 @@ if 'runtime["version"] != "2026.9.0"' not in compose:
 sign_call_archives = re.findall(
     r'AOS_DISTRO_ED25519_SEED="\$QA_SEED"\s+\\\s*'
     r'"\$REHEARSAL_CHECKOUT/scripts/package-release\.sh"\s+\\\s*'
-    r'--sign-release-archive\s+\\\s*("\$[A-Z_]+")',
+    r'--sign-release-archive\s+\\\s*("\$[A-Z0-9_]+")',
     compose,
 )
-if sign_call_archives != ['"$DARWIN_ARCHIVE"', '"$LINUX_ARCHIVE"']:
+if sign_call_archives != ['"$DARWIN_ARCHIVE"', '"$X86_64_GNU_ARCHIVE"', '"$AARCH64_GNU_ARCHIVE"']:
     raise SystemExit(
-        "rehearsal workflow must make exactly one shared-identity Darwin sign call followed by one GNU sign call"
+        "rehearsal workflow must make one shared-identity Darwin sign call followed by x86_64 and aarch64 GNU sign calls"
     )
-if compose.count('"$NATIVE_SEALER"') != 2 or compose.count('"$NATIVE_SEALER_ARCHIVE"') != 2:
-    raise SystemExit("both target sign calls must use the authenticated GNU native sealer")
+if compose.count('"$NATIVE_SEALER"') != 3 or compose.count('"$NATIVE_SEALER_ARCHIVE"') != 3:
+    raise SystemExit("all three target sign calls must use the authenticated GNU native sealer")
 for marker in (
     'SIGNED_DARWIN_ARCHIVE=$signed_darwin',
-    'SIGNED_GNU_ARCHIVE=$signed_gnu',
+    'SIGNED_X86_64_GNU_ARCHIVE=$signed_x86_gnu',
+    'SIGNED_AARCH64_GNU_ARCHIVE=$signed_aarch64_gnu',
     'grep -q \'/Distro.sig$\' "$SIGNED_DARWIN_TAR_LISTING"',
-    'grep -q \'/Distro.sig$\' "$SIGNED_GNU_TAR_LISTING"',
+    'grep -q \'/Distro.sig$\' "$SIGNED_X86_64_GNU_TAR_LISTING"',
+    'grep -q \'/Distro.sig$\' "$SIGNED_AARCH64_GNU_TAR_LISTING"',
 ):
     if marker not in compose:
         raise SystemExit(f"compose job is missing shared-identity archive evidence marker: {marker}")
 darwin_verify = compose.index("signed Darwin rehearsal archive has no Distro signature")
-gnu_verify = compose.index("signed GNU rehearsal archive has no Distro signature")
+x86_verify = compose.index("signed x86_64 GNU rehearsal archive has no Distro signature")
+aarch64_verify = compose.index("signed aarch64 GNU rehearsal archive has no Distro signature")
 seed_zero = compose.index('file.write(b"\\0" * 32)')
 seed_flush = compose.index("file.flush()", seed_zero)
 seed_fsync = compose.index("os.fsync(file.fileno())", seed_flush)
@@ -298,7 +333,8 @@ seed_unlink = compose.index("path.unlink()", seed_fsync)
 seed_absence = compose.index('[[ ! -e "$QA_SEED_FILE" ]]', seed_unlink)
 if not (
     darwin_verify
-    < gnu_verify
+    < x86_verify
+    < aarch64_verify
     < seed_zero
     < seed_flush
     < seed_fsync
@@ -306,7 +342,7 @@ if not (
     < seed_absence
 ):
     raise SystemExit(
-        "persistent QA seed zero-write/fsync/unlink/absence proof must follow both archive verifications"
+        "persistent QA seed zero-write/fsync/unlink/absence proof must follow all archive verifications"
     )
 
 darwin_runtime = sections.get("build-astrid-darwin")
@@ -328,9 +364,34 @@ for marker in (
 ):
     if marker not in gnu_runtime:
         raise SystemExit(f"GNU runtime job is missing {marker}")
+gnu_matrix = re.search(
+    r"(?ms)^    strategy:\n.*?^    steps:\n",
+    gnu_runtime,
+)
+if gnu_matrix is None:
+    raise SystemExit("GNU runtime job is missing its target matrix")
+for marker in (
+    "fail-fast: false",
+    "- x86_64-unknown-linux-gnu",
+    "- aarch64-unknown-linux-gnu",
+    "TARGET: ${{ matrix.target }}",
+):
+    if marker not in gnu_matrix.group(0):
+        raise SystemExit(f"GNU runtime job matrix is missing {marker}")
+for marker in (
+    "rustup target add aarch64-unknown-linux-gnu",
+    "gcc-aarch64-linux-gnu",
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
+):
+    if marker not in gnu_runtime:
+        raise SystemExit(f"GNU runtime job is missing {marker}")
 
 validator_call = 'python3 "$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive.py"'
-for step_name in ("Compose the GNU native sealer source", "Compose the Darwin candidate"):
+for step_name in (
+    "Compose the GNU native sealer source",
+    "Compose the additional GNU candidate",
+    "Compose the Darwin candidate",
+):
     step = re.search(
         rf"(?ms)^      - name: {re.escape(step_name)}\n(?P<body>.*?)(?=^      - name:|\Z)",
         compose,
@@ -346,10 +407,25 @@ for step_name in ("Compose the GNU native sealer source", "Compose the Darwin ca
     has_fskit = "astrid-storage-provider-fskit" in body
     if step_name == "Compose the Darwin candidate" and not has_fskit:
         raise SystemExit("Darwin composition must require the FSKit provider")
-    if step_name == "Compose the GNU native sealer source" and not has_fuse:
+    if step_name.endswith("GNU candidate") and not has_fuse:
         raise SystemExit("GNU composition must require the FUSE provider")
-    if step_name == "Compose the GNU native sealer source" and has_fskit:
+    if step_name.endswith("GNU candidate") and has_fskit:
         raise SystemExit("GNU composition must not require the Darwin FSKit provider")
+additional = re.search(
+    r"(?ms)^      - name: Compose the additional GNU candidate\n.*?(?=^      - name:|\Z)",
+    compose,
+)
+if additional is None:
+    raise SystemExit("compose job is missing the additional GNU composition body")
+for marker in (
+    '"$AARCH64_RUNTIME_ARCHIVE"',
+    '"$AARCH64_AOS_BINARY"',
+    '"$AARCH64_GNU_TARGET"',
+    "aarch64-gnu-artifacts",
+    "AARCH64_GNU_ARCHIVE=${candidates[0]}",
+):
+    if marker not in additional.group(0):
+        raise SystemExit(f"additional GNU composition is missing {marker}")
 
 if re.search(r'(?m)^\s*"\$REHEARSAL_CHECKOUT/scripts/validate-runtime-archive\.py"', compose):
     raise SystemExit("compose job must not direct-exec the runtime archive validator")
@@ -371,12 +447,12 @@ for index, line in enumerate(lines):
 
 if "Prove overlay-built GNU AOS accepts the signed Distro" not in compose:
     raise SystemExit("compose job must execute overlay-built AOS against the signed Distro")
-probe = '"$LINUX_AOS_BINARY" distro apply --principal operator-qa --yes'
+probe = '"$X86_64_AOS_BINARY" distro apply --principal operator-qa --yes'
 if probe not in compose:
     raise SystemExit("compose job must run overlay-built GNU AOS distro apply as the consume probe")
-if 'tar -xzf "$SIGNED_GNU_ARCHIVE"' not in compose:
+if 'tar -xzf "$SIGNED_X86_64_GNU_ARCHIVE"' not in compose:
     raise SystemExit("GNU consume probe must consume the signed GNU archive")
-if 'bundle="$extract/unicity-aos-${AOS_PRODUCT_VERSION}-${LINUX_TARGET}"' not in compose:
+if 'bundle="$extract/unicity-aos-${AOS_PRODUCT_VERSION}-${X86_64_GNU_TARGET}"' not in compose:
     raise SystemExit("GNU consume probe must select the signed GNU archive root")
 if "rehearsal-consume-aos" not in compose:
     raise SystemExit("compose job must plant the signed Distro into a disposable AOS_HOME")
@@ -400,13 +476,17 @@ if not (
 
 for marker in (
     'cp "$SIGNED_DARWIN_ARCHIVE" "$output/"',
-    'cp "$SIGNED_GNU_ARCHIVE" "$output/"',
+    'cp "$SIGNED_X86_64_GNU_ARCHIVE" "$output/"',
+    'cp "$SIGNED_AARCH64_GNU_ARCHIVE" "$output/"',
     'b3sum -- "$darwin_asset"',
-    'b3sum -- "$gnu_asset"',
+    'b3sum -- "$x86_gnu_asset"',
+    'b3sum -- "$aarch64_gnu_asset"',
     'sha256sum -- "$darwin_asset"',
-    'sha256sum -- "$gnu_asset"',
+    'sha256sum -- "$x86_gnu_asset"',
+    'sha256sum -- "$aarch64_gnu_asset"',
     '"aarch64-apple-darwin": {',
     '"x86_64-unknown-linux-gnu": {',
+    '"aarch64-unknown-linux-gnu": {',
     '"publication_allowed": False',
     '"key_scope": "ephemeral-per-run-qa"',
 ):
@@ -429,6 +509,8 @@ required = [
     "ASTRID_RUNTIME_VERSION: '2026.9.0'",
     'runs-on: macos-latest',
     'runs-on: ubuntu-latest',
+    'runs-on: ${{ matrix.runner }}',
+    'runner: ubuntu-24.04-arm',
     'name: astrid-${{ env.ASTRID_RUNTIME_TARGET }}',
     'name: aos-community-capsules',
     'name: rehearsal-sign-darwin',

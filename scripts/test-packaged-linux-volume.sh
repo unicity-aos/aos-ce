@@ -7,7 +7,7 @@ set -euo pipefail
 umask 077
 archive=${1:-}
 if [[ -z "$archive" || $# -ne 1 ]]; then
-  echo "usage: $0 SIGNED_X86_64_GNU_AOS_ARCHIVE" >&2
+  echo "usage: $0 SIGNED_GNU_AOS_ARCHIVE" >&2
   exit 2
 fi
 [[ -f "$archive" && ! -L "$archive" ]] || {
