@@ -98,6 +98,8 @@ for required in \
   'sleep 61' \
   'run_default status --json' \
   'run_default stop' \
+  '${#work} > 34' \
+  'mktemp -d /tmp/aos-pv.XXXXXX' \
   'exactly 22 ready capsules' \
   'unsafe cleanup; preserving disposable evidence' \
   'runner_image=' \

@@ -36,6 +36,16 @@ else
 fi
 
 work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/aos-packaged-linux-volume.XXXXXX")
+# The FUSE provider binds a Unix domain socket at
+# $work/home/.aos/run/providers/fuse/<uuid>.sock. Keep the disposable work
+# root short enough for the 107-byte sun_path limit on every host; GitHub
+# runners use /home/runner/work/_temp, which overflows it by itself.
+if (( ${#work} > 34 )); then
+  short_work=$(mktemp -d /tmp/aos-pv.XXXXXX)
+  rmdir "$short_work"
+  mv "$work" "$short_work"
+  work=$short_work
+fi
 cleanup() {
   local status=$?
   local unsafe=0
