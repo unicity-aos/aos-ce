@@ -553,8 +553,76 @@ validate_accepted_channel() {
   fi
 }
 
+validate_musl_release_metadata() {
+  musl_metadata=$1
+  legacy_metadata=$2
+  # Canonical output of musl_release_metadata.py; no Python is required by
+  # the bootstrap installer. Reject duplicate, missing and unknown fields.
+  awk '
+    BEGIN {
+      fields[""] = "schema-version kind product repository version tag source-commit release-workflow-identity"
+      fields["[legacy-release]"] = "metadata-asset metadata-sha256"
+      fields["[runtime-musl]"] = "repository version tag source-commit release-workflow-identity legacy-release-metadata-asset legacy-release-metadata-blake3 musl-release-metadata-asset musl-release-metadata-blake3"
+      fields["[targets.aarch64-unknown-linux-musl]"] = "asset sha256 blake3 sigstore-bundle size"
+      fields["[targets.x86_64-unknown-linux-musl]"] = "asset sha256 blake3 sigstore-bundle size"
+      for (s in fields) {
+        n = split(fields[s], keys, " ")
+        for (i = 1; i <= n; i++) required[s SUBSEP keys[i]] = 1
+      }
+    }
+    /^$/ { next }
+    /^\[/ {
+      section = $0
+      if (!(section in fields) || sections[section]++) bad = 1
+      next
+    }
+    {
+      key = section SUBSEP $1
+      if ($2 != "=" || !(key in required) || seen[key]++) bad = 1
+      value = substr($0, index($0, "=") + 1)
+      sub(/^[[:space:]]+/, "", value)
+      if ($1 == "schema-version") { if (value != "1") bad = 1 }
+      else if ($1 == "size") { if (value !~ /^[1-9][0-9]*$/) bad = 1 }
+      else if (value !~ /^"[^"\\]*"$/) bad = 1
+    }
+    END {
+      for (key in required) if (seen[key] != 1) bad = 1
+      exit bad ? 1 : 0
+    }
+  ' "$musl_metadata" || { echo "invalid signed musl extension schema" >&2; return 1; }
+  [ "$(toml_value "$musl_metadata" "" kind)" = aos-release-musl-extension ] || return 1
+  [ "$(toml_value "$musl_metadata" "" repository)" = "$AOS_TRUSTED_RELEASE_REPO" ] || return 1
+  for musl_key in product version tag source-commit release-workflow-identity; do
+    [ "$(toml_value "$musl_metadata" "" "$musl_key")" = "$(toml_value "$legacy_metadata" "" "$musl_key")" ] || return 1
+  done
+  [ "$(toml_value "$musl_metadata" '[legacy-release]' metadata-asset)" = "$release_metadata_asset" ] || return 1
+  [ "$(toml_value "$musl_metadata" '[legacy-release]' metadata-sha256)" = "$(sha256_file "$legacy_metadata")" ] || {
+    echo "musl extension does not bind the authenticated release" >&2; return 1
+  }
+  for musl_key in repository version tag source-commit release-workflow-identity; do
+    [ "$(toml_value "$musl_metadata" '[runtime-musl]' "$musl_key")" = "$(toml_value "$legacy_metadata" '[runtime]' "$musl_key")" ] || return 1
+  done
+  [ "$(toml_value "$musl_metadata" '[runtime-musl]' legacy-release-metadata-asset)" = "$runtime_metadata_asset" ] || return 1
+  [ "$(toml_value "$musl_metadata" '[runtime-musl]' legacy-release-metadata-blake3)" = "$runtime_metadata_blake3" ] || return 1
+  [ "$(toml_value "$musl_metadata" '[runtime-musl]' musl-release-metadata-asset)" = "astrid-${runtime_version}-musl-release.toml" ] || return 1
+  printf '%s\n' "$(toml_value "$musl_metadata" '[runtime-musl]' musl-release-metadata-blake3)" | grep -Eq '^[0-9a-f]{64}$' || return 1
+  for musl_target in aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+    musl_section="[targets.$musl_target]"
+    musl_asset="unicity-aos-${AOS_VERSION}-${musl_target}.tar.gz"
+    [ "$(toml_value "$musl_metadata" "$musl_section" asset)" = "$musl_asset" ] || return 1
+    [ "$(toml_value "$musl_metadata" "$musl_section" sigstore-bundle)" = "$musl_asset.sigstore.json" ] || return 1
+    for musl_digest in sha256 blake3; do
+      printf '%s\n' "$(toml_value "$musl_metadata" "$musl_section" "$musl_digest")" | grep -Eq '^[0-9a-f]{64}$' || return 1
+    done
+  done
+}
+
 os=$(uname -s)
 arch=$(uname -m)
+libc=gnu
+if [ "$os" = Linux ] && ldd --version 2>&1 | grep -qi musl; then
+  libc=musl
+fi
 runtime_binaries="astrid astrid-daemon astrid-build astrid-emit"
 case "$os:$arch" in
   Darwin:arm64|Darwin:aarch64)
@@ -570,12 +638,12 @@ case "$os:$arch" in
     runtime_binaries="$runtime_binaries astrid-storage-provider-fskit"
     ;;
   Linux:aarch64|Linux:arm64)
-    target=aarch64-unknown-linux-gnu
+    target=aarch64-unknown-linux-$libc
     cosign_asset=cosign-linux-arm64
     cosign_sha256=2ec865872e331c32fd12b08dae15332d3f92c0aa029219589684a4903ca85d11
     ;;
   Linux:x86_64|Linux:amd64)
-    target=x86_64-unknown-linux-gnu
+    target=x86_64-unknown-linux-$libc
     cosign_asset=cosign-linux-amd64
     cosign_sha256=ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc
     ;;
@@ -698,6 +766,20 @@ if [ -n "$release_metadata_sha256" ] && [ "$(sha256_file "$work/$release_metadat
   exit 1
 fi
 validate_release_metadata "$work/$release_metadata_asset" "$AOS_VERSION" "$release_identity"
+target_metadata="$work/$release_metadata_asset"
+if [ "$libc" = musl ]; then
+  musl_metadata_asset="unicity-aos-${AOS_VERSION}-musl-release.toml"
+  curl --proto '=https' --tlsv1.2 -fsSL "$release_base/$musl_metadata_asset" -o "$work/$musl_metadata_asset"
+  curl --proto '=https' --tlsv1.2 -fsSL "$release_base/$musl_metadata_asset.sigstore.json" -o "$work/$musl_metadata_asset.sigstore.json"
+  "$COSIGN_BIN" verify-blob \
+    --bundle "$work/$musl_metadata_asset.sigstore.json" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity "$release_identity" \
+    --use-signed-timestamps \
+    "$work/$musl_metadata_asset" >/dev/null
+  validate_musl_release_metadata "$work/$musl_metadata_asset" "$target_metadata"
+  target_metadata="$work/$musl_metadata_asset"
+fi
 
 # The signed runtime tuple is the authority for GNU runtime membership. Keep
 # the historical 0.10.4 four-binary set stable, and require the FUSE provider
@@ -708,10 +790,10 @@ if [ "$os" = Linux ] && [ "$runtime_version" = 2026.9.0 ]; then
 fi
 
 target_section="[targets.${target}]"
-asset=$(toml_value "$work/$release_metadata_asset" "$target_section" asset)
-asset_sha256=$(toml_value "$work/$release_metadata_asset" "$target_section" sha256)
-asset_blake3=$(toml_value "$work/$release_metadata_asset" "$target_section" blake3)
-asset_bundle=$(toml_value "$work/$release_metadata_asset" "$target_section" sigstore-bundle)
+asset=$(toml_value "$target_metadata" "$target_section" asset)
+asset_sha256=$(toml_value "$target_metadata" "$target_section" sha256)
+asset_blake3=$(toml_value "$target_metadata" "$target_section" blake3)
+asset_bundle=$(toml_value "$target_metadata" "$target_section" sigstore-bundle)
 expected_asset="unicity-aos-${AOS_VERSION}-${target}.tar.gz"
 [ "$asset" = "$expected_asset" ] || { echo "release metadata selected a non-canonical target asset" >&2; exit 1; }
 [ "$asset_bundle" = "$asset.sigstore.json" ] || { echo "release metadata selected a non-canonical signature bundle" >&2; exit 1; }
@@ -736,12 +818,16 @@ if [ -f "$work/channel.toml" ]; then
     echo "signed channel source commit does not match immutable release metadata" >&2
     exit 1
   }
-  for key in asset sha256 blake3 sigstore-bundle size; do
-    [ "$(toml_value "$work/channel.toml" "$target_section" "$key")" = "$(toml_value "$work/$release_metadata_asset" "$target_section" "$key")" ] || {
-      echo "signed channel target does not match immutable release metadata: $key" >&2
-      exit 1
-    }
-  done
+  # The immutable musl extension binds the complete channel-selected release
+  # metadata by SHA-256. Legacy channels intentionally carry GNU/Darwin only.
+  if [ "$libc" != musl ]; then
+    for key in asset sha256 blake3 sigstore-bundle size; do
+      [ "$(toml_value "$work/channel.toml" "$target_section" "$key")" = "$(toml_value "$work/$release_metadata_asset" "$target_section" "$key")" ] || {
+        echo "signed channel target does not match immutable release metadata: $key" >&2
+        exit 1
+      }
+    done
+  fi
 fi
 
 echo "Downloading Unicity AOS $AOS_VERSION for $target..."

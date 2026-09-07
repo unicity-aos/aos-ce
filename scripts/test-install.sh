@@ -160,6 +160,12 @@ if [ "$#" -eq 2 ] && [ "$1" = -u ]; then
 fi
 exec /bin/date "$@"
 EOF
+cat > "$fake_bin/ldd" <<'EOF'
+#!/bin/sh
+echo "${AOS_TEST_LIBC:-GNU libc}" >&2
+exit 1
+EOF
+chmod 755 "$fake_bin/ldd"
 
 cat > "$fake_bin/curl" <<'EOF'
 #!/bin/sh
@@ -248,6 +254,7 @@ AOS_VERSION=2026.9.0 \
 sh "$repo_root/install.sh" --yes --no-migrate-prompt
 
 test -x "$work/home/.aos/bin/aos"
+source "$repo_root/scripts/test-install-musl.sh"
 release_dir="$work/home/.aos/releases/2026.9.0"
 test "$runtime_version" = 0.10.4
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
@@ -772,6 +779,11 @@ python=${PYTHON3:-python3}
   --output "$fixture/channel.toml"
 cp "$good_bundle" "$fixture/channel.toml.sigstore.json"
 cp "$fixture/channel.toml" "$fixture/channel-good.toml"
+
+PATH="$fake_bin:$PATH" HOME="$work/musl-channel-home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_TEST_LIBC=musl sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+test -x "$work/musl-channel-home/.aos/bin/aos"
+test "$(cat "$work/musl-channel-home/.aos/update/channels/stable/current")" = 2
 
 PATH="$fake_bin:$PATH" HOME="$work/channel-home" AOS_TEST_FIXTURE="$fixture" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
