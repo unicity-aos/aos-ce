@@ -158,7 +158,7 @@ runtime = manifest.get("runtime")
 runtime_version = runtime.get("version") if isinstance(runtime, dict) else None
 if (
     isinstance(target, str)
-    and target.endswith("-unknown-linux-gnu")
+    and (target.endswith("-unknown-linux-gnu") or target.endswith("-unknown-linux-musl"))
     and runtime_version == "2026.9.0"
 ):
     runtime_executables.append("astrid-storage-provider-fuse")
@@ -238,6 +238,12 @@ require_native_release_sealer() {
       ;;
     "unicity-aos-${product_version}-aarch64-unknown-linux-gnu.tar.gz")
       expected_target=aarch64-unknown-linux-gnu
+      ;;
+    "unicity-aos-${product_version}-x86_64-unknown-linux-musl.tar.gz")
+      expected_target=x86_64-unknown-linux-musl
+      ;;
+    "unicity-aos-${product_version}-aarch64-unknown-linux-musl.tar.gz")
+      expected_target=aarch64-unknown-linux-musl
       ;;
     *)
       echo "native sealer candidate filename does not bind this checkout's version and a supported GNU target" >&2
@@ -527,7 +533,7 @@ fi
 python3 "$repo_root/scripts/capsule_release.py" --artifacts "$capsule_artifacts"
 
 runtime_binaries=(astrid astrid-daemon astrid-build astrid-emit)
-if [[ "$target" == *-unknown-linux-gnu && "$runtime_version" == "2026.9.0" ]]; then
+if [[ ( "$target" == *-unknown-linux-gnu || "$target" == *-unknown-linux-musl ) && "$runtime_version" == "2026.9.0" ]]; then
   runtime_binaries+=(astrid-storage-provider-fuse)
 elif [[ "$target" == *-apple-darwin ]]; then
   runtime_binaries+=(astrid-storage-provider-fskit)
@@ -636,7 +642,7 @@ runtime_executables = [
     "runtime/bin/astrid-build",
     "runtime/bin/astrid-emit",
 ]
-if target.endswith("-unknown-linux-gnu") and runtime == "2026.9.0":
+if (target.endswith("-unknown-linux-gnu") or target.endswith("-unknown-linux-musl")) and runtime == "2026.9.0":
     runtime_executables.append("runtime/bin/astrid-storage-provider-fuse")
 elif target.endswith("-apple-darwin"):
     runtime_executables.append("runtime/bin/astrid-storage-provider-fskit")
@@ -685,6 +691,14 @@ verifiers = {
         "sha256": "2ec865872e331c32fd12b08dae15332d3f92c0aa029219589684a4903ca85d11",
     },
     "x86_64-unknown-linux-gnu": {
+        "asset": "cosign-linux-amd64",
+        "sha256": "ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc",
+    },
+    "aarch64-unknown-linux-musl": {
+        "asset": "cosign-linux-arm64",
+        "sha256": "2ec865872e331c32fd12b08dae15332d3f92c0aa029219589684a4903ca85d11",
+    },
+    "x86_64-unknown-linux-musl": {
         "asset": "cosign-linux-amd64",
         "sha256": "ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc",
     },

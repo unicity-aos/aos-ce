@@ -30,6 +30,8 @@ if command -v dpkg-query >/dev/null; then
   }
 elif command -v rpm >/dev/null; then
   rpm -q fuse3 >/dev/null || { echo "Linux packaged-volume rehearsal requires fuse3" >&2; exit 1; }
+elif command -v apk >/dev/null; then
+  apk info -e fuse3 >/dev/null || { echo "Linux packaged-volume rehearsal requires the fuse3 package" >&2; exit 1; }
 else
   echo "unable to verify the fuse3 package manager state" >&2
   exit 1
@@ -91,13 +93,34 @@ mkdir -m 0700 "$work/home" "$work/extract"
   printf 'fusermount3_mode=%s\n' "$(stat -c '%a' "$fusermount3" 2>/dev/null || stat -f '%Lp' "$fusermount3")"
   "$fusermount3" --version 2>&1 || true
 } | tee "$work/runner-fuse.txt"
-case "$(uname -m)" in
-  x86_64) target=x86_64-unknown-linux-gnu ;;
-  aarch64) target=aarch64-unknown-linux-gnu ;;
+# The package target is explicit when the host cannot infer it: musl-static
+# artifacts certify on glibc hosts, so uname carries only the architecture.
+# An explicit target must be one of the supported triples and must match the
+# host architecture; without one, a GNU host runs its own GNU target.
+case "${AOS_PACKAGED_TARGET:-}" in
+  x86_64-unknown-linux-gnu | x86_64-unknown-linux-musl) target_arch=x86_64 ;;
+  aarch64-unknown-linux-gnu | aarch64-unknown-linux-musl) target_arch=aarch64 ;;
+  "")
+    target_arch=$(uname -m)
+    ;;
   *)
-    echo "unsupported packaged-volume architecture: $(uname -m)" >&2
+    echo "unsupported AOS_PACKAGED_TARGET: ${AOS_PACKAGED_TARGET}" >&2
     exit 1
     ;;
+esac
+case "$(uname -m):$target_arch" in
+  x86_64:x86_64 | aarch64:aarch64) ;;
+  *)
+    echo "packaged-volume target architecture ($target_arch) does not match the host ($(uname -m))" >&2
+    exit 1
+    ;;
+esac
+case "${AOS_PACKAGED_TARGET:-}" in
+  x86_64-* | aarch64-*) target=$AOS_PACKAGED_TARGET ;;
+  *) case "$target_arch" in
+       x86_64) target=x86_64-unknown-linux-gnu ;;
+       aarch64) target=aarch64-unknown-linux-gnu ;;
+     esac ;;
 esac
 expected_root=unicity-aos-2026.9.0-${target}
 # Bind the exact package bytes to the REHEARSAL-ONLY identity and checksum

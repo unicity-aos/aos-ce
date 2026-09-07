@@ -79,6 +79,9 @@ PY
 for required in \
   'x86_64) target=x86_64-unknown-linux-gnu ;;' \
   'aarch64) target=aarch64-unknown-linux-gnu ;;' \
+  'AOS_PACKAGED_TARGET' \
+  'x86_64-unknown-linux-gnu | x86_64-unknown-linux-musl' \
+  'aarch64-unknown-linux-gnu | aarch64-unknown-linux-musl' \
   'expected_root=unicity-aos-2026.9.0-${target}' \
   'REHEARSAL_TARGET=$target' \
   'REHEARSAL-ONLY-identity.json' \
@@ -104,6 +107,7 @@ for required in \
   'unsafe cleanup; preserving disposable evidence' \
   'runner_image=' \
   'command -v fusermount3' \
+  'apk info -e fuse3' \
   'storage mount --as operator-qa --read-write' \
   'findmnt -n -o FSTYPE --mountpoint' \
   'mount_is_active' \
