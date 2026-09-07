@@ -146,10 +146,13 @@ class ReleaseReadinessTests(unittest.TestCase):
         runtime = VALIDATOR.readiness_metadata(
             ROOT / "release/runtime-compatibility.toml"
         )["runtime"]
-        if runtime["release-ready"] and runtime["upgrade-self-heal-ready"]:
+        musl = VALIDATOR.readiness_metadata(
+            ROOT / "release/runtime-musl-compatibility.toml"
+        )["runtime"]
+        if runtime["release-ready"] and runtime["upgrade-self-heal-ready"] and musl["release-ready"]:
             self.assertEqual(VALIDATOR.main(["--require-release-ready"]), 0)
         else:
-            with self.assertRaisesRegex(ValueError, "refusing to publish"):
+            with self.assertRaisesRegex(ValueError, "refusing to publish|musl runtime"):
                 VALIDATOR.main(["--require-release-ready"])
 
     def test_main_admits_checked_in_false_ready_musl_pin(self) -> None:
@@ -162,7 +165,7 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertFalse(runtime["release-ready"])
         self.assertEqual(VALIDATOR.main([]), 0)
 
-    def test_require_release_ready_follows_the_gnu_gate_only(self) -> None:
+    def test_require_release_ready_also_requires_musl(self) -> None:
         gnu = VALIDATOR.readiness_metadata(
             ROOT / "release/runtime-compatibility.toml"
         )["runtime"]
@@ -171,7 +174,8 @@ class ReleaseReadinessTests(unittest.TestCase):
         )["runtime"]
         self.assertTrue(gnu["release-ready"])
         self.assertFalse(musl["release-ready"])
-        self.assertEqual(VALIDATOR.main(["--require-release-ready"]), 0)
+        with self.assertRaisesRegex(ValueError, "musl runtime compatibility release-ready"):
+            VALIDATOR.main(["--require-release-ready"])
 
     def test_musl_pin_rejects_identity_extra_keys_and_empty_ready_fields(self) -> None:
         pin = VALIDATOR.readiness_metadata(
@@ -216,11 +220,14 @@ class ReleaseReadinessTests(unittest.TestCase):
             capture_output=True,
             check=False,
         )
-        if runtime["release-ready"] and runtime["upgrade-self-heal-ready"]:
+        musl = VALIDATOR.readiness_metadata(
+            ROOT / "release/runtime-musl-compatibility.toml"
+        )["runtime"]
+        if runtime["release-ready"] and runtime["upgrade-self-heal-ready"] and musl["release-ready"]:
             self.assertEqual(strict.returncode, 0, strict.stderr)
         else:
             self.assertEqual(strict.returncode, 1)
-            self.assertIn("refusing to publish", strict.stderr)
+            self.assertRegex(strict.stderr, "refusing to publish|musl runtime")
 
 
 if __name__ == "__main__":

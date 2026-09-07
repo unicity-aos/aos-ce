@@ -11,6 +11,7 @@ from pathlib import Path
 
 import capsule_release
 import release_metadata
+import musl_release_metadata
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +41,8 @@ def validate_release_assets(
     version: str,
     source_commit: str,
     compatibility_path: Path | None = None,
+    musl_compatibility_path: Path | None = None,
+    require_musl: bool = False,
 ) -> list[str]:
     require(directory.is_dir() and not directory.is_symlink(), "release assets must be a directory")
     entries = list(directory.iterdir())
@@ -64,9 +67,29 @@ def validate_release_assets(
 
     specs = capsule_release.source_contract()
     capsules = {spec.asset for spec in specs}
-    targets = {item["asset"] for item in metadata["targets"].values()}
+    target_records = list(metadata["targets"].values())
+    extension_name = f"unicity-aos-{version}-musl-release.toml"
+    extension_path = directory / extension_name
+    require(not require_musl or extension_path.is_file(), "required musl extension is missing")
+    extension_payloads = set()
+    if extension_path.is_file():
+        extension = musl_release_metadata.validate_extension(
+            release_metadata.load(extension_path), legacy=metadata,
+            legacy_bytes=metadata_path.read_bytes(),
+        )
+        musl_compatibility_path = musl_compatibility_path or ROOT / "release/runtime-musl-compatibility.toml"
+        pin = musl_release_metadata.validate_runtime_pin(
+            release_metadata.load(musl_compatibility_path), require_ready=True,
+        )
+        require(
+            extension["runtime-musl"] == {key: value for key, value in pin.items() if key != "release-ready"},
+            "musl runtime pin differs from the tagged source",
+        )
+        target_records.extend(extension["targets"].values())
+        extension_payloads.add(extension_name)
+    targets = {item["asset"] for item in target_records}
     checksummed = targets | capsules
-    payloads = checksummed | set(FIXED_PAYLOADS) | {metadata_name}
+    payloads = checksummed | set(FIXED_PAYLOADS) | {metadata_name} | extension_payloads
     expected = payloads | {f"{name}.sigstore.json" for name in payloads}
     actual = {path.name for path in entries}
     require(
@@ -86,7 +109,7 @@ def validate_release_assets(
             f"SHA-256 mismatch for {name}",
         )
 
-    for item in metadata["targets"].values():
+    for item in target_records:
         name = item["asset"]
         require(item["sha256"] == sha256[name], f"release metadata SHA-256 mismatch for {name}")
         require(item["blake3"] == blake3[name], f"release metadata BLAKE3 mismatch for {name}")
@@ -133,6 +156,7 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--artifacts", type=Path, required=True)
     root.add_argument("--version", required=True)
     root.add_argument("--source-commit", required=True)
+    root.add_argument("--require-musl", action="store_true")
     return root
 
 
@@ -142,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         args.artifacts,
         version=args.version,
         source_commit=args.source_commit,
+        require_musl=args.require_musl,
     ):
         print(payload)
     return 0

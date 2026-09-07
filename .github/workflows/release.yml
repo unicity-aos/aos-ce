@@ -153,6 +153,10 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -169,7 +173,7 @@ jobs:
           toolchain: '1.95.0'
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: ${{ !endsWith(matrix.target, 'linux-gnu') }}
+        if: ${{ endsWith(matrix.target, 'apple-darwin') }}
         with:
           key: aos-release-${{ matrix.target }}
       - name: Install pinned BLAKE3 checksum tool
@@ -186,7 +190,7 @@ jobs:
           print(f"RUNTIME_IDENTITY={metadata['release-workflow-identity']}")
           PY
       - name: Build product binary
-        if: ${{ !endsWith(matrix.target, 'linux-gnu') }}
+        if: ${{ endsWith(matrix.target, 'apple-darwin') }}
         run: |
           cargo build --locked --release --target "${{ matrix.target }}" -p unicity-aos-bootstrap
           echo "AOS_BINARY=target/${{ matrix.target }}/release/aos" >> "$GITHUB_ENV"
@@ -215,6 +219,22 @@ jobs:
             '
           AOS_BINARY="target/glibc-2.31/${{ matrix.target }}/release/aos"
           python3 scripts/check_glibc.py --max-version 2.34 "$AOS_BINARY"
+          echo "AOS_BINARY=$AOS_BINARY" >> "$GITHUB_ENV"
+      - name: Build native static musl product binary
+        if: ${{ endsWith(matrix.target, 'linux-musl') }}
+        env:
+          MUSL_BUILD_IMAGE: docker.io/library/rust:1.95.0-alpine3.23@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2
+          TARGET: ${{ matrix.target }}
+        run: |
+          docker run --rm -e TARGET -v "$PWD:/workspace" -w /workspace \
+            "$MUSL_BUILD_IMAGE" sh -euxc '
+              test "$(uname -m)" = "${TARGET%%-*}"
+              apk add --no-cache build-base cmake pkgconf openssl perl git zlib-dev
+              cargo build --locked --release --target "$TARGET" -p unicity-aos-bootstrap
+              "target/$TARGET/release/aos" --help >/dev/null
+            '
+          AOS_BINARY="target/$TARGET/release/aos"
+          python3 scripts/check_static_elf.py --architecture "${TARGET%%-*}" "$AOS_BINARY"
           echo "AOS_BINARY=$AOS_BINARY" >> "$GITHUB_ENV"
       - name: Download pinned runtime release
         run: |
@@ -252,6 +272,21 @@ jobs:
             "$CHECK_ROOT/$RUNTIME_ROOT/astrid-daemon" \
             "$CHECK_ROOT/$RUNTIME_ROOT/astrid-build" \
             "$CHECK_ROOT/$RUNTIME_ROOT/astrid-emit"
+      - name: Verify static musl runtime executables
+        if: ${{ endsWith(matrix.target, 'linux-musl') }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          RUNTIME_ROOT="astrid-${RUNTIME_VERSION}-$TARGET"
+          CHECK_ROOT="$RUNNER_TEMP/runtime-musl-check"
+          python3 scripts/validate-runtime-archive.py "$RUNTIME_ASSET" "$RUNTIME_ROOT" \
+            astrid astrid-daemon astrid-build astrid-emit astrid-storage-provider-fuse
+          mkdir "$CHECK_ROOT"
+          tar -xzf "$RUNTIME_ASSET" -C "$CHECK_ROOT"
+          python3 scripts/check_static_elf.py --architecture "${TARGET%%-*}" \
+            "$CHECK_ROOT/$RUNTIME_ROOT/astrid" "$CHECK_ROOT/$RUNTIME_ROOT/astrid-daemon" \
+            "$CHECK_ROOT/$RUNTIME_ROOT/astrid-build" "$CHECK_ROOT/$RUNTIME_ROOT/astrid-emit" \
+            "$CHECK_ROOT/$RUNTIME_ROOT/astrid-storage-provider-fuse"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: capsule-artifacts
@@ -500,6 +535,12 @@ jobs:
             --output "$RELEASE_METADATA"
           python3 scripts/release_metadata.py validate-release \
             --require-ready "$RELEASE_METADATA"
+          python3 scripts/musl_release_metadata.py render \
+            --legacy-release "$RELEASE_METADATA" \
+            --runtime-pin release/runtime-musl-compatibility.toml \
+            --artifacts artifacts --sha256 artifacts/SHA256SUMS.txt \
+            --blake3 artifacts/BLAKE3SUMS.txt \
+            --output "artifacts/unicity-aos-${GITHUB_REF_NAME}-musl-release.toml"
           echo "RELEASE_METADATA=$RELEASE_METADATA" >> "$GITHUB_ENV"
       - name: Authenticate the remote tag before candidate publication
         env:
@@ -643,6 +684,7 @@ jobs:
             --dir "$EXISTING_ASSETS"
           PAYLOADS="$RUNNER_TEMP/existing-release-payloads.txt"
           python3 scripts/release_publication.py \
+            --require-musl \
             --artifacts "$EXISTING_ASSETS" \
             --version "$GITHUB_REF_NAME" \
             --source-commit "$EXPECTED_SOURCE" > "$PAYLOADS"
@@ -751,6 +793,7 @@ jobs:
             --dir "$FINAL"
           PAYLOADS="$RUNNER_TEMP/final-release-payloads.txt"
           python3 scripts/release_publication.py \
+            --require-musl \
             --artifacts "$FINAL" \
             --version "$GITHUB_REF_NAME" \
             --source-commit "$EXPECTED_SOURCE" > "$PAYLOADS"
