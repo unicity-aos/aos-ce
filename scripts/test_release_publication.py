@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capsule_release
 import release_metadata
 import release_publication
+import musl_release_metadata
 from test_capsule_release import write_fixture
 
 
@@ -49,6 +50,53 @@ EXPECTED_CAPSULE_ASSETS = frozenset(
 
 
 class ReleasePublicationTests(unittest.TestCase):
+    def test_musl_inventory_and_required_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            artifacts, compatibility = self.fixture(root)
+            with self.assertRaisesRegex(ValueError, "required musl extension"):
+                release_publication.validate_release_assets(
+                    artifacts, version=VERSION, source_commit=SOURCE_COMMIT,
+                    compatibility_path=compatibility, require_musl=True,
+                )
+            pin_path = root / "runtime-musl-compatibility.toml"
+            pin_path.write_text(
+                (release_publication.ROOT / "release/runtime-musl-compatibility.toml").read_text()
+                .replace("release-ready = false", "release-ready = true")
+                .replace('musl-release-metadata-asset = ""', 'musl-release-metadata-asset = "astrid-0.10.4-musl-release.toml"')
+                .replace('musl-release-metadata-blake3 = ""', 'musl-release-metadata-blake3 = "' + "d" * 64 + '"')
+            )
+            for target in musl_release_metadata.MUSL_TARGETS:
+                asset = f"unicity-aos-{VERSION}-{target}.tar.gz"
+                payload = target.encode()
+                (artifacts / asset).write_bytes(payload)
+                for manifest in ("SHA256SUMS.txt", "BLAKE3SUMS.txt"):
+                    with (artifacts / manifest).open("a") as stream:
+                        stream.write(f"{hashlib.sha256(payload).hexdigest()}  {asset}\n")
+                (artifacts / f"{asset}.sigstore.json").write_text("{}\n")
+            output = artifacts / f"unicity-aos-{VERSION}-musl-release.toml"
+            musl_release_metadata.main([
+                "render", "--legacy-release", str(artifacts / f"unicity-aos-{VERSION}-release.toml"),
+                "--runtime-pin", str(pin_path), "--artifacts", str(artifacts),
+                "--sha256", str(artifacts / "SHA256SUMS.txt"),
+                "--blake3", str(artifacts / "BLAKE3SUMS.txt"), "--output", str(output),
+            ])
+            (artifacts / f"{output.name}.sigstore.json").write_text("{}\n")
+            payloads = release_publication.validate_release_assets(
+                artifacts, version=VERSION, source_commit=SOURCE_COMMIT,
+                compatibility_path=compatibility, musl_compatibility_path=pin_path,
+                require_musl=True,
+            )
+            self.assertIn(output.name, payloads)
+            self.assertIn(f"unicity-aos-{VERSION}-x86_64-unknown-linux-musl.tar.gz", payloads)
+            output.write_text(output.read_text().replace('metadata-sha256 = "', 'metadata-sha256 = "a', 1))
+            with self.assertRaises(ValueError):
+                release_publication.validate_release_assets(
+                    artifacts, version=VERSION, source_commit=SOURCE_COMMIT,
+                    compatibility_path=compatibility, musl_compatibility_path=pin_path,
+                    require_musl=True,
+                )
+
     def fixture(self, root: Path) -> tuple[Path, Path]:
         artifacts = root / "artifacts"
         artifacts.mkdir()

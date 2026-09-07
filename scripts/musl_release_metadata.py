@@ -352,6 +352,13 @@ def render_extension(value: dict[str, Any]) -> str:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
+    render = commands.add_parser("render")
+    render.add_argument("--legacy-release", type=Path, required=True)
+    render.add_argument("--runtime-pin", type=Path, required=True)
+    render.add_argument("--artifacts", type=Path, required=True)
+    render.add_argument("--sha256", type=Path, required=True)
+    render.add_argument("--blake3", type=Path, required=True)
+    render.add_argument("--output", type=Path, required=True)
     validate = commands.add_parser("validate")
     validate.add_argument("path", type=Path)
     validate.add_argument(
@@ -362,8 +369,65 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def compose_extension(
+    legacy: dict[str, Any], legacy_bytes: bytes, runtime_pin: dict[str, Any],
+    artifacts: Path, sha256: dict[str, str], blake3: dict[str, str],
+) -> dict[str, Any]:
+    """Bind the two packaged targets to the same immutable AOS release."""
+    legacy = release_metadata.validate_release(legacy)
+    runtime = validate_runtime_pin(runtime_pin, require_ready=True)
+    for key in ("repository", "version", "tag", "source-commit", "release-workflow-identity"):
+        release_metadata.require(
+            runtime[key] == legacy["runtime"][key],
+            f"musl runtime {key} differs from the base release",
+        )
+    for musl_key, legacy_key in (
+        ("legacy-release-metadata-asset", "release-metadata-asset"),
+        ("legacy-release-metadata-blake3", "release-metadata-blake3"),
+    ):
+        release_metadata.require(
+            runtime[musl_key] == legacy["runtime"][legacy_key],
+            f"musl runtime {musl_key} differs from the base release",
+        )
+    version = legacy["version"]
+    targets = {}
+    for target in MUSL_TARGETS:
+        asset = f"unicity-aos-{version}-{target}.tar.gz"
+        path = artifacts / asset
+        release_metadata.require(path.is_file() and not path.is_symlink(), f"missing regular musl archive: {asset}")
+        release_metadata.require(asset in sha256 and asset in blake3, f"missing checksums for {asset}")
+        with path.open("rb") as stream:
+            actual_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+        release_metadata.require(actual_sha256 == sha256[asset], f"musl archive SHA-256 mismatch: {asset}")
+        targets[target] = {
+            "asset": asset, "sha256": sha256[asset], "blake3": blake3[asset],
+            "sigstore-bundle": f"{asset}.sigstore.json", "size": path.stat().st_size,
+        }
+    extension = {
+        "schema-version": 1, "kind": KIND, "repository": release_metadata.REPOSITORY,
+        **{key: legacy[key] for key in ("product", "version", "tag", "source-commit", "release-workflow-identity")},
+        "legacy-release": {
+            "metadata-asset": f"unicity-aos-{version}-release.toml",
+            "metadata-sha256": hashlib.sha256(legacy_bytes).hexdigest(),
+        },
+        "runtime-musl": {key: value for key, value in runtime.items() if key != "release-ready"},
+        "targets": targets,
+    }
+    return validate_extension(extension, legacy=legacy, legacy_bytes=legacy_bytes)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == "render":
+        legacy_bytes = args.legacy_release.read_bytes()
+        extension = compose_extension(
+            release_metadata.load(args.legacy_release), legacy_bytes,
+            release_metadata.load(args.runtime_pin), args.artifacts,
+            release_metadata.checksum_manifest(args.sha256),
+            release_metadata.checksum_manifest(args.blake3),
+        )
+        args.output.write_text(render_extension(extension), encoding="utf-8")
+        return 0
     extension = release_metadata.load(args.path)
     if args.legacy_release is None:
         validate_extension(extension)

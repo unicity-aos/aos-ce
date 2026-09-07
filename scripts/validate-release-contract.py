@@ -148,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     musl_runtime = musl_release_metadata.validate_runtime_pin(
         readiness_metadata("release/runtime-musl-compatibility.toml"),
-        require_ready=False,
+        require_ready=args.require_release_ready,
     )
     gnu_runtime = compatibility_metadata["runtime"]
     for key in ("repository", "version", "tag", "source-commit"):

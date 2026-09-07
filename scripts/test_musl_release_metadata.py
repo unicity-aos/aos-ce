@@ -75,7 +75,7 @@ def extension_fixture() -> tuple[dict[str, object], dict[str, object], bytes]:
     return extension, legacy, legacy_bytes
 
 
-class RuntimePinTests(unittest.TestCase):
+class RuntimeReadinessTests(unittest.TestCase):
     def test_unready_pin_is_admitted_but_require_ready_rejects_it(self) -> None:
         pin = runtime_pin_fixture(release_ready=False)
         runtime = MUSL.validate_runtime_pin(pin, require_ready=False)
@@ -83,6 +83,73 @@ class RuntimePinTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "release-ready gate is false"):
             MUSL.validate_runtime_pin(pin, require_ready=True)
 
+
+class CompositionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.legacy = release_fixture()
+        self.pin = runtime_pin_fixture(release_ready=True)
+        runtime = self.pin["runtime"]
+        self.legacy["runtime"] = {
+            key: runtime[key] for key in
+            ("repository", "version", "tag", "source-commit", "release-workflow-identity")
+        }
+        self.legacy["runtime"].update({
+            "release-metadata-available": True,
+            "release-metadata-asset": runtime["legacy-release-metadata-asset"],
+            "release-metadata-blake3": runtime["legacy-release-metadata-blake3"],
+        })
+        self.sha256 = {}
+        self.blake3 = {}
+        for target in MUSL.MUSL_TARGETS:
+            asset = f"unicity-aos-{VERSION}-{target}.tar.gz"
+            payload = target.encode()
+            (self.root / asset).write_bytes(payload)
+            self.sha256[asset] = hashlib.sha256(payload).hexdigest()
+            self.blake3[asset] = "e" * 64
+
+    def compose(self):
+        return MUSL.compose_extension(
+            self.legacy, b"authenticated base metadata", self.pin,
+            self.root, self.sha256, self.blake3,
+        )
+
+    def test_composes_exact_archives_and_base_digest(self) -> None:
+        result = self.compose()
+        self.assertEqual(set(result["targets"]), set(MUSL.MUSL_TARGETS))
+        self.assertEqual(result["legacy-release"]["metadata-sha256"], hashlib.sha256(b"authenticated base metadata").hexdigest())
+        for target, item in result["targets"].items():
+            self.assertEqual(item["size"], len(target))
+        self.assertIn("[targets.x86_64-unknown-linux-musl]", MUSL.render_extension(result))
+
+    def test_refuses_unready_runtime(self) -> None:
+        self.pin["runtime"]["release-ready"] = False
+        with self.assertRaisesRegex(ValueError, "gate is false"):
+            self.compose()
+
+    def test_refuses_different_runtime_source(self) -> None:
+        self.pin["runtime"]["source-commit"] = "f" * 40
+        with self.assertRaisesRegex(ValueError, "differs from the base"):
+            self.compose()
+
+    def test_refuses_missing_archive(self) -> None:
+        (self.root / next(iter(self.sha256))).unlink()
+        with self.assertRaisesRegex(ValueError, "missing regular musl archive"):
+            self.compose()
+
+    def test_refuses_changed_archive(self) -> None:
+        (self.root / next(iter(self.sha256))).write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+            self.compose()
+
+    def test_refuses_missing_checksum(self) -> None:
+        self.blake3.pop(next(iter(self.blake3)))
+        with self.assertRaisesRegex(ValueError, "missing checksums"):
+            self.compose()
+
+class RuntimePinTests(unittest.TestCase):
     def test_rejects_unknown_keys(self) -> None:
         pin = runtime_pin_fixture(release_ready=False)
         pin["runtime"]["surprise"] = True
