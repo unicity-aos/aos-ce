@@ -208,8 +208,7 @@ jobs:
             bash -euxo pipefail -c '
               if [[ "$TARGET" == aarch64-unknown-linux-gnu ]]; then
                 rustup target add aarch64-unknown-linux-gnu
-                apt-get update
-                apt-get install -y --no-install-recommends \
+                bash scripts/ci/install_gnu_build_packages.sh \
                   gcc-aarch64-linux-gnu \
                   libc6-dev-arm64-cross
                 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc

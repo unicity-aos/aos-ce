@@ -49,8 +49,7 @@ jobs:
             bash -euxo pipefail -c '
               if [[ "$TARGET" == aarch64-unknown-linux-gnu ]]; then
                 rustup target add aarch64-unknown-linux-gnu
-                apt-get update
-                apt-get install -y --no-install-recommends \
+                bash scripts/ci/install_gnu_build_packages.sh \
                   gcc-aarch64-linux-gnu \
                   libc6-dev-arm64-cross
                 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
@@ -95,6 +94,7 @@ jobs:
       - run: python3 scripts/validate-release-contract.py
       - run: python3 scripts/test_validate_release_contract.py
       - run: python3 scripts/test_changelog_notes.py
+      - run: python3 scripts/test_gnu_build_packages.py
       - run: python3 scripts/test_release_metadata.py
       - run: python3 scripts/test_musl_release_metadata.py
       - run: python3 scripts/test_check_static_elf.py
