@@ -40,9 +40,20 @@ implementations are consolidated into their final behavior.
 - Signed release metadata binds packaged executable bytes and capsule inventory.
   Installations preserve authenticated Distro manifests, locks, and signatures.
 - Agent skills remain distinct from capsule authority and installation.
+- Community Edition's repository license is explicitly MIT OR Apache-2.0.
+- The AOS product advances from 2026.1.3 to 2026.9.0. The
+  [dependency version inventory](release/DEPENDENCIES-2026.9.0.md) records source
+  lockfile changes; production Astrid pins remain a release-time dependency.
+- Hosts without MCP form support use native approval fallbacks: AppKit on
+  macOS, native confirmation on Windows, or Pinentry on Linux. The interaction
+  bridge refuses free-form and secret-shaped fields.
 - Runtime compatibility targets Astrid 2026.9.0 and Oracle 2026.9.0. See the
   [release requirements](release/RELEASE-2026.9.0.md) for platform setup and
   publication dependencies; Windows installation is not certified by this cut.
+
+### Removed
+
+- The vendored Telegram capsule; it is maintained in its separate repository.
 
 ### Fixed
 
