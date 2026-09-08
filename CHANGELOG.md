@@ -1,9 +1,18 @@
 # Changelog
 
-Release changes are compared with the preceding published tag. Repairs to
-unreleased implementations are consolidated into their final behavior.
+Notable changes to AOS are recorded here.
 
-## [2026.9.0] - Unreleased
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Versions follow [year.month.patch](release/VERSIONING.md). Repairs to unreleased
+implementations are consolidated into their final behavior.
+
+[Unreleased]: https://github.com/unicity-aos/aos-ce/compare/2026.9.0...HEAD
+[2026.9.0]: https://github.com/unicity-aos/aos-ce/compare/2026.1.3...2026.9.0
+[2026.1.3]: https://github.com/unicity-aos/aos-ce/releases/tag/2026.1.3
+
+## [Unreleased]
+
+## [2026.9.0] - 2026-09-08
 
 ### Added
 
@@ -31,6 +40,9 @@ unreleased implementations are consolidated into their final behavior.
 - Signed release metadata binds packaged executable bytes and capsule inventory.
   Installations preserve authenticated Distro manifests, locks, and signatures.
 - Agent skills remain distinct from capsule authority and installation.
+- Runtime compatibility targets Astrid 2026.9.0 and Oracle 2026.9.0. See the
+  [release requirements](release/RELEASE-2026.9.0.md) for platform setup and
+  publication dependencies; Windows installation is not certified by this cut.
 
 ### Fixed
 
@@ -41,13 +53,6 @@ unreleased implementations are consolidated into their final behavior.
 - GNU builds support enterprise Linux with glibc 2.34; musl targets use native
   musl binaries rather than relabeled GNU archives.
 - Required filesystem provider executables survive installation and self-heal.
-
-### Compatibility
-
-- This release targets Astrid 2026.9.0 and Oracle 2026.9.0.
-- Versions follow [year.month.patch](release/VERSIONING.md) from this release.
-- Native mount availability depends on the platform frontend and its setup.
-  Windows AOS installation is not certified by this release preparation.
 
 ## [2026.1.3] - Unreleased
 
