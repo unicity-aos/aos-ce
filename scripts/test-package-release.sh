@@ -508,6 +508,9 @@ do
   cp "$runtime_root/$source_binary" "$darwin_runtime_root/$binary"
   chmod 755 "$darwin_runtime_root/$binary"
 done
+PYTHONPATH="$repo_root/scripts" python3 -c \
+  'from pathlib import Path; import sys; from test_package_macos_filesystem import fixture; fixture(Path(sys.argv[1]))' \
+  "$darwin_runtime_root"
 COPYFILE_DISABLE=1 tar -czf "$work/darwin-runtime.tar.gz" \
   -C "$work" "$(basename "$darwin_runtime_root")"
 
@@ -525,6 +528,15 @@ mkdir "$darwin_extract"
 tar -xzf "$darwin_archive" -C "$darwin_extract"
 darwin_bundle="$darwin_extract/unicity-aos-$product_version-$darwin_target"
 darwin_provider="$darwin_bundle/runtime/bin/astrid-storage-provider-fskit"
+diff -r "$darwin_runtime_root/AstridFS.app" "$darwin_bundle/runtime/bin/AstridFS.app"
+test -f "$darwin_bundle/runtime/bin/macos/aos-filesystem.sh"
+python3 - "$darwin_bundle/release-manifest.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as source:
+    members = json.load(source)["release_files"]
+assert "runtime/bin/AstridFS.app/Contents/_CodeSignature/CodeResources" in members
+assert "runtime/bin/macos/aos-filesystem.sh" in members
+PY
 test -x "$darwin_provider"
 test "$(stat -c '%a' "$darwin_provider" 2>/dev/null || stat -f '%Lp' "$darwin_provider")" = 755
 python3 - "$darwin_bundle/release-manifest.json" "$darwin_provider" <<'PY'

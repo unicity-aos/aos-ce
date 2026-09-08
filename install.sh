@@ -1256,6 +1256,12 @@ chmod 700 "$release_stage/runtime" "$release_stage/runtime/bin" "$release_stage/
 for name in $runtime_binaries; do
   install -m 0700 "$bundle/runtime/bin/$name" "$release_stage/runtime/bin/$name"
 done
+if [ -d "$bundle/runtime/bin/AstridFS.app" ]; then
+  # The authenticated archive owns these signed bytes. Do not edit Info.plist,
+  # rename internal executables, or re-sign while installing the product.
+  cp -Rp "$bundle/runtime/bin/AstridFS.app" "$release_stage/runtime/bin/"
+  cp -Rp "$bundle/runtime/bin/macos" "$release_stage/runtime/bin/"
+fi
 install -m 0600 "$bundle/release-manifest.json" "$release_stage/release-manifest.json"
 install -m 0600 "$bundle/Distro.toml" "$release_stage/Distro.toml"
 if [ "$distro_archive_signed" -eq 1 ]; then
@@ -1292,6 +1298,17 @@ fi
 installation_started=0
 rm -rf "$release_backup"
 release_install_lock
+
+if [ -d "$release_dir/runtime/bin/AstridFS.app" ]; then
+  filesystem_manager="$release_dir/runtime/bin/macos/aos-filesystem.sh"
+  if ! /bin/sh "$filesystem_manager" install || ! /bin/sh "$filesystem_manager" enable; then
+    echo "AOS runtime is installed; macOS filesystem setup is incomplete." >&2
+    echo "Allow the Astrid filesystem extension in macOS settings, then run:" >&2
+    echo "/bin/sh '$filesystem_manager' install" >&2
+    echo "/bin/sh '$filesystem_manager' enable" >&2
+    exit 1
+  fi
+fi
 
 echo "Installed Unicity AOS $staged_version."
 case ":$PATH:" in

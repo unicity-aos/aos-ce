@@ -1,0 +1,1 @@
+Darwin packages retain the upstream signed Astrid filesystem app and management scripts. The common AOS installer installs the app as AOS.app and requests extension enablement, covering website and Oracle bootstrap installations. Signed bundle contents and internal Astrid identities remain unchanged; incomplete macOS approval is reported with retry commands.
