@@ -295,6 +295,9 @@ do
   cp "$runtime_root/$source_binary" "$darwin_runtime_root/$binary"
   chmod 755 "$darwin_runtime_root/$binary"
 done
+PYTHONPATH="$repo_root/scripts" python3 -c \
+  'from pathlib import Path; import sys; from test_package_macos_filesystem import fixture; fixture(Path(sys.argv[1]))' \
+  "$darwin_runtime_root"
 COPYFILE_DISABLE=1 tar -czf "$work/darwin-runtime.tar.gz" \
   -C "$work" "$(basename "$darwin_runtime_root")"
 bash "$repo_root/scripts/package-release.sh" \
@@ -343,10 +346,15 @@ HOME="$darwin_home" \
 AOS_TEST_FIXTURE="$darwin_fixture" \
 AOS_TEST_UNAME_S=Darwin \
 AOS_TEST_UNAME_M=arm64 \
+AOS_TEST_FSKIT_LOG="$work/fskit-calls" \
+ASTRID_FSKIT_APP_DEST="$work/AOS.app" \
 AOS_TEST_COSIGN_SHA256=94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5 \
 AOS_VERSION=2026.9.0 \
 sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
 darwin_release_dir="$darwin_home/.aos/releases/2026.9.0"
+diff -r "$darwin_runtime_root/AstridFS.app" "$darwin_release_dir/runtime/bin/AstridFS.app"
+grep -Fx "$work/AOS.app|install" "$work/fskit-calls"
+grep -Fx "$work/AOS.app|enable" "$work/fskit-calls"
 for binary in \
   astrid astrid-daemon astrid-build astrid-emit \
   astrid-storage-provider-fskit

@@ -184,7 +184,16 @@ for relative in expected_executables:
     if type(record["mode"]) is not int or record["mode"] != 0o755:
         raise SystemExit(f"release manifest executable mode is not 0755: {relative}")
 for relative, record in release_files.items():
-    if isinstance(record, dict) and record.get("mode") == 0o755 and relative not in expected_executables:
+    filesystem_executable = (
+        isinstance(target, str) and target.endswith("-apple-darwin")
+        and relative in {
+            "runtime/bin/AstridFS.app/Contents/MacOS/AstridFS",
+            "runtime/bin/AstridFS.app/Contents/Extensions/AstridFSAppEx.appex/Contents/MacOS/AstridFSAppEx",
+            "runtime/bin/macos/manage-macos-fskit.sh",
+            "runtime/bin/macos/validate-macos-fskit.sh",
+        }
+    )
+    if isinstance(record, dict) and record.get("mode") == 0o755 and relative not in expected_executables and not filesystem_executable:
         raise SystemExit(f"release manifest has an unlisted executable inventory record: {relative}")
 
 capsules = manifest.get("capsules")
@@ -572,6 +581,13 @@ for binary in "${runtime_binaries[@]}"; do
   install -m 0755 "$runtime_root/$binary" "$work/$root/runtime/bin/$binary"
 done
 
+if [[ "$target" == *-apple-darwin ]]; then
+  filesystem_requirement=optional
+  [[ "$runtime_version" != 2026.9.0 ]] || filesystem_requirement=required
+  python3 "$repo_root/scripts/package_macos_filesystem.py" \
+    "$runtime_root" "$work/$root/runtime/bin" "$filesystem_requirement"
+fi
+
 python3 "$repo_root/scripts/capsule_release.py" --print-assets > "$work/$root/capsule-assets.txt"
 chmod 0600 "$work/$root/capsule-assets.txt"
 while IFS= read -r capsule; do
@@ -609,6 +625,14 @@ for binary in "${runtime_binaries[@]}"; do
   record_release_file "runtime/bin/$binary" 755
 done
 record_release_file capsule-assets.txt 600
+if [[ -d "$work/$root/runtime/bin/AstridFS.app" ]]; then
+  while IFS= read -r -d '' member; do
+    relative=${member#"$work/$root/"}
+    mode=$(stat -c '%a' "$member" 2>/dev/null || stat -f '%Lp' "$member")
+    record_release_file "$relative" "$mode"
+  done < <(find "$work/$root/runtime/bin/AstridFS.app" \
+    "$work/$root/runtime/bin/macos" -type f -print0)
+fi
 record_release_file Distro.toml 600
 if [[ "$distro_signing" = yes ]]; then
   record_release_file Distro.lock 600
