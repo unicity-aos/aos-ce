@@ -16,6 +16,9 @@ implementations are consolidated into their final behavior.
 
 ### Added
 
+- Signed macOS filesystem app installation through the common installer,
+  including website and Oracle bootstrap paths. AOS.app retains Astrid's signed
+  internal identity; macOS approval failures include retry instructions.
 - Native Linux musl product archives for x86_64 and ARM64, authenticated platform
   selection, and bundled FUSE providers. GNU Linux and Darwin bundles include
   their corresponding filesystem providers.
