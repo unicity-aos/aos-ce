@@ -1,7 +1,7 @@
 # AOS 2026.9.0 release preparation
 
 This source PR is not publication authorization. Publish in dependency order:
-Astrid 2026.9.0, AOS 2026.9.0, then Oracle 0.3.0.
+Astrid 2026.9.0, AOS 2026.9.0, then Oracle 2026.9.0.
 
 ## Before enabling publication
 

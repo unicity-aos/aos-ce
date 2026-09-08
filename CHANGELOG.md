@@ -44,7 +44,8 @@ unreleased implementations are consolidated into their final behavior.
 
 ### Compatibility
 
-- This release targets Astrid 2026.9.0 and Oracle 0.3.0.
+- This release targets Astrid 2026.9.0 and Oracle 2026.9.0.
+- Versions follow [year.month.patch](release/VERSIONING.md) from this release.
 - Native mount availability depends on the platform frontend and its setup.
   Windows AOS installation is not certified by this release preparation.
 
