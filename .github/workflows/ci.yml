@@ -109,6 +109,7 @@ jobs:
       - run: bash scripts/test-rehearsal-sign-workflow-contract.sh
       - run: python3 scripts/test_create_astrid_094_fixture.py
       - run: bash scripts/test-package-release.sh
+      - run: python3 scripts/test_package_macos_filesystem.py
       - run: bash scripts/test-install.sh
       - run: python3 scripts/capsule_release.py
       - run: python3 scripts/test_capsule_release.py
