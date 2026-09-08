@@ -1,1 +1,0 @@
-- Re-pin the Darwin rehearsal to Astrid source commit 220c692336aac89f035134c1399e1d91fab3b3d5 for reproducible signing.

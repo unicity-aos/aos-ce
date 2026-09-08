@@ -1,24 +1,57 @@
 # Changelog
 
+Release changes are compared with the preceding published tag. Repairs to
+unreleased implementations are consolidated into their final behavior.
+
 ## [2026.9.0] - Unreleased
 
 ### Added
 
-- A staged, fail-closed Linux musl runtime-compatibility contract and strict
-  metadata schema/validator. The pin keeps the current Astrid 0.10.4 identity
-  with `release-ready = false` and empty musl publication fields. Related #62.
-- An unpublished native Rust semantic catalog capsule that owns the finite v1
-  component inventory, complete primitive records, two complete theme packs,
-  hostile-value validation, fail-closed token fallback, safe unknown-component
-  fallback, A2UI declared-loss fixtures, and a catalog-owned Theme Lab matrix.
-- A bounded `aos-rhai` capsule with profile-scoped Rhai evaluation, strict
-  resource ceilings, cooperative cancellation, and no script-visible host
-  effects.
-- A product-owned `aos daemon foreground` supervisor path that runs the
-  persistent bundled daemon under the enforced CE distro, private runtime home,
-  `.aos` workspace layout, and stderr logging environment. On Unix the daemon
-  replaces the AOS process so it directly owns signals and exit status. Closes
-  #64.
+- Native Linux musl product archives for x86_64 and ARM64, authenticated platform
+  selection, and bundled FUSE providers. GNU Linux and Darwin bundles include
+  their corresponding filesystem providers.
+- `aos distro apply --principal P --yes` for applying the signed Community
+  inventory with the selected principal and an AOS activation receipt.
+- The AOS-owned MCP broker and host interaction bridge for Codex, Claude, and
+  Grok. Hosts retain separate principal capsule sets rather than receiving
+  every installed Community capsule.
+- Authenticated host hook ingress, protocol-specific adapters, and session-bound
+  meta-harness context delivery.
+- `aos daemon foreground` for supervisors, with signal and exit-status ownership.
+- Bounded Rhai evaluation and semantic surface/catalog components. Presence in
+  source does not imply inclusion in the default Community distribution.
+
+### Changed
+
+- Runtime executables live in immutable versioned release directories, separate
+  from durable runtime state. A stopped runtime contains only its private,
+  non-empty `astrid.volume`.
+- Community publication selects 22 capsule artifacts. Oracle packs independently
+  require `aos-mcp` and `aos-skills`, with `aos-forge` when present.
+- Signed release metadata binds packaged executable bytes and capsule inventory.
+  Installations preserve authenticated Distro manifests, locks, and signatures.
+- Agent skills remain distinct from capsule authority and installation.
+
+### Fixed
+
+- MCP forwarding preserves framing, workspace and request-timeout arguments,
+  stderr, and child exit/signal results.
+- Every delegated stop is confirmed before reporting successful shutdown.
+- Status uses the selected principal rather than silently assuming default.
+- GNU builds support enterprise Linux with glibc 2.34; musl targets use native
+  musl binaries rather than relabeled GNU archives.
+- Required filesystem provider executables survive installation and self-heal.
+
+### Compatibility
+
+- This release targets Astrid 2026.9.0 and Oracle 0.3.0.
+- Native mount availability depends on the platform frontend and its setup.
+  Windows AOS installation is not certified by this release preparation.
+
+## [2026.1.3] - Unreleased
+
+### Added
+
 - The `aos` product command and product-owned `~/.aos` state boundary.
 - A pinned Unicity CE distribution manifest over Astrid Runtime 0.10.4, emplaced
   as the bundled runtime's operator-enforced distro.
@@ -34,7 +67,7 @@
 - Runtime import holds the standalone daemon's existing singleton lock without
   changing the source, and interrupted unreceipted cutovers always roll back
   before recopying the current locked source.
-- A signed release path for the 22 installable `aos-*` artifacts
+- A signed release path for the 19 installable `aos-*` artifacts
   built from this source tree and selected locally by Community Edition, with
   exact source/manifest identity checks, product-archive inclusion, offline
   provisioning, archive safety validation, BLAKE3 checksums, SHA-256
@@ -46,46 +79,22 @@
   tools, capsules, traces, and evaluations as an improvable world. Agents reach
   for Forge proactively when real work reveals a useful new capability, while
   optional workers remain a use-case choice rather than a prerequisite.
-- An authenticated `aos hook` ingress and Community Edition Meta Harness
-  capsule that normalize Codex, Claude, and Grok host events onto the generic
-  hook bus, collect private same-turn prompt context, and route it back only to
-  the exact originating session. Adaptive, propose, automatic, and off modes
-  preserve the agent's judgment while respecting its existing authority.
 - Homebrew formula updates initiated by the tap's authenticated stable-release
   poll, eliminating the cross-repository dispatch credential.
 - Strict, signed stable/dev/nightly channel and immutable release metadata
   contracts with exact workflow identities, expiry, replay-resistant generation
   state, and fail-closed direct installer resolution.
 - A native release gate that initializes a clean AOS home, verifies the exact
-  22-capsule CE lock, grants, and ready set, repeats initialization without
+  19-capsule CE lock, grants, and ready set, repeats initialization without
   changing runtime state, and proves clean daemon shutdown before publication.
 - Native `aos status` output for authenticated running state and verified
   stopped state without invoking the runtime CLI.
-- A selected `aos distro apply --principal P --yes` path that verifies the
-  authenticated release inventory and bundled Distro.toml, Distro.lock, and
-  Distro.sig with Astrid 0.10.4's signed lock algorithm, seeds the runtime trust
-  pin, requires an exact non-empty private volume-only stop, and records an
-  AOS-owned activation receipt.
 - An opt-in daily nightly train with deterministic run-dated versions, exact
   Astrid compatibility pins, protected publication and promotion, and
   idempotent recovery after interrupted release or pointer updates. It is
   disabled by default; merging `main` never publishes a release.
 
 ### Changed
-
-- Own the host-facing `aos mcp serve` command, MCP server identity, constrained
-  interaction fallback, and `aos-mcp` broker capsule in AOS CE. Hosts with MCP
-  form elicitation continue to render their own approvals; hosts such as Grok
-  fall back to AppKit on macOS, native confirmation on Windows, or Pinentry on
-  Linux. Free-form and secret-shaped fields are refused by this bridge.
-- Pin the exact public root-command inventory of the bundled runtime and fail
-  validation when a runtime update adds or removes a verb before AOS classifies
-  it as inherited, product-owned, or shared. Runtime verbs remain direct
-  `aos <verb>` commands without a nested runtime namespace.
-- Launch bundled Astrid executables from the immutable versioned release
-  runtime/bin, keep `ASTRID_HOME` at the durable runtime home, and bind
-  `ASTRID_RUN_DIR` to the AOS-owned run root without copying shipped binaries
-  into mutable runtime state.
 
 - Keep agent Skills out of `Capsule.toml` and the generic capsule release
   contract. Host plugins may vendor trigger Skills, the AOS Skills service
@@ -102,17 +111,15 @@
 - Parse AOS-owned commands with Clap-generated validation and help while
   preserving byte-for-byte delegation of inherited runtime commands and their
   help surfaces.
-- Authenticate native `aos status` requests as the principal selected by
-  `--principal`, while preserving the single-user `default` when the flag is
-  omitted.
 - Initialize against the operator-enforced Community Edition manifest and ask
   the runtime to grant its installed capsule set to the resolved target
   principal.
 - Bootstrap the default CE system fleet through Astrid's canonical distro
   installer before the daemon-backed authorization pass, allowing a completely
   fresh AOS home and non-default targets to use the same runtime trust path.
-- Keep the authenticated init operator separate from its target principal and
-  fail closed while signed direct update channels remain unpublished.
+- Keep the authenticated init operator separate from its target principal,
+  prevent AOS distribution replacement, and fail closed while signed direct
+  update channels remain unpublished.
 - Require explicit machine-readable runtime-compatibility and upgrade/self-heal
   approvals before the tag-triggered workflow can package or publish a release,
   backed by a packaged migration/reinstall test over the frozen 2026-07-15
@@ -123,30 +130,3 @@
   `aos stop` only after every coordination marker is gone and the singleton
   lock is available; all other inherited runtime failures retain their output
   and exit status.
-- Confirm every delegated runtime shutdown before reporting success, preserving
-  child output and exit status when stopped-state confirmation fails.
-
-### Fixed
-
-- Require stopped AOS runtime homes to contain only a non-empty private `astrid.volume` (Unix mode `0600`).
-
-- Stable `github-release` signing discovers product archives by filename
-  `unicity-aos-*.tar.gz` and refuses to publish when none are signed. The
-  download-artifact pattern `aos-*-*-*` is unchanged because it names GitHub
-  artifacts, not archive files.
-
-- Build Linux product binaries on a pinned glibc 2.31 baseline and reject AOS
-  or bundled Astrid executables that require glibc newer than 2.34, restoring
-  support for RHEL, Oracle Linux, Rocky Linux, and AlmaLinux 9. Closes #58.
-
-### Removed
-
-- The vendored `capsules/capsule-telegram` copy. The capsule is maintained in
-  its own repository at `unicity-aos/capsule-telegram` and installs directly
-  from there with `aos capsule install @unicity-aos/capsule-telegram`, so the
-  in-tree duplicate had no consumer: it was absent from `Distro.toml` and
-  `release/community-capsules.txt`, and was therefore never built, signed, or
-  shipped. Keeping it only invited the drift it had already accumulated —
-  it was the sole workspace member still pinned to `astrid-sdk` 0.5.3 and
-  building for `wasm32-wasip1`, which is why CI had to exclude it from every
-  workspace job. Those exclusions and the `telegram-wasi` job go away with it.

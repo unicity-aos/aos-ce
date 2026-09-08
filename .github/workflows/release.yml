@@ -640,6 +640,10 @@ jobs:
 
           Moving channel installs change only after a separate protected promotion.
           EOF
+          if [[ "$GITHUB_REF_NAME" != *-nightly.* ]]; then
+            printf '\n' >> release-notes.md
+            python3 scripts/changelog_notes.py --version "$GITHUB_REF_NAME" >> release-notes.md
+          fi
       - name: Refuse conflicting releases or authenticate a complete draft
         env:
           GH_TOKEN: ${{ github.token }}

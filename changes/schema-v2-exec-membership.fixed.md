@@ -1,1 +1,0 @@
-- Added schema-v2 release-manifest executable membership and explicit required `aos-mcp` capsule metadata, with fail-closed validation during native sealer extraction and archive signing.
