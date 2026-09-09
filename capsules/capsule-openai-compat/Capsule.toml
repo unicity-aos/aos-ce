@@ -30,7 +30,7 @@ capabilities = { net = ["*"] }
 net = ["*"]
 
 [env]
-api_key = { type = "secret", request = "Enter your API key for the OpenAI-compatible provider", placeholder = "sk-..." }
+api_key = { type = "secret", request = "Enter your API key for the OpenAI-compatible provider", placeholder = "sk-...", default = "" }
 base_url = { type = "string", request = "Enter the API base URL", default = "https://api.openai.com", placeholder = "https://api.openai.com" }
 model = { type = "select", request = "Enter the default model ID", default = "gpt-5.4", placeholder = "gpt-5.4", options_from = { http = "{base_url}/v1/models", bearer = "{api_key}", select = "data[].id", after = ["base_url", "api_key"] } }
 context_window = { type = "integer", request = "Enter the model's context window size (tokens)", default = "128000", placeholder = "128000" }

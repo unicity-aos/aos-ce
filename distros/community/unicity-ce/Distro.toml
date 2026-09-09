@@ -27,7 +27,9 @@ tool = "^1.0"
 pubkey = "ed25519:utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA="
 
 [variables]
-openai_api_key = { secret = true, description = "API key for OpenAI-compatible LLM provider" }
+# Host MCP tools do not require an LLM credential. Configure a key when using
+# an authenticated provider; an empty value also supports keyless local servers.
+openai_api_key = { secret = true, description = "API key for OpenAI-compatible LLM provider (optional at setup)", default = "" }
 openai_base_url = { description = "API base URL", default = "https://api.openai.com" }
 openai_model = { description = "Default model ID", default = "gpt-5.4" }
 openai_temperature = { description = "Default temperature (0.0-2.0, blank = provider default)", default = "" }
