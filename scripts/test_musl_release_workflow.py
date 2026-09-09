@@ -2,8 +2,10 @@
 """Keep native musl production connected to signing and publication."""
 
 from pathlib import Path
+import os
 import re
 import subprocess
+import tempfile
 import unittest
 
 
@@ -13,6 +15,33 @@ ROOT = Path(__file__).resolve().parent.parent
 class MuslReleaseWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflow = (ROOT / ".github/workflows/release.yml").read_text()
+
+    def test_gnu_clean_home_uses_container_built_probe(self):
+        build = self.workflow.split("- name: Build Linux product binary", 1)[1].split(
+            "- name: Build native static musl", 1)[0]
+        self.assertIn('-p unicity-aos-bootstrap --example init_provenance', build)
+        self.assertIn('if [[ "$TARGET" == x86_64-unknown-linux-gnu ]]', build)
+        test = self.workflow.split("- name: Test a clean Community Edition home", 1)[1]
+        self.assertIn('"$PWD/target/glibc-2.31/${{ matrix.target }}/release/examples/init_provenance"', test)
+
+    def test_prebuilt_probe_does_not_invoke_host_cargo(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            probe = root / "probe"
+            probe.write_text("#!/bin/sh\nexit 0\n")
+            probe.chmod(0o700)
+            cargo = root / "cargo"
+            marker = root / "cargo-invoked"
+            cargo.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 99\n')
+            cargo.chmod(0o700)
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}")
+            result = subprocess.run(
+                ["bash", str(ROOT / "scripts/test-clean-home-init.sh"), str(root), str(probe)],
+                env=env, text=True, capture_output=True)
+            # Reach bundle validation without trying to write a host Cargo tree.
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("clean-home init bundle is missing bin/aos", result.stderr)
+            self.assertFalse(marker.exists())
 
     def test_native_architecture_matrix(self):
         build = self.workflow.split("\n  build:", 1)[1].split("\n  capsules:", 1)[0]

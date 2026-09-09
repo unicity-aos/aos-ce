@@ -215,6 +215,10 @@ jobs:
               fi
               export CARGO_TARGET_DIR=/workspace/target/glibc-2.31
               cargo build --locked --release --target "$TARGET" -p unicity-aos-bootstrap
+              if [[ "$TARGET" == x86_64-unknown-linux-gnu ]]; then
+                cargo build --locked --release --target "$TARGET" \
+                  -p unicity-aos-bootstrap --example init_provenance
+              fi
             '
           AOS_BINARY="target/glibc-2.31/${{ matrix.target }}/release/aos"
           python3 scripts/check_glibc.py --max-version 2.34 "$AOS_BINARY"
@@ -306,7 +310,8 @@ jobs:
           mkdir "$RUNNER_TEMP/clean-home-bundle"
           tar -xzf "artifacts/unicity-aos-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
             -C "$RUNNER_TEMP/clean-home-bundle" --strip-components=1
-          scripts/test-clean-home-init.sh "$RUNNER_TEMP/clean-home-bundle"
+          scripts/test-clean-home-init.sh "$RUNNER_TEMP/clean-home-bundle" \
+            "$PWD/target/glibc-2.31/${{ matrix.target }}/release/examples/init_provenance"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aos-${{ matrix.target }}

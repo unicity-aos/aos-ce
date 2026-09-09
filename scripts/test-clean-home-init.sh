@@ -1,18 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-  echo "usage: $0 <extracted-product-bundle>" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "usage: $0 <extracted-product-bundle> [prebuilt-provenance-probe]" >&2
   exit 2
 fi
 
 bundle=$(cd "$1" && pwd -P)
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-cargo build --locked --manifest-path "$repo_root/Cargo.toml" \
-  -p unicity-aos-bootstrap --example init_provenance
-target_dir=$(cargo metadata --locked --manifest-path "$repo_root/Cargo.toml" \
-  --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
-provenance_probe="$target_dir/debug/examples/init_provenance"
+if [[ $# -eq 2 ]]; then
+  # Release CI builds this in the same container as AOS. Do not compile into
+  # that container's root-owned target tree from the unprivileged host runner.
+  provenance_probe=$(cd "$(dirname "$2")" && pwd -P)/$(basename "$2")
+  [[ -f "$provenance_probe" && -x "$provenance_probe" && ! -L "$provenance_probe" ]] || {
+    echo "invalid prebuilt provenance probe: $provenance_probe" >&2
+    exit 1
+  }
+else
+  cargo build --locked --manifest-path "$repo_root/Cargo.toml" \
+    -p unicity-aos-bootstrap --example init_provenance
+  target_dir=$(cargo metadata --locked --manifest-path "$repo_root/Cargo.toml" \
+    --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+  provenance_probe="$target_dir/debug/examples/init_provenance"
+fi
 for required in bin/aos runtime/bin/astrid runtime/bin/astrid-daemon Distro.toml capsule-assets.txt; do
   [[ -f "$bundle/$required" && ! -L "$bundle/$required" ]] || {
     echo "clean-home init bundle is missing $required" >&2
