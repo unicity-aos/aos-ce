@@ -12,6 +12,11 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Fixed
+
+- Complete Community initialization in one AOS invocation by resuming the
+  runtime's bounded installation batches without reinstalling completed capsules.
+
 ## [2026.9.0] - 2026-09-09
 
 ### Added
