@@ -165,6 +165,10 @@ class CapsuleReleaseTests(unittest.TestCase):
         self.assertEqual(variables["openai_api_key"]["default"], "")
         self.assertTrue(variables["openai_api_key"]["secret"])
         self.assertTrue(all("default" in value for value in variables.values()))
+        provider = distro.parents[3] / "capsules/capsule-openai-compat/Capsule.toml"
+        provider_key = tomllib.loads(provider.read_text())["env"]["api_key"]
+        self.assertEqual(provider_key["default"], "")
+        self.assertEqual(provider_key["type"], "secret")
 
     def test_source_contract_has_exact_community_set(self) -> None:
         self.assertEqual(len(self.specs), 22)
