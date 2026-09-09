@@ -1,1 +1,0 @@
-- Re-pin the prepare-only Darwin rehearsal Astrid source commit from 3de333f1 to 1897e086, keeping rehearsal overlays, product version, and production runtime/trust pins unchanged.

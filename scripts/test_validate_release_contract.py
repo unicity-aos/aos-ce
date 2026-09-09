@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import musl_release_metadata
@@ -155,10 +156,13 @@ class ReleaseReadinessTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "refusing to publish|musl runtime"):
                 VALIDATOR.main(["--require-release-ready"])
 
-    def test_main_admits_checked_in_false_ready_musl_pin(self) -> None:
+    def test_staged_validation_admits_false_ready_musl_pin(self) -> None:
         pin = VALIDATOR.readiness_metadata(
             ROOT / "release/runtime-musl-compatibility.toml"
         )
+        pin["runtime"]["release-ready"] = False
+        pin["runtime"]["musl-release-metadata-asset"] = ""
+        pin["runtime"]["musl-release-metadata-blake3"] = ""
         runtime = musl_release_metadata.validate_runtime_pin(
             pin, require_ready=False
         )
@@ -173,9 +177,15 @@ class ReleaseReadinessTests(unittest.TestCase):
             ROOT / "release/runtime-musl-compatibility.toml"
         )["runtime"]
         self.assertTrue(gnu["release-ready"])
-        self.assertFalse(musl["release-ready"])
-        with self.assertRaisesRegex(ValueError, "musl runtime compatibility release-ready"):
-            VALIDATOR.main(["--require-release-ready"])
+        musl["release-ready"] = False
+        original = VALIDATOR.readiness_metadata
+        def fixture(path):
+            if Path(path).name == "runtime-musl-compatibility.toml":
+                return {"schema-version": 1, "runtime": musl}
+            return original(path)
+        with patch.object(VALIDATOR, "readiness_metadata", side_effect=fixture):
+            with self.assertRaisesRegex(ValueError, "musl runtime compatibility release-ready"):
+                VALIDATOR.main(["--require-release-ready"])
 
     def test_musl_pin_rejects_identity_extra_keys_and_empty_ready_fields(self) -> None:
         pin = VALIDATOR.readiness_metadata(

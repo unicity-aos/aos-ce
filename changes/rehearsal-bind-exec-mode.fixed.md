@@ -1,1 +1,0 @@
-- Restore executable mode on downloaded Darwin rehearsal AOS binaries with chmod 0755 before the execute-bit bind, and reject missing, symlink, or non-regular artifact paths.

@@ -713,6 +713,11 @@ fn validate_release_runtime_bin(release_runtime_bin: &Path) -> io::Result<()> {
             )
         })?;
         let metadata = fs::symlink_metadata(entry.path())?;
+        #[cfg(target_os = "macos")]
+        if matches!(name.as_str(), "AstridFS.app" | "macos") {
+            validate_packaged_filesystem_directory(&entry.path())?;
+            continue;
+        }
         if !expected.contains(name.as_str())
             || metadata.file_type().is_symlink()
             || !metadata.is_file()
@@ -723,6 +728,27 @@ fn validate_release_runtime_bin(release_runtime_bin: &Path) -> io::Result<()> {
     }
     if actual.len() != expected.len() {
         return invalid("bundled product release runtime executable set is incomplete");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_packaged_filesystem_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return invalid("packaged filesystem support must be a real directory");
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            return invalid("packaged filesystem support contains a symlink");
+        }
+        if metadata.is_dir() {
+            validate_packaged_filesystem_directory(&entry.path())?;
+        } else if !metadata.is_file() {
+            return invalid("packaged filesystem support contains special data");
+        }
     }
     Ok(())
 }
@@ -1210,6 +1236,24 @@ mod tests {
     fn install_product_runtime(product: &AosHome) {
         fs::create_dir_all(product.runtime_home()).expect("create product runtime home");
         install_runtime_at(&product.release_runtime_bin_dir());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_inventory_admits_packaged_app_but_rejects_redirects_and_unknown_entries() {
+        use std::os::unix::fs::symlink;
+        let root = fixture_root("packaged-filesystem");
+        let bin = root.join("release-bin");
+        install_runtime_at(&bin);
+        write(&bin, "AstridFS.app/Contents/Info.plist", b"app fixture");
+        write(&bin, "macos/manage-macos-fskit.sh", b"manager fixture");
+        super::validate_release_runtime_bin(&bin).expect("packaged support is admitted");
+        write(&bin, "unexpected", b"not a shipped member");
+        assert!(super::validate_release_runtime_bin(&bin).is_err());
+        fs::remove_file(bin.join("unexpected")).unwrap();
+        symlink(root.join("outside"), bin.join("AstridFS.app/redirect")).unwrap();
+        assert!(super::validate_release_runtime_bin(&bin).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn install_runtime_at(runtime_bin: &Path) {

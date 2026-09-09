@@ -38,8 +38,13 @@ pub(crate) const RUNTIME_EXECUTABLE_NAMES: &[&str] = &[
 ];
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
-pub(crate) const RUNTIME_EXECUTABLE_NAMES: &[&str] =
-    &["astrid", "astrid-daemon", "astrid-build", "astrid-emit"];
+pub(crate) const RUNTIME_EXECUTABLE_NAMES: &[&str] = &[
+    "astrid",
+    "astrid-daemon",
+    "astrid-build",
+    "astrid-emit",
+    "astrid-storage-provider-fuse",
+];
 
 /// Product-owned per-project state directory selected for all AOS runtime access.
 pub const AOS_WORKSPACE_STATE_DIR: &str = ".aos";
@@ -845,10 +850,16 @@ mod tests {
 
     #[cfg(all(not(windows), not(target_os = "macos")))]
     #[test]
-    fn runtime_inventory_keeps_the_portable_four_binary_contract() {
+    fn runtime_inventory_includes_the_linux_storage_provider() {
         assert_eq!(
             RUNTIME_EXECUTABLE_NAMES,
-            ["astrid", "astrid-daemon", "astrid-build", "astrid-emit"]
+            [
+                "astrid",
+                "astrid-daemon",
+                "astrid-build",
+                "astrid-emit",
+                "astrid-storage-provider-fuse"
+            ]
         );
     }
 

@@ -184,7 +184,7 @@ for spec in source_contract():
     write_fixture(output / spec.asset, spec)
 PY
 
-for binary in astrid astrid-daemon astrid-build astrid-emit; do
+for binary in astrid astrid-daemon astrid-build astrid-emit astrid-storage-provider-fuse; do
   if [[ "$binary" == astrid ]]; then
     cat > "$runtime_root/$binary" <<'RUNTIME'
 #!/bin/sh
@@ -276,10 +276,7 @@ tar -tzf "$archive" > "$work/files"
 grep -q '/bin/aos$' "$work/files"
 grep -q '/libexec/install.sh$' "$work/files"
 grep -q '/runtime/bin/astrid-daemon$' "$work/files"
-if grep -q '/runtime/bin/astrid-storage-provider-fuse$' "$work/files"; then
-  echo "0.10.4 GNU release archive unexpectedly contains the FUSE provider" >&2
-  exit 1
-fi
+grep -q '/runtime/bin/astrid-storage-provider-fuse$' "$work/files"
 grep -q '/runtime-compatibility.toml$' "$work/files"
 test "$(grep -c '/capsules/aos-.*\.capsule$' "$work/files")" -eq 22
 grep -q '/capsule-assets.txt$' "$work/files"
@@ -315,6 +312,7 @@ expected_executables = [
     "runtime/bin/astrid-daemon",
     "runtime/bin/astrid-build",
     "runtime/bin/astrid-emit",
+    "runtime/bin/astrid-storage-provider-fuse",
 ]
 assert manifest["executables"] == expected_executables
 assert manifest["layout"] == {
@@ -333,6 +331,7 @@ expected_inventory = {
     "runtime/bin/astrid-build",
     "runtime/bin/astrid-daemon",
     "runtime/bin/astrid-emit",
+    "runtime/bin/astrid-storage-provider-fuse",
     *(f"capsules/{asset}" for asset in manifest["capsules"]["assets"]),
 }
 assert set(manifest["release_files"]) == expected_inventory, (
@@ -369,7 +368,7 @@ assert manifest["verifier"] == {
 PY
 
 # Rehearsal runtime 2026.9.0 has an explicit GNU FUSE provider contract while
-# the stable 0.10.4 GNU archive above remains the four portable binaries.
+# the pinned stable GNU archive above includes its FUSE provider.
 versioned_repo="$work/aos-2026.9.0-contract"
 mkdir -p \
   "$versioned_repo/scripts" \

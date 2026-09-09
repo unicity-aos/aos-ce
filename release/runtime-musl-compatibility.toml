@@ -6,12 +6,12 @@ schema-version = 1
 # two-target musl extension.
 [runtime]
 repository = "astrid-runtime/astrid"
-release-ready = false
-version = "0.10.4"
-tag = "v0.10.4"
-release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v0.10.4"
-source-commit = "b6bf5d1d579915eb5d3c944857d84e62a4fcc878"
-legacy-release-metadata-asset = "astrid-0.10.4-release.toml"
-legacy-release-metadata-blake3 = "25f4de92aa2db9db81e84902db479adf8bae68256fe3656db2c1673dfb302c0b"
-musl-release-metadata-asset = ""
-musl-release-metadata-blake3 = ""
+release-ready = true
+version = "2026.9.0"
+tag = "v2026.9.0"
+release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.0"
+source-commit = "7bad449122c08373e8fe4024a80f97a8787c2a44"
+legacy-release-metadata-asset = "astrid-2026.9.0-release.toml"
+legacy-release-metadata-blake3 = "66f7c7b9fabb17cc521e542fc524b9e9deca42826809306f6fd0096685d9e62e"
+musl-release-metadata-asset = "astrid-2026.9.0-musl-release.toml"
+musl-release-metadata-blake3 = "92fba87b0c94ff4bc41e9558e65295c2b37ef0174f875b6460be984fd9963de2"

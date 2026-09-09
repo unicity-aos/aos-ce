@@ -203,7 +203,7 @@ jobs:
           text = path.read_text(encoding="utf-8")
           old = 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "0.10.4";'
           new = 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "2026.9.0";'
-          if text.count(old) != 1:
+          if text.count(old) != 1 and text.count(new) != 1:
               raise SystemExit("rehearsal runtime-version overlay did not find a unique production constant")
           path.write_text(text.replace(old, new, 1), encoding="utf-8")
           PY

@@ -73,7 +73,7 @@ PY
 
 runtime_root="$work/astrid-$runtime_version-x86_64-unknown-linux-gnu"
 mkdir -p "$runtime_root"
-for binary in astrid astrid-daemon astrid-build astrid-emit; do
+for binary in astrid astrid-daemon astrid-build astrid-emit astrid-storage-provider-fuse; do
   printf '#!/bin/sh\necho %s\n' "$binary" > "$runtime_root/$binary"
   chmod 755 "$runtime_root/$binary"
 done
@@ -256,12 +256,12 @@ sh "$repo_root/install.sh" --yes --no-migrate-prompt
 test -x "$work/home/.aos/bin/aos"
 source "$repo_root/scripts/test-install-musl.sh"
 release_dir="$work/home/.aos/releases/2026.9.0"
-test "$runtime_version" = 0.10.4
+test "$runtime_version" = 2026.9.0
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
   test -x "$release_dir/runtime/bin/$binary"
   test ! -e "$work/home/.aos/runtime/bin/$binary"
 done
-test ! -e "$release_dir/runtime/bin/astrid-storage-provider-fuse"
+test -x "$release_dir/runtime/bin/astrid-storage-provider-fuse"
 test -f "$release_dir/release-manifest.json"
 test -f "$release_dir/Distro.toml"
 test -f "$release_dir/capsule-assets.txt"
@@ -364,7 +364,7 @@ do
 done
 
 # Build a second package through the real composer with an isolated
-# compatibility overlay.  The checked-in 0.10.4 contract above remains the
+# compatibility overlay.  The checked-in production contract above remains the
 # historical control; this fixture exercises the versioned 2026.9.0 GNU
 # membership that requires the FUSE provider.
 fuse_repo="$work/aos-2026.9.0-contract"
