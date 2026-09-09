@@ -15,7 +15,8 @@ implementations are consolidated into their final behavior.
 ### Fixed
 
 - Complete Community initialization in one AOS invocation by resuming the
-  runtime's bounded installation batches without reinstalling completed capsules.
+  runtime's bounded installation batches without reinstalling completed capsules,
+  then finalizing the default system fleet's capsule grants.
 
 ## [2026.9.0] - 2026-09-09
 

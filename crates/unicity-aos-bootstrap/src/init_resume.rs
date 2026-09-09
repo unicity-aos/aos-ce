@@ -10,6 +10,19 @@ use std::time::Duration;
 const INSTALL_BATCH: usize = 10;
 const INSTALL_WINDOW: Duration = Duration::from_secs(61);
 
+// The preparation pass always installs the embedded fleet for default, not
+// the caller's Oracle principal. Do not extend host-specific grant sets here.
+pub(super) fn grant_args(assets: &[String]) -> Vec<String> {
+    let mut args = ["--principal", "default", "agent", "modify", "default"]
+        .map(str::to_owned)
+        .to_vec();
+    for asset in assets {
+        args.push("--add-capsule".to_owned());
+        args.push(asset.trim_end_matches(".capsule").to_owned());
+    }
+    args
+}
+
 pub(super) fn initialize(mut command: Command, expected: usize) -> io::Result<()> {
     resume(
         expected,
@@ -97,6 +110,24 @@ fn partial_progress(stderr: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_grant_uses_only_the_embedded_default_fleet() {
+        assert_eq!(
+            grant_args(&["aos-cli.capsule".into(), "aos-mcp.capsule".into()]),
+            [
+                "--principal",
+                "default",
+                "agent",
+                "modify",
+                "default",
+                "--add-capsule",
+                "aos-cli",
+                "--add-capsule",
+                "aos-mcp"
+            ]
+        );
+    }
 
     fn partial(completed: usize) -> (bool, String) {
         (

@@ -896,6 +896,20 @@ fn product_init_stops_before_runtime_dispatch_when_system_fleet_init_fails() {
 }
 
 #[test]
+fn product_init_stops_when_default_fleet_grant_fails() {
+    let fixture = Fixture::new("init-grant-failure");
+    fixture.install_runtime(&RECORDING_RUNTIME.replace(
+        "if [ \"$1\" = \"start\" ]; then",
+        "if [ \"$1\" = \"--principal\" ] && [ \"$3\" = \"agent\" ]; then\nexit 42\nelif [ \"$1\" = \"start\" ]; then",
+    ));
+    let output = fixture.command().arg("init").output().expect("run init");
+    assert!(!output.status.success());
+    assert!(fixture.bootstrap_args.exists());
+    assert!(!fixture.args.exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("default fleet grant failed"));
+}
+
+#[test]
 fn product_non_default_init_delegates_principal_and_capsule_grants() {
     let fixture = Fixture::new("init-principal");
     fixture.install_runtime(RECORDING_RUNTIME);

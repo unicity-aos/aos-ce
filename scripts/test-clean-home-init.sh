@@ -90,10 +90,11 @@ manifest="$aos_home/distributions/unicity-ce/Distro.toml"
 run_aos agent show default --format json > "$work/default.before.json"
 snapshot_provenance > "$work/distro.before.json"
 
-python3 - "$bundle/capsule-assets.txt" "$work/default.before.json" "$work/distro.before.json" <<'PY'
+python3 - "$bundle/capsule-assets.txt" "$aos_home/runtime/etc/profiles/default.toml" "$work/distro.before.json" <<'PY'
 import json
 import pathlib
 import sys
+import tomllib
 
 assets_path, profile_path, lock_path = map(pathlib.Path, sys.argv[1:])
 expected = sorted(
@@ -103,13 +104,13 @@ expected = sorted(
 )
 if len(expected) != 22 or len(set(expected)) != 22:
     raise SystemExit("release capsule inventory is not the exact 22-capsule CE set")
-profile = json.loads(profile_path.read_text())
+profile = tomllib.loads(profile_path.read_text())
 lock = json.loads(lock_path.read_text())
 if lock.get("distro_id") != "unicity-ce":
     raise SystemExit("default principal has no CE distro provenance")
 if sorted(item["name"] for item in lock["capsules"]) != expected:
     raise SystemExit("durable distro provenance does not bind the exact release capsule set")
-granted = sorted(profile.get("grants", []))
+granted = sorted(profile.get("capsules", []))
 if granted != expected:
     raise SystemExit("default principal was not granted the exact release capsule set")
 PY
@@ -170,9 +171,15 @@ import fcntl
 import pathlib
 import sys
 
-with open(sys.argv[1], "r+b", buffering=0) as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    fcntl.flock(lock, fcntl.LOCK_UN)
+lock_path = pathlib.Path(sys.argv[1])
+if lock_path.is_symlink():
+    raise SystemExit("stopped runtime lock is a symlink")
+# Successful retirement may remove the runtime lock entirely. If retained,
+# it must be unlocked; process exit and transient-marker checks precede this.
+if lock_path.exists():
+    with lock_path.open("r+b", buffering=0) as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock, fcntl.LOCK_UN)
 runtime = pathlib.Path(sys.argv[2])
 if sorted(path.name for path in runtime.iterdir()) != ["astrid.volume"]:
     raise SystemExit("stopped AOS runtime is not exactly astrid.volume")

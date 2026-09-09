@@ -230,7 +230,8 @@ impl AosHome {
     /// A completely fresh Astrid home has no capsule capable of accepting CLI
     /// connections. Astrid installs through the daemon in bounded batches.
     /// Resume partial batches after the kernel's rate-limit window, leaving
-    /// completed-install detection and grants to Astrid itself.
+    /// completed-install detection to Astrid itself. Finalize the default
+    /// system fleet's grants through Astrid's idempotent admin command.
     ///
     /// # Errors
     /// Returns an error when the bundled runtime or exact CE capsule set is
@@ -241,10 +242,17 @@ impl AosHome {
         S: AsRef<OsStr>,
     {
         self.ensure_runtime_available()?;
-        init_resume::initialize(
-            self.runtime_command_with_args(args)?,
-            capsule_assets_from_manifest()?.len(),
-        )
+        let assets = capsule_assets_from_manifest()?;
+        init_resume::initialize(self.runtime_command_with_args(args)?, assets.len())?;
+        let status = self
+            .runtime_command_with_args(init_resume::grant_args(&assets))?
+            .status()?;
+        if !status.success() {
+            return Err(io::Error::other(
+                "CE capsules installed but default fleet grant failed",
+            ));
+        }
+        Ok(())
     }
 
     /// The conventional standalone Astrid Runtime home that first-run AOS can offer
