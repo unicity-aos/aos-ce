@@ -394,7 +394,9 @@ test "$(find "$legacy/run" -type f | wc -l | tr -d ' ')" -eq 5
 install_candidate
 test -x "$aos_home/bin/aos"
 test -x "$aos_home/releases/2026.9.0/runtime/bin/astrid-daemon"
-test ! -e "$aos_home/releases/2026.9.0/runtime/bin/astrid-storage-provider-fuse"
+if [[ "$host_os" == Linux ]]; then
+  test -x "$aos_home/releases/2026.9.0/runtime/bin/astrid-storage-provider-fuse"
+fi
 for name in $runtime_binaries; do
   test ! -e "$aos_home/runtime/bin/$name"
 done
@@ -545,6 +547,8 @@ cp "$repo_root/distros/community/unicity-ce/Distro.toml" \
 cp "$repo_root/install.sh" "$repo_root/README.md" "$fuse_repo/"
 cp "$repo_root/scripts/capsule_release.py" \
   "$repo_root/scripts/package-release.sh" \
+  "$repo_root/scripts/package_macos_filesystem.py" \
+  "$repo_root/scripts/aos-filesystem.sh" \
   "$repo_root/scripts/validate-runtime-archive.py" \
   "$fuse_repo/scripts/"
 python3 - "$fuse_repo/release/runtime-compatibility.toml" \
