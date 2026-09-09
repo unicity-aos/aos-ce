@@ -14,6 +14,10 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Read principal-scoped loaded capsule metadata for system inspection instead
+  of an obsolete private capsule directory. Shared executable hashes remain
+  references; missing metadata is reported instead of silently omitted.
+
 - Complete Community initialization in one AOS invocation by resuming the
   runtime's bounded installation batches without reinstalling completed capsules,
   then finalizing the default system fleet's capsule grants.
