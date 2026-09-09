@@ -46,6 +46,11 @@ impl Snapshot {
             // the installed metadata, including its shared WASM hash.
             if let Some(object) = meta.as_object_mut() {
                 object.remove("tools");
+                if object.is_empty() {
+                    // A successful live describe does not prove that the
+                    // runtime could read installed metadata.
+                    meta = Value::Null;
+                }
             }
             if capsules.insert(entry.name, meta).is_some() {
                 return Err(error("duplicate capsule in runtime inventory"));
@@ -64,7 +69,7 @@ impl Snapshot {
                 "capsule '{name}' is not in this principal's loaded snapshot"
             ))
         })?;
-        if !meta.is_object() {
+        if meta.as_object().is_none_or(serde_json::Map::is_empty) {
             return Err(error(format!(
                 "runtime metadata is unavailable for capsule '{name}'"
             )));
@@ -81,6 +86,8 @@ pub(super) fn receive(payload: Value) -> Result<(), SysError> {
     let snapshot = Snapshot::from_event(payload, &principal, caller.timestamp)?;
     // The kernel scopes KV by invocation principal and capsule. Never persist
     // shared executable bytes or use a principal supplied by tool arguments.
+    // Snapshot broadcasts use the dispatcher's ordered per-(capsule, principal)
+    // consumer; it awaits this handler before processing the next event.
     kv::set_json(SNAPSHOT_KEY, &snapshot)
 }
 
@@ -141,5 +148,21 @@ mod tests {
         )
         .unwrap();
         assert!(missing.metadata("broken").is_err());
+    }
+
+    #[test]
+    fn live_tools_without_installed_metadata_are_not_health() {
+        // The runtime can discover tools even when reading meta.json fails.
+        for meta in [json!({"tools":[{"name":"read_file"}]}), json!({})] {
+            let snapshot = Snapshot::from_event(
+                json!({"capsules":[{
+                    "principal":"alice", "name":"broken", "meta":meta
+                }]}),
+                "alice",
+                "now".into(),
+            )
+            .unwrap();
+            assert!(snapshot.metadata("broken").is_err());
+        }
     }
 }

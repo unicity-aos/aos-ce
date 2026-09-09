@@ -3,7 +3,8 @@ name = "aos-system"
 version = "0.2.0"
 description = "System management tools — lets the LLM inspect and manage its own runtime"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
-astrid-version = ">=0.1.0"
+# Principal-stamped capsules_loaded metadata is available from Astrid 0.9.0.
+astrid-version = ">=0.9.0"
 
 [[component]]
 id = "system-tools"
