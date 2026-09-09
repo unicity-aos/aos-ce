@@ -28,7 +28,11 @@ aos init
 ```
 
 `aos init`, including `aos init --offline`, provisions from those local,
-product-versioned capsule assets. Re-running the installer performs a
+product-versioned capsule assets. A fresh Community installation automatically
+resumes Astrid's ten-capsule batches after each rate-limit window; installing
+all 22 capsules includes approximately two minutes of waiting. Completed
+installs are not repeated, and a stalled batch remains an error.
+Re-running the installer performs a
 coordinated product upgrade without
 rewriting a standalone runtime installation. Every release publishes
 checksums, Sigstore bundles, GitHub build-provenance attestations, and

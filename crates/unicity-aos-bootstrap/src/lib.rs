@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 
 pub mod health;
+mod init_resume;
 mod migration;
 pub mod status;
 pub use migration::{LegacyDistro, MigrationOutcome};
@@ -227,10 +228,10 @@ impl AosHome {
     /// daemon-backed grant preflight.
     ///
     /// A completely fresh Astrid home has no capsule capable of accepting CLI
-    /// connections. The first pass uses Astrid's normal distro initializer to
-    /// install the release-pinned CE fleet under `default` without starting the
-    /// daemon. The requested init can then boot Astrid, authorize its operator,
-    /// and apply grants through the normal kernel path.
+    /// connections. Astrid installs through the daemon in bounded batches.
+    /// Resume partial batches after the kernel's rate-limit window, leaving
+    /// completed-install detection to Astrid itself. Finalize the default
+    /// system fleet's grants through Astrid's idempotent admin command.
     ///
     /// # Errors
     /// Returns an error when the bundled runtime or exact CE capsule set is
@@ -241,19 +242,15 @@ impl AosHome {
         S: AsRef<OsStr>,
     {
         self.ensure_runtime_available()?;
+        let assets = capsule_assets_from_manifest()?;
+        init_resume::initialize(self.runtime_command_with_args(args)?, assets.len())?;
         let status = self
-            .runtime_command_with_args(args)?
-            .status()
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("failed to initialize the bundled CE system fleet: {error}"),
-                )
-            })?;
+            .runtime_command_with_args(init_resume::grant_args(&assets))?
+            .status()?;
         if !status.success() {
-            return Err(io::Error::other(format!(
-                "bundled CE system-fleet initializer exited with {status}"
-            )));
+            return Err(io::Error::other(
+                "CE capsules installed but default fleet grant failed",
+            ));
         }
         Ok(())
     }
