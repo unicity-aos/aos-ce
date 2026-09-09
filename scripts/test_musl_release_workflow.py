@@ -6,6 +6,8 @@ import os
 import re
 import subprocess
 import tempfile
+import tarfile
+import textwrap
 import unittest
 
 
@@ -15,6 +17,24 @@ ROOT = Path(__file__).resolve().parent.parent
 class MuslReleaseWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflow = (ROOT / ".github/workflows/release.yml").read_text()
+
+    def test_signed_archive_listing_drains_tar_and_rejects_missing_signature(self):
+        block = self.workflow.split("          signed_archives=0\n", 1)[1].split(
+            "      - name: Generate checksums", 1)[0]
+        script = 'set -euo pipefail\nassets=("$1")\nsigned_archives=0\n' + textwrap.dedent(block)
+        with tempfile.TemporaryDirectory() as temp:
+            for signed in (True, False):
+                archive = Path(temp) / f"bundle-{signed}.tar.gz"
+                with tarfile.open(archive, "w:gz") as tar:
+                    if signed:
+                        tar.addfile(tarfile.TarInfo("product/Distro.sig"))
+                    # Larger than a pipe buffer, with the signature first.
+                    for index in range(10000):
+                        tar.addfile(tarfile.TarInfo(f"product/capsules/member-{index:05d}"))
+                result = subprocess.run(["bash", "-c", script, "check", str(archive)],
+                                        text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0 if signed else 1, result.stderr)
+                self.assertNotIn("write error", result.stderr)
 
     def test_gnu_clean_home_uses_container_built_probe(self):
         build = self.workflow.split("- name: Build Linux product binary", 1)[1].split(

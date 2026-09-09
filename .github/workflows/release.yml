@@ -494,7 +494,9 @@ jobs:
             exit 1
           }
           for asset in "${assets[@]}"; do
-            if tar -tzf "$asset" | grep -q '/Distro.sig$'; then
+            # Consume the full listing: grep -q closes early and makes tar fail
+            # with SIGPIPE under pipefail even when Distro.sig is present.
+            if tar -tzf "$asset" | grep '/Distro.sig$' > /dev/null; then
               continue
             fi
             signed="$RUNNER_TEMP/$(basename "$asset")"
@@ -508,7 +510,7 @@ jobs:
           done
           signed_archives=0
           for asset in "${assets[@]}"; do
-            if tar -tzf "$asset" | grep -q '/Distro.sig$'; then
+            if tar -tzf "$asset" | grep '/Distro.sig$' > /dev/null; then
               signed_archives=$((signed_archives + 1))
             fi
           done
