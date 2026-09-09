@@ -1298,7 +1298,7 @@ fn signed_distro_apply_stops_to_a_volume_and_writes_a_bound_receipt() {
     assert_eq!(receipt["distro_id"], "unicity-ce");
     assert_eq!(receipt["distro_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(receipt["principal"], "operator");
-    assert_eq!(receipt["astrid_runtime_version"], "0.10.4");
+    assert_eq!(receipt["astrid_runtime_version"], "2026.9.0");
     assert!(receipt["signing_pubkey"].as_str().unwrap().len() > 8);
     assert!(
         receipt["manifest_blake3"]
@@ -1689,7 +1689,7 @@ fn native_status_reports_stopped_without_invoking_the_runtime_cli() {
         assert!(output.stderr.is_empty());
         let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
         assert!(stdout.contains("stopped"));
-        assert!(stdout.contains("0.10.4"));
+        assert!(stdout.contains("2026.9.0"));
     }
 }
 

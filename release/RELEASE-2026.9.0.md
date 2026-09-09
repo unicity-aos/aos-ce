@@ -33,6 +33,16 @@ temporary source repins, fixture repairs, and fixes to newly introduced
 features are folded into the final behavior, not advertised as separate fixes
 to an older public release. Source history retains those details.
 
-The current compatibility files retain the last published runtime until its
-replacement can be authenticated. This PR therefore remains draft until the
-upstream pin step is complete. No Windows product certification is implied.
+## Published upstream identity
+
+Astrid v2026.9.0 is an immutable published release at
+`7bad449122c08373e8fe4024a80f97a8787c2a44`. Both metadata bundles were verified
+against the release workflow's Sigstore identity before pinning:
+
+- GNU/Darwin metadata BLAKE3: `66f7c7b9fabb17cc521e542fc524b9e9deca42826809306f6fd0096685d9e62e`.
+- Musl metadata BLAKE3: `92fba87b0c94ff4bc41e9558e65295c2b37ef0174f875b6460be984fd9963de2`.
+
+The four direct Rust client dependencies and Cargo.lock now use published
+2026.9.0 crates. Distro, bootstrap constant and command inventory agree; the
+inventory includes inherited `storage`. Production publication still executes
+the signing and archive checks. No Windows product certification is implied.

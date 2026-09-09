@@ -197,11 +197,13 @@ case "$host_os:$host_arch" in
     runtime_binaries="$runtime_binaries astrid-storage-provider-fskit"
     ;;
   Linux:aarch64|Linux:arm64)
+    runtime_binaries="$runtime_binaries astrid-storage-provider-fuse"
     target=aarch64-unknown-linux-gnu
     cosign_asset=cosign-linux-arm64
     cosign_sha256=2ec865872e331c32fd12b08dae15332d3f92c0aa029219589684a4903ca85d11
     ;;
   Linux:x86_64|Linux:amd64)
+    runtime_binaries="$runtime_binaries astrid-storage-provider-fuse"
     target=x86_64-unknown-linux-gnu
     cosign_asset=cosign-linux-amd64
     cosign_sha256=ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc
@@ -253,6 +255,11 @@ for name in $runtime_binaries; do
   printf '#!/bin/sh\necho packaged-%s\n' "$name" > "$runtime_root/$name"
   chmod 755 "$runtime_root/$name"
 done
+if [[ "$host_os" == Darwin ]]; then
+  PYTHONPATH="$repo_root/scripts" python3 -c \
+    'from pathlib import Path; import sys; from test_package_macos_filesystem import fixture; fixture(Path(sys.argv[1]))' \
+    "$runtime_root"
+fi
 COPYFILE_DISABLE=1 tar -czf "$work/runtime.tar.gz" -C "$work" "$(basename "$runtime_root")"
 bash "$repo_root/scripts/package-release.sh" \
   "$target" \
@@ -518,7 +525,7 @@ test ! -e "$aos_home/runtime/run"
 
 echo "sanitized packaged migration, reinstall, and self-heal checks passed"
 
-# Keep the historical 0.10.4 GNU control above, then perform an upgrade to a
+# Keep the legacy-layout migration control above, then perform an upgrade to a
 # real 2026.9.0 GNU package composed through an isolated compatibility overlay.
 # The strict provider is included in the shipped-asset snapshot so the
 # self-heal reinstall proves its immutable persistence rather than merely
@@ -716,4 +723,4 @@ for directory in \
   test "$(mode_of "$directory")" = 700
 done
 
-echo "historical 0.10.4 control and 2026.9.0 GNU FUSE self-heal checks passed"
+echo "legacy-layout migration and 2026.9.0 GNU FUSE self-heal checks passed"

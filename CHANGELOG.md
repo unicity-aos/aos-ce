@@ -12,7 +12,7 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
-## [2026.9.0] - 2026-09-08
+## [2026.9.0] - 2026-09-09
 
 ### Added
 
@@ -35,6 +35,8 @@ implementations are consolidated into their final behavior.
 
 ### Changed
 
+- Pin the runtime and Rust client dependencies to published Astrid 2026.9.0,
+  including authenticated GNU, Darwin, and musl release metadata.
 - Runtime executables live in immutable versioned release directories, separate
   from durable runtime state. A stopped runtime contains only its private,
   non-empty `astrid.volume`.

@@ -257,11 +257,15 @@ class ExtensionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown keys"):
             MUSL.validate_extension(extension)
 
-    def test_checked_in_pin_is_staged_and_fail_closed(self) -> None:
+    def test_checked_in_pin_is_ready_and_false_fixture_fails_closed(self) -> None:
         path = Path(__file__).resolve().parent.parent / "release/runtime-musl-compatibility.toml"
         pin = release_metadata.load(path)
         runtime = MUSL.validate_runtime_pin(pin, require_ready=False)
-        self.assertFalse(runtime["release-ready"])
+        self.assertTrue(runtime["release-ready"])
+        MUSL.validate_runtime_pin(pin, require_ready=True)
+        pin["runtime"]["release-ready"] = False
+        pin["runtime"]["musl-release-metadata-asset"] = ""
+        pin["runtime"]["musl-release-metadata-blake3"] = ""
         with self.assertRaisesRegex(ValueError, "release-ready gate is false"):
             MUSL.validate_runtime_pin(pin, require_ready=True)
 
