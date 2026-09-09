@@ -510,7 +510,7 @@ jobs:
           done
           signed_archives=0
           for asset in "${assets[@]}"; do
-            if tar -tzf "$asset" | grep -q '/Distro.sig$'; then
+            if tar -tzf "$asset" | grep '/Distro.sig$' > /dev/null; then
               signed_archives=$((signed_archives + 1))
             fi
           done
