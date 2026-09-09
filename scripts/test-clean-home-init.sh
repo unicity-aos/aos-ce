@@ -42,6 +42,8 @@ mkdir -p "$project"
 run_aos() {
   (
     cd "$project"
+    # First-run must work without a provider credential inherited from CI.
+    unset ASTRID_VAR_OPENAI_API_KEY
     HOME="$work/user" \
       AOS_HOME="$aos_home" \
       UNICITY_AOS_RUNTIME_BIN="$bundle/runtime/bin/astrid" \
@@ -93,7 +95,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-run_aos init --offline --yes --var openai_api_key=release-gate-not-a-real-key
+run_aos init --offline --yes
 
 manifest="$aos_home/distributions/unicity-ce/Distro.toml"
 [[ -f "$manifest" ]]
@@ -132,7 +134,7 @@ pid_file="$aos_home/run/system.pid"
 [[ -f "$pid_file" && ! -L "$pid_file" ]]
 cp "$pid_file" "$work/system.pid.before"
 run_aos capsule show aos-cli --format json > "$work/cli-meta.before.json"
-run_aos init --offline --yes --var openai_api_key=release-gate-not-a-real-key
+run_aos init --offline --yes
 snapshot_provenance > "$work/distro.after.json"
 python3 - "$work/distro.before.json" "$work/distro.after.json" <<'PY'
 import json

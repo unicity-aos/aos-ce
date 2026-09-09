@@ -14,6 +14,9 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Allow Community and Oracle host setup without an OpenAI API key. Provider
+  credentials can be configured when needed; host MCP tools do not require them.
+
 - Read principal-scoped loaded capsule metadata for system inspection instead
   of an obsolete private capsule directory. Shared executable hashes remain
   references; missing metadata is reported instead of silently omitted.

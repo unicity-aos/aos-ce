@@ -7,6 +7,7 @@ import json
 import sys
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from typing import Optional
@@ -157,6 +158,13 @@ class CapsuleReleaseTests(unittest.TestCase):
     def fixture_set(self, directory: Path) -> None:
         for spec in self.specs:
             write_fixture(directory / spec.asset, spec)
+
+    def test_headless_setup_has_no_required_provider_credential(self) -> None:
+        distro = Path(__file__).resolve().parent.parent / "distros/community/unicity-ce/Distro.toml"
+        variables = tomllib.loads(distro.read_text())["variables"]
+        self.assertEqual(variables["openai_api_key"]["default"], "")
+        self.assertTrue(variables["openai_api_key"]["secret"])
+        self.assertTrue(all("default" in value for value in variables.values()))
 
     def test_source_contract_has_exact_community_set(self) -> None:
         self.assertEqual(len(self.specs), 22)
