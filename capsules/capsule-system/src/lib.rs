@@ -11,8 +11,8 @@
 //!
 //! # Tools
 //!
-//! - `list_capsules` — enumerate installed capsules with names and versions
-//! - `inspect_capsule` — read a capsule's manifest and metadata
+//! - `list_capsules` — enumerate the principal's last loaded capsule snapshot
+//! - `inspect_capsule` — read metadata referencing a shared capsule artifact
 //! - `list_interfaces` — list available WIT interface contracts
 //! - `read_interface` — read a WIT interface definition
 //! - `system_status` — runtime health and interface coverage summary
@@ -21,8 +21,7 @@ use astrid_sdk::prelude::*;
 use astrid_sdk::schemars;
 use serde::{Deserialize, Serialize};
 
-/// Capsule directory under the principal home (FHS layout).
-const CAPSULES_DIR: &str = "home://.local/capsules";
+mod inventory;
 
 /// Standard WIT interface directory — per-principal, accessible via `home://wit/`.
 const WIT_DIR: &str = "home://wit";
@@ -65,6 +64,9 @@ struct CapsuleSummary {
 
 #[derive(Debug, Serialize)]
 struct SystemStatusResponse {
+    view: &'static str,
+    principal: String,
+    observed_at: String,
     capsule_count: usize,
     exports: Vec<String>,
     imports_satisfied: Vec<String>,
@@ -74,11 +76,6 @@ struct SystemStatusResponse {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Parse a `meta.json` file content into a serde_json::Value.
-fn parse_meta(content: &str) -> Option<serde_json::Value> {
-    serde_json::from_str(content).ok()
-}
 
 /// Extract `namespace/interface` strings from the nested exports/imports map
 /// in meta.json: `{ "astrid": { "session": "1.0.0" } }` → `["astrid/session 1.0.0"]`
@@ -111,26 +108,22 @@ fn list_entries(path: &str) -> Result<Vec<String>, SysError> {
 
 #[capsule]
 impl SystemTools {
-    /// List all installed capsules with their names and versions. Use `inspect_capsule`
-    /// for a capsule's manifest, exports, imports, and capabilities.
+    /// Receive the runtime-stamped, principal-scoped loaded metadata view.
+    #[astrid::interceptor("receive_inventory")]
+    pub fn receive_inventory(&self, payload: serde_json::Value) -> Result<(), SysError> {
+        inventory::receive(payload)
+    }
+
+    /// List capsules in the last runtime-loaded snapshot for this principal. Use `inspect_capsule`
+    /// for its metadata and shared WASM identity, exports, and imports.
     /// Returns a JSON array of capsule summaries.
     #[astrid::tool("list_capsules")]
     pub fn list_capsules(&self, _args: EmptyArgs) -> Result<String, SysError> {
-        let capsule_names = list_entries(CAPSULES_DIR)?;
+        let snapshot = inventory::load()?;
         let mut summaries = Vec::new();
 
-        for name in &capsule_names {
-            let meta_path = format!("{CAPSULES_DIR}/{name}/meta.json");
-            let meta_content = match astrid_sdk::fs::read_to_string(&meta_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let meta = match parse_meta(&meta_content) {
-                Some(m) => m,
-                None => continue,
-            };
-
+        for name in snapshot.capsules.keys() {
+            let meta = snapshot.metadata(name)?;
             let version = meta
                 .get("version")
                 .and_then(|v| v.as_str())
@@ -159,8 +152,8 @@ impl SystemTools {
             .map_err(|e| SysError::ApiError(format!("serialize: {e}")))
     }
 
-    /// Read a capsule's full manifest and installation metadata.
-    /// Returns the Capsule.toml content and meta.json as a combined response.
+    /// Read loaded capsule metadata, including its shared WASM identity.
+    /// Returns the last observed principal snapshot entry, not a private manifest copy.
     #[astrid::tool("inspect_capsule")]
     pub fn inspect_capsule(&self, args: InspectCapsuleArgs) -> Result<String, SysError> {
         let name = args.name.trim();
@@ -175,18 +168,16 @@ impl SystemTools {
             ));
         }
 
-        let manifest_path = format!("{CAPSULES_DIR}/{name}/Capsule.toml");
-        let meta_path = format!("{CAPSULES_DIR}/{name}/meta.json");
-
-        let manifest = astrid_sdk::fs::read_to_string(&manifest_path)
-            .unwrap_or_else(|_| format!("(Capsule.toml not found for {name})"));
-
-        let meta = astrid_sdk::fs::read_to_string(&meta_path)
-            .unwrap_or_else(|_| format!("(meta.json not found for {name})"));
-
-        Ok(format!(
-            "=== Capsule.toml ===\n{manifest}\n\n=== meta.json ===\n{meta}"
-        ))
+        let snapshot = inventory::load()?;
+        let metadata = snapshot.metadata(name)?;
+        serde_json::to_string_pretty(&serde_json::json!({
+            "view": "last_observed_loaded_capsules",
+            "principal": snapshot.principal,
+            "observed_at": snapshot.observed_at,
+            "name": name,
+            "metadata": metadata,
+        }))
+        .map_err(|e| SysError::ApiError(format!("serialize: {e}")))
     }
 
     /// List all WIT interface definitions available in the system.
@@ -238,27 +229,18 @@ impl SystemTools {
         })
     }
 
-    /// Show runtime status: capsule count, interface coverage, satisfied and
+    /// Show the last loaded principal snapshot: capsule count, interface coverage, satisfied and
     /// unsatisfied imports. Helps you understand the health of the system.
     #[astrid::tool("system_status")]
     pub fn system_status(&self, _args: EmptyArgs) -> Result<String, SysError> {
-        let capsule_names = list_entries(CAPSULES_DIR)?;
+        let snapshot = inventory::load()?;
 
         // Collect all exports and imports across all capsules
         let mut all_exports: Vec<String> = Vec::new();
         let mut all_imports: Vec<(String, String)> = Vec::new(); // (interface, capsule_name)
 
-        for name in &capsule_names {
-            let meta_path = format!("{CAPSULES_DIR}/{name}/meta.json");
-            let meta_content = match astrid_sdk::fs::read_to_string(&meta_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let meta = match parse_meta(&meta_content) {
-                Some(m) => m,
-                None => continue,
-            };
-
+        for name in snapshot.capsules.keys() {
+            let meta = snapshot.metadata(name)?;
             if let Some(exports) = meta.get("exports") {
                 for iface in flatten_interface_map(exports) {
                     // Strip version for matching: "astrid/session 1.0.0" → "astrid/session"
@@ -289,7 +271,10 @@ impl SystemTools {
         }
 
         let status = SystemStatusResponse {
-            capsule_count: capsule_names.len(),
+            view: "last_observed_loaded_capsules",
+            principal: snapshot.principal.clone(),
+            observed_at: snapshot.observed_at.clone(),
+            capsule_count: snapshot.capsules.len(),
             exports: all_exports,
             imports_satisfied: satisfied,
             imports_unsatisfied: unsatisfied,

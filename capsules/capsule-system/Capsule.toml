@@ -3,7 +3,8 @@ name = "aos-system"
 version = "0.2.0"
 description = "System management tools — lets the LLM inspect and manage its own runtime"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
-astrid-version = ">=0.1.0"
+# Principal-stamped capsules_loaded metadata is available from Astrid 0.9.0.
+astrid-version = ">=0.9.0"
 
 [[component]]
 id = "system-tools"
@@ -21,6 +22,7 @@ fs_read  = ["home://"]
 # Interceptor bindings: a [subscribe] entry's `handler` binds the topic to a
 # `#[astrid::interceptor]` export. The keys also serve as the subscribe ACL.
 [subscribe]
+"astrid.v1.capsules_loaded" = { wit = "opaque", handler = "receive_inventory" }
 "tool.v1.execute.list_capsules" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_list_capsules" }
 "tool.v1.execute.inspect_capsule" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_inspect_capsule" }
 "tool.v1.execute.list_interfaces" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_list_interfaces" }
