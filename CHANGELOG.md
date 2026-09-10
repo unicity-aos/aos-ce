@@ -6,11 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [year.month.patch](release/VERSIONING.md). Repairs to unreleased
 implementations are consolidated into their final behavior.
 
-[Unreleased]: https://github.com/unicity-aos/aos-ce/compare/2026.9.0...HEAD
+[Unreleased]: https://github.com/unicity-aos/aos-ce/compare/2026.9.1...HEAD
+[2026.9.1]: https://github.com/unicity-aos/aos-ce/compare/2026.9.0...2026.9.1
 [2026.9.0]: https://github.com/unicity-aos/aos-ce/compare/2026.1.3...2026.9.0
 [2026.1.3]: https://github.com/unicity-aos/aos-ce/releases/tag/2026.1.3
 
 ## [Unreleased]
+
+## [2026.9.1] - 2026-09-10
+
+### Changed
+
+- Bundle Astrid 2026.9.1 for initialization, resumed grants, durable capsule
+  preservation across shutdown, clean daemon retirement, and native capsule
+  subprocess input fixes. GNU, musl, and Darwin keep their filesystem providers.
 
 ### Fixed
 
@@ -20,10 +29,6 @@ implementations are consolidated into their final behavior.
 - Read principal-scoped loaded capsule metadata for system inspection instead
   of an obsolete private capsule directory. Shared executable hashes remain
   references; missing metadata is reported instead of silently omitted.
-
-- Complete Community initialization in one AOS invocation by resuming the
-  runtime's bounded installation batches without reinstalling completed capsules,
-  then finalizing the default system fleet's capsule grants.
 
 ## [2026.9.0] - 2026-09-09
 

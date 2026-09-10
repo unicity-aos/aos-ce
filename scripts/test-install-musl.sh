@@ -9,10 +9,10 @@ for m_target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
   COPYFILE_DISABLE=1 tar -czf "$work/$m_target-runtime.tar.gz" -C "$work" "$(basename "$m_root")"
   bash "$repo_root/scripts/package-release.sh" "$m_target" "$work/aos" \
     "$work/$m_target-runtime.tar.gz" "$(printf '%064d' 0)" "$work/capsules" "$fixture" >/dev/null
-  cp "$good_bundle" "$fixture/unicity-aos-2026.9.0-$m_target.tar.gz.sigstore.json"
+  cp "$good_bundle" "$fixture/unicity-aos-2026.9.1-$m_target.tar.gz.sigstore.json"
 done
 cp "$fixture/cosign-linux-amd64" "$fixture/cosign-linux-arm64"
-m_metadata="$fixture/unicity-aos-2026.9.0-musl-release.toml"
+m_metadata="$fixture/unicity-aos-2026.9.1-musl-release.toml"
 PYTHONPATH="$repo_root/scripts" python3 - "$fixture" "$release_metadata" "$repo_root/release/runtime-musl-compatibility.toml" <<'PY'
 import hashlib
 import pathlib
@@ -59,7 +59,7 @@ for m_arch in x86_64 aarch64; do
   fi
   PATH="$fake_bin:$PATH" HOME="$work/musl-$m_arch-home" AOS_TEST_FIXTURE="$fixture" \
     AOS_TEST_UNAME_M="$m_arch" AOS_TEST_LIBC=musl AOS_TEST_COSIGN_SHA256="$m_verifier" \
-    AOS_VERSION=2026.9.0 sh "$repo_root/install.sh" --yes --no-migrate-prompt
+    AOS_VERSION=2026.9.1 sh "$repo_root/install.sh" --yes --no-migrate-prompt
   test -x "$work/musl-$m_arch-home/.aos/bin/aos"
 done
 
@@ -73,7 +73,7 @@ for m_failure in signature binding duplicate missing; do
     missing) rm "$m_metadata" ;;
   esac
   if PATH="$fake_bin:$PATH" HOME="$work/musl-$m_failure-home" AOS_TEST_FIXTURE="$fixture" \
-    AOS_TEST_LIBC=musl AOS_VERSION=2026.9.0 \
+    AOS_TEST_LIBC=musl AOS_VERSION=2026.9.1 \
     sh "$repo_root/install.sh" --yes --no-migrate-prompt > "$work/musl-$m_failure.log" 2>&1; then
     echo "musl installer accepted $m_failure extension" >&2; exit 1
   fi

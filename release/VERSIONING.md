@@ -13,9 +13,9 @@ CalSemVer here. The month is not zero-padded.
   Document breaking changes and migrations in release notes; the year component
   is not a traditional SemVer compatibility-major guarantee.
 
-All three products target `2026.9.0` for this release. Git tags retain their
-existing repository conventions: Astrid and Oracle use `v2026.9.0`; AOS uses
-`2026.9.0`.
+All three products target `2026.9.1` for this patch. Git tags retain their
+existing repository conventions: Astrid and Oracle use `v2026.9.1`; AOS uses
+`2026.9.1`.
 
 Previously published versions are immutable. AOS `2026.1.x` was not a
 calendar-month series; do not reinterpret it as January. Astrid `0.10.x` and
@@ -26,4 +26,3 @@ published release.
 Changelogs describe the net user-facing change from the preceding published
 release. Fold repairs to unreleased implementations into the final behavior;
 keep historical published sections and consequential migration limitations.
-
