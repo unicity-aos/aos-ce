@@ -159,7 +159,7 @@ runtime_version = runtime.get("version") if isinstance(runtime, dict) else None
 if (
     isinstance(target, str)
     and (target.endswith("-unknown-linux-gnu") or target.endswith("-unknown-linux-musl"))
-    and runtime_version == "2026.9.0"
+    and runtime_version in ("2026.9.0", "2026.9.1")
 ):
     runtime_executables.append("astrid-storage-provider-fuse")
 elif isinstance(target, str) and target.endswith("-apple-darwin"):
@@ -542,7 +542,7 @@ fi
 python3 "$repo_root/scripts/capsule_release.py" --artifacts "$capsule_artifacts"
 
 runtime_binaries=(astrid astrid-daemon astrid-build astrid-emit)
-if [[ ( "$target" == *-unknown-linux-gnu || "$target" == *-unknown-linux-musl ) && "$runtime_version" == "2026.9.0" ]]; then
+if [[ ( "$target" == *-unknown-linux-gnu || "$target" == *-unknown-linux-musl ) && ( "$runtime_version" == "2026.9.0" || "$runtime_version" == "2026.9.1" ) ]]; then
   runtime_binaries+=(astrid-storage-provider-fuse)
 elif [[ "$target" == *-apple-darwin ]]; then
   runtime_binaries+=(astrid-storage-provider-fskit)
@@ -583,7 +583,9 @@ done
 
 if [[ "$target" == *-apple-darwin ]]; then
   filesystem_requirement=optional
-  [[ "$runtime_version" != 2026.9.0 ]] || filesystem_requirement=required
+  if [[ "$runtime_version" == 2026.9.0 || "$runtime_version" == 2026.9.1 ]]; then
+    filesystem_requirement=required
+  fi
   python3 "$repo_root/scripts/package_macos_filesystem.py" \
     "$runtime_root" "$work/$root/runtime/bin" "$filesystem_requirement"
 fi
@@ -666,7 +668,7 @@ runtime_executables = [
     "runtime/bin/astrid-build",
     "runtime/bin/astrid-emit",
 ]
-if (target.endswith("-unknown-linux-gnu") or target.endswith("-unknown-linux-musl")) and runtime == "2026.9.0":
+if (target.endswith("-unknown-linux-gnu") or target.endswith("-unknown-linux-musl")) and runtime in ("2026.9.0", "2026.9.1"):
     runtime_executables.append("runtime/bin/astrid-storage-provider-fuse")
 elif target.endswith("-apple-darwin"):
     runtime_executables.append("runtime/bin/astrid-storage-provider-fskit")

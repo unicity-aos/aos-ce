@@ -122,7 +122,7 @@ case "${AOS_PACKAGED_TARGET:-}" in
        aarch64) target=aarch64-unknown-linux-gnu ;;
      esac ;;
 esac
-expected_root=unicity-aos-2026.9.0-${target}
+expected_root=unicity-aos-2026.9.1-${target}
 # Bind the exact package bytes to the REHEARSAL-ONLY identity and checksum
 # manifests emitted by compose-and-sign.  Downloading an artifact is not an
 # identity check: reject renamed archives, mismatched hashes, and malformed
@@ -201,7 +201,7 @@ with tarfile.open(archive, "r:gz") as stream:
 PY
 
 bundle="$work/extract/$expected_root"
-release="$work/home/.aos/releases/2026.9.0"
+release="$work/home/.aos/releases/2026.9.1"
 python3 - "$bundle/Distro.toml" <<'PY'
 import pathlib
 import sys

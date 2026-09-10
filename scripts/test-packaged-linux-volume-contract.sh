@@ -20,7 +20,7 @@ for required in \
   'runner: ubuntu-latest' \
   'runner: ubuntu-24.04-arm' \
   'name: rehearsal-sign-darwin' \
-  '-name "unicity-aos-2026.9.0-${{ matrix.target }}.tar.gz"' \
+  '-name "unicity-aos-2026.9.1-${{ matrix.target }}.tar.gz"' \
   'mapfile -d' \
   'bash scripts/test-packaged-linux-volume.sh' \
   'sudo apt-get install -y --no-install-recommends fuse3 util-linux' \
@@ -70,7 +70,7 @@ for required in (
         raise SystemExit(f"packaged Linux volume matrix is missing: {required}")
 for required in (
     "runs-on: ${{ matrix.runner }}",
-    '-name "unicity-aos-2026.9.0-${{ matrix.target }}.tar.gz"',
+    '-name "unicity-aos-2026.9.1-${{ matrix.target }}.tar.gz"',
 ):
     if required not in job:
         raise SystemExit(f"packaged Linux volume job is missing: {required}")
@@ -82,7 +82,7 @@ for required in \
   'AOS_PACKAGED_TARGET' \
   'x86_64-unknown-linux-gnu | x86_64-unknown-linux-musl' \
   'aarch64-unknown-linux-gnu | aarch64-unknown-linux-musl' \
-  'expected_root=unicity-aos-2026.9.0-${target}' \
+  'expected_root=unicity-aos-2026.9.1-${target}' \
   'REHEARSAL_TARGET=$target' \
   'REHEARSAL-ONLY-identity.json' \
   'REHEARSAL-BLAKE3SUMS.txt' \

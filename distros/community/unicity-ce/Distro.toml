@@ -3,10 +3,10 @@ schema-version = 1
 [distro]
 id = "unicity-ce"
 name = "Unicity CE"
-pretty-name = "Unicity CE 2026.9.0 (Genesis)"
-version = "2026.9.0"
+pretty-name = "Unicity CE 2026.9.1 (Genesis)"
+version = "2026.9.1"
 codename = "genesis"
-release-date = "2026-07-20"
+release-date = "2026-09-10"
 description = "The complete Unicity AOS agent operating system experience"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 maintainers = ["Joshua J. Bouw <jjb@unicity-labs.com>"]
@@ -15,7 +15,7 @@ support = "https://github.com/unicity-aos/aos-ce/discussions"
 bug-tracker = "https://github.com/unicity-aos/aos-ce/issues"
 repository = "https://github.com/unicity-aos/aos-ce"
 license = "MIT OR Apache-2.0"
-astrid-version = "=2026.9.0"  # Product releases pin the exact bundled runtime; update this with release/runtime-compatibility.toml.
+astrid-version = "=2026.9.1"  # Product releases pin the exact bundled runtime; update this with release/runtime-compatibility.toml.
 
 [distro.requires.astrid]
 llm = "^1.0"

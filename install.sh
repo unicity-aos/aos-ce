@@ -783,10 +783,12 @@ fi
 
 # The signed runtime tuple is the authority for GNU runtime membership. Keep
 # the historical 0.10.4 four-binary set stable, and require the FUSE provider
-# only for the versioned 2026.9.0 runtime contract. Darwin's FSKit member is
+# for the versioned 2026.9.0/2026.9.1 runtime contract. Darwin's FSKit member is
 # selected above and remains independent of this Linux-only rule.
-if [ "$os" = Linux ] && [ "$runtime_version" = 2026.9.0 ]; then
-  runtime_binaries="$runtime_binaries astrid-storage-provider-fuse"
+if [ "$os" = Linux ]; then
+  case "$runtime_version" in
+    2026.9.0|2026.9.1) runtime_binaries="$runtime_binaries astrid-storage-provider-fuse" ;;
+  esac
 fi
 
 target_section="[targets.${target}]"
