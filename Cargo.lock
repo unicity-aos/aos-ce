@@ -343,9 +343,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "astrid-config"
-version = "2026.9.1"
+version = "2026.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dab5217607167faa6f47a92c7a488043c024472aabf893f4e9ac6726cea8c521"
+checksum = "4e823476df561f54059c7ac82bb77aadd9a00b8677b5a17242053788a48104e3"
 dependencies = [
  "astrid-core",
  "directories",
@@ -358,9 +358,9 @@ dependencies = [
 
 [[package]]
 name = "astrid-core"
-version = "2026.9.1"
+version = "2026.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39e9e3081be4a2b258aaf04d4399737681df4fc599218ceddd63a19d25089a1c"
+checksum = "a212a7c4ab59125a1aa60edad98a00e4b85cb72c9a0b0e0f971bff3f05e999f5"
 dependencies = [
  "async-trait",
  "base64",
@@ -384,9 +384,9 @@ dependencies = [
 
 [[package]]
 name = "astrid-crypto"
-version = "2026.9.1"
+version = "2026.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d4d43454a22fe22229e2cd61263ec6d4d9458ed095ec3a9efab93f0c865182c"
+checksum = "a5ec92b7f7cf9c52408e5a6102299482fbb10110b63ad761bb381d065064cb7e"
 dependencies = [
  "base64",
  "blake3",
@@ -401,13 +401,13 @@ dependencies = [
 
 [[package]]
 name = "astrid-events"
-version = "2026.9.1"
+version = "2026.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "081a481c8f19e1b42acfd0a83ea3125243bc6464c270c7dadac1440ee3dc6c13"
+checksum = "81a30ab3ebf2201bfe01473dc15345fa28aa14c6a3eecc709ea4152567c6a47e"
 dependencies = [
  "astrid-core",
  "astrid-runtime",
- "astrid-types 2026.9.1",
+ "astrid-types 2026.9.2",
  "async-trait",
  "chrono",
  "dashmap",
@@ -424,9 +424,9 @@ dependencies = [
 
 [[package]]
 name = "astrid-runtime"
-version = "2026.9.1"
+version = "2026.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2fd3791aedd4a380850817083a72acda8d4c7582cc5cd8f19ef8d60c126745a"
+checksum = "a814bf90f41be0d3cea3219c91b36fe496ad82bf9dc2afb3e7a6f234aa46dfcb"
 dependencies = [
  "futures",
  "tokio",
@@ -490,9 +490,9 @@ dependencies = [
 
 [[package]]
 name = "astrid-types"
-version = "2026.9.1"
+version = "2026.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8d04c16b39ddff4969bc65a3fd87b8d918a3f868c855dd97535c32f633ce762"
+checksum = "5322df08713ce587e45a3680350258e351bd83f68f9e271b4e2d40ba5d3cc2d9"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -504,16 +504,16 @@ dependencies = [
 
 [[package]]
 name = "astrid-uplink"
-version = "2026.9.1"
+version = "2026.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05ed3d6ac796db32c6747bd303e782ca5b7eb0e3c48d30106ca832a40ddea05b"
+checksum = "a46c275607562d797b36a884f5649f17b90ad7c7f5b9c39a42cf18afc2c95c95"
 dependencies = [
  "anyhow",
  "astrid-config",
  "astrid-core",
  "astrid-crypto",
  "astrid-events",
- "astrid-types 2026.9.1",
+ "astrid-types 2026.9.2",
  "hex",
  "rand",
  "serde",
@@ -2182,11 +2182,11 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "unicity-aos-bootstrap"
-version = "2026.9.1"
+version = "2026.9.2"
 dependencies = [
  "astrid-core",
  "astrid-crypto",
- "astrid-types 2026.9.1",
+ "astrid-types 2026.9.2",
  "astrid-uplink",
  "axum",
  "blake3",
