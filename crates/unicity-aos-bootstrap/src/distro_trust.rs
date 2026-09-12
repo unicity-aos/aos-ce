@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use unicity_aos_bootstrap::AosHome;
 
 pub(crate) const SELECTED_DISTRO_ID: &str = "unicity-ce";
-pub(crate) const ASTRID_RUNTIME_VERSION: &str = "2026.9.1";
+pub(crate) const ASTRID_RUNTIME_VERSION: &str = "2026.9.2";
 const SIG_DOMAIN_TAG: &[u8] = b"astrid-distro-lock-sig-v1\x00";
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const RECEIPT_KIND: &str = "aos-distro-apply-active-v1";

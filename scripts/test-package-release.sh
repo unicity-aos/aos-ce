@@ -367,9 +367,9 @@ assert manifest["verifier"] == {
 }
 PY
 
-# Rehearsal runtime 2026.9.1 has an explicit GNU FUSE provider contract while
+# Rehearsal runtime 2026.9.2 has an explicit GNU FUSE provider contract while
 # the pinned stable GNU archive above includes its FUSE provider.
-versioned_repo="$work/aos-2026.9.1-contract"
+versioned_repo="$work/aos-2026.9.2-contract"
 mkdir -p \
   "$versioned_repo/scripts" \
   "$versioned_repo/crates/unicity-aos-bootstrap" \
@@ -394,9 +394,9 @@ import sys
 runtime_path, distro_path = map(pathlib.Path, sys.argv[1:])
 runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
 replacements = {
-    "version": 'version = "2026.9.1"',
-    "tag": 'tag = "rehearsal-only-2026.9.1"',
-    "version-requirement": 'version-requirement = "=2026.9.1"',
+    "version": 'version = "2026.9.2"',
+    "tag": 'tag = "rehearsal-only-2026.9.2"',
+    "version-requirement": 'version-requirement = "=2026.9.2"',
     "release-workflow-identity": 'release-workflow-identity = "rehearsal-only:test"',
 }
 in_runtime = False
@@ -413,14 +413,14 @@ for index, line in enumerate(runtime_lines):
 runtime_path.write_text("\n".join(runtime_lines) + "\n", encoding="utf-8")
 distro_text = distro_path.read_text(encoding="utf-8")
 distro_path.write_text(
-    distro_text.replace('astrid-version = "=0.10.4"', 'astrid-version = "=2026.9.1"'),
+    distro_text.replace('astrid-version = "=0.10.4"', 'astrid-version = "=2026.9.2"'),
     encoding="utf-8",
 )
 PY
 
-versioned_runtime_root="$work/astrid-2026.9.1-$target"
-versioned_runtime_archive="$work/runtime-2026.9.1.tar.gz"
-versioned_output="$work/output-2026.9.1"
+versioned_runtime_root="$work/astrid-2026.9.2-$target"
+versioned_runtime_archive="$work/runtime-2026.9.2.tar.gz"
+versioned_output="$work/output-2026.9.2"
 mkdir -p "$versioned_runtime_root" "$versioned_output"
 for binary in astrid astrid-daemon astrid-build astrid-emit astrid-storage-provider-fuse; do
   printf '#!/bin/sh\nexit 0\n' > "$versioned_runtime_root/$binary"
@@ -454,7 +454,7 @@ import sys
 manifest_path, provider_path = map(pathlib.Path, sys.argv[1:])
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 provider = "runtime/bin/astrid-storage-provider-fuse"
-assert manifest["runtime"]["version"] == "2026.9.1"
+assert manifest["runtime"]["version"] == "2026.9.2"
 assert manifest["executables"] == [
     "bin/aos",
     "runtime/bin/astrid",
@@ -474,21 +474,21 @@ assert record == {
 PY
 
 versioned_runtime_name=$(basename "$versioned_runtime_root")
-missing_versioned_root="$work/missing-2026.9.1-fuse/$versioned_runtime_name"
-mkdir -p "$missing_versioned_root" "$work/missing-2026.9.1-output"
+missing_versioned_root="$work/missing-2026.9.2-fuse/$versioned_runtime_name"
+mkdir -p "$missing_versioned_root" "$work/missing-2026.9.2-output"
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
   cp "$versioned_runtime_root/$binary" "$missing_versioned_root/$binary"
 done
-COPYFILE_DISABLE=1 tar -czf "$work/missing-2026.9.1-runtime.tar.gz" \
-  -C "$work/missing-2026.9.1-fuse" "$(basename "$versioned_runtime_root")"
+COPYFILE_DISABLE=1 tar -czf "$work/missing-2026.9.2-runtime.tar.gz" \
+  -C "$work/missing-2026.9.2-fuse" "$(basename "$versioned_runtime_root")"
 if bash "$versioned_repo/scripts/package-release.sh" \
   "$target" \
   "$work/aos" \
-  "$work/missing-2026.9.1-runtime.tar.gz" \
+  "$work/missing-2026.9.2-runtime.tar.gz" \
   0000000000000000000000000000000000000000000000000000000000000000 \
   "$work/capsules" \
-  "$work/missing-2026.9.1-output" >/dev/null 2>&1; then
-  echo "2026.9.1 GNU package accepted a runtime without the FUSE provider" >&2
+  "$work/missing-2026.9.2-output" >/dev/null 2>&1; then
+  echo "2026.9.2 GNU package accepted a runtime without the FUSE provider" >&2
   exit 1
 fi
 
@@ -593,7 +593,7 @@ if source.count(official) != 1:
 pathlib.Path(sys.argv[2]).write_text(source.replace(official, fixture), encoding="utf-8")
 PY
 cp "$fixture_distro" "$bundle_root/Distro.toml"
-fixture_archive="$work/unicity-aos-2026.9.1-x86_64-unknown-linux-gnu.tar.gz"
+fixture_archive="$work/unicity-aos-2026.9.2-x86_64-unknown-linux-gnu.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$fixture_archive" -C "$work" "$(basename "$bundle_root")"
 
 membership_mutations="$work/membership-mutations"
@@ -625,7 +625,7 @@ else:
     raise SystemExit(f"unknown mutation: {mutation}")
 pathlib.Path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
-  mutation_archive="$mutation_dir/unicity-aos-2026.9.1-x86_64-unknown-linux-gnu.tar.gz"
+  mutation_archive="$mutation_dir/unicity-aos-2026.9.2-x86_64-unknown-linux-gnu.tar.gz"
   COPYFILE_DISABLE=1 tar -czf "$mutation_archive" -C "$mutation_dir" "$(basename "$mutation_root")"
   if bash "$repo_root/scripts/package-release.sh" \
     --extract-release-sealer "$mutation_archive" "$mutation_dir/native-sealer" >/dev/null 2>&1; then
@@ -635,10 +635,10 @@ PY
 done
 
 for bad_name in \
-  $'unicity-aos-2026.9.1-riscv64-unknown-elf.tar.gz\nunicity-aos-2026.9.1-x86_64-unknown-linux-gnu.tar.gz' \
-  'junk-before-unicity-aos-2026.9.1-x86_64-unknown-linux-gnu.tar.gz' \
+  $'unicity-aos-2026.9.2-riscv64-unknown-elf.tar.gz\nunicity-aos-2026.9.2-x86_64-unknown-linux-gnu.tar.gz' \
+  'junk-before-unicity-aos-2026.9.2-x86_64-unknown-linux-gnu.tar.gz' \
   'unicity-aos-0.0.1-evil-x86_64-unknown-linux-gnu.tar.gz' \
-  'unicity-aos-2026.9.1-aarch64-unknown-linux-gnu-x86_64-unknown-linux-gnu.tar.gz'
+  'unicity-aos-2026.9.2-aarch64-unknown-linux-gnu-x86_64-unknown-linux-gnu.tar.gz'
 do
   bad_archive="$work/$bad_name"
   cp "$fixture_archive" "$bad_archive"
