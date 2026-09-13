@@ -1,0 +1,32 @@
+name: AOS tray
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/aos-tray/**'
+      - '.github/workflows/aos-tray.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/aos-tray/**'
+      - '.github/workflows/aos-tray.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS tray build and model tests
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Build preview bundle without launching it
+        run: sh apps/aos-tray/scripts/build-preview.sh
+      - name: Test request identity and decision models
+        run: swift test --package-path apps/aos-tray
+      - name: Exercise disconnected and explicit demo snapshots
+        run: |
+          swift run --package-path apps/aos-tray --skip-build aos-tray --snapshot
+          swift run --package-path apps/aos-tray --skip-build aos-tray --demo --snapshot
