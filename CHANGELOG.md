@@ -14,6 +14,12 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Added
+
+- Add a developer-preview macOS AOS menu-bar shell with disconnected and explicit
+  demo modes for capsule and permission views. Runtime connectivity, installation
+  and credential entry are not yet implemented.
+
 ## [2026.9.2] - 2026-09-13
 
 ### Changed

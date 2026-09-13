@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj
+xcuserdata/
+*.dylib
+*.dSYM
