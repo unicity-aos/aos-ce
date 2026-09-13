@@ -38,10 +38,10 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 astrid-sdk = { version = "=0.7.1", features = ["derive"] }
-astrid-core = "=2026.9.1"
-astrid-crypto = "=2026.9.1"
-astrid-types = { version = "=2026.9.1", features = ["clock"] }
-astrid-uplink = "=2026.9.1"
+astrid-core = "=2026.9.2"
+astrid-crypto = "=2026.9.2"
+astrid-types = { version = "=2026.9.2", features = ["clock"] }
+astrid-uplink = "=2026.9.2"
 axum = "0.8"
 blake3 = "1.8.5"
 clap = { version = "4.6", features = ["derive"] }

@@ -6,12 +6,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [year.month.patch](release/VERSIONING.md). Repairs to unreleased
 implementations are consolidated into their final behavior.
 
-[Unreleased]: https://github.com/unicity-aos/aos-ce/compare/2026.9.1...HEAD
+[Unreleased]: https://github.com/unicity-aos/aos-ce/compare/2026.9.2...HEAD
+[2026.9.2]: https://github.com/unicity-aos/aos-ce/compare/2026.9.1...2026.9.2
 [2026.9.1]: https://github.com/unicity-aos/aos-ce/compare/2026.9.0...2026.9.1
 [2026.9.0]: https://github.com/unicity-aos/aos-ce/compare/2026.1.3...2026.9.0
 [2026.1.3]: https://github.com/unicity-aos/aos-ce/releases/tag/2026.1.3
 
 ## [Unreleased]
+
+## [2026.9.2] - 2026-09-13
+
+### Changed
+
+- Bundle Astrid 2026.9.2, adding optional authenticated MCP Streamable HTTP
+  transport and honoring the selected workspace configuration for that transport.
+  Existing stdio host integration and Community capsule selection are unchanged.
+- Update the exact runtime and client-library pins while retaining GNU, musl,
+  and macOS filesystem providers and authenticated runtime metadata.
 
 ## [2026.9.1] - 2026-09-10
 
