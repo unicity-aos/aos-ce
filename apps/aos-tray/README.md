@@ -23,6 +23,15 @@ with a persistent DEMO banner. Demo decisions change the fixture only.
 
 Default launch (no `--demo`) shows `DISCONNECTED` and empty inventory.
 
+To assemble a local app bundle without installing or launching it:
+
+```sh
+sh apps/aos-tray/scripts/build-preview.sh
+```
+
+The bundle is written under the ignored `.build/AOS Preview.app` directory.
+It is a developer preview, not a Developer ID signed/notarized distribution.
+
 ## Claim limits
 
 - Not connected to AOS, Astrid, MCP, or a live principal home.
