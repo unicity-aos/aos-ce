@@ -6,12 +6,13 @@
 //! trusted local decision surface without weakening or forking the runtime.
 
 mod interaction;
+mod mrtr;
 
 use std::ffi::OsString;
 use std::process::{ExitCode, ExitStatus, Stdio};
 
 use clap::{Args, ValueEnum};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -246,6 +247,7 @@ async fn serve(
     let mut downstream_in = Some(child_stdin);
     let mut client_supports_form = false;
     let mut presenter = interaction::NativePresenter;
+    let mut mrtr = mrtr::NativeMrtr::new();
     let mut upstream_open = true;
     let mut interrupt_rx = Some(interrupt_receiver());
 
@@ -260,26 +262,28 @@ async fn serve(
                     upstream_open = false;
                     continue;
                 }
-                let Some(forwarded) =
-                    prepare_client_message(&client_frame, mode, &mut client_supports_form)
-                else {
-                    let transport_input = downstream_in.as_mut().ok_or_else(|| {
-                        ServeFailure::Io("bundled MCP transport input is closed".to_owned())
-                    })?;
-                    write_frame(transport_input, &client_frame)
-                        .await
-                        .map_err(|error| {
-                            ServeFailure::Io(format!(
-                                "failed to write bundled MCP transport: {error}"
-                            ))
-                        })?;
-                    client_frame.clear();
-                    continue;
+                let rewritten;
+                let outbound = match prepare_client_message(
+                    &client_frame,
+                    mode,
+                    &mut client_supports_form,
+                    &mut mrtr,
+                ) {
+                    UpstreamPrepare::Unchanged => client_frame.as_slice(),
+                    UpstreamPrepare::Rewrite(frame) => {
+                        rewritten = frame;
+                        rewritten.as_slice()
+                    }
+                    UpstreamPrepare::Reject(error) => {
+                        return Err(ServeFailure::Io(format!(
+                            "refusing to forward tools/call: {error}"
+                        )));
+                    }
                 };
                 let transport_input = downstream_in.as_mut().ok_or_else(|| {
                     ServeFailure::Io("bundled MCP transport input is closed".to_owned())
                 })?;
-                write_frame(transport_input, &forwarded).await.map_err(|error| {
+                write_frame(transport_input, outbound).await.map_err(|error| {
                     ServeFailure::Io(format!("failed to write bundled MCP transport: {error}"))
                 })?;
                 client_frame.clear();
@@ -292,6 +296,46 @@ async fn serve(
                 })?;
                 if bytes_read == 0 {
                     break;
+                }
+                match intercept_downstream(
+                    &transport_frame,
+                    mode,
+                    client_supports_form,
+                    &mut mrtr,
+                    &mut presenter,
+                ) {
+                    DownstreamIntercept::Resume(resume) => {
+                        let frame = json_frame(&resume).ok_or_else(|| {
+                            ServeFailure::Io("failed to encode native input_required resume".to_owned())
+                        })?;
+                        let transport_input = downstream_in.as_mut().ok_or_else(|| {
+                            ServeFailure::Io("bundled MCP transport input is closed".to_owned())
+                        })?;
+                        write_frame(transport_input, &frame).await.map_err(|error| {
+                            ServeFailure::Io(format!(
+                                "failed to resume native input_required: {error}"
+                            ))
+                        })?;
+                        transport_frame.clear();
+                        continue;
+                    }
+                    DownstreamIntercept::Swallow => {
+                        transport_frame.clear();
+                        continue;
+                    }
+                    DownstreamIntercept::HostError(response) => {
+                        let frame = json_frame(&response).ok_or_else(|| {
+                            ServeFailure::Io(
+                                "failed to encode native input_required error".to_owned(),
+                            )
+                        })?;
+                        write_frame(&mut upstream_out, &frame).await.map_err(|error| {
+                            ServeFailure::Io(format!("failed to write MCP client: {error}"))
+                        })?;
+                        transport_frame.clear();
+                        continue;
+                    }
+                    DownstreamIntercept::None => {}
                 }
                 match transport_action(&transport_frame, mode, client_supports_form) {
                     TransportAction::Forward => {
@@ -454,24 +498,124 @@ fn json_frame(value: &Value) -> Option<Vec<u8>> {
     Some(frame)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum UpstreamPrepare {
+    Unchanged,
+    Rewrite(Vec<u8>),
+    Reject(mrtr::MrtrError),
+}
+
 fn prepare_client_message(
     frame: &[u8],
     mode: InteractionMode,
     client_supports_form: &mut bool,
-) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(frame).ok()?;
-    let mut value = serde_json::from_str::<Value>(text).ok()?;
-    if value.get("method").and_then(Value::as_str) != Some("initialize") {
-        return None;
+    mrtr: &mut mrtr::NativeMrtr,
+) -> UpstreamPrepare {
+    let Ok(text) = std::str::from_utf8(frame) else {
+        return UpstreamPrepare::Unchanged;
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(text) else {
+        return UpstreamPrepare::Unchanged;
+    };
+    if value.get("method").and_then(Value::as_str) == Some("initialize") {
+        *client_supports_form = supports_form_elicitation(&value);
+        if matches!(mode, InteractionMode::Auto | InteractionMode::Native)
+            && (mode == InteractionMode::Native || !*client_supports_form)
+            && advertise_form_elicitation(&mut value)
+        {
+            return UpstreamPrepare::Rewrite(json_frame(&value).unwrap_or_else(|| frame.to_vec()));
+        }
+        return UpstreamPrepare::Unchanged;
     }
-    *client_supports_form = supports_form_elicitation(&value);
-    if matches!(mode, InteractionMode::Auto | InteractionMode::Native)
-        && (mode == InteractionMode::Native || !*client_supports_form)
-        && advertise_form_elicitation(&mut value)
+    if !intercepts_local_input(mode, *client_supports_form) {
+        return UpstreamPrepare::Unchanged;
+    }
+    if let Some(id) = mrtr::cancelled_request_id(&value) {
+        mrtr.forget(id);
+        return UpstreamPrepare::Unchanged;
+    }
+    if value.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return UpstreamPrepare::Unchanged;
+    }
+    let advertised = matches!(mode, InteractionMode::Auto | InteractionMode::Native)
+        && advertise_request_form_meta(&mut value);
+    if let Err(error) = mrtr.record(&value) {
+        return UpstreamPrepare::Reject(error);
+    }
+    if advertised {
+        UpstreamPrepare::Rewrite(json_frame(&value).unwrap_or_else(|| frame.to_vec()))
+    } else {
+        UpstreamPrepare::Unchanged
+    }
+}
+
+fn intercepts_local_input(mode: InteractionMode, client_supports_form: bool) -> bool {
+    match mode {
+        InteractionMode::Native | InteractionMode::Deny => true,
+        InteractionMode::Auto => !client_supports_form,
+        InteractionMode::Client => false,
+    }
+}
+
+enum DownstreamIntercept {
+    None,
+    Resume(Value),
+    Swallow,
+    HostError(Value),
+}
+
+fn intercept_downstream(
+    frame: &[u8],
+    mode: InteractionMode,
+    client_supports_form: bool,
+    mrtr: &mut mrtr::NativeMrtr,
+    presenter: &mut dyn interaction::Presenter,
+) -> DownstreamIntercept {
+    if !intercepts_local_input(mode, client_supports_form) {
+        return DownstreamIntercept::None;
+    }
+    let Ok(text) = std::str::from_utf8(frame) else {
+        return DownstreamIntercept::None;
+    };
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return DownstreamIntercept::None;
+    };
+    if mrtr::is_input_required_result(&message) {
+        let resume = match mode {
+            InteractionMode::Deny => mrtr.decline(&message),
+            InteractionMode::Native | InteractionMode::Auto | InteractionMode::Client => {
+                mrtr.decide(&message, presenter)
+            }
+        };
+        return match resume {
+            Ok(resume) => DownstreamIntercept::Resume(resume),
+            Err(mrtr::MrtrError::UnknownId | mrtr::MrtrError::AlreadySettled) => {
+                DownstreamIntercept::Swallow
+            }
+            Err(error) => match message.get("id") {
+                Some(id) => {
+                    mrtr.complete(id);
+                    DownstreamIntercept::HostError(json!({
+                        "jsonrpc": message.get("jsonrpc").cloned().unwrap_or_else(|| {
+                            Value::String("2.0".to_owned())
+                        }),
+                        "id": id,
+                        "error": {
+                            "code": -32603,
+                            "message": error.to_string(),
+                        }
+                    }))
+                }
+                None => DownstreamIntercept::Swallow,
+            },
+        };
+    }
+    if message.get("method").is_none()
+        && let Some(id) = message.get("id")
     {
-        return Some(json_frame(&value).unwrap_or_else(|| frame.to_vec()));
+        mrtr.complete(id);
     }
-    None
+    DownstreamIntercept::None
 }
 
 enum TransportAction {
@@ -519,6 +663,24 @@ fn advertise_form_elicitation(initialize: &mut Value) -> bool {
     let Some(capabilities) = object_entry(params, "capabilities") else {
         return false;
     };
+    advertise_form_on_capabilities(capabilities)
+}
+
+fn advertise_request_form_meta(message: &mut Value) -> bool {
+    let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let Some(capabilities) = object_entry(meta, "io.modelcontextprotocol/clientCapabilities")
+    else {
+        return false;
+    };
+    advertise_form_on_capabilities(capabilities)
+}
+
+fn advertise_form_on_capabilities(capabilities: &mut Map<String, Value>) -> bool {
     let Some(elicitation) = object_entry(capabilities, "elicitation") else {
         return false;
     };
@@ -623,10 +785,36 @@ mod tests {
         .to_string()
     }
 
+    fn prepare(frame: &[u8], mode: InteractionMode, supported: &mut bool) -> Option<Vec<u8>> {
+        let mut mrtr = mrtr::NativeMrtr::new();
+        match prepare_client_message(frame, mode, supported, &mut mrtr) {
+            UpstreamPrepare::Rewrite(frame) => Some(frame),
+            UpstreamPrepare::Unchanged => None,
+            UpstreamPrepare::Reject(error) => panic!("unexpected tools/call reject: {error}"),
+        }
+    }
+
+    fn tools_call(id: Value, name: &str, arguments: Value) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                    "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+                }
+            }
+        })
+        .to_string()
+    }
+
     #[test]
     fn auto_advertises_form_only_when_client_cannot_present_it() {
         let mut supported = false;
-        let forwarded = prepare_client_message(
+        let forwarded = prepare(
             initialize(json!({ "roots": {} })).as_bytes(),
             InteractionMode::Auto,
             &mut supported,
@@ -642,7 +830,7 @@ mod tests {
 
         for mode in [InteractionMode::Auto, InteractionMode::Native] {
             let mut supported = false;
-            let forwarded = prepare_client_message(
+            let forwarded = prepare(
                 initialize(json!({ "elicitation": { "form": {} } })).as_bytes(),
                 mode,
                 &mut supported,
@@ -659,8 +847,7 @@ mod tests {
     fn client_and_deny_modes_never_invent_capabilities() {
         for mode in [InteractionMode::Client, InteractionMode::Deny] {
             let mut supported = false;
-            let forwarded =
-                prepare_client_message(initialize(json!({})).as_bytes(), mode, &mut supported);
+            let forwarded = prepare(initialize(json!({})).as_bytes(), mode, &mut supported);
             assert!(
                 forwarded.is_none(),
                 "{mode:?} must preserve unchanged initialize bytes"
@@ -678,8 +865,7 @@ mod tests {
         })
         .to_string();
         let mut supported = false;
-        let forwarded =
-            prepare_client_message(malformed.as_bytes(), InteractionMode::Auto, &mut supported);
+        let forwarded = prepare(malformed.as_bytes(), InteractionMode::Auto, &mut supported);
         assert!(
             forwarded.is_none(),
             "malformed capabilities must preserve raw bytes"
@@ -748,6 +934,315 @@ mod tests {
         assert!(rewrite_server_identity(&mut response));
         assert_eq!(response["result"]["serverInfo"]["name"], "unicity-aos");
         assert_eq!(response["result"]["serverInfo"]["title"], "Unicity AOS");
+    }
+
+    #[test]
+    fn native_tracks_tools_call_and_advertises_per_request_form() {
+        let mut supported = false;
+        let mut session = mrtr::NativeMrtr::new();
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "fs.read",
+                "arguments": { "path": "/tmp/report" },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                    "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+                }
+            }
+        })
+        .to_string();
+        let forwarded = match prepare_client_message(
+            request.as_bytes(),
+            InteractionMode::Native,
+            &mut supported,
+            &mut session,
+        ) {
+            UpstreamPrepare::Rewrite(frame) => frame,
+            other => panic!("per-request form is advertised, got {other:?}"),
+        };
+        let forwarded: Value = serde_json::from_slice(&forwarded).expect("json");
+        assert_eq!(
+            forwarded["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            "2025-11-25"
+        );
+        assert!(
+            forwarded["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["elicitation"]
+                ["form"]
+                .is_object()
+        );
+        assert!(!session.is_empty());
+    }
+
+    #[test]
+    fn native_does_not_invent_request_meta_or_protocol_version() {
+        let mut supported = false;
+        let mut session = mrtr::NativeMrtr::new();
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "fs.read",
+                "arguments": { "path": "/tmp/report" }
+            }
+        })
+        .to_string();
+        let forwarded = prepare_client_message(
+            request.as_bytes(),
+            InteractionMode::Native,
+            &mut supported,
+            &mut session,
+        );
+        assert_eq!(
+            forwarded,
+            UpstreamPrepare::Unchanged,
+            "missing _meta must keep original bytes"
+        );
+        assert!(!session.is_empty());
+    }
+
+    #[test]
+    fn client_mode_does_not_track_or_rewrite_tools_call() {
+        let mut supported = false;
+        let mut session = mrtr::NativeMrtr::new();
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "fs.read",
+                "_meta": { "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} } }
+            }
+        })
+        .to_string();
+        let forwarded = prepare_client_message(
+            request.as_bytes(),
+            InteractionMode::Client,
+            &mut supported,
+            &mut session,
+        );
+        assert_eq!(forwarded, UpstreamPrepare::Unchanged);
+        assert!(session.is_empty());
+    }
+
+    #[test]
+    fn deny_tracks_tools_call_without_inventing_form_meta() {
+        let mut supported = false;
+        let mut session = mrtr::NativeMrtr::new();
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "fs.read",
+                "_meta": { "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} } }
+            }
+        })
+        .to_string();
+        let forwarded = prepare_client_message(
+            request.as_bytes(),
+            InteractionMode::Deny,
+            &mut supported,
+            &mut session,
+        );
+        assert_eq!(forwarded, UpstreamPrepare::Unchanged);
+        assert!(!session.is_empty());
+    }
+
+    #[test]
+    fn native_duplicate_tools_call_id_is_rejected_without_replacing_tracking() {
+        let mut supported = false;
+        let mut session = mrtr::NativeMrtr::new();
+        let first = tools_call(json!(7), "fs.read", json!({ "path": "/tmp/report" }));
+        match prepare_client_message(
+            first.as_bytes(),
+            InteractionMode::Native,
+            &mut supported,
+            &mut session,
+        ) {
+            UpstreamPrepare::Rewrite(_) => {}
+            other => panic!("first tools/call should be tracked, got {other:?}"),
+        }
+
+        let second = tools_call(json!(7), "fs.write", json!({ "path": "/etc/passwd" }));
+        let prepared = prepare_client_message(
+            second.as_bytes(),
+            InteractionMode::Native,
+            &mut supported,
+            &mut session,
+        );
+        assert_eq!(
+            prepared,
+            UpstreamPrepare::Reject(mrtr::MrtrError::DuplicateId)
+        );
+        assert!(!session.is_empty());
+
+        let resume = session
+            .decline(&json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "result": {
+                    "resultType": "input_required",
+                    "requestState": "opaque-token",
+                    "inputRequests": {
+                        "astrid-consent": {
+                            "method": "elicitation/create",
+                            "params": {
+                                "mode": "form",
+                                "message": "Allow this capsule to continue?",
+                                "requestedSchema": {
+                                    "type": "object",
+                                    "properties": { "grant": { "type": "boolean" } },
+                                    "required": ["grant"]
+                                }
+                            }
+                        }
+                    }
+                }
+            }))
+            .expect("original call remains tracked");
+        assert_eq!(resume["params"]["name"], "fs.read");
+        assert_eq!(resume["params"]["arguments"]["path"], "/tmp/report");
+    }
+
+    #[test]
+    fn intercepting_malformed_tools_call_is_rejected_without_tracking() {
+        let requests = [
+            json!({
+                "jsonrpc": "2.0",
+                "id": true,
+                "method": "tools/call",
+                "params": { "name": "fs.read" }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "method": "tools/call",
+                "params": { "name": "fs.read" }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1.5,
+                "method": "tools/call",
+                "params": { "name": "fs.read" }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": "not-an-object"
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": { "name": "fs.read" }
+            }),
+        ];
+        for request in requests {
+            for mode in [InteractionMode::Native, InteractionMode::Deny] {
+                let mut supported = false;
+                let mut session = mrtr::NativeMrtr::new();
+                let prepared = prepare_client_message(
+                    request.to_string().as_bytes(),
+                    mode,
+                    &mut supported,
+                    &mut session,
+                );
+                assert!(
+                    matches!(
+                        prepared,
+                        UpstreamPrepare::Reject(mrtr::MrtrError::Malformed(_))
+                    ),
+                    "{mode:?} must reject malformed tools/call {request}"
+                );
+                assert!(
+                    session.is_empty(),
+                    "{mode:?} must not track malformed tools/call"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn client_mode_bytepasses_duplicate_and_malformed_tools_call() {
+        let mut supported = false;
+        let mut session = mrtr::NativeMrtr::new();
+        let first = tools_call(json!(7), "fs.read", json!({ "path": "/tmp/report" }));
+        assert_eq!(
+            prepare_client_message(
+                first.as_bytes(),
+                InteractionMode::Client,
+                &mut supported,
+                &mut session,
+            ),
+            UpstreamPrepare::Unchanged
+        );
+        let duplicate = tools_call(json!(7), "fs.write", json!({ "path": "/etc/passwd" }));
+        assert_eq!(
+            prepare_client_message(
+                duplicate.as_bytes(),
+                InteractionMode::Client,
+                &mut supported,
+                &mut session,
+            ),
+            UpstreamPrepare::Unchanged
+        );
+        let malformed = json!({
+            "jsonrpc": "2.0",
+            "id": true,
+            "method": "tools/call",
+            "params": { "name": "fs.read" }
+        })
+        .to_string();
+        assert_eq!(
+            prepare_client_message(
+                malformed.as_bytes(),
+                InteractionMode::Client,
+                &mut supported,
+                &mut session,
+            ),
+            UpstreamPrepare::Unchanged
+        );
+        assert!(session.is_empty());
+    }
+
+    #[test]
+    fn native_cancel_notification_forwards_and_drops_tracking() {
+        let mut supported = false;
+        let mut session = mrtr::NativeMrtr::new();
+        let request = tools_call(json!(7), "fs.read", json!({ "path": "/tmp/report" }));
+        match prepare_client_message(
+            request.as_bytes(),
+            InteractionMode::Native,
+            &mut supported,
+            &mut session,
+        ) {
+            UpstreamPrepare::Rewrite(_) => {}
+            other => panic!("tools/call should be tracked, got {other:?}"),
+        }
+        let cancel = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 7 }
+        })
+        .to_string();
+        let prepared = prepare_client_message(
+            cancel.as_bytes(),
+            InteractionMode::Native,
+            &mut supported,
+            &mut session,
+        );
+        assert_eq!(prepared, UpstreamPrepare::Unchanged);
+        assert!(session.is_empty());
     }
 
     #[test]
