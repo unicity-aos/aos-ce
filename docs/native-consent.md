@@ -76,3 +76,38 @@ The first real demonstration must show a pregranted action without a prompt,
 a new permission decided in the app, and the resulting tool outcome. It must use
 the actual connection, not demo state. Signing, installation, auto-start and
 cross-platform UI are not implemented by this shell.
+
+## Development presenter connection
+
+The next integration uses an explicitly selected Unix socket, not a second
+approval-bus subscriber. `aos mcp serve --interaction native --interaction-socket
+PATH` sends a constrained presentation request to `aos-tray --socket PATH`.
+These options are under implementation; they are not installed defaults.
+
+Each connection carries one newline-delimited JSON request and response:
+
+```json
+{"version":1,"id":"correlation-id","message":"Runtime-supplied explanation","options":[{"label":"Allow"},{"label":"Deny"}],"timeoutSeconds":120}
+{"version":1,"id":"correlation-id","selected":0}
+```
+
+`selected: null` means cancellation. The client maps an index back to its already
+validated decision value; the app does not manufacture grants. A mismatched ID,
+invalid selection, malformed frame, disconnect or timeout never means approval.
+An explicitly selected socket must not fall back to another presenter.
+
+Frames are bounded to 16,384 bytes, messages to 4,096 UTF-8 bytes, IDs to 128
+bytes, choices to one through four and deadlines to one through 300 seconds.
+The initial client deadline is 120 seconds. The app must expire abandoned prompts
+and keep simultaneous connections independent.
+
+The endpoint lives in an existing user-owned private directory (0700), with socket
+mode 0600 and same-user peer checks. Reject symlink path components and preexisting
+endpoints; cleanup must remove only the listener's own endpoint. This establishes
+a same-user local connection, not proof that a human or trusted application sent
+the request. The UI labels the supplied explanation and does not invent principal,
+capsule or scope identities that are absent from this presentation contract.
+
+This connection does not carry credentials or free-form input. Inventory remains
+unconnected until its real query path is implemented. Disposable-socket tests and
+an actual UI decision are separate evidence requirements.
