@@ -326,7 +326,12 @@ async fn serve(
                         let frame = json_frame(&response).ok_or_else(|| {
                             ServeFailure::Io("failed to encode local interaction".to_owned())
                         })?;
-                        write_frame(&mut upstream_out, &frame).await.map_err(|error| {
+                        // The runtime issued this request. The host must only see
+                        // the resulting tool response, not our JSON-RPC answer.
+                        let transport_input = downstream_in.as_mut().ok_or_else(|| {
+                            ServeFailure::Io("bundled MCP transport input is closed".to_owned())
+                        })?;
+                        write_frame(transport_input, &frame).await.map_err(|error| {
                             ServeFailure::Io(format!(
                                 "failed to answer local interaction: {error}"
                             ))
@@ -341,7 +346,10 @@ async fn serve(
                         let frame = json_frame(&response).ok_or_else(|| {
                             ServeFailure::Io("failed to encode cancelled interaction".to_owned())
                         })?;
-                        write_frame(&mut upstream_out, &frame).await.map_err(|error| {
+                        let transport_input = downstream_in.as_mut().ok_or_else(|| {
+                            ServeFailure::Io("bundled MCP transport input is closed".to_owned())
+                        })?;
+                        write_frame(transport_input, &frame).await.map_err(|error| {
                             ServeFailure::Io(format!(
                                 "failed to answer local interaction: {error}"
                             ))
