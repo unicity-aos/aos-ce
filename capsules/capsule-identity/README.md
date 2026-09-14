@@ -16,7 +16,7 @@ On a `spark.v1.request.build` event:
 3. Adds environment context (working directory, platform).
 4. Publishes the assembled prompt on `spark.v1.response.ready`.
 
-If no identity exists yet, the prompt includes onboarding instructions. After onboarding, the LLM calls `save_identity`, which saves the chosen callsign, class, aura, signal, and core directives to capsule state and writes `home://.config/spark.toml` as a recovery copy.
+If no identity exists yet, the prompt includes onboarding instructions. After onboarding, the LLM calls `save_identity`, which requests human approval, then saves the chosen callsign, class, aura, signal, and core directives to capsule state and writes `home://.config/spark.toml` as a recovery copy. Denial leaves both KV state and the durable file unchanged.
 
 State is scoped by the runtime's capsule KV isolation for the calling principal. Session ID is echoed back for react loop correlation.
 
