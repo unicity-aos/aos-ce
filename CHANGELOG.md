@@ -14,6 +14,21 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Added
+
+- Intercept modern MCP `input_required` results in `aos mcp serve` native, auto
+  (when the client lacks forms), and deny modes. The original `tools/call` is
+  resumed to the runtime with echoed `requestState`; incomplete results stay off
+  the host stream.
+
+### Fixed
+
+- Return locally handled MCP approval replies to the requesting runtime, rather
+  than emitting them to the agent host and leaving the runtime waiting.
+- Fail `aos mcp serve` closed when a native-tracked `tools/call` reuses an
+  in-flight JSON-RPC id or is malformed, instead of forwarding it and resuming
+  the original call.
+
 ## [2026.9.2] - 2026-09-13
 
 ### Changed

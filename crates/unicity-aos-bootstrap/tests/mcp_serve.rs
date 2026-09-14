@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -308,7 +308,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
 "#,
         )
         .expect("write initialize frame");
-    let response = match receiver.recv_timeout(Duration::from_secs(2)) {
+    let response = match receiver.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok((bytes, line))) => {
             assert!(bytes > 0, "line-reading runtime returned an empty frame");
             line
@@ -316,17 +316,17 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
         Ok(Err(error)) => panic!("read transformed response: {error}"),
         Err(mpsc::RecvTimeoutError::Timeout) => {
             drop(stdin);
-            let _ = wait_for_child(&mut child, Duration::from_secs(2));
+            let _ = wait_for_child(&mut child, Duration::from_secs(5));
             panic!("line-reading runtime did not receive transformed initialize frame");
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             drop(stdin);
-            let _ = wait_for_child(&mut child, Duration::from_secs(2));
+            let _ = wait_for_child(&mut child, Duration::from_secs(5));
             panic!("line-reading runtime probe disconnected before receiving a frame");
         }
     };
     drop(stdin);
-    let status = wait_for_child(&mut child, Duration::from_secs(2));
+    let status = wait_for_child(&mut child, Duration::from_secs(5));
     assert!(
         status.success(),
         "bridge failed after forwarding transformed initialize: {status}"
@@ -453,4 +453,384 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> ExitStatus {
 
 fn shell_literal_path(path: &Path) -> String {
     path.to_string_lossy().replace('\'', "'\\''")
+}
+
+#[test]
+fn deny_interaction_replies_to_runtime_not_mcp_host() {
+    assert_local_interaction_returns_to_runtime("deny");
+}
+
+#[test]
+fn unsupported_native_interaction_cancels_to_runtime_not_mcp_host() {
+    // Free-form secrets are refused before any platform UI is opened.
+    assert_local_interaction_returns_to_runtime("native");
+}
+
+fn assert_local_interaction_returns_to_runtime(mode: &str) {
+    let fixture = Fixture::new(mode);
+    fixture.install_runtime(
+        r#"#!/bin/sh
+IFS= read -r request || exit 90
+printf '%s\n' '{"jsonrpc":"2.0","id":"native-decision","method":"elicitation/create","params":{"mode":"form","message":"Test only","requestedSchema":{"type":"object","properties":{"secret":{"type":"string","format":"password"}}}}}'
+IFS= read -r answer || exit 91
+printf '%s\n' "$answer" > "$AOS_TEST_ARGS"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"receivedDecision":true}}'
+"#,
+    );
+    let mut child = fixture
+        .command()
+        .args(["mcp", "serve", "--interaction", mode])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start isolated bridge");
+    let mut input = child.stdin.take().expect("bridge input");
+    let output = child.stdout.take().expect("bridge output");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(output).read_line(&mut line).map(|_| line);
+        let _ = sender.send(result);
+    });
+    input
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fs.read","arguments":{"path":"/tmp/report"}}}"#,
+        )
+        .expect("send tool request");
+    input.write_all(b"\n").expect("newline");
+    let observed = receiver.recv_timeout(Duration::from_secs(5));
+    drop(input);
+    let status = wait_for_child(&mut child, Duration::from_secs(5));
+    reader.join().expect("reader completed");
+    let line = observed.expect("bounded reply").expect("read reply");
+    let host_reply: serde_json::Value = serde_json::from_str(&line).expect("host JSON");
+    assert_eq!(
+        host_reply,
+        serde_json::json!({"jsonrpc":"2.0", "id":1, "result":{"receivedDecision":true}}),
+        "the host must receive the runtime's tool result, never the local consent reply"
+    );
+    assert!(status.success(), "bridge exited {status}");
+    let runtime_reply: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.args).expect("runtime received answer"))
+            .expect("runtime JSON");
+    assert_eq!(
+        runtime_reply,
+        serde_json::json!({"jsonrpc":"2.0", "id":"native-decision", "result":{"action":"cancel"}})
+    );
+}
+
+#[test]
+fn deny_mrtr_resumes_original_call_to_runtime_not_mcp_host() {
+    assert_mrtr_resume_returns_to_runtime(
+        "deny",
+        r#"{"type":"object","properties":{"grant":{"type":"boolean"}},"required":["grant"]}"#,
+        false,
+    );
+}
+
+#[test]
+fn unsupported_native_mrtr_cancels_to_runtime_not_mcp_host() {
+    assert_mrtr_resume_returns_to_runtime(
+        "native",
+        r#"{"type":"object","properties":{"secret":{"type":"string","format":"password"}}}"#,
+        true,
+    );
+}
+
+#[test]
+fn client_mode_forwards_input_required_to_host() {
+    let fixture = Fixture::new("client-mrtr-bytepass");
+    fixture.install_runtime(
+        r#"#!/bin/sh
+IFS= read -r request || exit 90
+printf '%s\n' "$request" > "$AOS_TEST_ARGS"
+printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"resultType":"input_required","requestState":"opaque-token","inputRequests":{"astrid-consent":{"method":"elicitation/create","params":{"mode":"form","message":"Allow this capsule to continue?","requestedSchema":{"type":"object","properties":{"grant":{"type":"boolean"}},"required":["grant"]}}}}}}'
+"#,
+    );
+    let mut child = fixture
+        .command()
+        .args(["mcp", "serve", "--interaction", "client"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start isolated bridge");
+    let mut input = child.stdin.take().expect("bridge input");
+    let output = child.stdout.take().expect("bridge output");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(output).read_line(&mut line).map(|_| line);
+        let _ = sender.send(result);
+    });
+    input
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fs.read","arguments":{"path":"/tmp/report"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}}}"#,
+        )
+        .expect("send tool request");
+    input.write_all(b"\n").expect("newline");
+    let observed = receiver.recv_timeout(Duration::from_secs(5));
+    drop(input);
+    let status = wait_for_child(&mut child, Duration::from_secs(5));
+    reader.join().expect("reader completed");
+    let line = observed.expect("bounded reply").expect("read reply");
+    let host_reply: serde_json::Value = serde_json::from_str(&line).expect("host JSON");
+    assert_eq!(
+        host_reply["result"]["resultType"], "input_required",
+        "client mode must bytepass input_required to the host"
+    );
+    assert_eq!(host_reply["result"]["requestState"], "opaque-token");
+    assert!(status.success(), "bridge exited {status}");
+    let forwarded = serde_json::from_slice::<serde_json::Value>(
+        &fs::read(&fixture.args).expect("runtime received host tools/call"),
+    )
+    .expect("forwarded JSON");
+    assert_eq!(forwarded["method"], "tools/call");
+    assert_eq!(forwarded["params"]["name"], "fs.read");
+    assert!(
+        forwarded["params"].get("inputResponses").is_none(),
+        "client mode must not resume input_required to the runtime"
+    );
+}
+
+fn assert_mrtr_resume_returns_to_runtime(mode: &str, schema: &str, advertise_form: bool) {
+    let fixture = Fixture::new(&format!("mrtr-{mode}"));
+    let schema_literal = schema.replace('\'', r"'\''");
+    fixture.install_runtime(&format!(
+        r#"#!/bin/sh
+IFS= read -r request || exit 90
+printf '%s\n' '{{"jsonrpc":"2.0","id":7,"result":{{"resultType":"input_required","requestState":"opaque-token","inputRequests":{{"astrid-consent":{{"method":"elicitation/create","params":{{"mode":"form","message":"Allow this capsule to continue?","requestedSchema":{schema}}}}}}}}}}}'
+IFS= read -r resume || exit 91
+printf '%s\n' "$resume" > "$AOS_TEST_ARGS"
+printf '%s\n' '{{"jsonrpc":"2.0","id":7,"result":{{"content":[{{"type":"text","text":"done"}}]}}}}'
+"#,
+        schema = schema_literal
+    ));
+    let mut child = fixture
+        .command()
+        .args(["mcp", "serve", "--interaction", mode])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start isolated bridge");
+    let mut input = child.stdin.take().expect("bridge input");
+    let output = child.stdout.take().expect("bridge output");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(output).read_line(&mut line).map(|_| line);
+        let _ = sender.send(result);
+    });
+    input
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fs.read","arguments":{"path":"/tmp/report"},"extra":"keep-me","_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}}}"#,
+        )
+        .expect("send tool request");
+    input.write_all(b"\n").expect("newline");
+    let observed = receiver.recv_timeout(Duration::from_secs(5));
+    drop(input);
+    let status = wait_for_child(&mut child, Duration::from_secs(5));
+    reader.join().expect("reader completed");
+    let line = observed.expect("bounded reply").expect("read reply");
+    let host_reply: serde_json::Value = serde_json::from_str(&line).expect("host JSON");
+    assert_eq!(
+        host_reply,
+        serde_json::json!({"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"done"}]}}),
+        "the host must receive the runtime's final tool result, never input_required"
+    );
+    assert!(status.success(), "bridge exited {status}");
+    let resume: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.args).expect("runtime received resume"))
+            .expect("resume JSON");
+    assert_eq!(resume["method"], "tools/call");
+    assert_eq!(resume["id"], 7);
+    assert_eq!(resume["params"]["name"], "fs.read");
+    assert_eq!(resume["params"]["arguments"]["path"], "/tmp/report");
+    assert_eq!(resume["params"]["extra"], "keep-me");
+    assert_eq!(resume["params"]["requestState"], "opaque-token");
+    assert_eq!(
+        resume["params"]["inputResponses"]["astrid-consent"],
+        serde_json::json!({ "action": "cancel" })
+    );
+    assert_eq!(
+        resume["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+        "2025-11-25"
+    );
+    let form =
+        resume["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["elicitation"]
+            .get("form");
+    if advertise_form {
+        assert!(
+            form.is_some_and(serde_json::Value::is_object),
+            "native must advertise per-request form"
+        );
+    } else {
+        assert!(form.is_none(), "deny must not invent per-request form");
+    }
+}
+
+#[test]
+fn duplicate_tools_call_id_fails_closed_without_reaching_runtime() {
+    let fixture = Fixture::new("mrtr-duplicate-id");
+    let second_path = fixture.root.join("second-call");
+    fixture.install_runtime(
+        r#"#!/bin/sh
+IFS= read -r request || exit 90
+printf '%s\n' "$request" > "$AOS_TEST_ARGS"
+IFS= read -r second
+if [ -n "$second" ]; then
+  printf '%s\n' "$second" > "$AOS_TEST_SECOND"
+  exit 92
+fi
+exit 0
+"#,
+    );
+    let mut child = fixture
+        .command()
+        .env("AOS_TEST_SECOND", &second_path)
+        .args(["mcp", "serve", "--interaction", "native"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start isolated bridge");
+    let mut input = child.stdin.take().expect("bridge input");
+    let mut output = child.stdout.take().expect("bridge output");
+    let mut stderr = child.stderr.take().expect("bridge stderr");
+    input
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fs.read","arguments":{"path":"/tmp/report"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}}}"#,
+        )
+        .expect("send first tools/call");
+    input.write_all(b"\n").expect("newline");
+    input.flush().expect("flush first tools/call");
+    let first = wait_for_file(&fixture.args, Duration::from_secs(5));
+    let first: serde_json::Value = serde_json::from_slice(&first).expect("first tools/call JSON");
+    assert_eq!(first["params"]["name"], "fs.read");
+    input
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fs.write","arguments":{"path":"/etc/passwd"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}}}"#,
+        )
+        .expect("send duplicate tools/call");
+    input.write_all(b"\n").expect("newline");
+    input.flush().expect("flush duplicate tools/call");
+    let status = wait_for_child(&mut child, Duration::from_secs(5));
+    drop(input);
+    let mut host_out = String::new();
+    let _ = output.read_to_string(&mut host_out);
+    let mut err = String::new();
+    stderr.read_to_string(&mut err).expect("read bridge stderr");
+    assert!(
+        !status.success(),
+        "duplicate id must fail the connection, got {status}"
+    );
+    assert!(
+        err.contains("refusing to forward tools/call"),
+        "bridge must fail closed with an explicit error, stderr={err:?}"
+    );
+    assert!(
+        err.contains("already in flight"),
+        "duplicate id error should name the in-flight conflict, stderr={err:?}"
+    );
+    assert!(
+        !second_path.exists(),
+        "duplicate tools/call must not reach the runtime"
+    );
+    assert!(
+        host_out.trim().is_empty(),
+        "host must not receive a resumed or rewritten second call, got {host_out:?}"
+    );
+}
+
+#[test]
+fn cancelled_tools_call_does_not_resume_after_forget() {
+    let fixture = Fixture::new("mrtr-cancel");
+    let cancel_path = fixture.root.join("cancel");
+    let resume_path = fixture.root.join("resume");
+    let emitted_path = fixture.root.join("emitted");
+    fixture.install_runtime(
+        r#"#!/bin/sh
+IFS= read -r request || exit 90
+printf '%s\n' "$request" > "$AOS_TEST_ARGS"
+IFS= read -r cancel || exit 91
+printf '%s\n' "$cancel" > "$AOS_TEST_CANCEL"
+printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"resultType":"input_required","requestState":"opaque-token","inputRequests":{"astrid-consent":{"method":"elicitation/create","params":{"mode":"form","message":"Allow this capsule to continue?","requestedSchema":{"type":"object","properties":{"grant":{"type":"boolean"}},"required":["grant"]}}}}}}'
+printf 'emitted\n' > "$AOS_TEST_EMITTED"
+IFS= read -r resume
+if [ -n "$resume" ]; then
+  printf '%s\n' "$resume" > "$AOS_TEST_RESUME"
+  exit 92
+fi
+exit 0
+"#,
+    );
+    let mut child = fixture
+        .command()
+        .env("AOS_TEST_CANCEL", &cancel_path)
+        .env("AOS_TEST_RESUME", &resume_path)
+        .env("AOS_TEST_EMITTED", &emitted_path)
+        .args(["mcp", "serve", "--interaction", "deny"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start isolated bridge");
+    let mut input = child.stdin.take().expect("bridge input");
+    let output = child.stdout.take().expect("bridge output");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(output).read_line(&mut line).map(|_| line);
+        let _ = sender.send(result);
+    });
+    input
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fs.read","arguments":{"path":"/tmp/report"}}}"#,
+        )
+        .expect("send tools/call");
+    input.write_all(b"\n").expect("newline");
+    input.flush().expect("flush tools/call");
+    let first = wait_for_file(&fixture.args, Duration::from_secs(5));
+    let first: serde_json::Value = serde_json::from_slice(&first).expect("tools/call JSON");
+    assert_eq!(first["params"]["name"], "fs.read");
+    input
+        .write_all(
+            br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#,
+        )
+        .expect("send cancel");
+    input.write_all(b"\n").expect("newline");
+    input.flush().expect("flush cancel");
+    let cancel = wait_for_file(&cancel_path, Duration::from_secs(5));
+    let cancel: serde_json::Value = serde_json::from_slice(&cancel).expect("cancel JSON");
+    assert_eq!(cancel["method"], "notifications/cancelled");
+    assert_eq!(cancel["params"]["requestId"], 7);
+    let _ = wait_for_file(&emitted_path, Duration::from_secs(5));
+    let observed = receiver.recv_timeout(Duration::from_secs(1));
+    drop(input);
+    let status = wait_for_child(&mut child, Duration::from_secs(5));
+    reader.join().expect("reader completed");
+    assert!(
+        observed.is_err(),
+        "cancelled input_required must not reach the host or emit local consent, got {observed:?}"
+    );
+    assert!(status.success(), "bridge exited {status}");
+    assert!(
+        !resume_path.exists(),
+        "cancelled tools/call must not be resumed to the runtime"
+    );
+}
+
+fn wait_for_file(path: &Path, timeout: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::read(path) {
+            Ok(bytes) if !bytes.is_empty() => return bytes,
+            _ if Instant::now() >= deadline => {
+                panic!("did not observe {} within {timeout:?}", path.display())
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }

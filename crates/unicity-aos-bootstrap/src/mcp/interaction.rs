@@ -114,7 +114,7 @@ fn response(id: Value, action: &str, content: Option<Value>) -> Value {
     })
 }
 
-fn parse_request(request: &Value) -> Result<InteractionRequest, InteractionError> {
+pub(super) fn parse_request(request: &Value) -> Result<InteractionRequest, InteractionError> {
     let params =
         request
             .get("params")
