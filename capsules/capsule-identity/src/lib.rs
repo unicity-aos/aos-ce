@@ -264,6 +264,9 @@ impl IdentityBuilder {
     /// across KV resets). Requires human approval before any durable write.
     #[astrid::tool("save_identity", mutable)]
     pub fn save_identity(&mut self, args: SparkConfig) -> Result<serde_json::Value, SysError> {
+        // `home://` complete-file writes are buffered by Astrid and published
+        // through one content-catalog mutation on close. A failed publication
+        // therefore leaves the prior recovery object reachable.
         self.save_identity_with(args, approval::request, fs::write)
     }
 
@@ -361,11 +364,44 @@ fn display_identity_value(value: &str) -> String {
     if looks_secret(value) || value.chars().count() > 64 {
         return format!("redacted ({} chars)", value.chars().count());
     }
-    let sanitized: String = value.chars().filter(|c| !c.is_control()).collect();
+    let mut sanitized = String::with_capacity(value.len());
+    for c in value.chars() {
+        if identity_display_char_is_safe(c) {
+            sanitized.push(c);
+        } else {
+            sanitized.extend(c.escape_default());
+        }
+    }
     if sanitized.is_empty() {
         return format!("redacted ({} chars)", value.chars().count());
     }
     sanitized
+}
+
+/// Reject invisible direction-changing and implementation-defined characters
+/// from human consent text. Unsafe scalars are rendered as Rust escapes by
+/// [`display_identity_value`] so their presence remains visible without letting
+/// them reorder or disguise adjacent text.
+fn identity_display_char_is_safe(c: char) -> bool {
+    !c.is_control()
+        && !matches!(
+            c,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{e000}'..='\u{f8ff}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{13430}'..='\u{13455}'
+                | '\u{1bca0}'..='\u{1bcaf}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e007f}'
+                | '\u{f0000}'..='\u{ffffd}'
+                | '\u{100000}'..='\u{10fffd}'
+        )
 }
 
 fn looks_secret(value: &str) -> bool {
@@ -547,6 +583,22 @@ mod tests {
         assert!(!resource.contains("sk-live-secret"));
         assert!(!resource.contains("Preserve user boundaries"));
         assert!(!resource.contains("Calm, direct"));
+    }
+
+    #[test]
+    fn identity_save_resource_escapes_invisible_direction_controls() {
+        let current = SparkConfig::default();
+        let mut proposed = current.clone();
+        proposed.callsign = "safe\u{202e}txt".into();
+        proposed.class = "helper\u{2066}admin\u{2069}".into();
+
+        let resource = identity_save_resource(&current, &proposed);
+
+        assert!(!resource.contains('\u{202e}'));
+        assert!(!resource.contains('\u{2066}'));
+        assert!(!resource.contains('\u{2069}'));
+        assert!(resource.contains(r"safe\u{202e}txt"));
+        assert!(resource.contains(r"helper\u{2066}admin\u{2069}"));
     }
 
     #[test]
