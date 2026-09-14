@@ -14,6 +14,11 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Fixed
+
+- Bind MCP tool results to the kernel-stamped identity selected during tool
+  discovery as well as the call ID, including calls resumed after approval.
+
 ## [2026.9.2] - 2026-09-13
 
 ### Changed

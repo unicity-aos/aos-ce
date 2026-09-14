@@ -37,7 +37,9 @@
 //!   token (echoed into the reply), `request_id` is the approval correlation
 //!   id from the `approval_required` envelope, and `tool_name` / `call_id`
 //!   are echoed back from the `approval_required` reply flag so this handler
-//!   can re-establish the result drain the original dispatch dropped.
+//!   can re-establish the result drain the original dispatch dropped. The
+//!   expected provider identity is retained separately in broker-owned KV;
+//!   the response body cannot select which capsule may answer.
 //! * **outbound (decision → unblock tool)**
 //!   `astrid.v1.approval.response.<request_id>` —
 //!   `IpcPayload::ApprovalResponse` = `{ type:"approval_response",
@@ -115,8 +117,10 @@
 //! constrained decision verb. No free-form text is round-tripped into the
 //! tool.
 
+use std::collections::BTreeMap;
+
 use astrid_sdk::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Bus topic the host publishes capability-approval requests on. A single
@@ -319,6 +323,119 @@ struct ApprovalRespond {
     reason: Option<String>,
 }
 
+/// Bounded broker-owned correlation state for parked approval results.
+const PENDING_RESULT_ROUTES_KEY: &str = "mcp.approval.pending_result_routes";
+const PENDING_RESULT_ROUTE_TTL_MS: u64 = 120_000;
+const MAX_PENDING_RESULT_ROUTES: usize = 128;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingResultRoute {
+    tool_name: String,
+    call_id: String,
+    provider_source_id: String,
+    created_at_ms: u64,
+}
+
+impl PendingResultRoute {
+    fn matches(&self, tool_name: &str, call_id: &str) -> bool {
+        self.tool_name == tool_name
+            && self.call_id == call_id
+            && crate::cache::is_valid_provider_source_id(&self.provider_source_id)
+    }
+
+    fn is_fresh(&self, now_ms: u64) -> bool {
+        now_ms != 0
+            && self.created_at_ms != 0
+            && self.created_at_ms <= now_ms
+            && now_ms - self.created_at_ms < PENDING_RESULT_ROUTE_TTL_MS
+    }
+}
+
+/// Persist the exact provider selected for a tool call before returning an
+/// approval prompt to the MCP shim. The later response body is not trusted to
+/// choose this identity; it may only echo the tool/call routing tokens.
+pub(crate) fn remember_pending_result_route(
+    request_id: &str,
+    tool_name: &str,
+    call_id: &str,
+    provider_source_id: &str,
+) -> bool {
+    if response_topic(request_id).is_none()
+        || !crate::execute::is_valid_tool_name(tool_name)
+        || crate::broker::reply_topic(call_id).is_none()
+        || !crate::cache::is_valid_provider_source_id(provider_source_id)
+    {
+        return false;
+    }
+
+    let now_ms = crate::discovery::wall_ms();
+    if now_ms == 0 {
+        return false;
+    }
+    let mut routes = load_pending_result_routes();
+    routes.retain(|_, route| route.is_fresh(now_ms));
+    if routes.len() >= MAX_PENDING_RESULT_ROUTES {
+        let oldest = routes
+            .iter()
+            .min_by_key(|(_, route)| route.created_at_ms)
+            .map(|(id, _)| id.clone());
+        if let Some(oldest) = oldest {
+            routes.remove(&oldest);
+        }
+    }
+    routes.insert(
+        request_id.to_string(),
+        PendingResultRoute {
+            tool_name: tool_name.to_string(),
+            call_id: call_id.to_string(),
+            provider_source_id: provider_source_id.to_string(),
+            created_at_ms: now_ms,
+        },
+    );
+    persist_pending_result_routes(&routes)
+}
+
+/// Fail closed when the broker cannot persist the provider route for a parked
+/// approval. This releases the host waiter with a deny instead of leaving it
+/// blocked until timeout.
+pub(crate) fn deny_untracked_approval(request_id: &str) {
+    if let Some(topic) = response_topic(request_id) {
+        publish_decision(&topic, request_id, DENY, None);
+    }
+}
+
+/// Consume the broker-owned provider binding for an approval response.
+/// Mismatched echoed routing tokens fail closed and still consume the entry so
+/// a forged or replayed response cannot probe it repeatedly.
+fn take_pending_result_route(req: &ApprovalRespond) -> Option<String> {
+    let now_ms = crate::discovery::wall_ms();
+    let mut routes = load_pending_result_routes();
+    let route = routes.remove(&req.request_id);
+    routes.retain(|_, route| route.is_fresh(now_ms));
+    let persisted = persist_pending_result_routes(&routes);
+    if !persisted {
+        return None;
+    }
+    route
+        .filter(|route| route.is_fresh(now_ms) && route.matches(&req.tool_name, &req.call_id))
+        .map(|route| route.provider_source_id)
+}
+
+fn load_pending_result_routes() -> BTreeMap<String, PendingResultRoute> {
+    kv::get_bytes_opt(PENDING_RESULT_ROUTES_KEY)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn persist_pending_result_routes(routes: &BTreeMap<String, PendingResultRoute>) -> bool {
+    let Ok(bytes) = serde_json::to_vec(routes) else {
+        return false;
+    };
+    kv::set_bytes(PENDING_RESULT_ROUTES_KEY, &bytes).is_ok()
+}
+
 /// Handle `astrid.v1.request.mcp.approval.respond`.
 ///
 /// Maps the shim's elicited choice onto an
@@ -378,6 +495,23 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
         return Ok(());
     };
 
+    let Some(provider_source_id) = take_pending_result_route(&req) else {
+        log::warn(format!(
+            "{}: broker approval.respond: missing or mismatched provider route for request_id '{}'; denying",
+            crate::profile::log_tag(),
+            req.request_id
+        ));
+        publish_decision(&response_topic, &req.request_id, DENY, None);
+        if let Some(reply) = &reply_topic {
+            deliver_error(
+                reply,
+                &req.req_id,
+                "approval result route was not verifiable",
+            );
+        }
+        return Ok(());
+    };
+
     // Confused-deputy gate. Granting a capability is the most sensitive
     // action this capsule performs — require the kernel-set `source_id`
     // (NOT a body field) to be in the operator-pinned trusted-ingress
@@ -392,7 +526,7 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
                 crate::profile::log_tag(),
                 req.request_id
             ));
-            resolve_with_decision(&req, &response_topic, DENY, None);
+            resolve_with_decision(&req, &response_topic, DENY, None, &provider_source_id);
             return Ok(());
         }
     };
@@ -403,7 +537,7 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
             crate::profile::log_tag(),
             req.request_id
         ));
-        resolve_with_decision(&req, &response_topic, DENY, None);
+        resolve_with_decision(&req, &response_topic, DENY, None, &provider_source_id);
         return Ok(());
     }
 
@@ -413,7 +547,13 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
     // `ApprovalResponse.reason` field and is NEVER treated as a tool
     // argument (the host's approval path discards it after logging).
     let decision = normalize_decision(&req.decision);
-    resolve_with_decision(&req, &response_topic, decision, req.reason.as_deref());
+    resolve_with_decision(
+        &req,
+        &response_topic,
+        decision,
+        req.reason.as_deref(),
+        &provider_source_id,
+    );
     Ok(())
 }
 
@@ -857,6 +997,7 @@ fn resolve_with_decision(
     response_topic: &str,
     decision: &'static str,
     reason: Option<&str>,
+    provider_source_id: &str,
 ) {
     let reply_topic = crate::broker::reply_topic(&req.req_id);
 
@@ -912,7 +1053,7 @@ fn resolve_with_decision(
     };
 
     // Drain the resumed/denied result and deliver it as the terminal reply.
-    match result_sub.and_then(|sub| drain_result(&sub, &req.call_id)) {
+    match result_sub.and_then(|sub| drain_result(&sub, &req.call_id, provider_source_id)) {
         Some((content, is_error)) => deliver_result(reply, &req.req_id, content, is_error),
         None => deliver_error(
             reply,
@@ -928,14 +1069,23 @@ fn resolve_with_decision(
 /// slices so a result published the instant the tool resumes is picked up
 /// promptly. Reuses the execute path's result-envelope parser so both legs
 /// agree on the wire shape.
-fn drain_result(sub: &ipc::Subscription, call_id: &str) -> Option<(Value, bool)> {
+fn drain_result(
+    sub: &ipc::Subscription,
+    call_id: &str,
+    provider_source_id: &str,
+) -> Option<(Value, bool)> {
     let mut remaining = RESUME_TIMEOUT_MS;
     while remaining > 0 {
         let step = remaining.min(RESUME_SLICE_MS);
         match sub.recv(step) {
             Ok(poll) => {
                 for msg in poll.messages {
-                    if let Some(found) = crate::execute::match_result(&msg.payload, call_id) {
+                    if let Some(found) = crate::execute::match_result(
+                        &msg.payload,
+                        call_id,
+                        &msg.source_id,
+                        provider_source_id,
+                    ) {
                         return Some(found);
                     }
                 }
@@ -1241,6 +1391,27 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn pending_result_route_binds_provider_and_exact_echoed_route() {
+        install_test_profile();
+        let route = PendingResultRoute {
+            tool_name: "shell.exec".to_string(),
+            call_id: "call-7".to_string(),
+            provider_source_id: "0191f3a2-b4c7-7d8e-9f01-234567890abc".to_string(),
+            created_at_ms: 10_000,
+        };
+
+        assert!(route.matches("shell.exec", "call-7"));
+        assert!(!route.matches("fs.read", "call-7"));
+        assert!(!route.matches("shell.exec", "call-8"));
+        assert!(route.is_fresh(10_001));
+        assert!(!route.is_fresh(10_000 + PENDING_RESULT_ROUTE_TTL_MS));
+
+        let mut invalid = route;
+        invalid.provider_source_id.clear();
+        assert!(!invalid.matches("shell.exec", "call-7"));
     }
 
     #[test]

@@ -105,6 +105,19 @@ pub(crate) fn collect_snapshot(req_id: &str) -> Vec<McpToolDescriptor> {
     }
 }
 
+/// Resolve the live provider identity selected for `tool_name`.
+///
+/// Direct `tools/call` requests are allowed without a preceding `tools/list`,
+/// so this uses the same cache-or-discover path as listing. Old cache entries
+/// without provider provenance are never fresh and force rediscovery.
+pub(crate) fn provider_source_id(tool_name: &str, req_id: &str) -> Option<String> {
+    collect_snapshot(req_id)
+        .into_iter()
+        .find(|descriptor| descriptor.name == tool_name)
+        .map(|descriptor| descriptor.provider_source_id)
+        .filter(|source_id| cache::is_valid_provider_source_id(source_id))
+}
+
 /// Whether a fresh fan-out result should REPLACE the cache or be discarded in
 /// favour of the prior cache.
 #[derive(Debug, PartialEq, Eq)]
@@ -181,7 +194,25 @@ fn mcp_descriptor(d: &McpToolDescriptor) -> serde_json::Value {
 /// re-publish the assembled list so downstream consumers see fresh
 /// additions immediately.
 pub(crate) fn collect_tool_descriptors(payload: serde_json::Value) {
-    let descriptors = parse_describe_response(&payload);
+    let source_id = match runtime::caller() {
+        Ok(caller) if cache::is_valid_provider_source_id(&caller.source_id) => caller.source_id,
+        Ok(caller) => {
+            log::warn(format!(
+                "{}: ignoring tool descriptor broadcast from invalid source_id '{}'",
+                crate::profile::log_tag(),
+                caller.source_id
+            ));
+            return;
+        }
+        Err(error) => {
+            log::warn(format!(
+                "{}: ignoring tool descriptor broadcast without caller identity: {error}",
+                crate::profile::log_tag()
+            ));
+            return;
+        }
+    };
+    let descriptors = bind_provider(parse_describe_response(&payload), &source_id);
     if descriptors.is_empty() {
         return;
     }
@@ -247,12 +278,24 @@ fn static_tools_from_payload(payload: &serde_json::Value) -> Option<Vec<McpToolD
         let meta = capsule.get("meta").filter(|m| !m.is_null())?;
         // `tools` absent / non-array => not captured => unknown.
         let tools = meta.get("tools")?.as_array()?;
+        let source_id = if tools.is_empty() {
+            None
+        } else {
+            let source_id = capsule.get("source_id")?.as_str()?;
+            if !cache::is_valid_provider_source_id(source_id) {
+                return None;
+            }
+            Some(source_id)
+        };
         for tool in tools {
             let Some(name) = tool.get("name").and_then(serde_json::Value::as_str) else {
                 continue;
             };
             all.push(McpToolDescriptor {
                 name: name.to_string(),
+                provider_source_id: source_id
+                    .expect("non-empty tools require source_id")
+                    .to_string(),
                 title: None,
                 description: tool
                     .get("description")
@@ -328,7 +371,7 @@ fn discover(req_id: &str) -> Vec<McpToolDescriptor> {
                     let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.payload) else {
                         continue;
                     };
-                    let tools = parse_describe_response(&value);
+                    let tools = bind_provider(parse_describe_response(&value), &msg.source_id);
                     responders.insert(msg.source_id.clone());
                     log::debug(format!(
                         "{}: broker fan-out collected req_id={req_id} \
@@ -400,6 +443,21 @@ fn discover(req_id: &str) -> Vec<McpToolDescriptor> {
     }
 
     acc
+}
+
+/// Stamp descriptors with the kernel-authenticated identity of the message
+/// that advertised them. Invalid/system identities contribute no tools.
+fn bind_provider(
+    mut descriptors: Vec<McpToolDescriptor>,
+    source_id: &str,
+) -> Vec<McpToolDescriptor> {
+    if !cache::is_valid_provider_source_id(source_id) {
+        return Vec::new();
+    }
+    for descriptor in &mut descriptors {
+        descriptor.provider_source_id = source_id.to_string();
+    }
+    descriptors
 }
 
 /// Extract descriptors from a `tool.v1.response.describe.*` payload.
@@ -549,7 +607,9 @@ mod tests {
         let payload = json!({
             "status": "ready",
             "capsules": [
-                { "name": "fs", "meta": { "tools": [
+                { "name": "fs",
+                  "source_id": "0191f3a2-b4c7-7d8e-9f01-234567890abc",
+                  "meta": { "tools": [
                     { "name": "read_file", "description": "Read a file",
                       "input_schema": { "type": "object" } }
                 ] } },
@@ -559,8 +619,33 @@ mod tests {
         let tools = static_tools_from_payload(&payload).expect("all captured -> Some");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "read_file");
+        assert_eq!(
+            tools[0].provider_source_id,
+            "0191f3a2-b4c7-7d8e-9f01-234567890abc"
+        );
         assert_eq!(tools[0].description, "Read a file");
         assert_eq!(tools[0].input_schema, json!({ "type": "object" }));
+    }
+
+    #[test]
+    fn static_tool_without_live_source_identity_forces_fanout() {
+        install_test_profile();
+        let payload = json!({
+            "status": "ready",
+            "capsules": [
+                { "name": "fs", "meta": { "tools": [ { "name": "read_file" } ] } },
+            ],
+        });
+        assert!(static_tools_from_payload(&payload).is_none());
+    }
+
+    #[test]
+    fn provider_binding_rejects_invalid_source_and_stamps_valid_source() {
+        install_test_profile();
+        let source_id = "0191f3a2-b4c7-7d8e-9f01-234567890abc";
+        assert!(bind_provider(vec![desc("read_file")], "").is_empty());
+        let tools = bind_provider(vec![desc("read_file")], source_id);
+        assert_eq!(tools[0].provider_source_id, source_id);
     }
 
     #[test]
@@ -618,6 +703,7 @@ mod tests {
     fn desc(name: &str) -> McpToolDescriptor {
         McpToolDescriptor {
             name: name.to_string(),
+            provider_source_id: "0191f3a2-b4c7-7d8e-9f01-234567890abc".to_string(),
             title: None,
             description: String::new(),
             input_schema: serde_json::Value::Null,

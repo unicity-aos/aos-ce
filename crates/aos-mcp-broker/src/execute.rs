@@ -10,9 +10,9 @@
 //!   which only requires `{ call_id, tool_name, arguments }`, so the
 //!   tagged form is accepted unchanged.
 //! * **Inbound result** (`tool.v1.execute.<tool_name>.result`): parsed by
-//!   [`match_result`], filtered on `call_id`, and returned to the broker
-//!   caller as `(content, is_error)` for reshaping into the MCP
-//!   `tool.call` reply.
+//!   [`match_result`], filtered on both `call_id` and the kernel-stamped
+//!   identity selected during discovery, and returned to the broker caller as
+//!   `(content, is_error)` for reshaping into the MCP `tool.call` reply.
 //!
 //! The bare tool name is supplied by the broker, which strips the
 //! `mcp__aos__` MCP prefix and charset-validates before constructing the
@@ -141,10 +141,17 @@ pub(crate) fn dispatch_with_approval(
     tool_name: &str,
     call_id: &str,
     arguments: &Value,
+    provider_source_id: &str,
 ) -> DispatchOutcome {
     if !is_valid_tool_name(tool_name) {
         return DispatchOutcome::Failed(format!(
             "{}: invalid tool name '{tool_name}'",
+            crate::profile::log_tag()
+        ));
+    }
+    if !crate::cache::is_valid_provider_source_id(provider_source_id) {
+        return DispatchOutcome::Failed(format!(
+            "{}: tool '{tool_name}' has no verified provider identity",
             crate::profile::log_tag()
         ));
     }
@@ -222,7 +229,9 @@ pub(crate) fn dispatch_with_approval(
         match result_sub.recv(step) {
             Ok(poll) => {
                 for msg in poll.messages {
-                    if let Some((content, is_error)) = match_result(&msg.payload, call_id) {
+                    if let Some((content, is_error)) =
+                        match_result(&msg.payload, call_id, &msg.source_id, provider_source_id)
+                    {
                         return DispatchOutcome::Result(content, is_error);
                     }
                 }
@@ -310,14 +319,24 @@ fn poll_signal(sub: &ipc::Subscription) -> Option<DispatchOutcome> {
     approval.map(DispatchOutcome::ApprovalRequired)
 }
 
-/// Match a `tool.v1.execute.<name>.result` payload against `call_id`,
-/// returning `(content, is_error)` when it is the result for this call.
+/// Match a `tool.v1.execute.<name>.result` envelope against the selected live
+/// provider and `call_id`, returning `(content, is_error)` only when both bind.
 ///
 /// Used by [`dispatch_with_approval`]'s drain loop. `pub(crate)` so the
 /// approval bridge ([`crate::approval`]) reuses the exact same parser when
 /// it drains the resumed/denied result after a decision — one definition,
 /// no wire-shape drift between the two result legs.
-pub(crate) fn match_result(payload: &str, call_id: &str) -> Option<(Value, bool)> {
+pub(crate) fn match_result(
+    payload: &str,
+    call_id: &str,
+    message_source_id: &str,
+    provider_source_id: &str,
+) -> Option<(Value, bool)> {
+    if message_source_id != provider_source_id
+        || !crate::cache::is_valid_provider_source_id(message_source_id)
+    {
+        return None;
+    }
     let value = serde_json::from_str::<Value>(payload).ok()?;
     if value.get("call_id").and_then(Value::as_str) != Some(call_id) {
         return None;
@@ -693,6 +712,22 @@ mod tests {
         let too_long = "a".repeat(MAX_TOOL_NAME_LEN + 1);
         assert!(is_valid_tool_name(&ok));
         assert!(!is_valid_tool_name(&too_long));
+    }
+
+    #[test]
+    fn result_requires_call_and_discovered_provider_identity() {
+        install_test_profile();
+        let provider = "0191f3a2-b4c7-7d8e-9f01-234567890abc";
+        let attacker = "0191f3a2-b4c7-7d8e-9f01-234567890def";
+        let payload = r#"{"call_id":"call-7","result":{"content":"trusted"}}"#;
+
+        assert_eq!(
+            match_result(payload, "call-7", provider, provider),
+            Some((Value::String("trusted".to_string()), false))
+        );
+        assert_eq!(match_result(payload, "call-7", attacker, provider), None);
+        assert_eq!(match_result(payload, "other", provider, provider), None);
+        assert_eq!(match_result(payload, "call-7", "", provider), None);
     }
 
     #[test]
