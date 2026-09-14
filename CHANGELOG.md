@@ -14,6 +14,11 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Fixed
+
+- Return locally handled MCP approval replies to the requesting runtime, rather
+  than emitting them to the agent host and leaving the runtime waiting.
+
 ## [2026.9.2] - 2026-09-13
 
 ### Changed

@@ -454,3 +454,65 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> ExitStatus {
 fn shell_literal_path(path: &Path) -> String {
     path.to_string_lossy().replace('\'', "'\\''")
 }
+
+#[test]
+fn deny_interaction_replies_to_runtime_not_mcp_host() {
+    assert_local_interaction_returns_to_runtime("deny");
+}
+
+#[test]
+fn unsupported_native_interaction_cancels_to_runtime_not_mcp_host() {
+    // Free-form secrets are refused before any platform UI is opened.
+    assert_local_interaction_returns_to_runtime("native");
+}
+
+fn assert_local_interaction_returns_to_runtime(mode: &str) {
+    let fixture = Fixture::new(mode);
+    fixture.install_runtime(
+        r#"#!/bin/sh
+IFS= read -r request || exit 90
+printf '%s\n' '{"jsonrpc":"2.0","id":"native-decision","method":"elicitation/create","params":{"mode":"form","message":"Test only","requestedSchema":{"type":"object","properties":{"secret":{"type":"string","format":"password"}}}}}'
+IFS= read -r answer || exit 91
+printf '%s\n' "$answer" > "$AOS_TEST_ARGS"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"receivedDecision":true}}'
+"#,
+    );
+    let mut child = fixture
+        .command()
+        .args(["mcp", "serve", "--interaction", mode])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start isolated bridge");
+    let mut input = child.stdin.take().expect("bridge input");
+    let output = child.stdout.take().expect("bridge output");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(output).read_line(&mut line).map(|_| line);
+        let _ = sender.send(result);
+    });
+    input
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}\n")
+        .expect("send tool request");
+    let observed = receiver.recv_timeout(Duration::from_secs(5));
+    drop(input);
+    let status = wait_for_child(&mut child, Duration::from_secs(5));
+    reader.join().expect("reader completed");
+    let line = observed.expect("bounded reply").expect("read reply");
+    let host_reply: serde_json::Value = serde_json::from_str(&line).expect("host JSON");
+    assert_eq!(
+        host_reply,
+        serde_json::json!({"jsonrpc":"2.0", "id":1, "result":{"receivedDecision":true}}),
+        "the host must receive the runtime's tool result, never the local consent reply"
+    );
+    assert!(status.success(), "bridge exited {status}");
+    let runtime_reply: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.args).expect("runtime received answer"))
+            .expect("runtime JSON");
+    assert_eq!(
+        runtime_reply,
+        serde_json::json!({"jsonrpc":"2.0", "id":"native-decision", "result":{"action":"cancel"}})
+    );
+}
