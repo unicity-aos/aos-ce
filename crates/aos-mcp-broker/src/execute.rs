@@ -67,24 +67,25 @@ const INGRESS_PENDING_KEY_PREFIX: &str = "mcp.ingress.pending.";
 /// [`crate::broker::handle_mcp_call`] surfaces a `grant_required` flag and
 /// consumed by [`crate::approval::handle_mcp_grant_respond`]. See
 /// [`mark_grant_pending`] / [`take_grant_pending`]. KV is per-principal-scoped
-/// by the kernel, so the capsule id alone suffices within the keyspace.
+/// by the kernel, so the capsule id alone suffices as the key suffix. The
+/// marker VALUE pairs the write timestamp with the exact `request_id`
+/// originally surfaced, so a respond cannot approve/deny a different kernel
+/// awaiter or clear another live marker.
 const GRANT_PENDING_KEY_PREFIX: &str = "mcp.grant.pending.";
 
 /// Self-heal TTL for a grant-pending marker, in milliseconds.
 ///
-/// Unlike the ingress marker — which clears on a kernel-stamped `source_id`
-/// always present on the respond — a grant marker clears on the respond's
-/// `capsule_id` body field. If the shim crashes after the broker marked
-/// pending, or ever sends a respond without that field, the marker would
-/// otherwise stick and suppress EVERY future grant prompt for the pair. So the
-/// marker carries the wall-clock ms it was written, and a marker older than
-/// this is treated as stale (ignored, best-effort deleted) — the dedup
-/// self-heals regardless of which leg dropped the clear. Wall-clock (not
-/// monotonic) so a daemon restart, after which the KV marker survives but a
-/// monotonic clock would reset, still measures elapsed time correctly. Set
-/// well above the kernel's 60 s grant-awaiter window so a marker never expires
-/// while its grant could still land: the worst case is one duplicate prompt,
-/// never a double grant (the kernel grant is idempotent).
+/// The marker value is `"{wall_ms} {request_id}"`. [`take_grant_pending`]
+/// consumes it only when that exact `request_id` is still live for the
+/// capsule. A mismatch or malformed value is left in place; a stamp older
+/// than this TTL (or a clock-unavailable / future stamp) is treated as stale
+/// and best-effort deleted so a dropped respond cannot suppress every future
+/// prompt. Wall-clock (not monotonic) so a daemon restart, after which the KV
+/// marker survives but a monotonic clock would reset, still measures elapsed
+/// time correctly. Set well above the kernel's 60 s grant-awaiter window so a
+/// marker never expires while its grant could still land: the worst case is
+/// one duplicate prompt, never a double grant (the kernel grant is
+/// idempotent).
 pub(crate) const GRANT_PENDING_TTL_MS: u64 = 120_000;
 
 /// Outcome of a broker tool dispatch that watches for a mid-call approval.
@@ -444,22 +445,25 @@ fn grant_pending_key(_principal: &str, capsule_id: &str) -> Option<String> {
 }
 
 /// Record that the broker has surfaced a `grant_required` prompt for
-/// `(principal, capsule_id)`, so a duplicate ungranted call for the same pair
-/// while one is pending is suppressed instead of spawning a second prompt, and
-/// so [`take_grant_pending`] can clear it on respond.
+/// `(principal, capsule_id, request_id)`, so a duplicate ungranted call for
+/// the same pair while one is pending is suppressed instead of spawning a
+/// second prompt, and so [`take_grant_pending`] can pair the respond.
 ///
-/// The marker VALUE is the wall-clock ms it was written: [`grant_pending`]
-/// treats a marker older than [`GRANT_PENDING_TTL_MS`] as stale and ignores it,
-/// so the dedup self-heals even when the paired respond never clears it (a shim
-/// crash, or a respond that arrives without the `capsule_id` the clear keys on).
-/// If the clock read fails the marker is written as `0` — already stale — so the
-/// failure degrades to "no dedup" (one extra prompt), never a stuck marker.
+/// The marker VALUE is `"{wall_ms} {request_id}"`. [`grant_pending`] treats a
+/// marker older than [`GRANT_PENDING_TTL_MS`] (or malformed) as not pending
+/// and best-effort deletes it, so the dedup self-heals even when the paired
+/// respond never arrives. If the clock read fails the marker is written with
+/// stamp `0` — already stale — so the failure degrades to "no dedup" (one
+/// extra prompt), never a stuck marker. An empty/whitespace `request_id` is
+/// not written. A later `grant_required` for the same capsule while a fresh
+/// marker exists does **not** overwrite the stored request id (capsule-level
+/// dedup).
 ///
 /// Best-effort: a write failure is logged, not fatal. A lost marker just means
 /// a duplicate prompt could surface (one extra elicit), never a spurious grant
 /// — the grant itself is still gated on a human approve flowing through
 /// [`crate::approval::handle_mcp_grant_respond`].
-pub(crate) fn mark_grant_pending(principal: &str, capsule_id: &str) {
+pub(crate) fn mark_grant_pending(principal: &str, capsule_id: &str, request_id: &str) {
     let Some(key) = grant_pending_key(principal, capsule_id) else {
         log::warn(format!(
             "{}: empty capsule_id; not marking a grant consent prompt as pending",
@@ -467,8 +471,21 @@ pub(crate) fn mark_grant_pending(principal: &str, capsule_id: &str) {
         ));
         return;
     };
-    let stamp = crate::discovery::wall_ms().to_string();
-    if let Err(e) = kv::set_bytes(&key, stamp.as_bytes()) {
+    let Some(value) =
+        crate::grant_decision::encode_grant_pending_marker(crate::discovery::wall_ms(), request_id)
+    else {
+        log::warn(format!(
+            "{}: empty or malformed request_id; not marking a grant consent prompt \
+             as pending for capsule_id '{capsule_id}'",
+            crate::profile::log_tag()
+        ));
+        return;
+    };
+    // Capsule-level dedup: do not replace a live request_id with a later one.
+    if grant_pending(principal, capsule_id) {
+        return;
+    }
+    if let Err(e) = kv::set_bytes(&key, value.as_bytes()) {
         log::warn(format!(
             "{}: failed to mark grant consent prompt pending for capsule_id \
              '{capsule_id}': {e}",
@@ -477,50 +494,21 @@ pub(crate) fn mark_grant_pending(principal: &str, capsule_id: &str) {
     }
 }
 
-/// Whether a grant-pending marker value (the wall-clock ms it was written, per
-/// [`crate::discovery::wall_ms`]) is still within [`GRANT_PENDING_TTL_MS`].
+/// Whether a grant-pending marker value is still within [`GRANT_PENDING_TTL_MS`].
 fn marker_is_fresh(value: &[u8]) -> bool {
-    marker_is_fresh_at(value, crate::discovery::wall_ms())
-}
-
-/// Core of [`marker_is_fresh`] with the clock injected, so the freshness logic
-/// is unit-testable without a host (mirrors [`crate::cache`]'s `is_fresh`).
-///
-/// Reads as NOT fresh — fail toward re-prompting (surface a fresh consent
-/// prompt), never toward a stuck marker — when: the value does not parse; the
-/// stored stamp is `0` (the mark-time clock was unavailable); `now` is `0` (the
-/// clock is unavailable now); or the stamp is in the FUTURE relative to `now`
-/// (`written > now`). A future stamp means the wall clock stepped backward (NTP
-/// correction) or the stored value is corrupt/forged; reading it as fresh would
-/// suppress prompts far beyond the TTL (until the clock caught back up), which
-/// defeats the self-heal, so it too fails open to a re-prompt. With those guards
-/// the freshness window is exactly `[written, written + TTL)` and `now - written`
-/// can never underflow.
-fn marker_is_fresh_at(value: &[u8], now: u64) -> bool {
-    if now == 0 {
-        return false;
-    }
-    let Ok(written) = std::str::from_utf8(value)
-        .map(str::trim)
-        .unwrap_or("")
-        .parse::<u64>()
-    else {
-        return false;
-    };
-    if written == 0 || written > now {
-        return false;
-    }
-    now - written < GRANT_PENDING_TTL_MS
+    crate::grant_decision::marker_is_fresh_at(value, crate::discovery::wall_ms())
 }
 
 /// Returns whether a grant-consent prompt is already outstanding for
-/// `(principal, capsule_id)` WITHOUT consuming the marker.
+/// `(principal, capsule_id)` WITHOUT consuming a live marker.
 ///
 /// Used at the broker's `grant_required` surface point: if a prompt is already
 /// pending for this pair, the broker replies a benign "already pending"
-/// terminal result instead of a fresh elicit (dedup). The marker is left in
-/// place — it is consumed only by [`take_grant_pending`] on the respond, so the
-/// dedup holds across every duplicate call until the user decides.
+/// terminal result instead of a fresh elicit (dedup). A live marker is left
+/// in place — it is consumed only by [`take_grant_pending`] on a paired
+/// respond, so the dedup holds across every duplicate call until the user
+/// decides. Malformed or stale markers are not pending and are best-effort
+/// deleted so the next ungranted call re-prompts.
 ///
 /// Fail-OPEN on a read error (returns `false` → the broker surfaces a fresh
 /// prompt): a transient KV read failure must never SUPPRESS a consent prompt,
@@ -535,10 +523,11 @@ pub(crate) fn grant_pending(principal: &str, capsule_id: &str) -> bool {
             if marker_is_fresh(&bytes) {
                 true
             } else {
-                // Stale (or unparseable / clock-unavailable) marker: the paired
-                // respond never cleared it. Treat as not pending and best-effort
-                // delete so the next ungranted call re-prompts — the self-heal
-                // that keeps a dropped respond from wedging the pair forever.
+                // Stale or malformed marker: the paired respond never cleared
+                // it, or a legacy timestamp-only value cannot be paired. Treat
+                // as not pending and best-effort delete so the next ungranted
+                // call re-prompts — the self-heal that keeps a dropped respond
+                // from wedging the pair forever.
                 let _ = kv::delete(&key);
                 false
             }
@@ -556,32 +545,51 @@ pub(crate) fn grant_pending(principal: &str, capsule_id: &str) -> bool {
 }
 
 /// Consume the outstanding grant-consent prompt marker for
-/// `(principal, capsule_id)`, returning whether one existed.
+/// `(principal, capsule_id)` iff it pairs with `request_id`.
 ///
-/// Called by [`crate::approval::handle_mcp_grant_respond`] on BOTH approve and
-/// deny so the marker is single-use and can never stick: a declined prompt must
-/// not leave a marker that suppresses every future grant prompt for the pair.
-/// The return value is informational (the grant itself is driven by the
-/// published decision, not this marker); clearing the marker is the effect that
-/// matters here.
+/// Called by [`crate::approval::handle_mcp_grant_respond`] *before* any
+/// approve/deny publish or durable grant record. A [`crate::grant_decision::GrantMarkerDisposition::Match`]
+/// deletes the marker and returns `true`. [`crate::grant_decision::GrantMarkerDisposition::Mismatch`]
+/// and [`crate::grant_decision::GrantMarkerDisposition::Malformed`] leave the live (or unparseable)
+/// marker in place and return `false`, so a wrong or replayed respond cannot
+/// clear another prompt. [`crate::grant_decision::GrantMarkerDisposition::Stale`] best-effort deletes
+/// as self-heal and returns `false`. Empty `capsule_id` or empty `request_id`
+/// returns `false` without a delete.
 ///
-/// Fail-closed shape mirrors [`take_ingress_pending`]: an empty `capsule_id`, a
-/// missing marker, or a read error all return `false`. A delete failure after a
-/// confirmed-present marker is logged but reported as consumed.
-pub(crate) fn take_grant_pending(principal: &str, capsule_id: &str) -> bool {
+/// Fail-closed shape mirrors [`take_ingress_pending`]: a missing marker or a
+/// read error also return `false`. A delete failure after a confirmed match
+/// is logged but reported as consumed.
+pub(crate) fn take_grant_pending(principal: &str, capsule_id: &str, request_id: &str) -> bool {
+    if request_id.is_empty() {
+        return false;
+    }
     let Some(key) = grant_pending_key(principal, capsule_id) else {
         return false;
     };
     match kv::get_bytes_opt(&key) {
-        Ok(Some(_)) => {
-            if let Err(e) = kv::delete(&key) {
-                log::warn(format!(
-                    "{}: failed to clear grant pending marker for capsule_id \
-                     '{capsule_id}': {e}",
-                    crate::profile::log_tag()
-                ));
+        Ok(Some(bytes)) => {
+            match crate::grant_decision::grant_marker_disposition(
+                &bytes,
+                request_id,
+                crate::discovery::wall_ms(),
+            ) {
+                crate::grant_decision::GrantMarkerDisposition::Match => {
+                    if let Err(e) = kv::delete(&key) {
+                        log::warn(format!(
+                            "{}: failed to clear grant pending marker for capsule_id \
+                         '{capsule_id}': {e}",
+                            crate::profile::log_tag()
+                        ));
+                    }
+                    true
+                }
+                crate::grant_decision::GrantMarkerDisposition::Mismatch
+                | crate::grant_decision::GrantMarkerDisposition::Malformed => false,
+                crate::grant_decision::GrantMarkerDisposition::Stale => {
+                    let _ = kv::delete(&key);
+                    false
+                }
             }
-            true
         }
         Ok(None) => false,
         Err(e) => {
@@ -791,65 +799,14 @@ mod tests {
         // No host KV call is reached for an empty capsule_id — short-circuits
         // to `false` via `grant_pending_key` returning `None`. (The non-empty
         // path needs a live host and is exercised by integration, not here.)
-        assert!(!take_grant_pending("alice", ""));
+        assert!(!take_grant_pending("alice", "", "req-1"));
     }
 
     #[test]
-    fn marker_fresh_within_ttl() {
+    fn take_grant_pending_empty_request_id_fails_closed() {
         install_test_profile();
-        // A marker written `TTL - 1ms` ago is still within the window → fresh,
-        // so the dedup holds and a duplicate call is suppressed.
-        let now = 10_000_000;
-        let written = now - (GRANT_PENDING_TTL_MS - 1);
-        assert!(marker_is_fresh_at(written.to_string().as_bytes(), now));
-    }
-
-    #[test]
-    fn marker_stale_at_or_past_ttl_self_heals() {
-        install_test_profile();
-        // At exactly the TTL and beyond, the marker is stale → not fresh, so
-        // `grant_pending` ignores it and the next call re-prompts. This is the
-        // self-heal that keeps a never-cleared marker (shim crash, or a respond
-        // without `capsule_id`) from suppressing prompts forever.
-        let now = 10_000_000;
-        let at_ttl = now - GRANT_PENDING_TTL_MS;
-        let past_ttl = now - (GRANT_PENDING_TTL_MS + 60_000);
-        assert!(!marker_is_fresh_at(at_ttl.to_string().as_bytes(), now));
-        assert!(!marker_is_fresh_at(past_ttl.to_string().as_bytes(), now));
-    }
-
-    #[test]
-    fn marker_not_fresh_when_clock_unavailable_now_or_at_write() {
-        install_test_profile();
-        // `wall_ms() == 0` means the host clock is unavailable. Either a now of 0
-        // or a stored stamp of 0 reads as NOT fresh — fail toward re-prompting,
-        // never toward trusting an unageable marker.
-        assert!(!marker_is_fresh_at(b"10000000", 0));
-        assert!(!marker_is_fresh_at(b"0", 10_000_000));
-    }
-
-    #[test]
-    fn marker_not_fresh_when_unparseable() {
-        install_test_profile();
-        // A non-numeric value (e.g. a legacy `b"1"` presence marker, or garbage)
-        // cannot be aged → treated as not fresh so it cannot linger.
-        assert!(!marker_is_fresh_at(b"1", 10_000_000));
-        assert!(!marker_is_fresh_at(b"not-a-number", 10_000_000));
-        assert!(!marker_is_fresh_at(b"", 10_000_000));
-    }
-
-    #[test]
-    fn marker_future_stamp_is_stale() {
-        install_test_profile();
-        // A stamp dated in the FUTURE relative to `now` (the wall clock stepped
-        // backward, or the stored value is corrupt/forged) must read as STALE —
-        // fail open to a re-prompt — never as fresh. Reading it as fresh would
-        // suppress prompts until the clock caught back up (potentially far beyond
-        // the TTL), defeating the self-heal. The cost of failing open is at most
-        // one extra prompt, never indefinite suppression.
-        assert!(!marker_is_fresh_at(
-            20_000_000u64.to_string().as_bytes(),
-            10_000_000
-        ));
+        // An empty request_id cannot pair. Fail closed without a KV delete so a
+        // live marker for this capsule is left untouched.
+        assert!(!take_grant_pending("alice", "fs", ""));
     }
 }

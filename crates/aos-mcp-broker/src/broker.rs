@@ -555,7 +555,11 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
                         // First prompt for this pair — record it pending, then
                         // surface the flag. `mark` is best-effort: a lost marker
                         // only risks a duplicate prompt, never a spurious grant.
-                        execute::mark_grant_pending(&principal, &grant.capsule_id);
+                        execute::mark_grant_pending(
+                            &principal,
+                            &grant.capsule_id,
+                            &grant.request_id,
+                        );
                         outcome = "grant_required";
                         json!({
                             "kind": "tool.call",
