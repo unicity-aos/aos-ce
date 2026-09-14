@@ -655,19 +655,20 @@ fn ingress_ack(reply_topic: &str, req_id: &str, granted: bool) {
 /// State-mutating (an APPROVE causes the kernel to persist a capsule grant), so
 /// it is confused-deputy gated identically to [`crate::broker::handle_mcp_call`]:
 /// the inbound message's kernel-set `source_id` must already be a trusted
-/// ingress ([`crate::execute::is_ingress_trusted`]) before any decision is
-/// published. A rejected request publishes a `deny` (when a `request_id` is
-/// routable) so the kernel gate miss retires cleanly and clears the dedup
-/// marker — fail secure.
+/// ingress ([`crate::execute::is_ingress_trusted`]) before any *user* decision
+/// is published. Pairing happens first: [`crate::execute::take_grant_pending`]
+/// must consume the exact `(capsule_id, request_id)` originally surfaced.
+/// Unroutable or unpaired responds ack `granted:false` with no publish, no
+/// durable record, and no marker clear. A paired respond from an untrusted
+/// ingress (or with no caller) publishes `deny` for that paired `request_id`
+/// so the kernel awaiter retires — fail secure — and records no durable grant.
 ///
-/// The dedup marker for `(principal, capsule_id)` is consumed on BOTH approve
-/// and deny ([`crate::execute::take_grant_pending`]) so a declined prompt can
-/// never leave a marker that suppresses every future grant prompt for the pair.
-/// A payload so malformed it carries no `request_id` (and so no routable deny)
-/// — or no `capsule_id` to clear by — is logged and dropped; the kernel gate
-/// miss times out on its own schedule and any pending marker self-heals at
-/// [`crate::execute::GRANT_PENDING_TTL_MS`], so even that path cannot wedge the
-/// pair.
+/// The marker is consumed only on a successful pair, for both approve and deny,
+/// so a declined prompt cannot suppress every future grant prompt for the pair
+/// and a mismatched respond cannot clear another live marker. A payload so
+/// malformed it carries no routable `request_id` is logged and dropped; the
+/// kernel gate miss times out on its own schedule and any pending marker
+/// self-heals at [`crate::execute::GRANT_PENDING_TTL_MS`].
 pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
     let req: GrantRespond = match serde_json::from_value(payload) {
         Ok(v) => v,
@@ -699,11 +700,7 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
             crate::profile::log_tag(),
             req.request_id
         ));
-        // Clear any dedup marker so the next ungranted call can re-prompt — the
-        // decision was never published (bad request_id), so leaving the marker
-        // would wedge the pair. The caller principal scopes the KV; the suffix
-        // is the capsule id.
-        clear_grant_marker(&req.capsule_id);
+        // Do not clear any marker: this request_id was never a live prompt.
         // Ack the shim (when routable) so it does not hang; not granted.
         if let Some(reply) = &reply_topic {
             grant_ack(reply, &req.req_id, false);
@@ -711,12 +708,34 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
         return Ok(());
     };
 
-    // Confused-deputy gate. An APPROVE here causes the kernel to persist a
-    // capsule grant — the most sensitive action on this path — so require the
-    // kernel-set `source_id` (NOT a body field) to be a trusted ingress. On any
-    // failure (no caller context, untrusted ingress) publish a `deny` so the
-    // kernel gate miss retires, clear the marker, and ack not-granted.
-    let source_id = match runtime::caller() {
+    let caller = runtime::caller();
+    let principal = caller
+        .as_ref()
+        .ok()
+        .and_then(|ctx| ctx.principal.clone())
+        .unwrap_or_default();
+
+    // Pair before any publish or durable record. Mismatch/malformed/empty
+    // leaves a live marker in place; only an exact pair consumes it.
+    if !crate::execute::take_grant_pending(&principal, &req.capsule_id, &req.request_id) {
+        log::warn(format!(
+            "{}: broker grant.respond: unpaired request_id '{}' capsule_id '{}'",
+            crate::profile::log_tag(),
+            req.request_id,
+            req.capsule_id
+        ));
+        if let Some(reply) = &reply_topic {
+            grant_ack(reply, &req.req_id, false);
+        }
+        return Ok(());
+    }
+
+    // Paired. Confused-deputy gate: an APPROVE here causes the kernel to
+    // persist a capsule grant, so require the kernel-set `source_id` (NOT a
+    // body field) to be a trusted ingress. On any failure (no caller context,
+    // untrusted ingress) publish a `deny` for this paired request_id so the
+    // kernel awaiter retires, and ack not-granted. No durable grant record.
+    let source_id = match caller {
         Ok(ctx) => ctx.source_id,
         Err(e) => {
             log::warn(format!(
@@ -725,7 +744,6 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
                 req.request_id
             ));
             publish_decision(&response_topic, &req.request_id, DENY, None);
-            clear_grant_marker(&req.capsule_id);
             if let Some(reply) = &reply_topic {
                 grant_ack(reply, &req.req_id, false);
             }
@@ -740,7 +758,6 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
             req.request_id
         ));
         publish_decision(&response_topic, &req.request_id, DENY, None);
-        clear_grant_marker(&req.capsule_id);
         if let Some(reply) = &reply_topic {
             grant_ack(reply, &req.req_id, false);
         }
@@ -763,13 +780,14 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
     // elicitation support — with no provenance in the respond body to tell them
     // apart, so durably recording a deny would make a transport glitch a
     // permanent auto-deny the user never chose. A deny keeps its ephemeral
-    // semantics (marker consumed below, next call re-prompts: "not now", never
-    // "never") until the respond carries provenance
+    // semantics (marker already consumed above, next call re-prompts: "not now",
+    // never "never") until the respond carries provenance
     // (astrid-runtime/astrid#1114). The approve/skip choice lives in the pure
     // [`crate::grant_decision::respond_decision_to_record`] chokepoint. This
-    // runs only AFTER the confused-deputy gate above has passed, so a
-    // security-refusal deny (no caller context / untrusted ingress, handled
-    // earlier) records nothing either way — it is not the user's decision.
+    // runs only AFTER pairing and the confused-deputy gate above have passed,
+    // so a security-refusal deny (no caller context / untrusted ingress,
+    // handled earlier) records nothing either way — it is not the user's
+    // decision.
     if let Some(record) = crate::grant_decision::respond_decision_to_record(granted) {
         crate::grant_decision::record_grant_decision(&req.capsule_id, record);
     }
@@ -779,12 +797,6 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
     // persists the capsule grant. NO result drain follows — the call was
     // dropped at the gate; the shim re-sends it on `granted:true`.
     publish_decision(&response_topic, &req.request_id, decision, None);
-
-    // Consume the dedup marker on BOTH approve and deny so it is single-use and
-    // can never stick. The grant itself is driven by the published decision, not
-    // this marker; clearing it here is what lets the next call re-prompt (and a
-    // TTL self-heal backstops the clear if this respond never arrives).
-    clear_grant_marker(&req.capsule_id);
 
     if let Some(reply) = &reply_topic {
         grant_ack(reply, &req.req_id, granted);
@@ -805,25 +817,6 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
 /// `tool.call` when the capsule will now be granted.
 fn is_approve_verb(decision: &str) -> bool {
     matches!(decision, APPROVE | APPROVE_SESSION | APPROVE_ALWAYS)
-}
-
-/// Consume the `(principal, capsule_id)` grant-pending dedup marker. The KV
-/// scope is per-principal (the caller's principal), so the capsule id is the
-/// key suffix; the principal argument is passed for intent only. Best-effort —
-/// a failure to clear just risks one extra suppressed prompt, never a spurious
-/// grant. Called on every respond outcome so the marker is single-use.
-///
-/// An empty `capsule_id` (a respond that omitted the field) makes this a no-op —
-/// there is no key to clear. That does not wedge the pair: the marker carries a
-/// write timestamp and self-heals at [`crate::execute::GRANT_PENDING_TTL_MS`],
-/// so a missing-`capsule_id` respond degrades to a slightly delayed re-prompt,
-/// never permanent suppression.
-fn clear_grant_marker(capsule_id: &str) {
-    let principal = runtime::caller()
-        .ok()
-        .and_then(|ctx| ctx.principal)
-        .unwrap_or_default();
-    let _ = crate::execute::take_grant_pending(&principal, capsule_id);
 }
 
 /// Ack a `grant.respond` to the shim on `astrid.v1.response.<req_id>`.
