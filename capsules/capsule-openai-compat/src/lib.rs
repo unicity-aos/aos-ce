@@ -17,6 +17,7 @@
 //! - Mistral: `https://api.mistral.ai`
 //! - DeepSeek: `https://api.deepseek.com`
 //! - Fireworks: `https://api.fireworks.ai/inference`
+//! - Novita: `https://api.novita.ai/openai`
 
 mod schemas;
 
