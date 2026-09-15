@@ -24,15 +24,34 @@ pub(super) fn grant_args(assets: &[String]) -> Vec<String> {
 }
 
 pub(super) fn initialize(mut command: Command, expected: usize) -> io::Result<()> {
-    resume(
+    eprintln!("\n  ✦ AOS · preparing your agent workspace\n");
+    let result = resume(
         expected,
         || run_pass(&mut command),
-        || {
+        |completed, total| {
             eprintln!(
-                "aos: continuing capsule installation after the runtime's rate-limit window..."
+                "{}",
+                progress_line(completed, total, INSTALL_WINDOW.as_secs())
             );
             std::thread::sleep(INSTALL_WINDOW);
         },
+    );
+    if result.is_ok() {
+        eprintln!("\n  ✓ Capsule fleet ready");
+    }
+    result
+}
+
+fn progress_line(completed: usize, total: usize, wait_secs: u64) -> String {
+    const WIDTH: usize = 24;
+    let filled = completed
+        .saturating_mul(WIDTH)
+        .checked_div(total)
+        .unwrap_or(0);
+    let filled = filled.min(WIDTH);
+    let orbit = format!("{}{}", "━".repeat(filled), "·".repeat(WIDTH - filled));
+    format!(
+        "  ◌ Capsules {completed}/{total}  {orbit}\n    Safety window resets in {wait_secs}s · continuing automatically"
     )
 }
 
@@ -92,7 +111,7 @@ fn stream_available(
 fn resume(
     expected: usize,
     mut run: impl FnMut() -> io::Result<(bool, String)>,
-    mut wait: impl FnMut(),
+    mut wait: impl FnMut(usize, usize),
 ) -> io::Result<()> {
     let mut previous = 0;
     // At most ceil(N/10) incomplete passes plus a final successful pass.
@@ -117,7 +136,7 @@ fn resume(
         if pass + 1 == max_passes {
             break;
         }
-        wait();
+        wait(completed, total);
     }
     Err(io::Error::other(
         "bundled CE initializer exceeded its bounded resume passes",
@@ -217,10 +236,25 @@ mod tests {
     #[test]
     fn completes_ten_ten_two_in_one_product_invocation() {
         let mut passes = [partial(10), partial(20), (true, String::new())].into_iter();
-        let mut waits = 0;
-        resume(22, || Ok(passes.next().unwrap()), || waits += 1).unwrap();
-        assert_eq!(waits, 2);
+        let mut waits = Vec::new();
+        resume(
+            22,
+            || Ok(passes.next().unwrap()),
+            |completed, total| {
+                waits.push((completed, total));
+            },
+        )
+        .unwrap();
+        assert_eq!(waits, [(10, 22), (20, 22)]);
         assert!(passes.next().is_none());
+    }
+
+    #[test]
+    fn progress_is_compact_truthful_and_self_continuing() {
+        assert_eq!(
+            progress_line(10, 22, 61),
+            "  ◌ Capsules 10/22  ━━━━━━━━━━··············\n    Safety window resets in 61s · continuing automatically"
+        );
     }
 
     #[test]
@@ -228,7 +262,7 @@ mod tests {
         resume(
             22,
             || Ok((true, String::new())),
-            || panic!("unexpected wait"),
+            |_, _| panic!("unexpected wait"),
         )
         .unwrap();
     }
@@ -243,7 +277,7 @@ mod tests {
                     calls += 1;
                     Ok(partial(10))
                 },
-                || {}
+                |_, _| {}
             )
             .is_err()
         );
@@ -258,7 +292,7 @@ mod tests {
             resume(
                 22,
                 || Ok((false, error.clone())),
-                || panic!("unexpected wait")
+                |_, _| panic!("unexpected wait")
             )
             .is_err()
         );
@@ -266,7 +300,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_inventory_and_unrelated_errors() {
-        assert!(resume(23, || Ok(partial(10)), || panic!("unexpected wait")).is_err());
+        assert!(resume(23, || Ok(partial(10)), |_, _| panic!("unexpected wait")).is_err());
         assert!(partial_progress("connection refused").is_none());
         assert!(partial_progress("Installation incomplete: 10/22 capsule(s) installed").is_none());
     }

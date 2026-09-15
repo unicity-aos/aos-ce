@@ -252,6 +252,10 @@ impl AosHome {
                 "CE capsules installed but default fleet grant failed",
             ));
         }
+        eprintln!(
+            "  ◆ AOS ready\n    {} capsules · default agent fleet connected\n",
+            assets.len()
+        );
         Ok(())
     }
 

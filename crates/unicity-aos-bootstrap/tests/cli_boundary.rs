@@ -849,12 +849,25 @@ fn product_default_init_completes_without_a_second_runtime_init() {
     let fixture = Fixture::new("init-default");
     fixture.install_runtime(RECORDING_RUNTIME);
 
-    let status = fixture
+    let output = fixture
         .command()
         .args(["init"])
-        .status()
+        .output()
         .expect("run product init");
-    assert!(status.success());
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("init stderr is UTF-8");
+    assert!(
+        stderr.contains("✦ AOS · preparing your agent workspace"),
+        "missing onboarding opening: {stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Capsule fleet ready"),
+        "missing capsule completion: {stderr}"
+    );
+    assert!(
+        stderr.contains("◆ AOS ready\n    22 capsules · default agent fleet connected"),
+        "missing product-ready summary: {stderr}"
+    );
     let args = fs::read_to_string(&fixture.args).expect("read init args");
     assert!(
         args.starts_with(
