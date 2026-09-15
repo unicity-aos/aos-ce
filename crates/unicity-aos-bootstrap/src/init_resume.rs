@@ -1,7 +1,7 @@
 //! Complete Astrid's bounded installer batches without reimplementing receipts.
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -37,6 +37,10 @@ pub(super) fn initialize(mut command: Command, expected: usize) -> io::Result<()
 }
 
 fn run_pass(command: &mut Command) -> io::Result<(bool, String)> {
+    run_pass_to(command, &mut io::stderr().lock())
+}
+
+fn run_pass_to(command: &mut Command, output: &mut dyn Write) -> io::Result<(bool, String)> {
     let path = std::env::temp_dir().join(format!("aos-init-{}.log", uuid::Uuid::new_v4()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -46,15 +50,43 @@ fn run_pass(command: &mut Command) -> io::Result<(bool, String)> {
         options.mode(0o600);
     }
     let file = options.open(&path)?;
-    // File-backed stderr avoids waiting for EOF from an inherited daemon pipe.
+    // Keep stderr file-backed so a daemon inheriting the descriptor cannot
+    // hold a pipe open forever. Poll the regular file while the direct child
+    // runs so interactive questions are visible before stdin asks for input.
     let result = (|| {
-        let status = command.stderr(Stdio::from(file)).status()?;
-        let stderr = fs::read_to_string(&path)?;
-        io::stderr().write_all(stderr.as_bytes())?;
-        Ok((status.success(), stderr))
+        let mut child = command.stderr(Stdio::from(file)).spawn()?;
+        let mut reader = File::open(&path)?;
+        let mut captured = Vec::new();
+        let status = loop {
+            stream_available(&mut reader, output, &mut captured)?;
+            if let Some(status) = child.try_wait()? {
+                stream_available(&mut reader, output, &mut captured)?;
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        output.flush()?;
+        Ok((
+            status.success(),
+            String::from_utf8_lossy(&captured).into_owned(),
+        ))
     })();
     let _ = fs::remove_file(path);
     result
+}
+
+fn stream_available(
+    reader: &mut File,
+    output: &mut dyn Write,
+    captured: &mut Vec<u8>,
+) -> io::Result<()> {
+    let start = captured.len();
+    reader.read_to_end(captured)?;
+    if captured.len() > start {
+        output.write_all(&captured[start..])?;
+        output.flush()?;
+    }
+    Ok(())
 }
 
 fn resume(
@@ -111,6 +143,25 @@ fn partial_progress(stderr: &str) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    struct AcknowledgePrompt {
+        bytes: Vec<u8>,
+        path: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Write for AcknowledgePrompt {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            fs::write(&self.path, b"seen")?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn final_grant_uses_only_the_embedded_default_fleet() {
         assert_eq!(
@@ -127,6 +178,31 @@ mod tests {
                 "aos-mcp"
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_prompt_is_streamed_before_the_child_exits() {
+        let acknowledgement =
+            std::env::temp_dir().join(format!("aos-init-prompt-seen-{}", uuid::Uuid::new_v4()));
+        let mut output = AcknowledgePrompt {
+            bytes: Vec::new(),
+            path: acknowledgement.clone(),
+        };
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf 'Visible question? ' >&2; i=0; while [ $i -lt 50 ]; do [ -f \"$1\" ] && exit 0; i=$((i + 1)); sleep 0.02; done; exit 9",
+            "aos-init-test",
+            acknowledgement.to_str().expect("temporary path is UTF-8"),
+        ]);
+
+        let result = run_pass_to(&mut command, &mut output).expect("run child");
+        let _ = fs::remove_file(acknowledgement);
+
+        assert!(result.0, "child never observed its streamed prompt");
+        assert_eq!(result.1, "Visible question? ");
+        assert_eq!(output.bytes, b"Visible question? ");
     }
 
     fn partial(completed: usize) -> (bool, String) {

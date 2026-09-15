@@ -845,7 +845,7 @@ fn inherited_help_dispatches_byte_for_byte_while_product_help_stays_owned() {
 }
 
 #[test]
-fn product_default_init_delegates_grants_without_inventing_a_target() {
+fn product_default_init_completes_without_a_second_runtime_init() {
     let fixture = Fixture::new("init-default");
     fixture.install_runtime(RECORDING_RUNTIME);
 
@@ -856,7 +856,13 @@ fn product_default_init_delegates_grants_without_inventing_a_target() {
         .expect("run product init");
     assert!(status.success());
     let args = fs::read_to_string(&fixture.args).expect("read init args");
-    assert_eq!(args, "<init>\n<--grant-capsules>\n");
+    assert!(
+        args.starts_with(
+            "<--principal>\n<default>\n<agent>\n<modify>\n<default>\n<--add-capsule>\n"
+        ),
+        "final preparation action must be the default-fleet grant: {args}"
+    );
+    assert!(!args.contains("<init>"), "wrapper ran init twice: {args}");
     assert_eq!(
         fs::read_to_string(&fixture.bootstrap_args).expect("read bootstrap args"),
         "<--principal>\n<default>\n<init>\n<--target-principal>\n<default>\n"
@@ -948,9 +954,16 @@ fn offline_init_keeps_the_runtime_offline_flag_and_uses_only_local_capsules() {
         .status()
         .expect("run offline product init");
     assert!(status.success());
-    assert_eq!(
-        fs::read_to_string(&fixture.args).expect("read offline args"),
-        "<init>\n<--offline>\n<--grant-capsules>\n"
+    let args = fs::read_to_string(&fixture.args).expect("read offline args");
+    assert!(
+        args.starts_with(
+            "<--principal>\n<default>\n<agent>\n<modify>\n<default>\n<--add-capsule>\n"
+        ),
+        "offline init must finish at the default-fleet grant: {args}"
+    );
+    assert!(
+        !args.contains("<init>"),
+        "offline wrapper ran init twice: {args}"
     );
     assert_eq!(
         fs::read_to_string(&fixture.bootstrap_args).expect("read bootstrap args"),
