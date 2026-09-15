@@ -213,6 +213,8 @@ async fn serve(
     principal: Option<&str>,
     args: &ServeArgs,
 ) -> Result<(), ServeFailure> {
+    home.ensure_runtime_transport_available()
+        .map_err(|error| ServeFailure::Io(format!("failed to prepare bundled runtime: {error}")))?;
     let mode = args.interaction;
     let runtime_args = runtime_arguments(principal, args);
 
