@@ -84,6 +84,18 @@ if not_ready:
 PY
 }
 
+process_is_running() {
+  local pid=$1
+  local state
+
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [[ -r "/proc/$pid/stat" ]]; then
+    state=$(awk '{ print $3 }' "/proc/$pid/stat")
+    [[ "$state" != Z && "$state" != X ]] || return 1
+  fi
+  return 0
+}
+
 cleanup() {
   status=$?
   trap - EXIT
@@ -165,12 +177,12 @@ kill -0 "$daemon_pid"
 
 run_aos stop
 for _ in $(seq 1 200); do
-  if ! kill -0 "$daemon_pid" 2>/dev/null; then
+  if ! process_is_running "$daemon_pid"; then
     break
   fi
   sleep 0.05
 done
-if kill -0 "$daemon_pid" 2>/dev/null; then
+if process_is_running "$daemon_pid"; then
   echo "AOS runtime process $daemon_pid remained alive after stop" >&2
   exit 1
 fi
