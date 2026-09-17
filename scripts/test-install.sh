@@ -304,6 +304,7 @@ for binary in astrid astrid-daemon astrid-build astrid-emit; do
   test ! -e "$work/home/.aos/runtime/bin/$binary"
 done
 test -x "$release_dir/runtime/bin/astrid-storage-provider-fuse"
+test ! -e "$release_dir/share/AOS Command Center.app"
 test -f "$release_dir/release-manifest.json"
 test -f "$release_dir/Distro.toml"
 test -f "$release_dir/capsule-assets.txt"
@@ -325,7 +326,12 @@ test "$(stat -c '%a' "$release_dir/capsules" 2>/dev/null || stat -f '%Lp' "$rele
 darwin_fixture="$work/darwin-fixture"
 darwin_runtime_root="$work/astrid-$runtime_version-aarch64-apple-darwin"
 darwin_home="$work/darwin-home"
+command_center_app="$work/command-center-fixture/AOS Command Center.app"
 mkdir "$darwin_fixture" "$darwin_runtime_root" "$darwin_home"
+mkdir -p "$(dirname "$command_center_app")"
+PYTHONPATH="$repo_root/scripts" python3 -c \
+  'from pathlib import Path; import sys; from test_package_macos_command_center import fixture; fixture(Path(sys.argv[1]))' \
+  "$command_center_app"
 for binary in \
   astrid astrid-daemon astrid-build astrid-emit \
   astrid-storage-provider-fskit
@@ -342,6 +348,7 @@ PYTHONPATH="$repo_root/scripts" python3 -c \
   "$darwin_runtime_root"
 COPYFILE_DISABLE=1 tar -czf "$work/darwin-runtime.tar.gz" \
   -C "$work" "$(basename "$darwin_runtime_root")"
+AOS_COMMAND_CENTER_APP="$command_center_app" \
 bash "$repo_root/scripts/package-release.sh" \
   aarch64-apple-darwin \
   "$work/aos" \
@@ -404,6 +411,94 @@ do
   test -x "$darwin_release_dir/runtime/bin/$binary"
   test ! -e "$darwin_home/.aos/runtime/bin/$binary"
 done
+diff -r "$command_center_app" "$darwin_release_dir/share/AOS Command Center.app"
+test ! -e "$work/AOS.app/Contents/MacOS/aos-tray"
+test ! -e "$darwin_home/Applications/AOS Command Center.app"
+test ! -e "$darwin_home/.aos/Applications/AOS Command Center.app"
+test ! -e "$darwin_home/.aos/share/AOS Command Center.app"
+
+compat_root="$work/darwin-compat-bundle"
+compat_extract="$compat_root/unicity-aos-2026.9.2-aarch64-apple-darwin"
+mkdir "$compat_root"
+tar -xzf "$darwin_asset" -C "$compat_root"
+python3 - "$compat_extract" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+root = pathlib.Path(sys.argv[1])
+app = root / "share" / "AOS Command Center.app"
+if not app.is_dir():
+    raise SystemExit("compat fixture is missing Command Center before strip")
+shutil.rmtree(app)
+share = root / "share"
+if share.is_dir() and not any(share.iterdir()):
+    share.rmdir()
+manifest_path = root / "release-manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+prefix = "share/AOS Command Center.app/"
+removed = [key for key in list(manifest["release_files"]) if key.startswith(prefix)]
+if not removed:
+    raise SystemExit("compat fixture manifest had no Command Center inventory")
+for key in removed:
+    del manifest["release_files"][key]
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+compat_fixture="$work/darwin-compat-fixture"
+compat_home="$work/darwin-compat-home"
+mkdir "$compat_fixture" "$compat_home"
+COPYFILE_DISABLE=1 tar -czf "$compat_fixture/unicity-aos-2026.9.2-aarch64-apple-darwin.tar.gz" \
+  -C "$compat_root" "$(basename "$compat_extract")"
+compat_asset="$compat_fixture/unicity-aos-2026.9.2-aarch64-apple-darwin.tar.gz"
+compat_sha256=$(shasum -a 256 "$compat_asset" | awk '{print $1}')
+compat_blake3=$(b3sum "$compat_asset" | awk '{print $1}')
+compat_size=$(wc -c < "$compat_asset" | tr -d ' ')
+python3 - \
+  "$darwin_fixture/unicity-aos-2026.9.2-release.toml" \
+  "$compat_fixture/unicity-aos-2026.9.2-release.toml" \
+  "$compat_sha256" \
+  "$compat_blake3" \
+  "$compat_size" <<'PY'
+import pathlib
+import sys
+
+source, destination, sha256, blake3, size = sys.argv[1:]
+lines = pathlib.Path(source).read_text(encoding="utf-8").splitlines()
+inside = False
+for index, line in enumerate(lines):
+    if line.startswith("["):
+        inside = line == "[targets.aarch64-apple-darwin]"
+    if not inside:
+        continue
+    if line.startswith("sha256 = "):
+        lines[index] = f'sha256 = "{sha256}"'
+    elif line.startswith("blake3 = "):
+        lines[index] = f'blake3 = "{blake3}"'
+    elif line.startswith("size = "):
+        lines[index] = f"size = {size}"
+pathlib.Path(destination).write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+cp "$good_bundle" "$compat_fixture/unicity-aos-2026.9.2-release.toml.sigstore.json"
+cp "$good_bundle" "$compat_asset.sigstore.json"
+cp "$good_bundle" "$compat_fixture/valid.sigstore.json"
+cp "$fixture/cosign-linux-amd64" "$compat_fixture/cosign-darwin-arm64"
+chmod 755 "$compat_fixture/cosign-darwin-arm64"
+PATH="$fake_bin:$PATH" \
+HOME="$compat_home" \
+AOS_TEST_FIXTURE="$compat_fixture" \
+AOS_TEST_UNAME_S=Darwin \
+AOS_TEST_UNAME_M=arm64 \
+AOS_TEST_FSKIT_LOG="$work/fskit-compat-calls" \
+ASTRID_FSKIT_APP_DEST="$work/AOS-compat.app" \
+AOS_TEST_COSIGN_SHA256=94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5 \
+AOS_VERSION=2026.9.2 \
+sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+compat_release_dir="$compat_home/.aos/releases/2026.9.2"
+test -x "$compat_release_dir/runtime/bin/astrid"
+test ! -e "$compat_release_dir/share/AOS Command Center.app"
+test ! -e "$compat_home/Applications/AOS Command Center.app"
+test ! -e "$work/AOS-compat.app/Contents/MacOS/aos-tray"
 
 # Build a second package through the real composer with an isolated
 # compatibility overlay.  The checked-in production contract above remains the

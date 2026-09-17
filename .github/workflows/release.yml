@@ -128,6 +128,7 @@ jobs:
           PRODUCT=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/unicity-aos-bootstrap/Cargo.toml | head -n1)
           test "$PRODUCT" = "$GITHUB_REF_NAME"
       - run: bash scripts/test-package-release.sh
+      - run: bash scripts/test_sign_command_center.sh
       - run: bash scripts/test-install.sh
       - run: python3 scripts/test_create_astrid_094_fixture.py
       - run: python3 scripts/capsule_release.py
@@ -294,6 +295,53 @@ jobs:
         with:
           path: capsule-artifacts
           name: aos-community-capsules
+      - name: Sign and staple the Darwin Command Center
+        if: ${{ endsWith(matrix.target, 'apple-darwin') }}
+        env:
+          AOS_MACOS_DEVELOPMENT_TEAM_ID: ${{ secrets.AOS_MACOS_DEVELOPMENT_TEAM_ID }}
+          AOS_MACOS_DEVELOPER_ID_IDENTITY: ${{ secrets.AOS_MACOS_DEVELOPER_ID_IDENTITY }}
+          AOS_MACOS_CERTIFICATE_P12: ${{ secrets.AOS_MACOS_CERTIFICATE_P12 }}
+          AOS_MACOS_CERTIFICATE_PASSWORD: ${{ secrets.AOS_MACOS_CERTIFICATE_PASSWORD }}
+          AOS_MACOS_NOTARY_KEY_ID: ${{ secrets.AOS_MACOS_NOTARY_KEY_ID }}
+          AOS_MACOS_NOTARY_ISSUER_ID: ${{ secrets.AOS_MACOS_NOTARY_ISSUER_ID }}
+          AOS_MACOS_NOTARY_KEY: ${{ secrets.AOS_MACOS_NOTARY_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "${AOS_MACOS_DEVELOPMENT_TEAM_ID}" ]]
+          [[ -n "${AOS_MACOS_DEVELOPER_ID_IDENTITY}" ]]
+          [[ -n "${AOS_MACOS_CERTIFICATE_P12}" ]]
+          [[ -n "${AOS_MACOS_CERTIFICATE_PASSWORD}" ]]
+          [[ -n "${AOS_MACOS_NOTARY_KEY_ID}" ]]
+          [[ -n "${AOS_MACOS_NOTARY_ISSUER_ID}" ]]
+          [[ -n "${AOS_MACOS_NOTARY_KEY}" ]]
+          NOTARY_KEY_PATH="$RUNNER_TEMP/aos-command-center-notary.p8"
+          P12_PATH="$RUNNER_TEMP/aos-command-center-signing.p12"
+          printf '%s' "$AOS_MACOS_NOTARY_KEY" > "$NOTARY_KEY_PATH"
+          chmod 0600 "$NOTARY_KEY_PATH"
+          printf '%s' "$AOS_MACOS_CERTIFICATE_P12" | python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' > "$P12_PATH"
+          chmod 0600 "$P12_PATH"
+          [[ -s "$P12_PATH" ]]
+          export AOS_MACOS_NOTARY_KEY_PATH="$NOTARY_KEY_PATH"
+          export AOS_MACOS_CERTIFICATE_P12_PATH="$P12_PATH"
+          unset AOS_MACOS_NOTARY_KEY
+          unset AOS_MACOS_CERTIFICATE_P12
+          trap 'rm -f "$NOTARY_KEY_PATH" "$P12_PATH"' EXIT
+          DEV_OUT="$RUNNER_TEMP/aos-command-center-dev"
+          SIGNED_OUT="$RUNNER_TEMP/aos-command-center-signed"
+          PROD_OUT="$RUNNER_TEMP/aos-command-center-production"
+          mkdir -p "$DEV_OUT" "$SIGNED_OUT" "$PROD_OUT"
+          scripts/build-command-center.sh \
+            --mode development \
+            --target "${{ matrix.target }}" \
+            --output "$DEV_OUT"
+          scripts/sign-command-center.sh \
+            --app "$DEV_OUT/AOS Command Center.app" \
+            --output "$SIGNED_OUT"
+          scripts/build-command-center.sh \
+            --mode production \
+            --app "$SIGNED_OUT/AOS Command Center.app" \
+            --output "$PROD_OUT"
+          echo "AOS_COMMAND_CENTER_APP=$PROD_OUT/AOS Command Center.app" >> "$GITHUB_ENV"
       - name: Compose product bundle
         run: |
           python3 scripts/capsule_release.py --artifacts capsule-artifacts

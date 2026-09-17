@@ -21,9 +21,9 @@ election failure returns a nonzero installer result with explicit retry
 commands; the installed runtime is retained. No automatic sudo, Gatekeeper
 bypass, or fallback unsigned signing is performed.
 
-The managed app is not yet a general control UI. A future AOS command center
-can own menu-bar/tray status, MCP elicitations and registry management without
-changing the filesystem extension's identity or adding UI duties to it.
+The managed app is not a general control UI. Menu-bar Command Center packaging
+is documented in `release/MACOS-COMMAND-CENTER.md` and does not change the
+filesystem extension's identity or add UI duties to it.
 
 Fixture tests establish byte/mode preservation and installer dispatch, not
 Apple notarization. Production signature and mount checks remain necessary.

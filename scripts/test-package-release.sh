@@ -495,7 +495,11 @@ fi
 darwin_target=aarch64-apple-darwin
 darwin_runtime_root="$work/astrid-$runtime_version-$darwin_target"
 darwin_output="$work/darwin-output"
-mkdir -p "$darwin_runtime_root" "$darwin_output"
+command_center_app="$work/command-center-fixture/AOS Command Center.app"
+mkdir -p "$darwin_runtime_root" "$darwin_output" "$(dirname "$command_center_app")"
+PYTHONPATH="$repo_root/scripts" python3 -c \
+  'from pathlib import Path; import sys; from test_package_macos_command_center import fixture; fixture(Path(sys.argv[1]))' \
+  "$command_center_app"
 for binary in \
   astrid astrid-daemon astrid-build astrid-emit \
   astrid-storage-provider-fskit
@@ -513,6 +517,7 @@ PYTHONPATH="$repo_root/scripts" python3 -c \
 COPYFILE_DISABLE=1 tar -czf "$work/darwin-runtime.tar.gz" \
   -C "$work" "$(basename "$darwin_runtime_root")"
 
+AOS_COMMAND_CENTER_APP="$command_center_app" \
 bash "$repo_root/scripts/package-release.sh" \
   "$darwin_target" \
   "$work/aos" \
@@ -529,12 +534,18 @@ darwin_bundle="$darwin_extract/unicity-aos-$product_version-$darwin_target"
 darwin_provider="$darwin_bundle/runtime/bin/astrid-storage-provider-fskit"
 diff -r "$darwin_runtime_root/AstridFS.app" "$darwin_bundle/runtime/bin/AstridFS.app"
 test -f "$darwin_bundle/runtime/bin/macos/aos-filesystem.sh"
+diff -r "$command_center_app" "$darwin_bundle/share/AOS Command Center.app"
 python3 - "$darwin_bundle/release-manifest.json" <<'PY'
 import json, sys
 with open(sys.argv[1]) as source:
-    members = json.load(source)["release_files"]
+    manifest = json.load(source)
+members = manifest["release_files"]
 assert "runtime/bin/AstridFS.app/Contents/_CodeSignature/CodeResources" in members
 assert "runtime/bin/macos/aos-filesystem.sh" in members
+tray = "share/AOS Command Center.app/Contents/MacOS/aos-tray"
+assert "share/AOS Command Center.app/Contents/_CodeSignature/CodeResources" in members
+assert members[tray]["mode"] == 0o755
+assert tray not in manifest["executables"]
 PY
 test -x "$darwin_provider"
 test "$(stat -c '%a' "$darwin_provider" 2>/dev/null || stat -f '%Lp' "$darwin_provider")" = 755
@@ -569,7 +580,8 @@ for binary in astrid astrid-daemon astrid-build astrid-emit; do
 done
 COPYFILE_DISABLE=1 tar -czf "$work/missing-provider-runtime.tar.gz" \
   -C "$work/missing-provider" "$(basename "$missing_provider_root")"
-if bash "$repo_root/scripts/package-release.sh" \
+if AOS_COMMAND_CENTER_APP="$command_center_app" \
+  bash "$repo_root/scripts/package-release.sh" \
   "$darwin_target" \
   "$work/aos" \
   "$work/missing-provider-runtime.tar.gz" \
@@ -579,6 +591,37 @@ if bash "$repo_root/scripts/package-release.sh" \
   echo "Darwin release composer accepted a runtime without the FSKit provider" >&2
   exit 1
 fi
+
+mkdir -p "$work/missing-command-center-output"
+if env -u AOS_COMMAND_CENTER_APP bash "$repo_root/scripts/package-release.sh" \
+  "$darwin_target" \
+  "$work/aos" \
+  "$work/darwin-runtime.tar.gz" \
+  0000000000000000000000000000000000000000000000000000000000000000 \
+  "$work/capsules" \
+  "$work/missing-command-center-output" >/dev/null 2>"$work/missing-command-center.err"; then
+  echo "Darwin release composer accepted a compose without AOS_COMMAND_CENTER_APP" >&2
+  exit 1
+fi
+grep -Fq "Darwin release composer requires AOS_COMMAND_CENTER_APP" \
+  "$work/missing-command-center.err"
+
+gnu_ignore_output="$work/gnu-ignore-command-center"
+mkdir -p "$gnu_ignore_output"
+AOS_COMMAND_CENTER_APP="$command_center_app" \
+bash "$repo_root/scripts/package-release.sh" \
+  "$target" \
+  "$work/aos" \
+  "$work/runtime.tar.gz" \
+  0000000000000000000000000000000000000000000000000000000000000000 \
+  "$work/capsules" \
+  "$gnu_ignore_output"
+gnu_ignore_extract="$work/gnu-ignore-extract"
+mkdir "$gnu_ignore_extract"
+tar -xzf "$gnu_ignore_output/unicity-aos-$product_version-$target.tar.gz" \
+  -C "$gnu_ignore_extract"
+gnu_ignore_bundle="$gnu_ignore_extract/unicity-aos-$product_version-$target"
+test ! -e "$gnu_ignore_bundle/share/AOS Command Center.app"
 
 fixture_distro="$work/FixtureDistro.toml"
 python3 - "$bundle_root/Distro.toml" "$fixture_distro" <<'PY'

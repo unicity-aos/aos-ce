@@ -260,7 +260,13 @@ if [[ "$host_os" == Darwin ]]; then
     'from pathlib import Path; import sys; from test_package_macos_filesystem import fixture; fixture(Path(sys.argv[1]))' \
     "$runtime_root"
 fi
+command_center_app="$work/command-center-fixture/AOS Command Center.app"
+mkdir -p "$(dirname "$command_center_app")"
+PYTHONPATH="$repo_root/scripts" python3 -c \
+  'from pathlib import Path; import sys; from test_package_macos_command_center import fixture; fixture(Path(sys.argv[1]))' \
+  "$command_center_app"
 COPYFILE_DISABLE=1 tar -czf "$work/runtime.tar.gz" -C "$work" "$(basename "$runtime_root")"
+AOS_COMMAND_CENTER_APP="$command_center_app" \
 bash "$repo_root/scripts/package-release.sh" \
   "$target" \
   "$product_binary" \
@@ -381,6 +387,8 @@ install_candidate() {
   HOME="$home" \
   AOS_TEST_FIXTURE="$fixture" \
   AOS_VERSION=2026.9.2 \
+  ASTRID_FSKIT_APP_DEST="$work/AOS.app" \
+  AOS_TEST_FSKIT_LOG="$work/fskit-calls" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
 }
 
@@ -548,6 +556,7 @@ cp "$repo_root/install.sh" "$repo_root/README.md" "$fuse_repo/"
 cp "$repo_root/scripts/capsule_release.py" \
   "$repo_root/scripts/package-release.sh" \
   "$repo_root/scripts/package_macos_filesystem.py" \
+  "$repo_root/scripts/package_macos_command_center.py" \
   "$repo_root/scripts/aos-filesystem.sh" \
   "$repo_root/scripts/validate-runtime-archive.py" \
   "$fuse_repo/scripts/"
@@ -601,8 +610,14 @@ do
   printf '#!/bin/sh\necho packaged-%s\n' "$binary" > "$fuse_runtime_root/$binary"
   chmod 755 "$fuse_runtime_root/$binary"
 done
+if [[ "$host_os" == Darwin ]]; then
+  PYTHONPATH="$repo_root/scripts" python3 -c \
+    'from pathlib import Path; import sys; from test_package_macos_filesystem import fixture; fixture(Path(sys.argv[1]))' \
+    "$fuse_runtime_root"
+fi
 COPYFILE_DISABLE=1 tar -czf "$fuse_runtime_archive" \
   -C "$work" "$(basename "$fuse_runtime_root")"
+AOS_COMMAND_CENTER_APP="$command_center_app" \
 bash "$fuse_repo/scripts/package-release.sh" \
   "$target" \
   "$product_binary" \
@@ -672,6 +687,8 @@ fuse_install_candidate() {
   HOME="$home" \
   AOS_TEST_FIXTURE="$fuse_fixture" \
   AOS_VERSION=2026.9.2 \
+  ASTRID_FSKIT_APP_DEST="$work/AOS.app" \
+  AOS_TEST_FSKIT_LOG="$work/fskit-calls" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
 }
 
