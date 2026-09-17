@@ -38,6 +38,11 @@ pub(crate) const MAX_CACHED_TOOLS: usize = 512;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct McpToolDescriptor {
     pub(crate) name: String,
+    /// Kernel-stamped identity of the live capsule instance that advertised
+    /// this tool. This is internal routing authority and is never emitted in
+    /// MCP `tools/list` responses.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) provider_source_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) title: Option<String>,
     #[serde(default)]
@@ -67,7 +72,14 @@ impl CacheState {
     /// forever. Likewise `updated_at_ms == 0` (cache was written under
     /// a degraded clock) bypasses the short-circuit.
     pub(crate) fn is_fresh(&self, now_ms: u64) -> bool {
-        if now_ms == 0 || self.updated_at_ms == 0 || self.tools.is_empty() {
+        if now_ms == 0
+            || self.updated_at_ms == 0
+            || self.tools.is_empty()
+            || self
+                .tools
+                .values()
+                .any(|tool| !is_valid_provider_source_id(&tool.provider_source_id))
+        {
             return false;
         }
         now_ms.saturating_sub(self.updated_at_ms) < CACHE_TTL_MS
@@ -77,6 +89,15 @@ impl CacheState {
     pub(crate) fn as_vec(&self) -> Vec<McpToolDescriptor> {
         self.tools.values().cloned().collect()
     }
+}
+
+/// Whether `source_id` is a non-nil kernel runtime UUID.
+///
+/// Capsule IPC always carries this shape. Rejecting empty, malformed, and nil
+/// values prevents old cache entries or system-originated messages from being
+/// mistaken for a routable tool provider.
+pub(crate) fn is_valid_provider_source_id(source_id: &str) -> bool {
+    uuid::Uuid::parse_str(source_id).is_ok_and(|id| !id.is_nil())
 }
 
 /// Read the current cache snapshot. Missing / corrupt KV entries yield
@@ -252,6 +273,7 @@ mod tests {
                 name.clone(),
                 McpToolDescriptor {
                     name,
+                    provider_source_id: "0191f3a2-b4c7-7d8e-9f01-234567890abc".to_string(),
                     title: None,
                     description: String::new(),
                     input_schema: serde_json::Value::Null,
@@ -275,6 +297,19 @@ mod tests {
     fn stale_past_ttl() {
         install_test_profile();
         assert!(!state(1_000, 3).is_fresh(1_000 + CACHE_TTL_MS + 1));
+    }
+
+    #[test]
+    fn cache_without_provider_identity_is_never_fresh() {
+        install_test_profile();
+        let mut cached = state(10_000, 1);
+        cached
+            .tools
+            .get_mut("tool0")
+            .unwrap()
+            .provider_source_id
+            .clear();
+        assert!(!cached.is_fresh(10_001));
     }
 
     /// The `tools/list` reliability guard: an empty cache (cold, or left

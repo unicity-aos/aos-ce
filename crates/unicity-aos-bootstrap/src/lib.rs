@@ -252,6 +252,10 @@ impl AosHome {
                 "CE capsules installed but default fleet grant failed",
             ));
         }
+        eprintln!(
+            "  ◆ AOS ready\n    {} capsules · default agent fleet connected\n",
+            assets.len()
+        );
         Ok(())
     }
 
@@ -400,8 +404,12 @@ impl AosHome {
         verbose: bool,
     ) -> io::Result<Command> {
         let daemon_binary = self.runtime_daemon_binary();
-        self.ensure_runtime_executable(&daemon_binary, "daemon")?;
-        self.ensure_unicity_ce_manifest()?;
+        if Self::has_absolute_runtime_override() {
+            self.ensure_runtime_executable(&daemon_binary, "daemon")?;
+            self.ensure_unicity_ce_manifest()?;
+        } else {
+            self.ensure_runtime_available()?;
+        }
         let mut args = Vec::new();
         if let Some(workspace) = workspace {
             args.push(OsString::from("--workspace"));
@@ -508,10 +516,117 @@ impl AosHome {
         self.spawn_runtime_with_args(args)?.wait()
     }
 
-    fn ensure_runtime_available(&self) -> io::Result<()> {
-        let binary = self.runtime_binary();
-        self.ensure_runtime_executable(&binary, "runtime")?;
+    /// Ensure the complete bundled runtime selected by this product release is
+    /// available, repairing the one known cross-generation installer layout.
+    ///
+    /// AOS 2026.1.3 installed a newer archive with its own obsolete placement
+    /// rules. The verified archive still replaced `bin/aos` and
+    /// `libexec/install.sh`, but left runtime executables in mutable
+    /// `runtime/bin` instead of the immutable product release. A newer CLI can
+    /// therefore safely recognize that exact footprint and ask its authenticated
+    /// installer to replay the current version. No durable runtime state is
+    /// removed or rewritten by this compatibility repair.
+    ///
+    /// # Errors
+    /// Returns an error when the runtime inventory is incomplete, the legacy
+    /// footprint is unsafe, or the authenticated repair installer fails.
+    pub fn ensure_runtime_available(&self) -> io::Result<()> {
+        if Self::has_absolute_runtime_override() {
+            let binary = self.runtime_binary();
+            self.ensure_runtime_executable(&binary, "runtime")?;
+        } else if let Err(error) = self.ensure_release_runtime_inventory() {
+            if error.kind() != io::ErrorKind::NotFound
+                || !self.has_legacy_cross_generation_layout()?
+            {
+                return Err(error);
+            }
+            self.repair_legacy_cross_generation_layout()?;
+        }
         self.ensure_unicity_ce_manifest().map(drop)
+    }
+
+    /// Prepare a direct runtime transport while preserving the explicit
+    /// package-manager override contract. Product-owned release trees receive
+    /// full inventory validation and cross-generation repair; an absolute
+    /// runtime override is validated as the executable selected by its caller.
+    ///
+    /// # Errors
+    /// Returns an error when the selected runtime executable or product release
+    /// inventory is unavailable.
+    pub fn ensure_runtime_transport_available(&self) -> io::Result<()> {
+        if Self::has_absolute_runtime_override() {
+            self.ensure_runtime_executable(&self.runtime_binary(), "runtime")
+        } else {
+            self.ensure_runtime_available()
+        }
+    }
+
+    fn has_absolute_runtime_override() -> bool {
+        std::env::var_os("UNICITY_AOS_RUNTIME_BIN")
+            .map(PathBuf::from)
+            .is_some_and(|path| path.is_absolute())
+    }
+
+    fn ensure_release_runtime_inventory(&self) -> io::Result<()> {
+        for name in RUNTIME_EXECUTABLE_NAMES {
+            self.ensure_runtime_executable(
+                &self.release_runtime_bin_dir().join(name),
+                &format!("runtime inventory member {name}"),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn has_legacy_cross_generation_layout(&self) -> io::Result<bool> {
+        if std::env::var_os("UNICITY_AOS_REPAIRING_UPDATE").is_some() {
+            return Ok(false);
+        }
+
+        let manifest = self.release_dir().join("release-manifest.json");
+        let installer = self.root.join("libexec/install.sh");
+        if !is_regular_file_without_symlink(&manifest)?
+            || !is_regular_file_without_symlink(&installer)?
+        {
+            return Ok(false);
+        }
+
+        for name in &RUNTIME_EXECUTABLE_NAMES[..4] {
+            let legacy = self.runtime_home().join("bin").join(name);
+            if !is_regular_file_without_symlink(&legacy)? {
+                return Ok(false);
+            }
+            self.ensure_runtime_executable(&legacy, "legacy runtime compatibility member")?;
+        }
+        Ok(true)
+    }
+
+    fn repair_legacy_cross_generation_layout(&self) -> io::Result<()> {
+        let installer = self.root.join("libexec/install.sh");
+        eprintln!(
+            "Unicity AOS detected an incomplete cross-generation update; repairing version {PRODUCT_VERSION} with its authenticated installer..."
+        );
+        let status = Command::new("sh")
+            .arg(&installer)
+            .args(["--version", PRODUCT_VERSION, "--yes", "--no-migrate-prompt"])
+            .env("AOS_HOME", &self.root)
+            .env("UNICITY_AOS_REPAIRING_UPDATE", "1")
+            .status()
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to run authenticated cross-generation repair at {}: {error}",
+                        installer.display()
+                    ),
+                )
+            })?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "authenticated cross-generation repair exited with {}",
+                status.code().unwrap_or(1)
+            )));
+        }
+        self.ensure_release_runtime_inventory()
     }
 
     fn ensure_runtime_executable(&self, binary: &Path, label: &str) -> io::Result<()> {
@@ -551,6 +666,14 @@ impl AosHome {
             }
         }
         Ok(())
+    }
+}
+
+fn is_regular_file_without_symlink(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && !metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -872,6 +995,21 @@ mod tests {
         directory
     }
 
+    fn install_runtime_inventory(home: &AosHome) {
+        let runtime_bin = home.release_runtime_bin_dir();
+        fs::create_dir_all(&runtime_bin).expect("create runtime bin");
+        for name in RUNTIME_EXECUTABLE_NAMES {
+            let executable = runtime_bin.join(name);
+            fs::write(&executable, b"runtime fixture").expect("write runtime fixture");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+                    .expect("make runtime fixture executable");
+            }
+        }
+    }
+
     #[test]
     fn runtime_executes_from_the_exact_product_release() {
         let home = AosHome::from_root("/tmp/unicity-aos-test");
@@ -926,6 +1064,95 @@ mod tests {
             )
         );
         fs::remove_dir_all(fixture).expect("remove mutable runtime fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_cross_generation_install_replays_authenticated_installer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = temporary_home();
+        let home = AosHome::from_root(&fixture);
+        install_capsule_fixtures(home.root());
+        fs::write(home.release_dir().join("release-manifest.json"), b"{}")
+            .expect("write release manifest marker");
+        fs::create_dir_all(home.root().join("libexec")).expect("create libexec");
+        fs::create_dir_all(home.runtime_home().join("bin")).expect("create legacy runtime bin");
+        fs::write(home.runtime_home().join("astrid.volume"), b"durable state")
+            .expect("write durable volume marker");
+
+        for name in &RUNTIME_EXECUTABLE_NAMES[..4] {
+            let path = home.runtime_home().join("bin").join(name);
+            fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write legacy executable");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("make legacy executable runnable");
+        }
+
+        let installer = home.root().join("libexec/install.sh");
+        let inventory = RUNTIME_EXECUTABLE_NAMES
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        fs::write(
+            &installer,
+            format!(
+                r#"#!/bin/sh
+set -eu
+printf '<%s>\n' "$@" > "$AOS_HOME/repair-args"
+mkdir -p "$AOS_HOME/releases/{version}/runtime/bin"
+for name in {inventory}; do
+  printf '#!/bin/sh\nexit 0\n' > "$AOS_HOME/releases/{version}/runtime/bin/$name"
+  chmod 700 "$AOS_HOME/releases/{version}/runtime/bin/$name"
+done
+"#,
+                version = env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .expect("write repair installer");
+
+        home.ensure_runtime_available()
+            .expect("repair malformed cross-generation install");
+
+        assert_eq!(
+            fs::read_to_string(home.root().join("repair-args")).expect("read repair arguments"),
+            format!(
+                "<--version>\n<{}>\n<--yes>\n<--no-migrate-prompt>\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        for name in RUNTIME_EXECUTABLE_NAMES {
+            assert!(home.release_runtime_bin_dir().join(name).is_file());
+        }
+        assert_eq!(
+            fs::read(home.runtime_home().join("astrid.volume")).expect("read durable volume"),
+            b"durable state"
+        );
+        fs::remove_dir_all(fixture).expect("remove repair fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_release_without_legacy_layout_does_not_download_a_repair() {
+        let fixture = temporary_home();
+        let home = AosHome::from_root(&fixture);
+        install_capsule_fixtures(home.root());
+        fs::write(home.release_dir().join("release-manifest.json"), b"{}")
+            .expect("write release manifest marker");
+        fs::create_dir_all(home.root().join("libexec")).expect("create libexec");
+        fs::write(
+            home.root().join("libexec/install.sh"),
+            b"#!/bin/sh\ntouch \"$AOS_HOME/unexpected-repair\"\n",
+        )
+        .expect("write installer fixture");
+
+        let error = home
+            .ensure_runtime_available()
+            .expect_err("unrecognized incomplete layout must fail closed");
+
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert!(!home.root().join("unexpected-repair").exists());
+        fs::remove_dir_all(fixture).expect("remove incomplete fixture");
     }
 
     #[test]
@@ -1001,19 +1228,7 @@ mod tests {
         let fixture = temporary_home();
         let home = AosHome::from_root(&fixture);
         install_capsule_fixtures(home.root());
-        let runtime_bin = home.release_runtime_bin_dir();
-        fs::create_dir_all(&runtime_bin).expect("create runtime bin");
-        fs::write(home.runtime_daemon_binary(), b"daemon").expect("write daemon fixture");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let daemon = home.runtime_daemon_binary();
-            let mut permissions = fs::metadata(&daemon)
-                .expect("read daemon fixture metadata")
-                .permissions();
-            permissions.set_mode(0o700);
-            fs::set_permissions(&daemon, permissions).expect("make daemon fixture executable");
-        }
+        install_runtime_inventory(&home);
 
         let command = home
             .foreground_daemon_command(Some(std::path::Path::new("/workspace")), true)
@@ -1049,12 +1264,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn foreground_daemon_rejects_a_non_executable_fixture() {
+        use std::os::unix::fs::PermissionsExt;
+
         let fixture = temporary_home();
         let home = AosHome::from_root(&fixture);
         install_capsule_fixtures(home.root());
-        let runtime_bin = home.release_runtime_bin_dir();
-        fs::create_dir_all(&runtime_bin).expect("create runtime bin");
-        fs::write(home.runtime_daemon_binary(), b"daemon").expect("write daemon fixture");
+        install_runtime_inventory(&home);
+        fs::set_permissions(
+            home.runtime_daemon_binary(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("make daemon fixture non-executable");
 
         let error = home
             .foreground_daemon_command(None, false)
@@ -1064,7 +1284,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("daemon executable is not executable")
+                .contains("astrid-daemon executable is not executable")
         );
         fs::remove_dir_all(fixture).expect("remove foreground daemon fixture");
     }
