@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build a local, unsigned developer preview. Never installs or launches it.
+# Build an ad-hoc-signed local preview. Never installs or launches it.
 set -eu
 
 package_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -10,4 +10,6 @@ mkdir -p "$preview/Contents/MacOS"
 cp "$package_dir/Info.plist" "$preview/Contents/Info.plist"
 cp "$binary_dir/aos-tray" "$preview/Contents/MacOS/aos-tray"
 /usr/bin/plutil -lint "$preview/Contents/Info.plist"
+/usr/bin/codesign --force --sign - "$preview"
+/usr/bin/codesign --verify --strict "$preview"
 printf '%s\n' "$preview"

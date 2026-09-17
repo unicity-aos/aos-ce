@@ -9,6 +9,19 @@ struct LaunchArgumentTests {
         #expect(parsed.mode == .disconnected)
         #expect(parsed.snapshot == false)
         #expect(parsed.help == false)
+        #expect(parsed.socketPath == nil)
+    }
+
+    @Test func socketPathIsExclusive() {
+        let parsed = try? LaunchArguments.parse(["aos-tray", "--socket", "/private/tmp/aos.sock"]).get()
+        #expect(parsed?.socketPath == "/private/tmp/aos.sock")
+        #expect(parsed?.mode == .disconnected)
+        #expect(LaunchArguments.parse(["aos-tray", "--socket"]) == .failure(.missingSocketPath))
+        #expect(LaunchArguments.parse(["aos-tray", "--socket", "--help"]) == .failure(.missingSocketPath))
+        #expect(LaunchArguments.parse(["aos-tray", "--demo", "--socket", "/x"]) == .failure(.conflictingModes))
+        #expect(LaunchArguments.parse(["aos-tray", "--socket", "/x", "--demo"]) == .failure(.conflictingModes))
+        #expect(LaunchArguments.parse(["aos-tray", "--snapshot", "--socket", "/x"]) == .failure(.conflictingModes))
+        #expect(LaunchArguments.parse(["aos-tray", "--socket", "/x", "--snapshot"]) == .failure(.conflictingModes))
     }
 
     @Test func demoAndSnapshot() throws {
@@ -34,6 +47,9 @@ struct DisconnectedPresentationTests {
         #expect(presentation.requests.isEmpty)
         #expect(!presentation.isDemo)
         #expect(!presentation.showsDemoBanner)
+        #expect(presentation.nativeConnectionLabel == "OFF")
+        #expect(presentation.inventoryLabel == "UNAVAILABLE")
+        #expect(presentation.runtimePrompts.isEmpty)
         #expect(presentation.emptyRequestsText.contains("DISCONNECTED"))
         #expect(presentation.emptyCapsulesText.contains("DISCONNECTED"))
         let json = try presentation.json()
@@ -78,6 +94,9 @@ struct DemoFixtureTests {
         #expect(presentation.demoBannerText.contains("DEMO FIXTURE"))
         #expect(!presentation.capsules.isEmpty)
         #expect(!presentation.requests.isEmpty)
+        #expect(presentation.nativeConnectionLabel == "OFF")
+        #expect(presentation.inventoryLabel == "UNAVAILABLE")
+        #expect(presentation.runtimePrompts.isEmpty)
     }
 
     @Test func pregrantedCapsulesDoNotPrompt() {
@@ -214,6 +233,40 @@ struct DemoFixtureTests {
         #expect(store.applyDecision(requestID: "a", decision: .approveOnce).isSuccess)
         #expect(store.requests.first { $0.id == "a" }?.state == .approved)
         #expect(store.requests.first { $0.id == "b" }?.state == .denied)
+    }
+}
+
+@Suite
+struct NativeSocketPresentationTests {
+    @Test func socketPresentationKeepsInventoryDisconnected() throws {
+        let prompt = RuntimePromptRow(
+            id: "11111111-1111-1111-1111-111111111111",
+            requestID: "correlation-id",
+            message: "Runtime-supplied explanation",
+            options: ["Allow once", "Deny this"]
+        )
+        let presentation = TrayPresentation.make(
+            from: .disconnected(),
+            nativeSocket: true,
+            runtimePrompts: [prompt]
+        )
+        #expect(presentation.connection == .disconnected)
+        #expect(presentation.connectionLabel == "DISCONNECTED")
+        #expect(presentation.nativeConnectionLabel == "LOCAL SOCKET")
+        #expect(presentation.inventoryLabel == "UNAVAILABLE")
+        #expect(presentation.capsules.isEmpty)
+        #expect(presentation.requests.isEmpty)
+        #expect(presentation.runtimePrompts.map(\.options) == [["Allow once", "Deny this"]])
+        #expect(presentation.runtimeSuppliedCaption == "Runtime-supplied message")
+        #expect(presentation.explanation.contains("not human authenticity proof"))
+        let json = try presentation.json()
+        #expect(json.contains("LOCAL SOCKET"))
+        #expect(json.contains("UNAVAILABLE"))
+        #expect(json.contains("Allow once"))
+        #expect(json.contains("Deny this"))
+        #expect(!json.contains("principal"))
+        #expect(!json.lowercased().contains("password"))
+        #expect(!json.lowercased().contains("secret"))
     }
 }
 

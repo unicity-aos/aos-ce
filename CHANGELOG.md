@@ -16,9 +16,11 @@ implementations are consolidated into their final behavior.
 
 ### Added
 
-- Add a developer-preview macOS AOS menu-bar shell with disconnected and explicit
-  demo modes for capsule and permission views. Runtime connectivity, installation
-  and credential entry are not yet implemented.
+- Add a developer-preview macOS AOS menu-bar app with permission dialogs,
+  typed private-input forms, runtime overview, searchable capsule inventory and
+  owned-principal selection. Explicit local setup pairs a dedicated responder;
+  disconnection and cancellation never approve. App distribution and automatic
+  launch are not yet integrated.
 
 ## [2026.9.2] - 2026-09-13
 

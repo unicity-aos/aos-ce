@@ -5,6 +5,16 @@ import AOSTrayCore
 @main
 enum AOSTrayMain {
     static func main() {
+#if DEBUG
+        if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--preview-runtime-input" {
+            NativeRuntimeInputPreview.run(path: CommandLine.arguments[2])
+            return
+        }
+        if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--preview-input" {
+            NativeInputPreview.run(kind: CommandLine.arguments[2])
+            return
+        }
+#endif
         switch LaunchArguments.parse(CommandLine.arguments) {
         case .failure(let error):
             write(FileHandle.standardError, "aos-tray: \(error.message)\n")
@@ -29,7 +39,10 @@ enum AOSTrayMain {
                 return
             }
 
-            TrayApp.run(store: store)
+            TrayApp.run(store: store, socketPath: arguments.socketPath,
+                        aosBinary: arguments.aosBinary, aosHome: arguments.aosHome,
+                        nativeInputConfig: arguments.nativeInputConfig,
+                        openOverview: arguments.openOverview)
         }
     }
 

@@ -46,24 +46,46 @@ public struct TrayPresentation: Equatable, Codable, Sendable {
     public var statusItemAccessibility: String
     public var connection: RuntimeConnection
     public var connectionLabel: String
+    public var nativeConnectionLabel: String
+    public var inventoryLabel: String
     public var explanation: String
     public var isDemo: Bool
     public var showsDemoBanner: Bool
     public var demoBannerText: String
+    public var runtimeSuppliedCaption: String
+    public var runtimePrompts: [RuntimePromptRow]
     public var capsules: [CapsuleRow]
     public var requests: [RequestRow]
     public var menu: [MenuItemPresentation]
     public var lifecycle: TrayLifecyclePolicy
     public var emptyRequestsText: String
     public var emptyCapsulesText: String
+    public var emptyRuntimePromptsText: String
 
-    public static func make(from store: TrayStore) -> TrayPresentation {
+    public static func make(
+        from store: TrayStore,
+        nativeSocket: Bool = false,
+        runtimePrompts: [RuntimePromptRow] = []
+    ) -> TrayPresentation {
         let connectionLabel = ProductIdentity.disconnectedLabel
+        let nativeConnectionLabel = nativeSocket
+            ? ProductIdentity.nativeConnectionLocalSocket
+            : ProductIdentity.nativeConnectionOff
         let statusAccessibility: String
         if store.isDemo {
             statusAccessibility = "\(ProductIdentity.name), \(connectionLabel), demo fixture"
+        } else if nativeSocket {
+            statusAccessibility = "\(ProductIdentity.name), \(connectionLabel), local socket"
         } else {
             statusAccessibility = "\(ProductIdentity.name), \(connectionLabel)"
+        }
+        let explanation: String
+        if store.isDemo {
+            explanation = ProductIdentity.demoExplanation
+        } else if nativeSocket {
+            explanation = ProductIdentity.socketExplanation
+        } else {
+            explanation = ProductIdentity.disconnectedExplanation
         }
 
         return TrayPresentation(
@@ -73,12 +95,14 @@ public struct TrayPresentation: Equatable, Codable, Sendable {
             statusItemAccessibility: statusAccessibility,
             connection: store.connection,
             connectionLabel: connectionLabel,
-            explanation: store.isDemo
-                ? ProductIdentity.demoExplanation
-                : ProductIdentity.disconnectedExplanation,
+            nativeConnectionLabel: nativeConnectionLabel,
+            inventoryLabel: ProductIdentity.inventoryUnavailable,
+            explanation: explanation,
             isDemo: store.isDemo,
             showsDemoBanner: store.isDemo,
             demoBannerText: store.isDemo ? ProductIdentity.demoBanner : "",
+            runtimeSuppliedCaption: ProductIdentity.runtimeSuppliedCaption,
+            runtimePrompts: runtimePrompts,
             capsules: store.capsules.map { capsule in
                 CapsuleRow(
                     principal: capsule.principal.value,
@@ -134,7 +158,8 @@ public struct TrayPresentation: Equatable, Codable, Sendable {
                 : "No requests. Runtime is DISCONNECTED.",
             emptyCapsulesText: store.isDemo
                 ? "No fixture capsules."
-                : "No capsules. Runtime is DISCONNECTED."
+                : "No capsules. Runtime is DISCONNECTED.",
+            emptyRuntimePromptsText: ProductIdentity.emptyRuntimePromptsText
         )
     }
 
