@@ -21,6 +21,7 @@ final class TraySession: ObservableObject {
     @Published private(set) var mountError: String?
     var aosBinary: String?
     var aosHome: String?
+    var expectedAosBinary: String?
 
     func selectLibraryPrincipal(_ input: String) async {
         guard !refreshingLibrary else { return }
@@ -154,6 +155,11 @@ final class TraySession: ObservableObject {
         _ = promptUpdates.accept(broker.currentSnapshot())
         runtimePrompts = []
         onRuntimePromptsChanged?([])
+    }
+
+    func applyLaunchError(_ message: String?) {
+        lastError = message
+        overviewError = message
     }
 
     func show(_ section: PanelSection) {

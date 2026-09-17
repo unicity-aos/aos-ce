@@ -39,8 +39,15 @@ enum AOSTrayMain {
                 return
             }
 
+            let launch = InstalledRuntimeLaunch.apply(
+                arguments: arguments,
+                environment: ProcessInfo.processInfo.environment,
+                userHome: FileManager.default.homeDirectoryForCurrentUser.path
+            )
             TrayApp.run(store: store, socketPath: arguments.socketPath,
-                        aosBinary: arguments.aosBinary, aosHome: arguments.aosHome,
+                        aosBinary: launch.aosBinary, aosHome: launch.aosHome,
+                        expectedAosBinary: launch.expectedBinary,
+                        launchError: launch.launchError,
                         nativeInputConfig: arguments.nativeInputConfig,
                         openOverview: arguments.openOverview)
         }

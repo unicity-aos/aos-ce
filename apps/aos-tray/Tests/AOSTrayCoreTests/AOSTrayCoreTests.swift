@@ -10,6 +10,8 @@ struct LaunchArgumentTests {
         #expect(parsed.snapshot == false)
         #expect(parsed.help == false)
         #expect(parsed.socketPath == nil)
+        #expect(parsed.aosBinary == nil)
+        #expect(parsed.aosHome == nil)
     }
 
     @Test func socketPathIsExclusive() {

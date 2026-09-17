@@ -38,6 +38,10 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- No-args AOS Tray launch binds the current user's `~/.aos/bin/aos` and
+  `~/.aos`, or a valid absolute `AOS_HOME`, instead of leaving Finder
+  launches unable to inventory or set up native input. `PATH` search,
+  app-adjacent binaries, and silent pairing remain out of scope.
 - Failed native-input setup now removes only files this attempt created and
   refuses preexisting device-key sidecars instead of deleting them. A
   successful pairing redeem is not rolled back in the daemon.

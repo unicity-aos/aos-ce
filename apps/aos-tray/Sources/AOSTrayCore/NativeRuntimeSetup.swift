@@ -46,6 +46,17 @@ public enum NativeRuntimeSetupCopy {
         "Demo mode cannot enroll a native-input device or claim hosted acting. Nothing was changed."
     public static let missingRuntime =
         "Native-input setup needs a local AOS installation. Nothing was enrolled."
+    public static let invalidHome =
+        "AOS_HOME must be an absolute directory path without '.' or '..' components. The tray did not search PATH or pair a device."
+    public static func missingBinary(_ path: String) -> String {
+        "AOS was not found at \(path). Install AOS into that home's bin directory. The tray did not search PATH or pair a device."
+    }
+    public static func unavailableMessage(expectedBinary: String?) -> String {
+        if let expectedBinary {
+            return missingBinary(expectedBinary)
+        }
+        return missingRuntime
+    }
     public static let unsupported =
         "This AOS runtime does not support local-personal native-input setup."
     public static let existing =

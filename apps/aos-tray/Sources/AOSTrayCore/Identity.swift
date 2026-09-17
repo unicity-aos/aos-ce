@@ -179,6 +179,11 @@ public struct LaunchArguments: Equatable, Sendable {
       aos-tray --native-input-config ABSOLUTE_PATH
       aos-tray --help
 
+    Default no-args launch binds the current user's ~/.aos/bin/aos and ~/.aos.
+    A valid absolute AOS_HOME overrides the home; the binary is always that
+    home's bin/aos. PATH and app-adjacent executables are not searched, and
+    this launch does not pair a device. Missing binaries are reported.
+    --aos-binary and --aos-home still select an explicit pair together.
     Default mode is DISCONNECTED. No runtime inventory is invented.
     --demo loads an in-memory fixture with a persistent DEMO banner.
     Demo decisions modify the fixture only.
