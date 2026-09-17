@@ -46,6 +46,17 @@ public enum NativeRuntimeSetupCopy {
         "Demo mode cannot enroll a native-input device or claim hosted acting. Nothing was changed."
     public static let missingRuntime =
         "Native-input setup needs a local AOS installation. Nothing was enrolled."
+    public static let invalidHome =
+        "AOS_HOME must be an absolute directory path without '.' or '..' components. The tray did not search PATH or pair a device."
+    public static func missingBinary(_ path: String) -> String {
+        "AOS was not found at \(path). Install AOS into that home's bin directory. The tray did not search PATH or pair a device."
+    }
+    public static func unavailableMessage(expectedBinary: String?) -> String {
+        if let expectedBinary {
+            return missingBinary(expectedBinary)
+        }
+        return missingRuntime
+    }
     public static let unsupported =
         "This AOS runtime does not support local-personal native-input setup."
     public static let existing =
@@ -82,7 +93,7 @@ public enum NativeRuntimeSetupCopy {
 /// Runs only an explicitly selected AOS executable's local-personal native-setup command.
 public enum NativeRuntimeSetup {
     public static func defaultConnectionPath(home: String) -> String? {
-        guard home.hasPrefix("/"), !home.contains("\0"), !home.hasSuffix("/") else { return nil }
+        guard let home = realHome(home) else { return nil }
         return home + "/native-input/connection.json"
     }
 
@@ -151,11 +162,15 @@ public enum NativeRuntimeSetup {
         timeout: TimeInterval = 60
     ) throws -> NativeRuntimeSetupReceipt {
         guard confirmEnroll, confirmRoute else { throw NativeRuntimeSetupError.unconfirmed }
-        guard binary.hasPrefix("/"), home.hasPrefix("/"), timeout > 0, timeout.isFinite else {
+        guard binary.hasPrefix("/"), timeout > 0, timeout.isFinite else {
             throw NativeRuntimeSetupError.unavailable
         }
         guard OwnedPrincipal.isValidID(principal), principal != "anonymous" else {
             throw NativeRuntimeSetupError.invalidPrincipal
+        }
+        guard let canonicalHome = realHome(home),
+              let expectedConnection = defaultConnectionPath(home: canonicalHome) else {
+            throw NativeRuntimeSetupError.failed
         }
         let stdout = Pipe()
         let stderr = Pipe()
@@ -169,7 +184,7 @@ public enum NativeRuntimeSetup {
         process.executableURL = URL(fileURLWithPath: binary)
         process.arguments = commandArguments(principal: principal)
         var environment = ProcessInfo.processInfo.environment
-        environment["AOS_HOME"] = home
+        environment["AOS_HOME"] = canonicalHome
         process.environment = environment
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = stdout
@@ -200,25 +215,56 @@ public enum NativeRuntimeSetup {
             if stderrText.contains("already exists") { throw NativeRuntimeSetupError.existing }
             throw NativeRuntimeSetupError.failed
         }
-        return try decodeReceipt(out)
+        return try decodeReceipt(out, principal: principal, connectionPath: expectedConnection)
     }
 
-    static func decodeReceipt(_ bytes: Data) throws -> NativeRuntimeSetupReceipt {
+    static func realHome(_ home: String) -> String? {
+        guard home.hasPrefix("/"), !home.contains("\0"), !home.hasSuffix("/") else { return nil }
+        let parts = home.split(separator: "/", omittingEmptySubsequences: true)
+        guard !parts.isEmpty, parts.allSatisfy({ $0 != "." && $0 != ".." && !$0.isEmpty }) else {
+            return nil
+        }
+
+        var current = home
+        var missing: [String] = []
+        for _ in 0...parts.count {
+            var info = stat()
+            if current.withCString({ lstat($0, &info) }) == 0 {
+                var resolved = [CChar](repeating: 0, count: Int(PATH_MAX))
+                guard current.withCString({ realpath($0, &resolved) }) != nil else { return nil }
+                let canonical = String(cString: resolved)
+                var canonInfo = stat()
+                guard canonical.withCString({ stat($0, &canonInfo) }) == 0,
+                      (canonInfo.st_mode & S_IFMT) == S_IFDIR else {
+                    return nil
+                }
+                return missing.reversed().reduce(canonical) { $0 + "/" + $1 }
+            }
+            guard errno == ENOENT else { return nil }
+            let url = URL(fileURLWithPath: current, isDirectory: true)
+            let name = url.lastPathComponent
+            guard !name.isEmpty, current != "/" else { return nil }
+            missing.append(name)
+            let parent = url.deletingLastPathComponent().path
+            if parent == current { return nil }
+            current = parent
+        }
+        return nil
+    }
+
+    static func decodeReceipt(_ bytes: Data, principal: String, connectionPath: String) throws -> NativeRuntimeSetupReceipt {
         guard let object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else {
             throw NativeRuntimeSetupError.failed
         }
-        for (key, value) in object {
-            let haystack = "\(key) \(value)".lowercased()
-            if haystack.contains("token") || haystack.contains("secret") || haystack.contains("privatekey")
-                || haystack.contains("astrid_pair") {
-                throw NativeRuntimeSetupError.failed
-            }
-        }
+        let allowed: Set<String> = [
+            "scope", "authority", "principal", "connectionPath", "restartRequired", "connected",
+        ]
+        guard Set(object.keys) == allowed else { throw NativeRuntimeSetupError.failed }
         let receipt = try JSONDecoder().decode(NativeRuntimeSetupReceipt.self, from: bytes)
         guard receipt.scope == "local-personal", receipt.authority == "setup",
               receipt.restartRequired, receipt.connected == false,
-              OwnedPrincipal.isValidID(receipt.principal), receipt.principal != "anonymous",
-              receipt.connectionPath.hasPrefix("/") else {
+              receipt.principal == principal,
+              receipt.connectionPath == connectionPath else {
             throw NativeRuntimeSetupError.failed
         }
         return receipt

@@ -12,6 +12,7 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
@@ -85,6 +86,82 @@ struct OwnedCleanup {
     meta: Option<PathBuf>,
 }
 
+/// Resolve `AOS_HOME` to a real directory spelling before any pairing mutation.
+///
+/// Longest existing prefixes are canonicalized so macOS `/tmp` and `/var`
+/// aliases match the tray loader's `O_NOFOLLOW` walk. Missing suffix names are
+/// appended without creating them. An existing prefix that cannot be
+/// canonicalized fails closed and is not skipped.
+fn canonical_setup_home(root: &Path) -> Result<PathBuf, SetupError> {
+    if !root.is_absolute() {
+        return Err(SetupError::Failed(
+            "AOS_HOME must be an absolute path".to_owned(),
+        ));
+    }
+    if root.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(SetupError::Failed(
+            "AOS_HOME must not contain a NUL byte".to_owned(),
+        ));
+    }
+    // Path::components() skips '.' except at the start; inspect raw names so
+    // `/tmp/foo/./nested` cannot normalize into a pairing home.
+    for (index, part) in root
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .enumerate()
+    {
+        if part.is_empty() {
+            if index == 0 {
+                continue;
+            }
+            return Err(SetupError::Failed(
+                "AOS_HOME must not contain empty path components".to_owned(),
+            ));
+        }
+        if part == b"." || part == b".." {
+            return Err(SetupError::Failed(
+                "AOS_HOME must not contain '.' or '..' path components".to_owned(),
+            ));
+        }
+    }
+
+    let mut current = root.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(_) => {
+                let canonical = fs::canonicalize(&current).map_err(|error| {
+                    SetupError::Failed(format!("AOS_HOME cannot be resolved: {error}"))
+                })?;
+                let metadata = fs::metadata(&canonical).map_err(|error| {
+                    SetupError::Failed(format!("AOS_HOME is not a directory: {error}"))
+                })?;
+                if !metadata.is_dir() {
+                    return Err(SetupError::Failed(
+                        "AOS_HOME must resolve to a directory".to_owned(),
+                    ));
+                }
+                let mut resolved = canonical;
+                for name in missing.into_iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(name) = current.file_name() else {
+                    return Err(SetupError::Failed("AOS_HOME cannot be resolved".to_owned()));
+                };
+                missing.push(name.to_os_string());
+                if !current.pop() {
+                    return Err(SetupError::Failed("AOS_HOME cannot be resolved".to_owned()));
+                }
+            }
+            Err(error) => return Err(SetupError::Failed(error.to_string())),
+        }
+    }
+}
+
 pub(crate) fn connection_path(home: &AosHome) -> PathBuf {
     home.root().join("native-input/connection.json")
 }
@@ -154,14 +231,15 @@ pub(crate) fn run(home: &AosHome, principal: &PrincipalId) -> Result<SetupDocume
             "native-input setup requires a non-anonymous owned principal".to_owned(),
         ));
     }
-    let connection = connection_path(home);
-    let config_path = operator_config_path(home);
-    let artifacts = KeyArtifacts::from_private(private_key_path(home))?;
-    let _lock = SetupLock::acquire(home)?;
+    let home = AosHome::from_root(canonical_setup_home(home.root())?);
+    let connection = connection_path(&home);
+    let config_path = operator_config_path(&home);
+    let artifacts = KeyArtifacts::from_private(private_key_path(&home))?;
+    let _lock = SetupLock::acquire(&home)?;
     refuse_existing(&connection, &config_path, &artifacts)?;
     let mut owned = OwnedCleanup::default();
     match enroll(
-        home,
+        &home,
         principal,
         &connection,
         &config_path,

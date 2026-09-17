@@ -6,10 +6,12 @@ import AOSTrayCore
 enum TrayApp {
     static func run(store: TrayStore, socketPath: String? = nil,
                     aosBinary: String? = nil, aosHome: String? = nil,
+                    expectedAosBinary: String? = nil, launchError: String? = nil,
                     nativeInputConfig: String? = nil, openOverview: Bool = false) {
         let session = TraySession(store: store)
         session.aosBinary = aosBinary
         session.aosHome = aosHome
+        session.expectedAosBinary = expectedAosBinary
         if let socketPath {
             do {
                 try session.startSocket(path: socketPath)
@@ -27,7 +29,7 @@ enum TrayApp {
 
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
-        let delegate = TrayAppDelegate(session: session, openOverview: openOverview, nativeInputConfig: nativeInputConfig)
+        let delegate = TrayAppDelegate(session: session, openOverview: openOverview, nativeInputConfig: nativeInputConfig, launchError: launchError)
         application.delegate = delegate
         // NSApplication does not retain its delegate. Keep the connection and
         // window lifetime owner alive in optimized builds as well as previews.
@@ -50,14 +52,16 @@ final class TrayAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, 
     private var permissionPanel: NSPanel?
     private let openOverview: Bool
     private var nativeInputConfig: String?
+    private let launchError: String?
     private var nativeInputStatusItem: NSMenuItem?
     private var nativeSetupWindow: NativeRuntimeSetupWindow?
     private let nativeInput = NativeRuntimeInputService()
 
-    init(session: TraySession, openOverview: Bool = false, nativeInputConfig: String? = nil) {
+    init(session: TraySession, openOverview: Bool = false, nativeInputConfig: String? = nil, launchError: String? = nil) {
         self.session = session
         self.openOverview = openOverview
         self.nativeInputConfig = nativeInputConfig
+        self.launchError = launchError
         super.init()
         session.onRuntimePromptsChanged = { [weak self] rows in
             guard let self else { return }
@@ -78,6 +82,9 @@ final class TrayAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, 
         adoptDefaultNativeInputIfNeeded()
         reconnectNativeInput(nil)
         if openOverview { showOverview(nil) }
+        if let launchError {
+            session.applyLaunchError(launchError)
+        }
         if !session.runtimePrompts.isEmpty {
             revealPermission()
         }
@@ -158,7 +165,7 @@ final class TrayAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, 
             alert.messageText = "Native input setup unavailable"
             alert.informativeText = session.store.isDemo
                 ? NativeRuntimeSetupCopy.demoUnavailable
-                : NativeRuntimeSetupCopy.missingRuntime
+                : NativeRuntimeSetupCopy.unavailableMessage(expectedBinary: session.expectedAosBinary)
             alert.alertStyle = .informational
             alert.addButton(withTitle: "OK")
             alert.runModal()

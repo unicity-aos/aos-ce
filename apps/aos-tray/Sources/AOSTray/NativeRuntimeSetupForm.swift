@@ -150,7 +150,7 @@ final class NativeRuntimeSetupWindow: NSObject, NSWindowDelegate {
     private func refreshDiscovery() async {
         guard let binary = session.aosBinary, let home = session.aosHome else {
             discovery = .failed
-            message = NativeRuntimeSetupCopy.missingRuntime
+            message = NativeRuntimeSetupCopy.unavailableMessage(expectedBinary: session.expectedAosBinary)
             render()
             return
         }
@@ -181,7 +181,7 @@ final class NativeRuntimeSetupWindow: NSObject, NSWindowDelegate {
             return
         }
         guard let binary = session.aosBinary, let home = session.aosHome else {
-            message = NativeRuntimeSetupCopy.missingRuntime
+            message = NativeRuntimeSetupCopy.unavailableMessage(expectedBinary: session.expectedAosBinary)
             render()
             return
         }

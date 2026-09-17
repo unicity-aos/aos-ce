@@ -879,6 +879,30 @@ bundle="$work/unpack/$bundle_name"
 for file in bin/aos libexec/install.sh release-manifest.json Distro.toml capsule-assets.txt; do
   [ -f "$bundle/$file" ] || { echo "release archive is missing $file" >&2; exit 1; }
 done
+
+# An installer may authenticate a newer release, but it must not interpret that
+# release's layout. Hand control to the authenticated installer shipped inside
+# the selected archive whenever it differs from this one. The successor repeats
+# all signature and digest checks before committing, so this remains fail-closed
+# while ensuring every release installs its own schema.
+if [ ! -f "$0" ] || [ -L "$0" ] || ! cmp -s "$bundle/libexec/install.sh" "$0"; then
+  echo "Handing installation to the authenticated Unicity AOS $AOS_VERSION updater..."
+  set --
+  if [ "$version_explicit" -eq 1 ]; then
+    set -- "$@" --version "$AOS_VERSION"
+  else
+    set -- "$@" --channel "$AOS_CHANNEL"
+  fi
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    set -- "$@" --yes
+  fi
+  if [ "$SKIP_MIGRATION_PROMPT" -eq 1 ]; then
+    set -- "$@" --no-migrate-prompt
+  fi
+  sh "$bundle/libexec/install.sh" "$@"
+  exit $?
+fi
+
 for name in $runtime_binaries; do
   file="runtime/bin/$name"
   [ -f "$bundle/$file" ] || { echo "release archive is missing $file" >&2; exit 1; }
@@ -1303,6 +1327,11 @@ if [ -d "$AOS_HOME/runtime/bin" ] && [ ! -L "$AOS_HOME/runtime/bin" ]; then
     }
     rm -f "$legacy"
   done
+  # A never-initialized malformed update leaves this directory empty. An
+  # initialized pre-volume workspace also stores content-addressed capsule WASM
+  # members here; preserve those for Astrid's authenticated legacy importer.
+  # `rmdir` deliberately removes only the empty case and never user data.
+  rmdir "$AOS_HOME/runtime/bin" 2>/dev/null || :
 fi
 installation_started=0
 rm -rf "$release_backup"

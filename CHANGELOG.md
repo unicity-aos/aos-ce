@@ -26,12 +26,42 @@ implementations are consolidated into their final behavior.
   Archives without the member still install. The app is not placed in
   `/Applications`, is not AOS Developer ID signed here, and is not launched or
   default-connected yet. Developer preview builds are not packaged GO.
+- Intercept modern MCP `input_required` results in `aos mcp serve` native, auto
+  (when the client lacks forms), and deny modes. The original `tools/call` is
+  resumed to the runtime with echoed `requestState`; incomplete results stay off
+  the host stream.
+- Optional `aos mcp serve --interaction-socket PATH` for native tray presentation
+  over a same-user Unix socket. Requires `--interaction native` and does not fall
+  back to AppKit or the MCP host. The tray prompt deadline defaults to 120 seconds
+  via `--interaction-timeout` and is distinct from `--request-timeout`, which is
+  forwarded to the runtime.
+- Bound native MRTR tracking with `--max-in-flight-calls` (default 32) and
+  `--max-input-rounds` (default 8). Excess unique calls fail closed without
+  dropping already-tracked requests. Exhausted input rounds complete the
+  tracked call, return a JSON-RPC internal error to the host, and cancel the
+  runtime request.
 
 ### Fixed
 
+- No-args AOS Tray launch binds the current user's `~/.aos/bin/aos` and
+  `~/.aos`, or a valid absolute `AOS_HOME`, instead of leaving Finder
+  launches unable to inventory or set up native input. `PATH` search,
+  app-adjacent binaries, and silent pairing remain out of scope.
 - Failed native-input setup now removes only files this attempt created and
   refuses preexisting device-key sidecars instead of deleting them. A
   successful pairing redeem is not rolled back in the daemon.
+- Native-input setup canonicalizes macOS `/tmp` home aliases before pairing
+  and binds setup receipts to the requested principal and expected
+  connection path.
+- Bind MCP tool results to the kernel-stamped identity selected during tool
+  discovery as well as the call ID, including calls resumed after approval.
+- Preserve partial MCP frames when bidirectional reads are interrupted, rather
+  than discarding the already-read prefix before the next read.
+- Return locally handled MCP approval replies to the requesting runtime, rather
+  than emitting them to the agent host and leaving the runtime waiting.
+- Fail `aos mcp serve` closed when a native-tracked `tools/call` reuses an
+  in-flight JSON-RPC id or is malformed, instead of forwarding it and resuming
+  the original call.
 
 ## [2026.9.2] - 2026-09-13
 

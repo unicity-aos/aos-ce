@@ -17,6 +17,10 @@ import Testing
     private var alice: OwnedPrincipal { OwnedPrincipal(id: "alice", enabled: true) }
     private var bob: OwnedPrincipal { OwnedPrincipal(id: "bob", enabled: false) }
 
+    private var successPrinter: String {
+        #"printf '{"scope":"local-personal","authority":"setup","principal":"alice","connectionPath":"%s/native-input/connection.json","restartRequired":true,"connected":false}' "$AOS_HOME""#
+    }
+
     @Test func commandUsesOnlyNativeSetupContractAndNeverAToken() {
         let args = NativeRuntimeSetup.commandArguments(principal: "alice")
         #expect(args == ["native-setup", "--principal", "alice", "--confirm-enroll", "--confirm-route", "--json"])
@@ -76,13 +80,62 @@ import Testing
         #expect(!NativeRuntimeSetup.existingEnrollment(home: "relative", configPath: "relative"))
     }
 
+    @Test func tmpAliasHomeCanonicalizesAndAdoptsTheCanonicalConnection() throws {
+        let name = "ani-setup-alias-\(UUID())"
+        let alias = "/tmp/\(name)"
+        let canonical = "/private/tmp/\(name)"
+        try FileManager.default.createDirectory(atPath: canonical, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: canonical) }
+        #expect(NativeRuntimeSetup.realHome(alias) == canonical)
+        #expect(NativeRuntimeSetup.defaultConnectionPath(home: alias) == canonical + "/native-input/connection.json")
+        #expect(NativeRuntimeSetup.adoptableConnectionPath(home: alias) == nil)
+
+        let directory = URL(fileURLWithPath: canonical).appendingPathComponent("native-input")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let file = directory.appendingPathComponent("connection.json")
+        let object: [String: Any] = [
+            "socketPath": canonical + "/run/system.sock",
+            "principal": "alice",
+            "privateKeyPath": canonical + "/runtime/keys/local/aos-tray.ed25519",
+            "tokenPath": canonical + "/run/system.token",
+            "capacity": 8,
+            "inputTimeoutSeconds": 120,
+            "ioTimeoutSeconds": 5,
+            "readTimeoutSeconds": 3600,
+        ]
+        try JSONSerialization.data(withJSONObject: object).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        #expect(NativeRuntimeSetup.adoptableConnectionPath(home: alias) == file.path)
+        #expect(NativeRuntimeSetup.existingEnrollment(home: alias, configPath: nil))
+    }
+
+    @Test func danglingSymlinkHomeFailsClosedWithoutMutation() throws {
+        let parent = URL(fileURLWithPath: "/private/tmp/ani-setup-dangle-\(UUID())")
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let dangle = parent.appendingPathComponent("home")
+        #expect(symlink("/does/not/exist-\(UUID())", dangle.path) == 0)
+        #expect(NativeRuntimeSetup.realHome(dangle.path) == nil)
+        #expect(NativeRuntimeSetup.defaultConnectionPath(home: dangle.path) == nil)
+        try fixture("printf spawned > \"$AOS_HOME/spawned\"; \(successPrinter)\n") { command, _ in
+            #expect(throws: NativeRuntimeSetupError.failed) {
+                try NativeRuntimeSetup.runBlocking(
+                    binary: command, home: dangle.path, principal: "alice",
+                    confirmEnroll: true, confirmRoute: true
+                )
+            }
+        }
+        let names = try FileManager.default.contentsOfDirectory(atPath: parent.path)
+        #expect(names == ["home"])
+        #expect(!FileManager.default.fileExists(atPath: parent.appendingPathComponent("native-input").path))
+    }
+
     @Test func successfulCommandContractNeverPutsATokenOnArgv() throws {
-        let receipt = #"{"scope":"local-personal","authority":"setup","principal":"alice","connectionPath":"/tmp/aos/native-input/connection.json","restartRequired":true,"connected":false}"#
         try fixture("""
         for arg in "$@"; do printf '<%s>\\n' "$arg"; done > "$AOS_HOME/args"
         if [ -p /dev/stdin ]; then cat > "$AOS_HOME/stdin"; fi
         [ "$1" = native-setup ] && [ "$2" = --principal ] && [ "$3" = alice ] && [ "$4" = --confirm-enroll ] && [ "$5" = --confirm-route ] && [ "$6" = --json ] && [ $# = 6 ] || exit 7
-        printf '%s' '\(receipt)'
+        \(successPrinter)
         """) { command, home in
             let result = try NativeRuntimeSetup.runBlocking(
                 binary: command, home: home, principal: "alice",
@@ -93,12 +146,46 @@ import Testing
             #expect(result.principal == "alice")
             #expect(result.restartRequired)
             #expect(!result.connected)
-            #expect(result.connectionPath == "/tmp/aos/native-input/connection.json")
+            #expect(result.connectionPath == NativeRuntimeSetup.defaultConnectionPath(home: home))
             let args = try String(contentsOfFile: home + "/args", encoding: .utf8)
             #expect(args == "<native-setup>\n<--principal>\n<alice>\n<--confirm-enroll>\n<--confirm-route>\n<--json>\n")
             #expect(!args.contains("token"))
             #expect(!args.contains("astrid_pair"))
             #expect(!FileManager.default.fileExists(atPath: home + "/stdin"))
+        }
+    }
+
+    @Test func receiptMustMatchRequestedPrincipalAndExpectedConnection() throws {
+        try fixture(#"""
+        printf '{"scope":"local-personal","authority":"setup","principal":"bob","connectionPath":"%s/native-input/connection.json","restartRequired":true,"connected":false}' "$AOS_HOME"
+        """#) { command, home in
+            #expect(throws: NativeRuntimeSetupError.failed) {
+                try NativeRuntimeSetup.runBlocking(
+                    binary: command, home: home, principal: "alice",
+                    confirmEnroll: true, confirmRoute: true
+                )
+            }
+        }
+        #expect(OwnedPrincipal.isValidID("token"))
+        try fixture(#"""
+        printf '{"scope":"local-personal","authority":"setup","principal":"token","connectionPath":"%s/native-input/connection.json","restartRequired":true,"connected":false}' "$AOS_HOME"
+        """#) { command, home in
+            let result = try NativeRuntimeSetup.runBlocking(
+                binary: command, home: home, principal: "token",
+                confirmEnroll: true, confirmRoute: true
+            )
+            #expect(result.principal == "token")
+            #expect(result.connectionPath == NativeRuntimeSetup.defaultConnectionPath(home: home))
+        }
+        try fixture(#"""
+        printf '{"scope":"local-personal","authority":"setup","principal":"alice","connectionPath":"%s/native-input/connection.json","restartRequired":true,"connected":false,"token":"x"}' "$AOS_HOME"
+        """#) { command, home in
+            #expect(throws: NativeRuntimeSetupError.failed) {
+                try NativeRuntimeSetup.runBlocking(
+                    binary: command, home: home, principal: "alice",
+                    confirmEnroll: true, confirmRoute: true
+                )
+            }
         }
     }
 
@@ -157,7 +244,9 @@ import Testing
                 )
             }
         }
-        try fixture("printf '%s' '{\"scope\":\"local-personal\",\"authority\":\"setup\",\"principal\":\"alice\",\"connectionPath\":\"/tmp/aos/native-input/connection.json\",\"restartRequired\":true,\"connected\":false,\"token\":\"astrid_pair_device-token\"}'\n") { command, home in
+        try fixture(#"""
+        printf '{"scope":"local-personal","authority":"setup","principal":"alice","connectionPath":"%s/native-input/connection.json","restartRequired":true,"connected":false,"token":"astrid_pair_device-token"}' "$AOS_HOME"
+        """#) { command, home in
             #expect(throws: NativeRuntimeSetupError.failed) {
                 try NativeRuntimeSetup.runBlocking(
                     binary: command, home: home, principal: "alice",
@@ -165,7 +254,9 @@ import Testing
                 )
             }
         }
-        try fixture("printf '%s' '{\"scope\":\"local-personal\",\"authority\":\"setup\",\"principal\":\"alice\",\"connectionPath\":\"/tmp/aos/native-input/connection.json\",\"restartRequired\":false,\"connected\":true}'\n") { command, home in
+        try fixture(#"""
+        printf '{"scope":"local-personal","authority":"setup","principal":"alice","connectionPath":"%s/native-input/connection.json","restartRequired":false,"connected":true}' "$AOS_HOME"
+        """#) { command, home in
             #expect(throws: NativeRuntimeSetupError.failed) {
                 try NativeRuntimeSetup.runBlocking(
                     binary: command, home: home, principal: "alice",

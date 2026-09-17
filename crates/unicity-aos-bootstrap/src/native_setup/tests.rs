@@ -336,3 +336,58 @@ fn setup_lock_serializes_the_operation() {
     let _released = SetupLock::acquire(&home).expect("lock released");
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn tmp_alias_home_canonicalizes_without_mutation() {
+    let name = format!(
+        "aos-native-setup-canon-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let alias = PathBuf::from("/tmp").join(&name);
+    assert!(!alias.exists());
+    let canonical = canonical_setup_home(&alias).expect("canonicalize alias");
+    let expected = fs::canonicalize("/tmp").expect("tmp").join(&name);
+    assert_eq!(canonical, expected);
+    assert!(!alias.exists());
+    assert!(!expected.exists());
+}
+
+#[test]
+fn dangling_symlink_home_fails_closed_without_mutation() {
+    let root = temp_root("dangle-parent");
+    let missing = root.join("missing-target");
+    let dangle = root.join("dangle");
+    std::os::unix::fs::symlink(&missing, &dangle).expect("dangling symlink");
+    let before: Vec<_> = fs::read_dir(&root)
+        .expect("list")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    let error = run(&AosHome::from_root(&dangle), &principal()).expect_err("dangle");
+    assert!(
+        failed(error).contains("AOS_HOME cannot be resolved"),
+        "expected resolve failure"
+    );
+    let after: Vec<_> = fs::read_dir(&root)
+        .expect("list")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(before, after);
+    assert!(!missing.exists());
+    assert!(!dangle.join("native-input").exists());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dot_and_parent_components_are_rejected_before_pairing() {
+    let root = temp_root("dot-components");
+    let dotted = root.join(".").join("nested");
+    let parented = root.join("child").join("..").join("other");
+    assert!(canonical_setup_home(&dotted).is_err());
+    assert!(canonical_setup_home(&parented).is_err());
+    assert!(fs::read_dir(&root).expect("list").next().is_none());
+    let _ = fs::remove_dir_all(&root);
+}

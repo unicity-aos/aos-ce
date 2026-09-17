@@ -37,7 +37,9 @@
 //!   token (echoed into the reply), `request_id` is the approval correlation
 //!   id from the `approval_required` envelope, and `tool_name` / `call_id`
 //!   are echoed back from the `approval_required` reply flag so this handler
-//!   can re-establish the result drain the original dispatch dropped.
+//!   can re-establish the result drain the original dispatch dropped. The
+//!   expected provider identity is retained separately in broker-owned KV;
+//!   the response body cannot select which capsule may answer.
 //! * **outbound (decision → unblock tool)**
 //!   `astrid.v1.approval.response.<request_id>` —
 //!   `IpcPayload::ApprovalResponse` = `{ type:"approval_response",
@@ -115,8 +117,10 @@
 //! constrained decision verb. No free-form text is round-tripped into the
 //! tool.
 
+use std::collections::BTreeMap;
+
 use astrid_sdk::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Bus topic the host publishes capability-approval requests on. A single
@@ -319,6 +323,119 @@ struct ApprovalRespond {
     reason: Option<String>,
 }
 
+/// Bounded broker-owned correlation state for parked approval results.
+const PENDING_RESULT_ROUTES_KEY: &str = "mcp.approval.pending_result_routes";
+const PENDING_RESULT_ROUTE_TTL_MS: u64 = 120_000;
+const MAX_PENDING_RESULT_ROUTES: usize = 128;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingResultRoute {
+    tool_name: String,
+    call_id: String,
+    provider_source_id: String,
+    created_at_ms: u64,
+}
+
+impl PendingResultRoute {
+    fn matches(&self, tool_name: &str, call_id: &str) -> bool {
+        self.tool_name == tool_name
+            && self.call_id == call_id
+            && crate::cache::is_valid_provider_source_id(&self.provider_source_id)
+    }
+
+    fn is_fresh(&self, now_ms: u64) -> bool {
+        now_ms != 0
+            && self.created_at_ms != 0
+            && self.created_at_ms <= now_ms
+            && now_ms - self.created_at_ms < PENDING_RESULT_ROUTE_TTL_MS
+    }
+}
+
+/// Persist the exact provider selected for a tool call before returning an
+/// approval prompt to the MCP shim. The later response body is not trusted to
+/// choose this identity; it may only echo the tool/call routing tokens.
+pub(crate) fn remember_pending_result_route(
+    request_id: &str,
+    tool_name: &str,
+    call_id: &str,
+    provider_source_id: &str,
+) -> bool {
+    if response_topic(request_id).is_none()
+        || !crate::execute::is_valid_tool_name(tool_name)
+        || crate::broker::reply_topic(call_id).is_none()
+        || !crate::cache::is_valid_provider_source_id(provider_source_id)
+    {
+        return false;
+    }
+
+    let now_ms = crate::discovery::wall_ms();
+    if now_ms == 0 {
+        return false;
+    }
+    let mut routes = load_pending_result_routes();
+    routes.retain(|_, route| route.is_fresh(now_ms));
+    if routes.len() >= MAX_PENDING_RESULT_ROUTES {
+        let oldest = routes
+            .iter()
+            .min_by_key(|(_, route)| route.created_at_ms)
+            .map(|(id, _)| id.clone());
+        if let Some(oldest) = oldest {
+            routes.remove(&oldest);
+        }
+    }
+    routes.insert(
+        request_id.to_string(),
+        PendingResultRoute {
+            tool_name: tool_name.to_string(),
+            call_id: call_id.to_string(),
+            provider_source_id: provider_source_id.to_string(),
+            created_at_ms: now_ms,
+        },
+    );
+    persist_pending_result_routes(&routes)
+}
+
+/// Fail closed when the broker cannot persist the provider route for a parked
+/// approval. This releases the host waiter with a deny instead of leaving it
+/// blocked until timeout.
+pub(crate) fn deny_untracked_approval(request_id: &str) {
+    if let Some(topic) = response_topic(request_id) {
+        publish_decision(&topic, request_id, DENY, None);
+    }
+}
+
+/// Consume the broker-owned provider binding for an approval response.
+/// Mismatched echoed routing tokens fail closed and still consume the entry so
+/// a forged or replayed response cannot probe it repeatedly.
+fn take_pending_result_route(req: &ApprovalRespond) -> Option<String> {
+    let now_ms = crate::discovery::wall_ms();
+    let mut routes = load_pending_result_routes();
+    let route = routes.remove(&req.request_id);
+    routes.retain(|_, route| route.is_fresh(now_ms));
+    let persisted = persist_pending_result_routes(&routes);
+    if !persisted {
+        return None;
+    }
+    route
+        .filter(|route| route.is_fresh(now_ms) && route.matches(&req.tool_name, &req.call_id))
+        .map(|route| route.provider_source_id)
+}
+
+fn load_pending_result_routes() -> BTreeMap<String, PendingResultRoute> {
+    kv::get_bytes_opt(PENDING_RESULT_ROUTES_KEY)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn persist_pending_result_routes(routes: &BTreeMap<String, PendingResultRoute>) -> bool {
+    let Ok(bytes) = serde_json::to_vec(routes) else {
+        return false;
+    };
+    kv::set_bytes(PENDING_RESULT_ROUTES_KEY, &bytes).is_ok()
+}
+
 /// Handle `astrid.v1.request.mcp.approval.respond`.
 ///
 /// Maps the shim's elicited choice onto an
@@ -378,6 +495,23 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
         return Ok(());
     };
 
+    let Some(provider_source_id) = take_pending_result_route(&req) else {
+        log::warn(format!(
+            "{}: broker approval.respond: missing or mismatched provider route for request_id '{}'; denying",
+            crate::profile::log_tag(),
+            req.request_id
+        ));
+        publish_decision(&response_topic, &req.request_id, DENY, None);
+        if let Some(reply) = &reply_topic {
+            deliver_error(
+                reply,
+                &req.req_id,
+                "approval result route was not verifiable",
+            );
+        }
+        return Ok(());
+    };
+
     // Confused-deputy gate. Granting a capability is the most sensitive
     // action this capsule performs — require the kernel-set `source_id`
     // (NOT a body field) to be in the operator-pinned trusted-ingress
@@ -392,7 +526,7 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
                 crate::profile::log_tag(),
                 req.request_id
             ));
-            resolve_with_decision(&req, &response_topic, DENY, None);
+            resolve_with_decision(&req, &response_topic, DENY, None, &provider_source_id);
             return Ok(());
         }
     };
@@ -403,7 +537,7 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
             crate::profile::log_tag(),
             req.request_id
         ));
-        resolve_with_decision(&req, &response_topic, DENY, None);
+        resolve_with_decision(&req, &response_topic, DENY, None, &provider_source_id);
         return Ok(());
     }
 
@@ -413,7 +547,13 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
     // `ApprovalResponse.reason` field and is NEVER treated as a tool
     // argument (the host's approval path discards it after logging).
     let decision = normalize_decision(&req.decision);
-    resolve_with_decision(&req, &response_topic, decision, req.reason.as_deref());
+    resolve_with_decision(
+        &req,
+        &response_topic,
+        decision,
+        req.reason.as_deref(),
+        &provider_source_id,
+    );
     Ok(())
 }
 
@@ -655,19 +795,20 @@ fn ingress_ack(reply_topic: &str, req_id: &str, granted: bool) {
 /// State-mutating (an APPROVE causes the kernel to persist a capsule grant), so
 /// it is confused-deputy gated identically to [`crate::broker::handle_mcp_call`]:
 /// the inbound message's kernel-set `source_id` must already be a trusted
-/// ingress ([`crate::execute::is_ingress_trusted`]) before any decision is
-/// published. A rejected request publishes a `deny` (when a `request_id` is
-/// routable) so the kernel gate miss retires cleanly and clears the dedup
-/// marker — fail secure.
+/// ingress ([`crate::execute::is_ingress_trusted`]) before any *user* decision
+/// is published. Pairing happens first: [`crate::execute::take_grant_pending`]
+/// must consume the exact `(capsule_id, request_id)` originally surfaced.
+/// Unroutable or unpaired responds ack `granted:false` with no publish, no
+/// durable record, and no marker clear. A paired respond from an untrusted
+/// ingress (or with no caller) publishes `deny` for that paired `request_id`
+/// so the kernel awaiter retires — fail secure — and records no durable grant.
 ///
-/// The dedup marker for `(principal, capsule_id)` is consumed on BOTH approve
-/// and deny ([`crate::execute::take_grant_pending`]) so a declined prompt can
-/// never leave a marker that suppresses every future grant prompt for the pair.
-/// A payload so malformed it carries no `request_id` (and so no routable deny)
-/// — or no `capsule_id` to clear by — is logged and dropped; the kernel gate
-/// miss times out on its own schedule and any pending marker self-heals at
-/// [`crate::execute::GRANT_PENDING_TTL_MS`], so even that path cannot wedge the
-/// pair.
+/// The marker is consumed only on a successful pair, for both approve and deny,
+/// so a declined prompt cannot suppress every future grant prompt for the pair
+/// and a mismatched respond cannot clear another live marker. A payload so
+/// malformed it carries no routable `request_id` is logged and dropped; the
+/// kernel gate miss times out on its own schedule and any pending marker
+/// self-heals at [`crate::execute::GRANT_PENDING_TTL_MS`].
 pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
     let req: GrantRespond = match serde_json::from_value(payload) {
         Ok(v) => v,
@@ -699,11 +840,7 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
             crate::profile::log_tag(),
             req.request_id
         ));
-        // Clear any dedup marker so the next ungranted call can re-prompt — the
-        // decision was never published (bad request_id), so leaving the marker
-        // would wedge the pair. The caller principal scopes the KV; the suffix
-        // is the capsule id.
-        clear_grant_marker(&req.capsule_id);
+        // Do not clear any marker: this request_id was never a live prompt.
         // Ack the shim (when routable) so it does not hang; not granted.
         if let Some(reply) = &reply_topic {
             grant_ack(reply, &req.req_id, false);
@@ -711,12 +848,34 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
         return Ok(());
     };
 
-    // Confused-deputy gate. An APPROVE here causes the kernel to persist a
-    // capsule grant — the most sensitive action on this path — so require the
-    // kernel-set `source_id` (NOT a body field) to be a trusted ingress. On any
-    // failure (no caller context, untrusted ingress) publish a `deny` so the
-    // kernel gate miss retires, clear the marker, and ack not-granted.
-    let source_id = match runtime::caller() {
+    let caller = runtime::caller();
+    let principal = caller
+        .as_ref()
+        .ok()
+        .and_then(|ctx| ctx.principal.clone())
+        .unwrap_or_default();
+
+    // Pair before any publish or durable record. Mismatch/malformed/empty
+    // leaves a live marker in place; only an exact pair consumes it.
+    if !crate::execute::take_grant_pending(&principal, &req.capsule_id, &req.request_id) {
+        log::warn(format!(
+            "{}: broker grant.respond: unpaired request_id '{}' capsule_id '{}'",
+            crate::profile::log_tag(),
+            req.request_id,
+            req.capsule_id
+        ));
+        if let Some(reply) = &reply_topic {
+            grant_ack(reply, &req.req_id, false);
+        }
+        return Ok(());
+    }
+
+    // Paired. Confused-deputy gate: an APPROVE here causes the kernel to
+    // persist a capsule grant, so require the kernel-set `source_id` (NOT a
+    // body field) to be a trusted ingress. On any failure (no caller context,
+    // untrusted ingress) publish a `deny` for this paired request_id so the
+    // kernel awaiter retires, and ack not-granted. No durable grant record.
+    let source_id = match caller {
         Ok(ctx) => ctx.source_id,
         Err(e) => {
             log::warn(format!(
@@ -725,7 +884,6 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
                 req.request_id
             ));
             publish_decision(&response_topic, &req.request_id, DENY, None);
-            clear_grant_marker(&req.capsule_id);
             if let Some(reply) = &reply_topic {
                 grant_ack(reply, &req.req_id, false);
             }
@@ -740,7 +898,6 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
             req.request_id
         ));
         publish_decision(&response_topic, &req.request_id, DENY, None);
-        clear_grant_marker(&req.capsule_id);
         if let Some(reply) = &reply_topic {
             grant_ack(reply, &req.req_id, false);
         }
@@ -763,13 +920,14 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
     // elicitation support — with no provenance in the respond body to tell them
     // apart, so durably recording a deny would make a transport glitch a
     // permanent auto-deny the user never chose. A deny keeps its ephemeral
-    // semantics (marker consumed below, next call re-prompts: "not now", never
-    // "never") until the respond carries provenance
+    // semantics (marker already consumed above, next call re-prompts: "not now",
+    // never "never") until the respond carries provenance
     // (astrid-runtime/astrid#1114). The approve/skip choice lives in the pure
     // [`crate::grant_decision::respond_decision_to_record`] chokepoint. This
-    // runs only AFTER the confused-deputy gate above has passed, so a
-    // security-refusal deny (no caller context / untrusted ingress, handled
-    // earlier) records nothing either way — it is not the user's decision.
+    // runs only AFTER pairing and the confused-deputy gate above have passed,
+    // so a security-refusal deny (no caller context / untrusted ingress,
+    // handled earlier) records nothing either way — it is not the user's
+    // decision.
     if let Some(record) = crate::grant_decision::respond_decision_to_record(granted) {
         crate::grant_decision::record_grant_decision(&req.capsule_id, record);
     }
@@ -779,12 +937,6 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
     // persists the capsule grant. NO result drain follows — the call was
     // dropped at the gate; the shim re-sends it on `granted:true`.
     publish_decision(&response_topic, &req.request_id, decision, None);
-
-    // Consume the dedup marker on BOTH approve and deny so it is single-use and
-    // can never stick. The grant itself is driven by the published decision, not
-    // this marker; clearing it here is what lets the next call re-prompt (and a
-    // TTL self-heal backstops the clear if this respond never arrives).
-    clear_grant_marker(&req.capsule_id);
 
     if let Some(reply) = &reply_topic {
         grant_ack(reply, &req.req_id, granted);
@@ -805,25 +957,6 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
 /// `tool.call` when the capsule will now be granted.
 fn is_approve_verb(decision: &str) -> bool {
     matches!(decision, APPROVE | APPROVE_SESSION | APPROVE_ALWAYS)
-}
-
-/// Consume the `(principal, capsule_id)` grant-pending dedup marker. The KV
-/// scope is per-principal (the caller's principal), so the capsule id is the
-/// key suffix; the principal argument is passed for intent only. Best-effort —
-/// a failure to clear just risks one extra suppressed prompt, never a spurious
-/// grant. Called on every respond outcome so the marker is single-use.
-///
-/// An empty `capsule_id` (a respond that omitted the field) makes this a no-op —
-/// there is no key to clear. That does not wedge the pair: the marker carries a
-/// write timestamp and self-heals at [`crate::execute::GRANT_PENDING_TTL_MS`],
-/// so a missing-`capsule_id` respond degrades to a slightly delayed re-prompt,
-/// never permanent suppression.
-fn clear_grant_marker(capsule_id: &str) {
-    let principal = runtime::caller()
-        .ok()
-        .and_then(|ctx| ctx.principal)
-        .unwrap_or_default();
-    let _ = crate::execute::take_grant_pending(&principal, capsule_id);
 }
 
 /// Ack a `grant.respond` to the shim on `astrid.v1.response.<req_id>`.
@@ -864,6 +997,7 @@ fn resolve_with_decision(
     response_topic: &str,
     decision: &'static str,
     reason: Option<&str>,
+    provider_source_id: &str,
 ) {
     let reply_topic = crate::broker::reply_topic(&req.req_id);
 
@@ -919,7 +1053,7 @@ fn resolve_with_decision(
     };
 
     // Drain the resumed/denied result and deliver it as the terminal reply.
-    match result_sub.and_then(|sub| drain_result(&sub, &req.call_id)) {
+    match result_sub.and_then(|sub| drain_result(&sub, &req.call_id, provider_source_id)) {
         Some((content, is_error)) => deliver_result(reply, &req.req_id, content, is_error),
         None => deliver_error(
             reply,
@@ -935,14 +1069,23 @@ fn resolve_with_decision(
 /// slices so a result published the instant the tool resumes is picked up
 /// promptly. Reuses the execute path's result-envelope parser so both legs
 /// agree on the wire shape.
-fn drain_result(sub: &ipc::Subscription, call_id: &str) -> Option<(Value, bool)> {
+fn drain_result(
+    sub: &ipc::Subscription,
+    call_id: &str,
+    provider_source_id: &str,
+) -> Option<(Value, bool)> {
     let mut remaining = RESUME_TIMEOUT_MS;
     while remaining > 0 {
         let step = remaining.min(RESUME_SLICE_MS);
         match sub.recv(step) {
             Ok(poll) => {
                 for msg in poll.messages {
-                    if let Some(found) = crate::execute::match_result(&msg.payload, call_id) {
+                    if let Some(found) = crate::execute::match_result(
+                        &msg.payload,
+                        call_id,
+                        &msg.source_id,
+                        provider_source_id,
+                    ) {
                         return Some(found);
                     }
                 }
@@ -1248,6 +1391,27 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn pending_result_route_binds_provider_and_exact_echoed_route() {
+        install_test_profile();
+        let route = PendingResultRoute {
+            tool_name: "shell.exec".to_string(),
+            call_id: "call-7".to_string(),
+            provider_source_id: "0191f3a2-b4c7-7d8e-9f01-234567890abc".to_string(),
+            created_at_ms: 10_000,
+        };
+
+        assert!(route.matches("shell.exec", "call-7"));
+        assert!(!route.matches("fs.read", "call-7"));
+        assert!(!route.matches("shell.exec", "call-8"));
+        assert!(route.is_fresh(10_001));
+        assert!(!route.is_fresh(10_000 + PENDING_RESULT_ROUTE_TTL_MS));
+
+        let mut invalid = route;
+        invalid.provider_source_id.clear();
+        assert!(!invalid.matches("shell.exec", "call-7"));
     }
 
     #[test]

@@ -4,10 +4,12 @@ Native macOS menu-bar shell for AOS. Accessory process, no Dock icon. Closing
 the panel hides it. Quit AOS Tray does not stop the AOS runtime, mounts,
 agents, or MCP sessions.
 
-Default launch is disconnected and does not discover a home automatically.
-An explicitly selected installation enables runtime status, principal-scoped
-capsule inventory and native-input setup. There is no automatic daemon start,
-app installation or filesystem mount.
+Default no-args launch binds the current user's `~/.aos/bin/aos` and `~/.aos`,
+or a valid absolute `AOS_HOME`. The binary is always that home's `bin/aos`.
+The tray does not search `PATH`, use an app-adjacent executable, or enroll a
+device. A missing binary is reported instead of inventing inventory. Explicit
+`--aos-binary` / `--aos-home` still select a pair together. There is no
+automatic daemon start, app installation or filesystem mount.
 
 ## Run
 
@@ -31,7 +33,9 @@ scope identities that are absent from the payload. Cancel, timeout,
 disconnect, and quit never approve. This is a same-user credential boundary,
 not human authenticity proof. Inventory stays unavailable.
 
-Default launch (no `--demo`) shows `DISCONNECTED` and empty inventory.
+`--demo` stays an in-memory fixture. `--socket` stays a presenter without
+default-home inventory. No-args launch inspects the bound install when the
+binary exists.
 
 To assemble a local app bundle without installing or launching it:
 

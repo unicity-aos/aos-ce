@@ -247,6 +247,48 @@ if PATH="$fake_bin:$PATH" HOME="$work/impossible-nightly-home" AOS_TEST_FIXTURE=
 fi
 test ! -e "$work/impossible-nightly-home/.aos"
 
+# A previous release may authenticate a newer archive, but its installer must
+# not interpret the newer layout. A byte-different predecessor hands off to the
+# authenticated installer in the archive; that installer repeats verification
+# and commits its own schema.
+legacy_installer="$work/legacy-install.sh"
+cp "$repo_root/install.sh" "$legacy_installer"
+printf '\n# predecessor installer identity\n' >> "$legacy_installer"
+delegated_home="$work/delegated-home"
+PATH="$fake_bin:$PATH" \
+HOME="$delegated_home" \
+AOS_TEST_FIXTURE="$fixture" \
+AOS_VERSION=2026.9.2 \
+sh "$legacy_installer" --yes --no-migrate-prompt > "$work/delegated-install.log"
+grep -F 'Handing installation to the authenticated Unicity AOS 2026.9.2 updater...' \
+  "$work/delegated-install.log" >/dev/null
+for binary in astrid astrid-daemon astrid-build astrid-emit astrid-storage-provider-fuse; do
+  test -x "$delegated_home/.aos/releases/2026.9.2/runtime/bin/$binary"
+  test ! -e "$delegated_home/.aos/runtime/bin/$binary"
+done
+test ! -e "$delegated_home/.aos/runtime/bin"
+
+# Initialized pre-volume workspaces stored content-addressed capsule objects in
+# runtime/bin. A successor installer retires only its known executable copies;
+# Astrid's legacy importer still needs the capsule bytes.
+legacy_state_home="$work/delegated-legacy-state-home"
+mkdir -p "$legacy_state_home/.aos/runtime/bin"
+printf 'legacy capsule bytes\n' > \
+  "$legacy_state_home/.aos/runtime/bin/$(printf '%064d' 7).wasm"
+for binary in astrid astrid-daemon astrid-build astrid-emit; do
+  cp "$runtime_root/$binary" "$legacy_state_home/.aos/runtime/bin/$binary"
+done
+PATH="$fake_bin:$PATH" \
+HOME="$legacy_state_home" \
+AOS_TEST_FIXTURE="$fixture" \
+AOS_VERSION=2026.9.2 \
+sh "$legacy_installer" --yes --no-migrate-prompt >/dev/null
+for binary in astrid astrid-daemon astrid-build astrid-emit; do
+  test ! -e "$legacy_state_home/.aos/runtime/bin/$binary"
+done
+test "$(cat "$legacy_state_home/.aos/runtime/bin/$(printf '%064d' 7).wasm")" = \
+  'legacy capsule bytes'
+
 PATH="$fake_bin:$PATH" \
 HOME="$work/home" \
 AOS_TEST_FIXTURE="$fixture" \
@@ -1255,6 +1297,7 @@ for binary in astrid astrid-daemon astrid-build astrid-emit; do
   test ! -e "$work/home/.aos/runtime/bin/$binary"
   test -x "$release_dir/runtime/bin/$binary"
 done
+test ! -e "$work/home/.aos/runtime/bin"
 
 cat > "$work/aos-mismatch" <<'EOF'
 #!/bin/sh

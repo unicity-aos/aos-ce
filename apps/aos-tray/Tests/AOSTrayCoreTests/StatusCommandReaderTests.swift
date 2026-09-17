@@ -3,7 +3,7 @@ import Darwin
 import Testing
 @testable import AOSTrayCore
 
-@Suite struct StatusCommandReaderTests {
+@Suite(.serialized) struct StatusCommandReaderTests {
     private let stopped = #"{"state":"stopped","pid":0,"uptime_secs":0,"runtime_version":"test","ephemeral":false,"connected_clients":0,"loaded_capsules":[]}"#
 
     private func fixture(_ body: String, check: (String, String) throws -> Void) throws {
@@ -53,7 +53,11 @@ import Testing
     }
 
     @Test func oversizedStreamIsStoppedAndReaped() throws {
-        try assertStopped("echo $$ > \"$AOS_HOME/pid\"\nwhile :; do printf '%01000d' 0; done\n", timeout: 3)
+        try assertStopped("""
+        echo $$ > "$AOS_HOME/pid"
+        sleep 0.05
+        while :; do printf '%01000d' 0; done
+        """, timeout: 3)
     }
 
     @Test func mountSelectionStaysOneArgumentAndRequiresMatchingResponse() throws {
@@ -77,7 +81,13 @@ import Testing
     }
 
     @Test func timeoutReapsChildEvenWhenItIgnoresTERMAndClosesOutput() throws {
-        try assertStopped("echo $$ > \"$AOS_HOME/pid\"\ntrap '' TERM\nexec 1>&-\nwhile :; do :; done\n", timeout: 3)
+        try assertStopped("""
+        echo $$ > "$AOS_HOME/pid"
+        sleep 0.05
+        trap '' TERM
+        exec 1>&-
+        while :; do :; done
+        """, timeout: 3)
     }
 
     @Test(.enabled(if: ProcessInfo.processInfo.environment["AOS_TRAY_STATUS_TEST_BINARY"] != nil))
@@ -96,8 +106,20 @@ import Testing
             #expect(throws: (any Error).self) {
                 try StatusCommandReader.readBlocking(binary: command, home: home, timeout: timeout)
             }
-            let pidText = try String(contentsOfFile: home + "/pid", encoding: .utf8)
-            let pid = try #require(Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)))
+            let pidPath = home + "/pid"
+            var pidText: String?
+            let deadline = ProcessInfo.processInfo.systemUptime + 1
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                if let text = try? String(contentsOfFile: pidPath, encoding: .utf8) {
+                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        pidText = trimmed
+                        break
+                    }
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            let pid = try #require(Int32(pidText ?? ""))
             #expect(Darwin.kill(pid, 0) == -1)
             #expect(errno == ESRCH)
         }

@@ -236,17 +236,19 @@ fn main() -> ExitCode {
     if runtime_stop_requested(&args) {
         return handle_runtime_stop(&args);
     }
-    if product_init_requested(&args)
-        && let Err(code) = prepare_product_init(&args)
-    {
-        return code;
+    if product_init_requested(&args) {
+        match prepare_product_init(&args) {
+            Ok(true) => {}
+            Ok(false) => return ExitCode::SUCCESS,
+            Err(code) => return code,
+        }
     }
-    let runtime_args = runtime_args_for_dispatch(args);
+    let args = runtime_args_for_dispatch(args);
     let home = match resolve_home() {
         Ok(home) => home,
         Err(code) => return code,
     };
-    match home.exec_runtime_with_args(runtime_args) {
+    match home.exec_runtime_with_args(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("aos: failed to start bundled runtime: {error}");
@@ -264,17 +266,19 @@ fn main() -> ExitCode {
     if runtime_stop_requested(&args) {
         return handle_runtime_stop(&args);
     }
-    if product_init_requested(&args)
-        && let Err(code) = prepare_product_init(&args)
-    {
-        return code;
+    if product_init_requested(&args) {
+        match prepare_product_init(&args) {
+            Ok(true) => {}
+            Ok(false) => return ExitCode::SUCCESS,
+            Err(code) => return code,
+        }
     }
-    let runtime_args = runtime_args_for_dispatch(args);
+    let args = runtime_args_for_dispatch(args);
     let home = match resolve_home() {
         Ok(home) => home,
         Err(code) => return code,
     };
-    match home.run_runtime_with_args(runtime_args) {
+    match home.run_runtime_with_args(args) {
         Ok(status) => child_exit_code(status),
         Err(error) => {
             eprintln!("aos: failed to start bundled runtime: {error}");
@@ -430,7 +434,9 @@ fn product_init_requested(args: &[OsString]) -> bool {
         .is_some_and(|root| root == "init")
 }
 
-fn prepare_product_init(args: &[OsString]) -> Result<(), ExitCode> {
+/// Prepare the default CE fleet and report whether a distinct target still
+/// needs the runtime's principal-scoped init pass.
+fn prepare_product_init(args: &[OsString]) -> Result<bool, ExitCode> {
     let cli = ProductCli::try_parse_from(
         std::iter::once(OsString::from("aos")).chain(args.iter().cloned()),
     )
@@ -442,6 +448,10 @@ fn prepare_product_init(args: &[OsString]) -> Result<(), ExitCode> {
         eprintln!("aos: internal error: CE init preparation received another command");
         return Err(ExitCode::FAILURE);
     };
+    let dispatch_target = init
+        .target_principal
+        .as_deref()
+        .is_some_and(|principal| principal != "default");
 
     let mut runtime_args = vec![
         OsString::from("--principal"),
@@ -471,10 +481,12 @@ fn prepare_product_init(args: &[OsString]) -> Result<(), ExitCode> {
     }
 
     let home = resolve_home()?;
-    home.prepare_unicity_ce_init(runtime_args).map_err(|error| {
-        eprintln!("aos: failed to prepare the bundled runtime for CE init: {error}");
-        ExitCode::FAILURE
-    })
+    home.prepare_unicity_ce_init(runtime_args)
+        .map_err(|error| {
+            eprintln!("aos: failed to prepare the bundled runtime for CE init: {error}");
+            ExitCode::FAILURE
+        })?;
+    Ok(dispatch_target)
 }
 
 fn help_targets_product(args: &[OsString]) -> bool {
@@ -485,12 +497,7 @@ fn help_targets_product(args: &[OsString]) -> bool {
 }
 
 fn runtime_args_for_dispatch(mut args: Vec<OsString>) -> Vec<OsString> {
-    if leading_runtime_root_index(&args)
-        .ok()
-        .flatten()
-        .and_then(|index| args.get(index))
-        .is_some_and(|arg| arg == "init")
-    {
+    if product_init_requested(&args) {
         args.push(OsString::from("--grant-capsules"));
     }
     args
@@ -1179,7 +1186,7 @@ mod tests {
     use super::{
         DaemonCommand, DistroCommand, ProductCli, ProductCommand, child_exit_code,
         distro_principal, handle_product_command, help_targets_product, is_owned_root,
-        leading_owned_root, runtime_args_for_dispatch, runtime_stop_requested,
+        leading_owned_root, product_init_requested, runtime_stop_requested,
     };
 
     #[test]
@@ -1337,58 +1344,14 @@ mod tests {
     }
 
     #[test]
-    fn product_init_delegates_capsule_grants_to_the_runtime() {
-        assert_eq!(
-            runtime_args_for_dispatch(vec![OsString::from("init")]),
-            [OsString::from("init"), OsString::from("--grant-capsules")]
-        );
-        assert_eq!(
-            runtime_args_for_dispatch(vec![
-                OsString::from("init"),
-                OsString::from("--target-principal"),
-                OsString::from("alice"),
-            ]),
-            [
-                OsString::from("init"),
-                OsString::from("--target-principal"),
-                OsString::from("alice"),
-                OsString::from("--grant-capsules"),
-            ]
-        );
-        assert_eq!(
-            runtime_args_for_dispatch(vec![
-                OsString::from("init"),
-                OsString::from("--target-principal"),
-                OsString::from("default"),
-            ]),
-            [
-                OsString::from("init"),
-                OsString::from("--target-principal"),
-                OsString::from("default"),
-                OsString::from("--grant-capsules"),
-            ]
-        );
-        assert_eq!(
-            runtime_args_for_dispatch(vec![
-                OsString::from("--principal"),
-                OsString::from("operator"),
-                OsString::from("init"),
-                OsString::from("--target-principal"),
-                OsString::from("alice"),
-            ]),
-            [
-                OsString::from("--principal"),
-                OsString::from("operator"),
-                OsString::from("init"),
-                OsString::from("--target-principal"),
-                OsString::from("alice"),
-                OsString::from("--grant-capsules"),
-            ]
-        );
-        assert_eq!(
-            runtime_args_for_dispatch(vec![OsString::from("doctor")]),
-            [OsString::from("doctor")]
-        );
+    fn product_init_is_owned_by_the_wrapper() {
+        assert!(product_init_requested(&[OsString::from("init")]));
+        assert!(product_init_requested(&[
+            OsString::from("--principal"),
+            OsString::from("default"),
+            OsString::from("init"),
+        ]));
+        assert!(!product_init_requested(&[OsString::from("doctor")]));
     }
 
     #[test]
@@ -1442,7 +1405,6 @@ mod tests {
             let args = [OsString::from("help"), OsString::from(root)];
             assert!(!help_targets_product(&args));
             assert!(handle_product_command(&args).is_none());
-            assert_eq!(runtime_args_for_dispatch(args.to_vec()), args);
         }
     }
 
