@@ -33,4 +33,28 @@ import Testing
         let mount = try JSONDecoder().decode(MountedVolume.self, from: bytes)
         #expect(throws: (any Error).self) { try mount.verifiedNativeRoot() }
     }
+
+    @Test func privateTmpAliasIsNotFoundationIdentityAndOrdinaryFolderStillFails() throws {
+        let name = "aos-vol-alias-\(UUID().uuidString)"
+        let canonical = "/private/tmp/\(name)/mnt/files"
+        let alias = "/tmp/\(name)/mnt/files"
+        try FileManager.default.createDirectory(atPath: canonical, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: "/private/tmp/\(name)") }
+
+        #expect(URL(fileURLWithPath: canonical).resolvingSymlinksInPath().path == alias)
+        #expect(NativeRuntimeSetup.realExistingDirectory(canonical) == canonical)
+        #expect(NativeRuntimeSetup.realExistingDirectory(alias) == canonical)
+        #expect(MountedVolume.matchesReportedMountRoot(canonical, reportedRoot: canonical))
+        #expect(MountedVolume.matchesReportedMountRoot(alias, reportedRoot: canonical))
+        #expect(!MountedVolume.matchesReportedMountRoot(canonical, reportedRoot: alias))
+
+        let bytes = try JSONSerialization.data(withJSONObject: [
+            "mount_id": UUID().uuidString, "mountpoint": canonical,
+            "provider": "astrid-storage-provider-fskit", "access": "read-write"
+        ])
+        let mount = try JSONDecoder().decode(MountedVolume.self, from: bytes)
+        #expect(throws: (any Error).self) { try mount.verifiedNativeRoot() }
+        #expect(!MountedVolume.isExactAstridFS(canonical))
+        #expect(!MountedVolume.isExactAstridFS(alias))
+    }
 }

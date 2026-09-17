@@ -18,10 +18,12 @@ final class TraySession: ObservableObject {
     @Published private(set) var libraryPrincipal = "default"
     @Published private(set) var principalDiscovery: PrincipalDiscovery?
     @Published private(set) var checkingMount = false
+    @Published private(set) var filesBusy = false
     @Published private(set) var mountError: String?
     var aosBinary: String?
     var aosHome: String?
     var expectedAosBinary: String?
+    var volumeBusy: Bool { checkingMount || filesBusy }
 
     func selectLibraryPrincipal(_ input: String) async {
         guard !refreshingLibrary else { return }
@@ -79,8 +81,18 @@ final class TraySession: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([current.url])
     }
 
+    func openFiles() {
+        guard !volumeBusy, aosBinary != nil, aosHome != nil else { return }
+        Task { await openFilesNow() }
+    }
+
+    func ejectVolume() {
+        guard !volumeBusy, aosBinary != nil, aosHome != nil else { return }
+        Task { await ejectVolumeNow() }
+    }
+
     func chooseMountedVolume() {
-        guard !checkingMount, aosBinary != nil, aosHome != nil else { return }
+        guard !volumeBusy, aosBinary != nil, aosHome != nil else { return }
         let panel = NSOpenPanel()
         panel.title = "Open mounted AOS volume"
         panel.message = "Choose the mounted volume itself. AOS will verify it belongs to this runtime."
@@ -96,8 +108,58 @@ final class TraySession: ObservableObject {
         }
     }
 
+    private func openFilesNow() async {
+        guard !volumeBusy, let aosBinary, let aosHome else { return }
+        filesBusy = true
+        mountError = nil
+        defer { filesBusy = false }
+        do {
+            let status = try await StatusCommandReader.read(binary: aosBinary, home: aosHome)
+            overview = status
+            guard status.state == .running else { throw CommandCenterVolumeError.runtimeStopped }
+            let discovery: PrincipalDiscovery
+            do {
+                discovery = try await PrincipalDiscoveryReader.read(binary: aosBinary, home: aosHome)
+            } catch {
+                throw CommandCenterVolumeError.invalidPrincipal
+            }
+            principalDiscovery = discovery
+            let url = try await CommandCenterVolume.openFiles(
+                binary: aosBinary, home: aosHome, selectedPrincipal: libraryPrincipal,
+                discovery: discovery, runtimeState: status.state)
+            guard NSWorkspace.shared.open(url) else { throw CommandCenterVolumeError.unverified }
+        } catch let error as CommandCenterVolumeError {
+            mountError = CommandCenterVolumeCopy.message(for: error)
+        } catch {
+            mountError = CommandCenterVolumeCopy.commandFailed
+        }
+    }
+
+    private func ejectVolumeNow() async {
+        guard !volumeBusy, let aosBinary, let aosHome else { return }
+        filesBusy = true
+        mountError = nil
+        defer { filesBusy = false }
+        do {
+            let discovery: PrincipalDiscovery
+            do {
+                discovery = try await PrincipalDiscoveryReader.read(binary: aosBinary, home: aosHome)
+            } catch {
+                throw CommandCenterVolumeError.invalidPrincipal
+            }
+            principalDiscovery = discovery
+            try await CommandCenterVolume.eject(
+                binary: aosBinary, home: aosHome, selectedPrincipal: libraryPrincipal,
+                discovery: discovery)
+        } catch let error as CommandCenterVolumeError {
+            mountError = CommandCenterVolumeCopy.message(for: error, ejecting: true)
+        } catch {
+            mountError = CommandCenterVolumeCopy.ejectFailed
+        }
+    }
+
     private func openMountedVolume(_ selected: URL) async {
-        guard !checkingMount, let aosBinary, let aosHome else { return }
+        guard !volumeBusy, let aosBinary, let aosHome else { return }
         checkingMount = true
         mountError = nil
         defer { checkingMount = false }

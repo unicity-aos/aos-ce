@@ -109,6 +109,25 @@ import Testing
         #expect(NativeRuntimeSetup.existingEnrollment(home: alias, configPath: nil))
     }
 
+    @Test func tmpAliasExistingDirectoryCanonicalizesAndRefusesExtraSymlinks() throws {
+        let name = "aos-vol-alias-\(UUID().uuidString)"
+        let canonical = "/private/tmp/\(name)"
+        let alias = "/tmp/\(name)"
+        try FileManager.default.createDirectory(atPath: canonical, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: canonical) }
+        #expect(URL(fileURLWithPath: canonical).resolvingSymlinksInPath().path == alias)
+        #expect(NativeRuntimeSetup.realHome(alias) == canonical)
+        #expect(NativeRuntimeSetup.realExistingDirectory(alias) == canonical)
+        #expect(NativeRuntimeSetup.realExistingDirectory(canonical) == canonical)
+        #expect(URL(fileURLWithPath: canonical, isDirectory: true).path == canonical)
+
+        let link = canonical + "-link"
+        #expect(symlink(canonical, link) == 0)
+        defer { try? FileManager.default.removeItem(atPath: link) }
+        #expect(NativeRuntimeSetup.realExistingDirectory(link) == nil)
+        #expect(NativeRuntimeSetup.realExistingDirectory("/tmp/\(name)-link") == nil)
+    }
+
     @Test func danglingSymlinkHomeFailsClosedWithoutMutation() throws {
         let parent = URL(fileURLWithPath: "/private/tmp/ani-setup-dangle-\(UUID())")
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)

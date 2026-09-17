@@ -37,15 +37,24 @@ struct OverviewView: View {
                     Text("Volume file unavailable.").foregroundStyle(.secondary)
                 }
                 HStack {
+                    Button("Open files") { session.openFiles() }
+                        .disabled(session.aosBinary == nil || session.volumeBusy)
+                    Button("Eject") { session.ejectVolume() }
+                        .disabled(session.aosBinary == nil || session.volumeBusy)
+                    if session.filesBusy { ProgressView().controlSize(.small) }
+                }
+                Text(CommandCenterVolumeCopy.openCaption)
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
                     Button("Open mounted volume…") { session.chooseMountedVolume() }
-                        .disabled(session.aosBinary == nil || session.checkingMount)
+                        .disabled(session.aosBinary == nil || session.volumeBusy)
                     if session.checkingMount { ProgressView().controlSize(.small) }
                 }
                 if let error = session.mountError {
                     Text(error).font(.caption).foregroundStyle(.secondary)
                 }
                 DisclosureGroup("About these readings") {
-                    Text("Loaded capsules are not the complete installed library. Container file size is not allocated disk space or available capacity. Open mounted volume verifies an existing macOS mount; it does not mount or start anything.")
+                    Text("Loaded capsules are not the complete installed library. Container file size is not allocated disk space or available capacity. Open files mounts the Command Center folder if needed, then opens Finder. Eject unmounts that same folder. Open mounted volume verifies an existing macOS mount; it does not mount or start anything.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.font(.caption)
             }
