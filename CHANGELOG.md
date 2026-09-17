@@ -14,10 +14,34 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Added
+
+- Intercept modern MCP `input_required` results in `aos mcp serve` native, auto
+  (when the client lacks forms), and deny modes. The original `tools/call` is
+  resumed to the runtime with echoed `requestState`; incomplete results stay off
+  the host stream.
+- Optional `aos mcp serve --interaction-socket PATH` for native tray presentation
+  over a same-user Unix socket. Requires `--interaction native` and does not fall
+  back to AppKit or the MCP host. The tray prompt deadline defaults to 120 seconds
+  via `--interaction-timeout` and is distinct from `--request-timeout`, which is
+  forwarded to the runtime.
+- Bound native MRTR tracking with `--max-in-flight-calls` (default 32) and
+  `--max-input-rounds` (default 8). Excess unique calls fail closed without
+  dropping already-tracked requests. Exhausted input rounds complete the
+  tracked call, return a JSON-RPC internal error to the host, and cancel the
+  runtime request.
+
 ### Fixed
 
 - Bind MCP tool results to the kernel-stamped identity selected during tool
   discovery as well as the call ID, including calls resumed after approval.
+- Preserve partial MCP frames when bidirectional reads are interrupted, rather
+  than discarding the already-read prefix before the next read.
+- Return locally handled MCP approval replies to the requesting runtime, rather
+  than emitting them to the agent host and leaving the runtime waiting.
+- Fail `aos mcp serve` closed when a native-tracked `tools/call` reuses an
+  in-flight JSON-RPC id or is malformed, instead of forwarding it and resuming
+  the original call.
 
 ## [2026.9.2] - 2026-09-13
 
