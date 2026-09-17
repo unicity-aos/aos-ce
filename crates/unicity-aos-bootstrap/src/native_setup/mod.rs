@@ -3,15 +3,21 @@
 //! Pairing enrolls a dedicated device; it does not select a native responder
 //! or grant hosted acting authority. This module writes only the tray
 //! connection file and a missing `[native_input.responders]` binding.
+//!
+//! Failed setup removes only files this attempt created. Preexisting key
+//! artifacts and connections are refused, not overwritten or deleted. A
+//! successful `pair-device redeem` is not undone; this path does not call
+//! `pair-device revoke` and does not provide transactional daemon rollback.
 
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
 use astrid_core::{DeviceKeyId, PrincipalId};
+use fs2::FileExt;
 use serde::Serialize;
 
 use unicity_aos_bootstrap::AosHome;
@@ -23,6 +29,7 @@ const CONNECTION_CAPACITY: i32 = 8;
 const INPUT_TIMEOUT_SECONDS: f64 = 120.0;
 const IO_TIMEOUT_SECONDS: f64 = 5.0;
 const READ_TIMEOUT_SECONDS: f64 = 3600.0;
+const SETUP_LOCK_FILE: &str = "setup.lock";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +59,30 @@ impl SetupDocument {
 pub(crate) enum SetupError {
     Unsupported,
     Failed(String),
+}
+
+struct SetupLock {
+    _file: File,
+}
+
+struct KeyArtifacts {
+    private: PathBuf,
+    public_hex: PathBuf,
+    meta: PathBuf,
+}
+
+struct KeyPresence {
+    private: bool,
+    public_hex: bool,
+    meta: bool,
+}
+
+#[derive(Default)]
+struct OwnedCleanup {
+    connection: Option<PathBuf>,
+    private: Option<PathBuf>,
+    public_hex: Option<PathBuf>,
+    meta: Option<PathBuf>,
 }
 
 pub(crate) fn connection_path(home: &AosHome) -> PathBuf {
@@ -125,12 +156,21 @@ pub(crate) fn run(home: &AosHome, principal: &PrincipalId) -> Result<SetupDocume
     }
     let connection = connection_path(home);
     let config_path = operator_config_path(home);
-    let key_path = private_key_path(home);
-    refuse_existing(&connection, &config_path, &key_path)?;
-    match enroll(home, principal, &connection, &config_path, &key_path) {
+    let artifacts = KeyArtifacts::from_private(private_key_path(home))?;
+    let _lock = SetupLock::acquire(home)?;
+    refuse_existing(&connection, &config_path, &artifacts)?;
+    let mut owned = OwnedCleanup::default();
+    match enroll(
+        home,
+        principal,
+        &connection,
+        &config_path,
+        &artifacts,
+        &mut owned,
+    ) {
         Ok(document) => Ok(document),
         Err(error) => {
-            rollback_generated(&connection, &key_path);
+            owned.rollback();
             Err(error)
         }
     }
@@ -141,10 +181,10 @@ fn enroll(
     principal: &PrincipalId,
     connection: &Path,
     config_path: &Path,
-    key_path: &Path,
+    artifacts: &KeyArtifacts,
+    owned: &mut OwnedCleanup,
 ) -> Result<SetupDocument, SetupError> {
-    let public_key =
-        parse_public_key(&run_runtime(home, runtime_generate_args(principal), None)?.stdout)?;
+    let public_key = generate_device_key(home, principal, artifacts, owned)?;
     let mut token =
         parse_pair_token(&run_runtime(home, runtime_issue_args(principal), None)?.stdout)?;
     let redeemed = match run_runtime(
@@ -161,20 +201,133 @@ fn enroll(
             return Err(error);
         }
     };
-    write_connection(home, principal, connection, key_path)?;
+    write_connection(home, principal, connection, &artifacts.private)?;
+    owned.claim_connection(connection);
+    // Redeem already happened; this path does not call pair-device revoke.
     write_responder(config_path, principal, &redeemed.key_id)?;
     Ok(SetupDocument::local(principal, connection))
 }
 
-fn rollback_generated(connection: &Path, key_path: &Path) {
-    let _ = fs::remove_file(connection);
-    let _ = fs::remove_file(key_path);
-    if let (Some(parent), Some(name)) = (
-        key_path.parent(),
-        key_path.file_stem().and_then(|name| name.to_str()),
-    ) {
-        let _ = fs::remove_file(parent.join(format!("{name}.pub.hex")));
-        let _ = fs::remove_file(parent.join(format!("{name}.meta.toml")));
+fn generate_device_key(
+    home: &AosHome,
+    principal: &PrincipalId,
+    artifacts: &KeyArtifacts,
+    owned: &mut OwnedCleanup,
+) -> Result<String, SetupError> {
+    let before = artifacts.presence()?;
+    let generated = run_runtime(home, runtime_generate_args(principal), None);
+    owned.claim_new_keys(artifacts, &before)?;
+    parse_public_key(&generated?.stdout)
+}
+
+impl KeyArtifacts {
+    fn from_private(private: PathBuf) -> Result<Self, SetupError> {
+        let parent = private.parent().ok_or_else(|| {
+            SetupError::Failed("device key path has no parent directory".to_owned())
+        })?;
+        let name = private
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| SetupError::Failed("device key name is invalid".to_owned()))?;
+        Ok(Self {
+            public_hex: parent.join(format!("{name}.pub.hex")),
+            meta: parent.join(format!("{name}.meta.toml")),
+            private,
+        })
+    }
+
+    fn presence(&self) -> Result<KeyPresence, SetupError> {
+        Ok(KeyPresence {
+            private: path_exists(&self.private)?,
+            public_hex: path_exists(&self.public_hex)?,
+            meta: path_exists(&self.meta)?,
+        })
+    }
+}
+
+impl KeyPresence {
+    fn any(&self) -> bool {
+        self.private || self.public_hex || self.meta
+    }
+}
+
+impl OwnedCleanup {
+    fn claim_new_keys(
+        &mut self,
+        artifacts: &KeyArtifacts,
+        before: &KeyPresence,
+    ) -> Result<(), SetupError> {
+        let now = artifacts.presence()?;
+        if !before.private && now.private {
+            self.private = Some(artifacts.private.clone());
+        }
+        if !before.public_hex && now.public_hex {
+            self.public_hex = Some(artifacts.public_hex.clone());
+        }
+        if !before.meta && now.meta {
+            self.meta = Some(artifacts.meta.clone());
+        }
+        Ok(())
+    }
+
+    fn claim_connection(&mut self, connection: &Path) {
+        self.connection = Some(connection.to_path_buf());
+    }
+
+    fn rollback(&self) {
+        for path in [
+            self.connection.as_deref(),
+            self.private.as_deref(),
+            self.public_hex.as_deref(),
+            self.meta.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+impl SetupLock {
+    fn acquire(home: &AosHome) -> Result<Self, SetupError> {
+        let dir = home.root().join("native-input");
+        create_private_dir(&dir)?;
+        let path = dir.join(SETUP_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| SetupError::Failed(error.to_string()))?;
+        let path_metadata =
+            fs::symlink_metadata(&path).map_err(|error| SetupError::Failed(error.to_string()))?;
+        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+            return Err(SetupError::Failed(
+                "native-input setup lock must be a real regular file".to_owned(),
+            ));
+        }
+        let file_metadata = file
+            .metadata()
+            .map_err(|error| SetupError::Failed(error.to_string()))?;
+        if !file_metadata.is_file()
+            || path_metadata.dev() != file_metadata.dev()
+            || path_metadata.ino() != file_metadata.ino()
+        {
+            return Err(SetupError::Failed(
+                "native-input setup lock changed while it was opened".to_owned(),
+            ));
+        }
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                SetupError::Failed("another native-input setup is already in progress".to_owned())
+            } else {
+                SetupError::Failed(error.to_string())
+            }
+        })?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -206,13 +359,17 @@ pub(crate) fn runtime_unsupported(output: &Output) -> bool {
     unknown && mentions_setup
 }
 
-fn refuse_existing(connection: &Path, config: &Path, key: &Path) -> Result<(), SetupError> {
+fn refuse_existing(
+    connection: &Path,
+    config: &Path,
+    artifacts: &KeyArtifacts,
+) -> Result<(), SetupError> {
     if path_exists(connection)? {
         return Err(SetupError::Failed(
             "a native-input connection already exists; not overwritten".to_owned(),
         ));
     }
-    if path_exists(key)? {
+    if artifacts.presence()?.any() {
         return Err(SetupError::Failed(
             "device key aos-tray already exists; not overwritten".to_owned(),
         ));
@@ -500,223 +657,4 @@ fn create_private_dir(path: &Path) -> Result<(), SetupError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::process::ExitStatusExt;
-
-    fn principal() -> PrincipalId {
-        PrincipalId::new("alice").expect("valid principal")
-    }
-
-    #[test]
-    fn pairing_args_never_include_a_token_or_force_flag() {
-        let principal = principal();
-        let generate: Vec<String> = runtime_generate_args(&principal)
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        let issue: Vec<String> = runtime_issue_args(&principal)
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        let redeem: Vec<String> = runtime_redeem_args(&principal, &"ab".repeat(32))
-            .expect("valid public key")
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            generate,
-            [
-                "--principal",
-                "alice",
-                "keypair",
-                "generate",
-                "--name",
-                "aos-tray",
-                "--raw"
-            ]
-        );
-        assert_eq!(
-            issue,
-            [
-                "--principal",
-                "alice",
-                "pair-device",
-                "issue",
-                "--scope",
-                "use-only",
-                "--label",
-                "aos-tray",
-                "--raw"
-            ]
-        );
-        assert_eq!(
-            redeem,
-            [
-                "--principal",
-                "alice",
-                "pair-device",
-                "redeem",
-                "--public-key",
-                &"ab".repeat(32)
-            ]
-        );
-        for args in [&generate, &issue, &redeem] {
-            assert!(!args.iter().any(|arg| arg.contains("astrid_pair_")));
-            assert!(!args.iter().any(|arg| arg == "--force"));
-            assert!(!args.iter().any(|arg| arg.contains("token")));
-        }
-    }
-
-    #[test]
-    fn product_paths_stay_under_the_aos_home() {
-        let home = AosHome::from_root("/tmp/aos-setup-home");
-        assert_eq!(
-            connection_path(&home),
-            PathBuf::from("/tmp/aos-setup-home/native-input/connection.json")
-        );
-        assert_eq!(
-            operator_config_path(&home),
-            PathBuf::from("/tmp/aos-setup-home/runtime/config.toml")
-        );
-        assert_eq!(
-            private_key_path(&home),
-            PathBuf::from("/tmp/aos-setup-home/runtime/keys/local/aos-tray.ed25519")
-        );
-        assert_eq!(
-            socket_path(&home),
-            PathBuf::from("/tmp/aos-setup-home/run/system.sock")
-        );
-        assert_eq!(
-            token_path(&home),
-            PathBuf::from("/tmp/aos-setup-home/run/system.token")
-        );
-        assert_ne!(
-            socket_path(&home),
-            home.runtime_home().join("run/system.sock")
-        );
-    }
-
-    #[test]
-    fn responder_insert_is_narrow_and_refuses_existing_native_input() {
-        let principal = principal();
-        let written = insert_responder("", &principal, "0123456789abcdef").expect("insert");
-        assert!(written.contains("[native_input.responders]"));
-        assert!(written.contains("alice"));
-        assert!(written.contains("0123456789abcdef"));
-
-        let preserved = insert_responder("strict = true\n", &principal, "0123456789abcdef")
-            .expect("insert beside unrelated keys");
-        assert!(preserved.contains("strict = true"));
-        assert!(preserved.contains("[native_input.responders]"));
-
-        let error = insert_responder(
-            "[native_input.responders]\nbob = 'fedcba9876543210'\n",
-            &principal,
-            "0123456789abcdef",
-        )
-        .expect_err("existing native_input");
-        match error {
-            SetupError::Failed(message) => {
-                assert!(message.contains("already exists; not overwritten"));
-            }
-            SetupError::Unsupported => panic!("existing routing is not unsupported"),
-        }
-    }
-
-    #[test]
-    fn public_key_token_and_redeem_parsing_stay_strict() {
-        let principal = principal();
-        assert_eq!(
-            parse_public_key(format!("{}\n", "ab".repeat(32)).as_bytes()).expect("key"),
-            "ab".repeat(32)
-        );
-        assert!(parse_public_key(b"short").is_err());
-        assert!(parse_pair_token(b"astrid_pair_device-token\n").is_ok());
-        assert!(parse_pair_token(b"astrid_inv_device-token\n").is_err());
-        let redeemed = parse_redeemed(
-            br#"{"principal":"alice","public_key_fingerprint":"blake3:aa","key_id":"0123456789abcdef"}"#,
-            &principal,
-        )
-        .expect("redeem");
-        assert_eq!(redeemed.key_id, "0123456789abcdef");
-        assert!(
-            parse_redeemed(
-                br#"{"principal":"bob","public_key_fingerprint":"blake3:aa","key_id":"0123456789abcdef"}"#,
-                &principal,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn unsupported_runtime_is_classified_without_a_global_fallback() {
-        let unsupported = Output {
-            status: ExitStatusExt::from_raw(2 << 8),
-            stdout: Vec::new(),
-            stderr: b"error: unexpected argument '--scope' found".to_vec(),
-        };
-        assert!(runtime_unsupported(&unsupported));
-        let failed = Output {
-            status: ExitStatusExt::from_raw(1 << 8),
-            stdout: Vec::new(),
-            stderr: b"principal requires a delegated device".to_vec(),
-        };
-        assert!(!runtime_unsupported(&failed));
-    }
-
-    #[test]
-    fn private_connection_file_is_created_0600_and_not_overwritten() {
-        let root = std::env::temp_dir().join(format!(
-            "aos-native-setup-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).expect("temp");
-        let path = root.join("connection.json");
-        write_private_create_new(&path, b"{\"principal\":\"alice\"}").expect("write");
-        let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        let error = write_private_create_new(&path, b"other").expect_err("overwrite");
-        match error {
-            SetupError::Failed(message) => assert!(message.contains("already exists")),
-            SetupError::Unsupported => panic!("existing file is not unsupported"),
-        }
-        assert_eq!(fs::read(&path).expect("read"), b"{\"principal\":\"alice\"}");
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn generated_key_sidecars_are_removed_on_later_failure() {
-        let root = std::env::temp_dir().join(format!(
-            "aos-native-setup-rollback-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).expect("temp");
-        let connection = root.join("connection.json");
-        let key = root.join("aos-tray.ed25519");
-        let public_hex = root.join("aos-tray.pub.hex");
-        let meta = root.join("aos-tray.meta.toml");
-        let keep = root.join("unrelated");
-        fs::write(&connection, b"partial").expect("connection");
-        fs::write(&key, [1u8; 32]).expect("key");
-        fs::write(&public_hex, b"ab").expect("pub");
-        fs::write(&meta, b"note = true\n").expect("meta");
-        fs::write(&keep, b"keep").expect("keep");
-        rollback_generated(&connection, &key);
-        assert!(!connection.exists());
-        assert!(!key.exists());
-        assert!(!public_hex.exists());
-        assert!(!meta.exists());
-        assert_eq!(fs::read(&keep).expect("kept"), b"keep");
-        let _ = fs::remove_dir_all(&root);
-    }
-}
+mod tests;

@@ -148,10 +148,8 @@ fn native_setup_refuses_existing_connection_key_or_responders_without_runtime_pa
         .output()
         .expect("refuse existing connection");
     assert_eq!(existing_connection.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&existing_connection.stderr)
-            .contains("a native-input connection already exists; not overwritten")
-    );
+    assert!(String::from_utf8_lossy(&existing_connection.stderr)
+        .contains("a native-input connection already exists; not overwritten"));
     assert_eq!(
         fs::read(&connection).expect("preserve connection"),
         b"keep-me"
@@ -168,10 +166,8 @@ fn native_setup_refuses_existing_connection_key_or_responders_without_runtime_pa
         .output()
         .expect("refuse existing key");
     assert_eq!(existing_key.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&existing_key.stderr)
-            .contains("device key aos-tray already exists; not overwritten")
-    );
+    assert!(String::from_utf8_lossy(&existing_key.stderr)
+        .contains("device key aos-tray already exists; not overwritten"));
     assert_eq!(fs::read(&key).expect("preserve key").len(), 32);
     assert!(!fixture.args.exists());
     fs::remove_file(&key).expect("clear key");
@@ -188,15 +184,66 @@ fn native_setup_refuses_existing_connection_key_or_responders_without_runtime_pa
         .output()
         .expect("refuse existing responders");
     assert_eq!(existing_route.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&existing_route.stderr)
+        .contains("native-input operator routing already exists; not overwritten"));
+    assert!(fs::read_to_string(&config)
+        .expect("preserve config")
+        .contains("bob = \"fedcba9876543210\""));
+    assert!(!fixture.args.exists());
+}
+
+#[test]
+fn native_setup_refuses_preexisting_public_or_meta_sidecars_without_runtime() {
+    let fixture = Fixture::new("native-setup-key-sidecars");
+    fixture.install_runtime(NATIVE_SETUP_RUNTIME);
+    let (connection, _, key) = native_setup_home_paths(&fixture);
+    let public_hex = key.with_file_name("aos-tray.pub.hex");
+    let meta = key.with_file_name("aos-tray.meta.toml");
+
+    fs::create_dir_all(key.parent().expect("key parent")).expect("key dir");
+    fs::write(&public_hex, b"keep-public").expect("seed public sidecar");
+    fs::set_permissions(&public_hex, fs::Permissions::from_mode(0o600)).expect("public mode");
+    let existing_public = fixture
+        .command()
+        .args(native_setup_args())
+        .output()
+        .expect("refuse existing public sidecar");
+    assert_eq!(existing_public.status.code(), Some(1));
     assert!(
-        String::from_utf8_lossy(&existing_route.stderr)
-            .contains("native-input operator routing already exists; not overwritten")
+        String::from_utf8_lossy(&existing_public.stderr)
+            .contains("device key aos-tray already exists; not overwritten"),
+        "stderr: {}",
+        String::from_utf8_lossy(&existing_public.stderr)
     );
+    assert_eq!(
+        fs::read(&public_hex).expect("preserve public"),
+        b"keep-public"
+    );
+    assert!(!key.exists());
+    assert!(!connection.exists());
+    assert!(!fixture.args.exists());
+    fs::remove_file(&public_hex).expect("clear public sidecar");
+
+    fs::write(&meta, b"note = \"keep\"\n").expect("seed meta sidecar");
+    fs::set_permissions(&meta, fs::Permissions::from_mode(0o600)).expect("meta mode");
+    let existing_meta = fixture
+        .command()
+        .args(native_setup_args())
+        .output()
+        .expect("refuse existing meta sidecar");
+    assert_eq!(existing_meta.status.code(), Some(1));
     assert!(
-        fs::read_to_string(&config)
-            .expect("preserve config")
-            .contains("bob = \"fedcba9876543210\"")
+        String::from_utf8_lossy(&existing_meta.stderr)
+            .contains("device key aos-tray already exists; not overwritten"),
+        "stderr: {}",
+        String::from_utf8_lossy(&existing_meta.stderr)
     );
+    assert_eq!(
+        fs::read(&meta).expect("preserve meta"),
+        b"note = \"keep\"\n"
+    );
+    assert!(!key.exists());
+    assert!(!connection.exists());
     assert!(!fixture.args.exists());
 }
 
@@ -211,10 +258,8 @@ fn native_setup_fails_closed_without_confirms_json_or_a_valid_principal() {
         .output()
         .expect("reject missing confirms");
     assert_eq!(missing.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&missing.stderr)
-            .contains("requires --json --confirm-enroll --confirm-route")
-    );
+    assert!(String::from_utf8_lossy(&missing.stderr)
+        .contains("requires --json --confirm-enroll --confirm-route"));
     assert!(!fixture.args.exists());
 
     let missing_principal = fixture
@@ -228,10 +273,8 @@ fn native_setup_fails_closed_without_confirms_json_or_a_valid_principal() {
         .output()
         .expect("reject missing principal");
     assert_eq!(missing_principal.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&missing_principal.stderr)
-            .contains("requires an explicit '--principal PRINCIPAL'")
-    );
+    assert!(String::from_utf8_lossy(&missing_principal.stderr)
+        .contains("requires an explicit '--principal PRINCIPAL'"));
     assert!(!fixture.args.exists());
 
     let invalid = fixture

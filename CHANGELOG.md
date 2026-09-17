@@ -22,6 +22,12 @@ implementations are consolidated into their final behavior.
   disconnection and cancellation never approve. App distribution and automatic
   launch are not yet integrated.
 
+### Fixed
+
+- Failed native-input setup now removes only files this attempt created and
+  refuses preexisting device-key sidecars instead of deleting them. A
+  successful pairing redeem is not rolled back in the daemon.
+
 ## [2026.9.2] - 2026-09-13
 
 ### Changed
