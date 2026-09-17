@@ -57,7 +57,7 @@ struct RuntimePromptBrokerTests {
             options: ["Allow once", "Deny this"],
             timeoutSeconds: 30
         )
-        async let first = broker.decide(request)
+        async let first = Task.detached { await broker.decide(request) }.value
         try await waitUntil { !broker.currentPrompts().isEmpty }
         let promptID = try #require(broker.currentPrompts().first?.id)
         #expect(broker.currentPrompts().first?.options == ["Allow once", "Deny this"])
@@ -76,8 +76,8 @@ struct RuntimePromptBrokerTests {
             options: ["A", "B"],
             timeoutSeconds: 30
         )
-        async let first = broker.decide(request)
-        async let second = broker.decide(request)
+        async let first = Task.detached { await broker.decide(request) }.value
+        async let second = Task.detached { await broker.decide(request) }.value
         try await waitUntil { broker.currentPrompts().count == 2 }
         let ids = broker.currentPrompts().map(\.id)
         #expect(Set(ids).count == 2)
@@ -96,7 +96,7 @@ struct RuntimePromptBrokerTests {
             options: ["Allow", "Deny"],
             timeoutSeconds: 30
         )
-        let task = Task { await broker.decide(request) }
+        let task = Task.detached { await broker.decide(request) }
         task.cancel()
         try await Task.sleep(nanoseconds: 20_000_000)
         let value = try await waitForValue(timeout: 1) { await task.value }
@@ -114,7 +114,7 @@ struct RuntimePromptBrokerTests {
             options: ["Allow", "Deny"],
             timeoutSeconds: 30
         )
-        let task = Task { await broker.decide(request) }
+        let task = Task.detached { await broker.decide(request) }
         try await waitUntil { !broker.currentPrompts().isEmpty }
         #expect(broker.currentPrompts().first?.options == ["Allow", "Deny"])
         task.cancel()
