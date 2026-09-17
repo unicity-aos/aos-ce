@@ -16,6 +16,10 @@ use serde::Serialize;
 
 use crate::AosHome;
 
+mod inventory;
+pub use inventory::CapsuleInventory;
+pub mod mounted_volume;
+
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_COMPATIBILITY: &str = include_str!("../../../release/runtime-compatibility.toml");
 const COORDINATION_MARKERS: [&str; 6] = [
@@ -37,6 +41,10 @@ pub struct AosStatus {
     pub ephemeral: bool,
     pub connected_clients: u32,
     pub loaded_capsules: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capsule_inventory: Option<CapsuleInventory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mounted_volume: Option<mounted_volume::MountedVolume>,
 }
 
 impl From<DaemonStatus> for AosStatus {
@@ -49,6 +57,8 @@ impl From<DaemonStatus> for AosStatus {
             ephemeral: status.ephemeral,
             connected_clients: status.connected_clients,
             loaded_capsules: status.loaded_capsules,
+            capsule_inventory: None,
+            mounted_volume: None,
         }
     }
 }
@@ -72,6 +82,8 @@ impl AosStatus {
             ephemeral: false,
             connected_clients: 0,
             loaded_capsules: Vec::new(),
+            capsule_inventory: None,
+            mounted_volume: None,
         })
     }
 }
@@ -88,6 +100,16 @@ pub async fn read_for_principal(
     home: &AosHome,
     principal: PrincipalId,
 ) -> Result<AosStatus, String> {
+    read_with_inventory(home, principal, false).await
+}
+
+/// Optional inventory uses the same authenticated connection and never starts a runtime.
+pub async fn read_with_inventory(
+    home: &AosHome,
+    principal: PrincipalId,
+    include_capsules: bool,
+) -> Result<AosStatus, String> {
+    let inventory_principal = principal.to_string();
     let connection = tokio::time::timeout(STATUS_TIMEOUT, KernelClient::connect(principal))
         .await
         .map_err(|_| "connection timed out".to_owned())
@@ -98,6 +120,13 @@ pub async fn read_for_principal(
         Ok(client) => client,
         Err(connection_error) => {
             return confirm_stopped(home)
+                .map(|mut status| {
+                    if include_capsules {
+                        status.capsule_inventory =
+                            Some(CapsuleInventory::stopped(inventory_principal));
+                    }
+                    status
+                })
                 .map_err(|state_error| format!("{connection_error}; {state_error}"));
         }
     };
@@ -108,7 +137,21 @@ pub async fn read_for_principal(
         .map_err(|error| format!("status request failed: {error}"))?;
 
     match response {
-        KernelResponse::Status(status) => Ok(status.into()),
+        KernelResponse::Status(status) => {
+            let mut status = AosStatus::from(status);
+            if include_capsules {
+                let response = tokio::time::timeout(
+                    STATUS_TIMEOUT,
+                    client.request(KernelRequest::GetCapsuleMetadata),
+                )
+                .await;
+                status.capsule_inventory = Some(CapsuleInventory::from_response(
+                    inventory_principal,
+                    response.ok().and_then(Result::ok),
+                ));
+            }
+            Ok(status)
+        }
         KernelResponse::Error(error) => Err(error),
         _ => Err("runtime returned an unexpected status response".to_owned()),
     }
@@ -299,6 +342,8 @@ mod tests {
             ephemeral: false,
             connected_clients: 1,
             loaded_capsules: vec!["agents".to_owned()],
+            capsule_inventory: None,
+            mounted_volume: None,
         };
 
         let value = serde_json::to_value(status).expect("serialize status");

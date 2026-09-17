@@ -12,6 +12,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use astrid_crypto::KeyPair;
 use serde::Serialize;
 
+#[path = "cli_boundary/native_setup_tests.rs"]
+mod native_setup_tests;
+#[path = "cli_boundary/principals_tests.rs"]
+mod principals_tests;
+
 struct Fixture {
     root: PathBuf,
     runtime: PathBuf,
@@ -282,6 +287,92 @@ printf '%s\n' "$ASTRID_WORKSPACE_STATE_DIR" > "$AOS_TEST_WORKSPACE"
 printf '%s\n' "$ASTRID_ENFORCED_DISTRO" > "$AOS_TEST_DISTRO"
 printf '%s\n' "$ASTRID_DAEMON_LOG_TARGET" > "$AOS_TEST_LOG_TARGET"
 exit "${AOS_TEST_EXIT:-0}"
+"#;
+
+const DISCOVERY_RUNTIME: &str = r#"#!/bin/sh
+for arg in "$@"; do
+    printf '<%s>\n' "$arg"
+done > "$AOS_TEST_ARGS"
+mine=0
+for arg in "$@"; do
+    if [ "$arg" = "--mine" ]; then
+        mine=1
+    fi
+done
+if [ "$mine" != 1 ]; then
+    printf '%s' "discovery fixture refused a global agent list" >&2
+    exit 99
+fi
+printf '%s' "${AOS_TEST_STDOUT-[]}"
+if [ -n "${AOS_TEST_STDERR:-}" ]; then
+    printf '%s' "$AOS_TEST_STDERR" >&2
+fi
+exit "${AOS_TEST_EXIT:-0}"
+"#;
+
+const NATIVE_SETUP_RUNTIME: &str = r#"#!/bin/sh
+principal=""
+prev=""
+public_key=""
+for arg in "$@"; do
+    if [ "$prev" = "--principal" ]; then
+        principal="$arg"
+    fi
+    if [ "$prev" = "--public-key" ]; then
+        public_key="$arg"
+    fi
+    prev="$arg"
+done
+{
+    printf 'CMD\n'
+    for arg in "$@"; do
+        printf '<%s>\n' "$arg"
+    done
+} >> "$AOS_TEST_ARGS"
+command=""
+if [ "$3" = "keypair" ] && [ "$4" = "generate" ]; then
+    command="generate"
+elif [ "$3" = "pair-device" ] && [ "$4" = "issue" ]; then
+    command="issue"
+elif [ "$3" = "pair-device" ] && [ "$4" = "redeem" ]; then
+    command="redeem"
+else
+    printf '%s' "native-setup fixture received an unexpected command" >&2
+    exit 99
+fi
+if [ "${AOS_TEST_UNSUPPORTED:-0}" = "1" ]; then
+    printf '%s' "error: unrecognized subcommand '$3'" >&2
+    exit 2
+fi
+case "$command" in
+    generate)
+        mkdir -p "$ASTRID_HOME/keys/local"
+        dd if=/dev/zero of="$ASTRID_HOME/keys/local/aos-tray.ed25519" bs=32 count=1 2>/dev/null
+        chmod 600 "$ASTRID_HOME/keys/local/aos-tray.ed25519"
+        printf '%s\n' "abababababababababababababababababababababababababababababababab"
+        ;;
+    issue)
+        if [ "${AOS_TEST_FAIL:-0}" = "1" ]; then
+            printf '%s' "principal requires a delegated device" >&2
+            exit 1
+        fi
+        printf '%s\n' "astrid_pair_device-token"
+        ;;
+    redeem)
+        token=$(cat)
+        printf 'STDIN:%s\n' "$token" >> "$AOS_TEST_ARGS"
+        if [ "$token" != "astrid_pair_device-token" ]; then
+            printf '%s' "pairing token missing from stdin" >&2
+            exit 1
+        fi
+        if [ -z "$principal" ] || [ -z "$public_key" ]; then
+            printf '%s' "redeem requires a principal and public key" >&2
+            exit 1
+        fi
+        printf '{"principal":"%s","key_id":"0123456789abcdef","public_key_fingerprint":"blake3:aa"}' "$principal"
+        ;;
+esac
+exit 0
 "#;
 
 #[test]
@@ -1159,30 +1250,6 @@ fn explicit_principal_is_accepted_in_either_product_status_position() {
 }
 
 #[test]
-fn malformed_or_ambiguous_product_principals_never_delegate() {
-    let fixture = Fixture::new("malformed-principals");
-    fixture.install_runtime(RECORDING_RUNTIME);
-
-    for args in [
-        vec!["--principal", "init"],
-        vec!["--principal", "init", "--yes"],
-        vec!["--principal=", "init"],
-        vec!["--principal", "operator", "init", "--target-principal"],
-        vec!["--principal", "operator", "init", "--target-principal="],
-        vec!["--principal", "operator", "--principal", "other", "init"],
-    ] {
-        let output = fixture
-            .command()
-            .args(args)
-            .output()
-            .expect("run malformed product invocation");
-
-        assert_eq!(output.status.code(), Some(2));
-        assert!(!fixture.args.exists());
-    }
-}
-
-#[test]
 fn product_distro_apply_rejects_arbitrary_paths_and_unsigned_bypasses() {
     let fixture = Fixture::new("owned-distro");
     fixture.install_runtime(RECORDING_RUNTIME);
@@ -1691,7 +1758,11 @@ fn native_status_reports_stopped_without_invoking_the_runtime_cli() {
     let fixture = Fixture::new("status");
     fixture.install_runtime(RECORDING_RUNTIME);
 
-    for args in [vec!["status"], vec!["status", "--json"]] {
+    for args in [
+        vec!["status"],
+        vec!["status", "--json"],
+        vec!["status", "--json", "--include-capsules"],
+    ] {
         let output = fixture
             .command()
             .args(args)
@@ -1704,6 +1775,47 @@ fn native_status_reports_stopped_without_invoking_the_runtime_cli() {
         let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
         assert!(stdout.contains("stopped"));
         assert!(stdout.contains("2026.9.2"));
+        if stdout.contains("capsule_inventory") {
+            let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(json["capsule_inventory"]["state"], "stopped");
+            assert!(json["capsule_inventory"].get("capsules").is_none());
+        }
+    }
+}
+
+#[test]
+fn mounted_volume_status_refuses_stopped_runtime_without_forwarding_or_provisioning() {
+    let fixture = Fixture::new("mounted-status");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    let output = fixture
+        .command()
+        .args(["status", "--json", "--mountpoint=/Volumes/AOS QA"])
+        .output()
+        .expect("inspect stopped mount");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires a running runtime"));
+    assert!(
+        !fixture.args.exists(),
+        "status must not forward to the runtime CLI"
+    );
+    assert!(
+        !fixture.home.join("distributions").exists(),
+        "status must not provision a manifest"
+    );
+    for args in [
+        vec!["status", "--mountpoint=/Volumes/AOS"],
+        vec![
+            "status",
+            "--json",
+            "--include-capsules",
+            "--mountpoint=/Volumes/AOS",
+        ],
+    ] {
+        assert_eq!(
+            fixture.command().args(args).output().unwrap().status.code(),
+            Some(2)
+        );
     }
 }
 
