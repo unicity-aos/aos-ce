@@ -20,9 +20,14 @@ implementations are consolidated into their final behavior.
   (when the client lacks forms), and deny modes. The original `tools/call` is
   resumed to the runtime with echoed `requestState`; incomplete results stay off
   the host stream.
+- Optional `aos mcp serve --interaction-socket PATH` for native tray presentation
+  over a same-user Unix socket. Requires `--interaction native` and does not fall
+  back to AppKit or the MCP host. The initial prompt deadline is 120 seconds.
 
 ### Fixed
 
+- Preserve partial MCP frames when bidirectional reads are interrupted, rather
+  than discarding the already-read prefix before the next read.
 - Return locally handled MCP approval replies to the requesting runtime, rather
   than emitting them to the agent host and leaving the runtime waiting.
 - Fail `aos mcp serve` closed when a native-tracked `tools/call` reuses an

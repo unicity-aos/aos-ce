@@ -133,6 +133,7 @@ fn serve_rejects_flags_without_values_before_starting_the_runtime() {
     for arguments in [
         vec!["mcp", "serve", "--workspace"],
         vec!["mcp", "serve", "--request-timeout"],
+        vec!["mcp", "serve", "--interaction-socket"],
     ] {
         let output = fixture
             .command()
@@ -145,6 +146,34 @@ fn serve_rejects_flags_without_values_before_starting_the_runtime() {
             "invalid argv must not reach runtime"
         );
     }
+}
+
+#[test]
+fn serve_rejects_interaction_socket_without_native_mode() {
+    let fixture = Fixture::new("socket-mode");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    let output = fixture
+        .command()
+        .args([
+            "mcp",
+            "serve",
+            "--interaction",
+            "client",
+            "--interaction-socket",
+            "/tmp/aos-tray.sock",
+        ])
+        .output()
+        .expect("run MCP bridge with invalid socket mode");
+    assert!(!output.status.success(), "bridge exited {}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--interaction native"),
+        "stderr must explain the native-only socket flag, got {stderr:?}"
+    );
+    assert!(
+        !fixture.args.exists(),
+        "invalid interaction-socket must not start the runtime"
+    );
 }
 
 #[test]

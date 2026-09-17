@@ -5,10 +5,13 @@
 //! interaction policy. That lets hosts without MCP form elicitation use a
 //! trusted local decision surface without weakening or forking the runtime.
 
+#[cfg(test)]
+mod framing_tests;
 mod interaction;
 mod mrtr;
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::{ExitCode, ExitStatus, Stdio};
 
 use clap::{Args, ValueEnum};
@@ -144,6 +147,55 @@ pub(crate) struct ServeArgs {
     /// Runtime request timeout forwarded exactly by the product bridge.
     #[arg(long = "request-timeout", value_name = "DURATION")]
     request_timeout: Option<String>,
+    /// Unix socket for native tray presentation. Requires `--interaction native`.
+    #[arg(long = "interaction-socket", value_name = "PATH")]
+    interaction_socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NativeSurface {
+    Platform,
+    #[cfg(unix)]
+    Socket(PathBuf),
+}
+
+fn native_surface(args: &ServeArgs) -> Result<NativeSurface, String> {
+    match args.interaction_socket.as_ref() {
+        None => Ok(NativeSurface::Platform),
+        Some(_) if args.interaction != InteractionMode::Native => {
+            Err("--interaction-socket requires --interaction native".to_owned())
+        }
+        Some(path) => {
+            #[cfg(unix)]
+            {
+                Ok(NativeSurface::Socket(path.clone()))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                Err("--interaction-socket is only supported on Unix".to_owned())
+            }
+        }
+    }
+}
+
+enum ServePresenter {
+    Platform(interaction::NativePresenter),
+    #[cfg(unix)]
+    Socket(interaction::TrayPresenter),
+}
+
+impl interaction::Presenter for ServePresenter {
+    fn present(
+        &mut self,
+        request: &interaction::InteractionRequest,
+    ) -> Result<Option<usize>, interaction::InteractionError> {
+        match self {
+            Self::Platform(presenter) => presenter.present(request),
+            #[cfg(unix)]
+            Self::Socket(presenter) => presenter.present(request),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -160,6 +212,10 @@ enum InteractionMode {
 }
 
 pub(crate) fn handle_serve(principal: Option<String>, args: ServeArgs) -> ExitCode {
+    if let Err(error) = native_surface(&args) {
+        eprintln!("aos mcp serve: {error}");
+        return ExitCode::FAILURE;
+    }
     let home = match AosHome::resolve() {
         Ok(home) => home,
         Err(error) => {
@@ -246,7 +302,14 @@ async fn serve(
     let mut upstream_out = tokio::io::stdout();
     let mut downstream_in = Some(child_stdin);
     let mut client_supports_form = false;
-    let mut presenter = interaction::NativePresenter;
+    let mut presenter = match native_surface(args) {
+        Ok(NativeSurface::Platform) => ServePresenter::Platform(interaction::NativePresenter),
+        #[cfg(unix)]
+        Ok(NativeSurface::Socket(path)) => {
+            ServePresenter::Socket(interaction::TrayPresenter::new(path))
+        }
+        Err(error) => return Err(ServeFailure::Io(error)),
+    };
     let mut mrtr = mrtr::NativeMrtr::new();
     let mut upstream_open = true;
     let mut interrupt_rx = Some(interrupt_receiver());
@@ -440,8 +503,12 @@ async fn read_frame(
     reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
     frame: &mut Vec<u8>,
 ) -> std::io::Result<usize> {
-    frame.clear();
-    reader.read_until(b'\n', frame).await
+    // The other select branch can win after read_until appends a prefix.
+    // Preserve that prefix across cancellation; the caller clears only after
+    // handling a complete frame. At EOF, retained bytes still form a final
+    // frame rather than an empty-stream indication.
+    reader.read_until(b'\n', frame).await?;
+    Ok(frame.len())
 }
 
 async fn next_interrupt(
@@ -1243,6 +1310,56 @@ mod tests {
         );
         assert_eq!(prepared, UpstreamPrepare::Unchanged);
         assert!(session.is_empty());
+    }
+
+    fn serve_args(interaction: InteractionMode, socket: Option<&str>) -> ServeArgs {
+        ServeArgs {
+            interaction,
+            workspace: None,
+            request_timeout: None,
+            interaction_socket: socket.map(PathBuf::from),
+        }
+    }
+
+    #[test]
+    fn interaction_socket_requires_explicit_native_mode() {
+        for mode in [
+            InteractionMode::Auto,
+            InteractionMode::Client,
+            InteractionMode::Deny,
+        ] {
+            let error = native_surface(&serve_args(mode, Some("/tmp/aos-tray.sock")))
+                .expect_err("socket without native");
+            assert!(
+                error.contains("--interaction native"),
+                "{mode:?} must reject --interaction-socket: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_without_socket_keeps_the_platform_presenter() {
+        assert_eq!(
+            native_surface(&serve_args(InteractionMode::Native, None)).expect("native default"),
+            NativeSurface::Platform
+        );
+        assert_eq!(
+            native_surface(&serve_args(InteractionMode::Auto, None)).expect("auto default"),
+            NativeSurface::Platform
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_socket_selects_the_tray_surface() {
+        assert_eq!(
+            native_surface(&serve_args(
+                InteractionMode::Native,
+                Some("/tmp/aos-tray.sock")
+            ))
+            .expect("native socket"),
+            NativeSurface::Socket(PathBuf::from("/tmp/aos-tray.sock"))
+        );
     }
 
     #[test]

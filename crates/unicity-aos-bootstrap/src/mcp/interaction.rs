@@ -15,6 +15,13 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Map, Value, json};
 
+mod consent;
+
+#[cfg(unix)]
+mod tray;
+#[cfg(unix)]
+pub(super) use tray::TrayPresenter;
+
 const MAX_MESSAGE_BYTES: usize = 4096;
 const SAFE_APPROVAL_CHOICES: &[&str] =
     &["approve_once", "approve_session", "approve_always", "deny"];
@@ -31,6 +38,7 @@ pub(super) struct InteractionRequest {
     field: String,
     response: ResponseKind,
     options: Vec<OptionValue>,
+    consent: Option<consent::ConsentPresentation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,7 +180,7 @@ pub(super) fn parse_request(request: &Value) -> Result<InteractionRequest, Inter
         ));
     }
 
-    let (response, options) = match property.get("type").and_then(Value::as_str) {
+    let (response, mut options) = match property.get("type").and_then(Value::as_str) {
         Some("boolean") => (
             ResponseKind::Boolean,
             vec![
@@ -196,7 +204,12 @@ pub(super) fn parse_request(request: &Value) -> Result<InteractionRequest, Inter
         }
     };
 
+    let consent = consent::parse(params, field, &options)?;
+    if let Some(display) = &consent {
+        consent::apply_runtime_restart_labels(&mut options, display);
+    }
     Ok(InteractionRequest {
+        consent,
         message: message.to_owned(),
         field: field.to_owned(),
         response,
