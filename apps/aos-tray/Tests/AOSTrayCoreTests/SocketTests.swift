@@ -47,7 +47,7 @@ struct SocketEndpointTests {
     }
 }
 
-@Suite
+@Suite(.serialized)
 struct RuntimePromptBrokerTests {
     @Test func lateClickAfterCancelNeverApproves() async throws {
         let broker = RuntimePromptBroker()
@@ -57,7 +57,7 @@ struct RuntimePromptBrokerTests {
             options: ["Allow once", "Deny this"],
             timeoutSeconds: 30
         )
-        async let first = broker.decide(request)
+        async let first = Task.detached { await broker.decide(request) }.value
         try await waitUntil { !broker.currentPrompts().isEmpty }
         let promptID = try #require(broker.currentPrompts().first?.id)
         #expect(broker.currentPrompts().first?.options == ["Allow once", "Deny this"])
@@ -76,8 +76,8 @@ struct RuntimePromptBrokerTests {
             options: ["A", "B"],
             timeoutSeconds: 30
         )
-        async let first = broker.decide(request)
-        async let second = broker.decide(request)
+        async let first = Task.detached { await broker.decide(request) }.value
+        async let second = Task.detached { await broker.decide(request) }.value
         try await waitUntil { broker.currentPrompts().count == 2 }
         let ids = broker.currentPrompts().map(\.id)
         #expect(Set(ids).count == 2)
@@ -96,7 +96,7 @@ struct RuntimePromptBrokerTests {
             options: ["Allow", "Deny"],
             timeoutSeconds: 30
         )
-        let task = Task { await broker.decide(request) }
+        let task = Task.detached { await broker.decide(request) }
         task.cancel()
         try await Task.sleep(nanoseconds: 20_000_000)
         let value = try await waitForValue(timeout: 1) { await task.value }
@@ -114,7 +114,7 @@ struct RuntimePromptBrokerTests {
             options: ["Allow", "Deny"],
             timeoutSeconds: 30
         )
-        let task = Task { await broker.decide(request) }
+        let task = Task.detached { await broker.decide(request) }
         try await waitUntil { !broker.currentPrompts().isEmpty }
         #expect(broker.currentPrompts().first?.options == ["Allow", "Deny"])
         task.cancel()
@@ -124,7 +124,7 @@ struct RuntimePromptBrokerTests {
     }
 }
 
-@Suite
+@Suite(.serialized)
 struct UnixPresentationServerTests {
     @Test func acceptSelectsProvidedIndex() async throws {
         let dir = try PrivateSocketDir.make()
@@ -134,10 +134,10 @@ struct UnixPresentationServerTests {
         try server.start()
         defer { server.stop() }
 
-        try await waitUntil { SocketEndpoint.inode(at: path) != nil }
+        #expect(SocketEndpoint.inode(at: path) != nil)
         try assertMode(path, 0o600)
 
-        let response = try UnixTestClient.transact(
+        let response = try await UnixTestClient.transact(
             path: path,
             payload: requestJSON(id: "correlation-id", message: "Runtime-supplied explanation", options: ["Allow", "Deny"], timeout: 30)
         )
@@ -157,7 +157,7 @@ struct UnixPresentationServerTests {
         })
         try server.start()
         defer { server.stop() }
-        try await waitUntil { SocketEndpoint.inode(at: path) != nil }
+        #expect(SocketEndpoint.inode(at: path) != nil)
 
         async let first = UnixTestClient.transactAsync(
             path: path,
@@ -184,7 +184,7 @@ struct UnixPresentationServerTests {
             broker.cancelAll()
             server.stop()
         }
-        try await waitUntil { SocketEndpoint.inode(at: path) != nil }
+        #expect(SocketEndpoint.inode(at: path) != nil)
 
         async let response = UnixTestClient.transactAsync(
             path: path,
@@ -219,9 +219,9 @@ struct UnixPresentationServerTests {
         )
         try server.start()
         defer { server.stop() }
-        try await waitUntil { SocketEndpoint.inode(at: path) != nil }
+        #expect(SocketEndpoint.inode(at: path) != nil)
 
-        let response = try UnixTestClient.transact(
+        let response = try await UnixTestClient.transact(
             path: path,
             payload: requestJSON(id: "t", message: "timeout please", options: ["Allow"], timeout: 1),
             waitSeconds: 4
@@ -237,9 +237,9 @@ struct UnixPresentationServerTests {
         let server = UnixPresentationServer(path: path, responder: ScriptedResponder { _ in 0 })
         try server.start()
         defer { server.stop() }
-        try await waitUntil { SocketEndpoint.inode(at: path) != nil }
+        #expect(SocketEndpoint.inode(at: path) != nil)
 
-        let payload = try UnixTestClient.transactRaw(path: path, payload: "{not-json}\n", waitSeconds: 1)
+        let payload = try await UnixTestClient.transactRaw(path: path, payload: "{not-json}\n", waitSeconds: 1)
         #expect(payload == nil || payload?.isEmpty == true)
     }
 
@@ -250,7 +250,7 @@ struct UnixPresentationServerTests {
         let first = UnixPresentationServer(path: path, responder: ScriptedResponder { _ in 0 })
         try first.start()
         defer { first.stop() }
-        try await waitUntil { SocketEndpoint.inode(at: path) != nil }
+        #expect(SocketEndpoint.inode(at: path) != nil)
         let inode = try #require(SocketEndpoint.inode(at: path))
 
         let second = UnixPresentationServer(path: path, responder: ScriptedResponder { _ in 1 })
@@ -263,7 +263,7 @@ struct UnixPresentationServerTests {
         }
         #expect(SocketEndpoint.inode(at: path) == inode)
 
-        let response = try UnixTestClient.transact(
+        let response = try await UnixTestClient.transact(
             path: path,
             payload: requestJSON(id: "still-first", message: "hello", options: ["Allow"], timeout: 30)
         )
@@ -276,7 +276,7 @@ struct UnixPresentationServerTests {
         let path = dir.socketPath("cleanup.sock")
         let server = UnixPresentationServer(path: path, responder: ScriptedResponder { _ in nil })
         try server.start()
-        try await waitUntil { SocketEndpoint.inode(at: path) != nil }
+        #expect(SocketEndpoint.inode(at: path) != nil)
         server.stop()
         #expect(SocketEndpoint.inode(at: path) == nil)
         #expect(!FileManager.default.fileExists(atPath: path))
@@ -295,7 +295,7 @@ struct UnixPresentationServerTests {
             }
         )
         try server.start()
-        try await waitUntil { SocketEndpoint.inode(at: path) != nil }
+        #expect(SocketEndpoint.inode(at: path) != nil)
 
         let fd = try UnixTestClient.connect(path)
         defer { Darwin.close(fd) }
@@ -336,7 +336,7 @@ struct UnixPresentationServerTests {
         )
         try server.start()
         defer { server.stop() }
-        try await waitUntil { SocketEndpoint.inode(at: path) != nil }
+        #expect(SocketEndpoint.inode(at: path) != nil)
 
         let fd = try UnixTestClient.connect(path)
         try UnixTestClient.send(fd, requestJSON(id: "h", message: "hangup", options: ["Allow"], timeout: 30) + "\n")
@@ -415,10 +415,8 @@ private struct PrivateSocketDir {
 }
 
 private enum UnixTestClient {
-    static func transact(path: String, payload: String, waitSeconds: Int = 5) throws -> [String: Any] {
-        let line = try transactLine(path: path, payload: payload, waitSeconds: waitSeconds)
-        let data = try #require(line.data(using: .utf8))
-        return try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    static func transact(path: String, payload: String, waitSeconds: Int = 5) async throws -> [String: Any] {
+        try await transactAsync(path: path, payload: payload, waitSeconds: waitSeconds)
     }
 
     static func transactAsync(path: String, payload: String, waitSeconds: Int = 5) async throws -> [String: Any] {
@@ -431,13 +429,19 @@ private enum UnixTestClient {
 
     static func transactLine(path: String, payload: String, waitSeconds: Int) throws -> String {
         let body = payload.hasSuffix("\n") ? payload : payload + "\n"
-        guard let line = try transactRaw(path: path, payload: body, waitSeconds: waitSeconds) else {
+        guard let line = try transactRawBlocking(path: path, payload: body, waitSeconds: waitSeconds) else {
             throw WaitTimeout()
         }
         return line
     }
 
-    static func transactRaw(path: String, payload: String, waitSeconds: Int) throws -> String? {
+    static func transactRaw(path: String, payload: String, waitSeconds: Int) async throws -> String? {
+        try await Task.detached {
+            try transactRawBlocking(path: path, payload: payload, waitSeconds: waitSeconds)
+        }.value
+    }
+
+    static func transactRawBlocking(path: String, payload: String, waitSeconds: Int) throws -> String? {
         let fd = try connect(path)
         defer { Darwin.close(fd) }
         try send(fd, payload)
@@ -533,16 +537,54 @@ private func assertMode(_ path: String, _ mode: mode_t) throws {
 
 private struct WaitTimeout: Error {}
 
+private final class DeadlineWait: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resumed = false
+    private let condition: @Sendable () -> Bool
+    private let deadline: Date
+    private let queue = DispatchQueue.global(qos: .userInitiated)
+
+    init(timeout: TimeInterval, condition: @escaping @Sendable () -> Bool) {
+        self.deadline = Date().addingTimeInterval(timeout)
+        self.condition = condition
+    }
+
+    func wait(_ continuation: CheckedContinuation<Void, Error>) {
+        tick(continuation)
+    }
+
+    private func tick(_ continuation: CheckedContinuation<Void, Error>) {
+        if condition() {
+            resume(.success(()), continuation)
+            return
+        }
+        if Date() >= deadline {
+            resume(.failure(WaitTimeout()), continuation)
+            return
+        }
+        queue.asyncAfter(deadline: .now() + .milliseconds(20)) { [self] in
+            self.tick(continuation)
+        }
+    }
+
+    private func resume(_ result: Result<Void, Error>, _ continuation: CheckedContinuation<Void, Error>) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !resumed else { return }
+        resumed = true
+        continuation.resume(with: result)
+    }
+}
+
 private func waitUntil(
     timeout: TimeInterval = 2,
-    _ condition: @Sendable () -> Bool
+    _ condition: @escaping @Sendable () -> Bool
 ) async throws {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return }
-        try await Task.sleep(nanoseconds: 20_000_000)
+    if condition() { return }
+    let waiter = DeadlineWait(timeout: timeout, condition: condition)
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        waiter.wait(continuation)
     }
-    throw WaitTimeout()
 }
 
 private func waitForValue<T: Sendable>(
