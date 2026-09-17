@@ -436,6 +436,34 @@ async fn serve(
                         transport_frame.clear();
                         continue;
                     }
+                    DownstreamIntercept::Exhausted {
+                        response,
+                        runtime_cancel,
+                    } => {
+                        let frame = json_frame(&response).ok_or_else(|| {
+                            ServeFailure::Io(
+                                "failed to encode native input_required error".to_owned(),
+                            )
+                        })?;
+                        write_frame(&mut upstream_out, &frame).await.map_err(|error| {
+                            ServeFailure::Io(format!("failed to write MCP client: {error}"))
+                        })?;
+                        let cancel = json_frame(&runtime_cancel).ok_or_else(|| {
+                            ServeFailure::Io(
+                                "failed to encode exhausted-call cancellation".to_owned(),
+                            )
+                        })?;
+                        let transport_input = downstream_in.as_mut().ok_or_else(|| {
+                            ServeFailure::Io("bundled MCP transport input is closed".to_owned())
+                        })?;
+                        write_frame(transport_input, &cancel).await.map_err(|error| {
+                            ServeFailure::Io(format!(
+                                "failed to cancel exhausted native tools/call: {error}"
+                            ))
+                        })?;
+                        transport_frame.clear();
+                        continue;
+                    }
                     DownstreamIntercept::None => {}
                 }
                 match transport_action(&transport_frame, mode, client_supports_form) {
@@ -687,6 +715,10 @@ enum DownstreamIntercept {
     Resume(Value),
     Swallow,
     HostError(Value),
+    Exhausted {
+        response: Value,
+        runtime_cancel: Value,
+    },
 }
 
 fn intercept_downstream(
@@ -714,11 +746,27 @@ fn intercept_downstream(
         };
         return match resume {
             Ok(resume) => DownstreamIntercept::Resume(resume),
-            Err(
-                mrtr::MrtrError::UnknownId
-                | mrtr::MrtrError::AlreadySettled
-                | mrtr::MrtrError::TooManyRounds,
-            ) => DownstreamIntercept::Swallow,
+            Err(mrtr::MrtrError::UnknownId | mrtr::MrtrError::AlreadySettled) => {
+                DownstreamIntercept::Swallow
+            }
+            Err(mrtr::MrtrError::TooManyRounds) => {
+                let Some(id) = message.get("id") else {
+                    return DownstreamIntercept::Swallow;
+                };
+                let Some(response) = jsonrpc_error_for(&message, &mrtr::MrtrError::TooManyRounds)
+                else {
+                    return DownstreamIntercept::Swallow;
+                };
+                mrtr.complete(id);
+                DownstreamIntercept::Exhausted {
+                    response,
+                    runtime_cancel: json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": { "requestId": id },
+                    }),
+                }
+            }
             Err(error) => match message.get("id") {
                 Some(id) => {
                     mrtr.complete(id);

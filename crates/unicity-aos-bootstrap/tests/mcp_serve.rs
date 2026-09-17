@@ -880,6 +880,115 @@ exit 0
     );
 }
 
+#[test]
+fn exhausted_input_rounds_error_the_host_and_reclaim_capacity() {
+    let fixture = Fixture::new("mrtr-exhausted-rounds");
+    let cancel_path = fixture.root.join("cancel");
+    let second_path = fixture.root.join("second");
+    fixture.install_runtime(
+        r#"#!/bin/sh
+IFS= read -r request || exit 90
+printf '%s\n' "$request" > "$AOS_TEST_ARGS"
+printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"resultType":"input_required","requestState":"round-a","inputRequests":{"astrid-consent":{"method":"elicitation/create","params":{"mode":"form","message":"Allow this capsule to continue?","requestedSchema":{"type":"object","properties":{"grant":{"type":"boolean"}},"required":["grant"]}}}}}}'
+IFS= read -r _resume_a || exit 91
+printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"resultType":"input_required","requestState":"round-b","inputRequests":{"astrid-consent":{"method":"elicitation/create","params":{"mode":"form","message":"Allow this capsule to continue?","requestedSchema":{"type":"object","properties":{"grant":{"type":"boolean"}},"required":["grant"]}}}}}}'
+IFS= read -r _resume_b || exit 92
+printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"resultType":"input_required","requestState":"round-c","inputRequests":{"astrid-consent":{"method":"elicitation/create","params":{"mode":"form","message":"Allow this capsule to continue?","requestedSchema":{"type":"object","properties":{"grant":{"type":"boolean"}},"required":["grant"]}}}}}}'
+IFS= read -r cancel || exit 93
+printf '%s\n' "$cancel" > "$AOS_TEST_CANCEL"
+IFS= read -r second || exit 94
+printf '%s\n' "$second" > "$AOS_TEST_SECOND"
+printf '%s\n' '{"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"next"}]}}'
+"#,
+    );
+    let mut child = fixture
+        .command()
+        .env("AOS_TEST_CANCEL", &cancel_path)
+        .env("AOS_TEST_SECOND", &second_path)
+        .args([
+            "mcp",
+            "serve",
+            "--interaction",
+            "deny",
+            "--max-in-flight-calls",
+            "1",
+            "--max-input-rounds",
+            "2",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start isolated bridge");
+    let mut input = child.stdin.take().expect("bridge input");
+    let output = child.stdout.take().expect("bridge output");
+    let (sender, receiver) = mpsc::sync_channel(4);
+    let reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(output);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    input
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fs.read","arguments":{"path":"/tmp/report"}}}"#,
+        )
+        .expect("send first tools/call");
+    input.write_all(b"\n").expect("newline");
+    input.flush().expect("flush first tools/call");
+    let first = wait_for_file(&fixture.args, Duration::from_secs(5));
+    let first: serde_json::Value = serde_json::from_slice(&first).expect("first tools/call JSON");
+    assert_eq!(first["params"]["name"], "fs.read");
+    let error_line = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("host must receive a terminal error for the exhausted call");
+    let host_error: serde_json::Value =
+        serde_json::from_str(&error_line).expect("exhausted-call host JSON");
+    assert_eq!(host_error["id"], 7);
+    assert_eq!(host_error["error"]["code"], -32603);
+    assert_eq!(
+        host_error["error"]["message"],
+        "tracked tools/call exceeded the native input round limit"
+    );
+    let cancel = wait_for_file(&cancel_path, Duration::from_secs(5));
+    let cancel: serde_json::Value = serde_json::from_slice(&cancel).expect("cancel JSON");
+    assert_eq!(cancel["method"], "notifications/cancelled");
+    assert_eq!(cancel["params"]["requestId"], 7);
+    input
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"fs.write","arguments":{"path":"/tmp/other"}}}"#,
+        )
+        .expect("send second tools/call");
+    input.write_all(b"\n").expect("newline");
+    input.flush().expect("flush second tools/call");
+    let second = wait_for_file(&second_path, Duration::from_secs(5));
+    let second: serde_json::Value =
+        serde_json::from_slice(&second).expect("second tools/call JSON");
+    assert_eq!(second["id"], 8);
+    assert_eq!(second["params"]["name"], "fs.write");
+    let result_line = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reclaimed slot must deliver the next host result");
+    drop(input);
+    let status = wait_for_child(&mut child, Duration::from_secs(5));
+    reader.join().expect("reader completed");
+    let host_result: serde_json::Value =
+        serde_json::from_str(&result_line).expect("second-call host JSON");
+    assert_eq!(
+        host_result,
+        serde_json::json!({"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"next"}]}})
+    );
+    assert!(status.success(), "bridge exited {status}");
+}
+
 fn wait_for_file(path: &Path, timeout: Duration) -> Vec<u8> {
     let deadline = Instant::now() + timeout;
     loop {

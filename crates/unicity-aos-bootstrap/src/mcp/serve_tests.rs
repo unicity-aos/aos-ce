@@ -629,9 +629,9 @@ fn input_required_round(state: &str) -> String {
 }
 
 #[test]
-fn native_excess_rounds_are_swallowed_without_dropping_the_call() {
+fn native_excess_rounds_settle_with_host_error_and_free_the_slot() {
     let mut supported = false;
-    let mut session = mrtr::NativeMrtr::with_limits(mrtr::DEFAULT_MAX_IN_FLIGHT_CALLS, 2);
+    let mut session = mrtr::NativeMrtr::with_limits(1, 2);
     let request = tools_call(json!(7), "fs.read", json!({ "path": "/tmp/report" }));
     match prepare_client_message(
         request.as_bytes(),
@@ -658,6 +658,9 @@ fn native_excess_rounds_are_swallowed_without_dropping_the_call() {
             }
             DownstreamIntercept::Swallow => panic!("{state} must resume, not swallow"),
             DownstreamIntercept::HostError(_) => panic!("{state} must resume, not host-error"),
+            DownstreamIntercept::Exhausted { .. } => {
+                panic!("{state} must resume, not settle as exhausted")
+            }
             DownstreamIntercept::None => panic!("{state} must resume, not fall through"),
         }
     }
@@ -669,16 +672,39 @@ fn native_excess_rounds_are_swallowed_without_dropping_the_call() {
         &mut session,
         &mut presenter,
     ) {
-        DownstreamIntercept::Swallow => {}
+        DownstreamIntercept::Exhausted {
+            response,
+            runtime_cancel,
+        } => {
+            assert_eq!(response["id"], 7);
+            assert_eq!(response["error"]["code"], -32603);
+            assert_eq!(
+                response["error"]["message"],
+                "tracked tools/call exceeded the native input round limit"
+            );
+            assert_eq!(runtime_cancel["method"], "notifications/cancelled");
+            assert_eq!(runtime_cancel["params"]["requestId"], 7);
+        }
+        DownstreamIntercept::Swallow => panic!("excess rounds must not be swallowed"),
         DownstreamIntercept::HostError(_) => {
-            panic!("excess rounds must not complete via host error")
+            panic!("excess rounds must cancel the runtime, not only error the host")
         }
         DownstreamIntercept::Resume(_) => panic!("excess rounds must not resume"),
         DownstreamIntercept::None => panic!("excess rounds must not fall through"),
     }
+    assert!(session.is_empty(), "exhausted call must release its slot");
+
+    let next = tools_call(json!(8), "fs.write", json!({ "path": "/tmp/other" }));
+    match prepare_client_message(
+        next.as_bytes(),
+        InteractionMode::Native,
+        &mut supported,
+        &mut session,
+    ) {
+        UpstreamPrepare::Rewrite(_) => {}
+        other => panic!("reclaimed slot must accept the next tools/call, got {other:?}"),
+    }
     assert!(!session.is_empty());
-    assert!(session.complete(&json!(7)));
-    assert!(session.is_empty());
 }
 
 #[test]
