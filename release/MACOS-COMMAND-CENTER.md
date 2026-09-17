@@ -1,4 +1,4 @@
-# macOS Command Center packaging
+# macOS Command Center packaging and signing
 
 Darwin product archives may carry `share/AOS Command Center.app` as an extra
 release member, distinct from the signed filesystem bundle at
@@ -20,28 +20,56 @@ into `share/AOS Command Center.app`, inventories every regular file, and
 rejects symlinks. It does not rewrite Info.plist, re-sign, notarize, or call
 Apple signature verifiers. Fixture tests prove byte and mode preservation.
 
-`scripts/build-command-center.sh` is the local/signing policy helper. The
-packager does not sign.
+## Production signing
 
-- `--mode development --target aarch64-apple-darwin|x86_64-apple-darwin --output DIR`
-  builds the named architecture, stamps the product version and display name
-  `AOS Command Center` onto the assembled app, and ad-hoc signs it. Source
-  `apps/aos-tray/Info.plist` stays the developer preview (`AOS` / `0.0.1`).
-  Ad-hoc output is for local tests only and is not production-valid.
-- `--mode production --app PATH --output DIR` copies an already signed and
-  stapled app, then `codesign --verify --strict --deep` and `stapler validate`.
-  Ad-hoc signatures and missing Developer ID Application authority fail closed.
-  This mode never runs `codesign --sign`, never calls notary, and never reads
-  signing credentials. AOS does not assume Astrid Developer ID material.
+Darwin release cells assemble, Developer ID sign, notarize, staple, then
+production-validate the app before compose:
+
+1. `scripts/build-command-center.sh --mode development --target <darwin-triple> --output DIR`
+   swift-builds the named architecture and ad-hoc signs a local app. Ad-hoc
+   output is not production-valid.
+2. `scripts/sign-command-center.sh --app PATH --output DIR` copies that app,
+   codesigns it as `ai.unicity.aos.tray` with `--options runtime --timestamp`,
+   zips with `ditto` **before** `notarytool submit`, then staples and
+   validates. It never calls `security find-identity` and never exports
+   key material.
+3. `scripts/build-command-center.sh --mode production --app PATH --output DIR`
+   copies the stapled app and fail-closes unless `codesign --verify` shows
+   Developer ID Application authority and `stapler validate` succeeds. This
+   mode never signs, notarizes, or reads credentials.
+4. The production app path is exported as `AOS_COMMAND_CENTER_APP` into the
+   existing six-argument `package-release.sh` compose. Linux GNU and musl
+   cells leave the variable unset.
+
+The tag/dispatch `build` job is not a `pull_request` workflow and does not
+put the whole matrix behind `environment: release`. Apple credentials are
+wired only on Darwin cells, fail closed when empty, and use AOS-owned names.
+A dedicated `aos-macos-signing` GitHub Environment is a later ruling.
+
+These names are the contract. This repository does not store their values,
+and this increment does not claim the secrets are configured:
+
+| Helper environment | Release mapping |
+| --- | --- |
+| `AOS_MACOS_DEVELOPMENT_TEAM_ID` | `secrets.AOS_MACOS_DEVELOPMENT_TEAM_ID` |
+| `AOS_MACOS_DEVELOPER_ID_IDENTITY` | `secrets.AOS_MACOS_DEVELOPER_ID_IDENTITY` |
+| `AOS_MACOS_NOTARY_KEY_ID` | `secrets.AOS_MACOS_NOTARY_KEY_ID` |
+| `AOS_MACOS_NOTARY_ISSUER_ID` | `secrets.AOS_MACOS_NOTARY_ISSUER_ID` |
+| `AOS_MACOS_NOTARY_KEY_PATH` | workflow writes `secrets.AOS_MACOS_NOTARY_KEY` to `$RUNNER_TEMP`, mode `0600`, then unsets the secret environment variable |
+| `AOS_MACOS_NOTARY_PROFILE` | optional local keychain profile; unused on the API-key CI path |
+| `AOS_MACOS_TOOL_DIR` | test override; default `/usr/bin` |
+
+There is no silent ad-hoc identity, no `Developer ID Application` default, and
+no fallback to `ASTRID_MACOS_*` or `ASTRID_FSKIT_*`. Missing AOS credentials
+fail closed. Creating the org/repo Apple secrets is reserved authority; none
+are assumed present.
+
+`scripts/test_sign_command_center.sh` covers fail-closed credentials, Astrid
+refusal, ad-hoc refusal, tool-dir wrappers, team/identifier mismatch, a
+success fixture, and the `release.yml` contract. It is not a live Apple
+notarization.
 
 Preview CI of `apps/aos-tray` is not packaged GO.
-
-Production acceptance is the same for a later QA rehearsal and a later
-release identity: supply an already Developer ID Application signed and
-stapled app, then run `--mode production`. Ad-hoc output is never a
-production-valid input. AOS does not mint, select, or assume a Team ID
-(including Astrid's) and does not call notary. The supplied app is the
-trust identity. Fixture packager tests prove byte preservation only.
 
 ## Install
 
@@ -52,19 +80,18 @@ not write `/Applications`, and does not create a login item.
 
 Older AOS releases missing the tray remain installable.
 
-## Launch seam (not wired)
+## Launch
 
-The packaged app still requires both `--aos-binary ABSOLUTE` and
-`--aos-home ABSOLUTE`. It does not read `AOS_HOME`, PATH, or `LSEnvironment`,
-and `autoLaunchAtLogin` remains false. After a Darwin install:
+No-args launch binds the current user's `~/.aos/bin/aos` and `~/.aos`. A valid
+absolute `AOS_HOME` overrides the home; the binary is always that home's
+`bin/aos`. PATH and app-adjacent executables are not searched. Missing binaries
+are reported rather than guessed.
+
+`--aos-binary ABSOLUTE` and `--aos-home ABSOLUTE` still select an explicit
+pair together. `autoLaunchAtLogin` remains false. After a Darwin install:
 
 - App bytes: `$AOS_HOME/releases/<version>/share/AOS Command Center.app`
-- CLI: `$AOS_BIN_DIR/aos` (default `$AOS_HOME/bin/aos`)
-- Home: `$AOS_HOME` (default `$HOME/.aos`)
+- Default CLI: `$HOME/.aos/bin/aos`
+- Default home: `$HOME/.aos`
 
-Proposed later binding (not this increment): a dedicated launch resolver
-passes those two absolute paths into the packaged app, for example as
-wrapper argv or bundle `LSEnvironment`. It must not invent auth pairing
-or execute `aos` from the shell `PATH`. Finder/login-item wiring stays
-with that later resolver. Linux and Windows have no Command Center GUI
-in this increment.
+Linux and Windows have no Command Center GUI in this increment.
