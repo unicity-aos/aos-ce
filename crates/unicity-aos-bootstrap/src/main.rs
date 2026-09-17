@@ -134,6 +134,14 @@ struct DistroApplyArgs {
     /// Variable forwarded to Astrid's distro apply.
     #[arg(long = "var", value_name = "KEY=VALUE")]
     vars: Vec<String>,
+    /// Refresh already-installed named signed Distro members (repeatable).
+    /// Omitted: unfiltered apply of the bundled Distro.
+    #[arg(
+        long = "capsule",
+        value_name = "NAME",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    capsules: Vec<String>,
 }
 
 #[derive(Args)]
@@ -852,11 +860,85 @@ fn distro_principal(
     PrincipalId::new(principal).map_err(|error| format!("invalid distro apply principal: {error}"))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DistroApplyLifecycle {
+    stop_runtime: bool,
+    write_receipt: bool,
+    require_stopped_volume: bool,
+    receipt_principal_policy: distro_trust::ReceiptPrincipalPolicy,
+}
+
+fn reject_duplicate_capsule_names(names: &[String]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(format!(
+                "distro apply --capsule '{name}' was specified more than once"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn distro_apply_lifecycle(capsules: &[String]) -> Result<DistroApplyLifecycle, String> {
+    if capsules.is_empty() {
+        return Ok(DistroApplyLifecycle {
+            stop_runtime: true,
+            write_receipt: true,
+            require_stopped_volume: true,
+            receipt_principal_policy: distro_trust::ReceiptPrincipalPolicy::MustMatch,
+        });
+    }
+    reject_duplicate_capsule_names(capsules)?;
+    Ok(DistroApplyLifecycle {
+        stop_runtime: false,
+        write_receipt: false,
+        require_stopped_volume: false,
+        receipt_principal_policy: distro_trust::ReceiptPrincipalPolicy::IgnoreMismatch,
+    })
+}
+
+fn distro_apply_runtime_args(
+    principal: &str,
+    manifest_path: &Path,
+    offline: bool,
+    vars: &[String],
+    capsules: &[String],
+) -> Vec<OsString> {
+    let mut runtime_args = vec![
+        OsString::from("--principal"),
+        OsString::from(principal),
+        OsString::from("distro"),
+        OsString::from("apply"),
+        OsString::from("--yes"),
+    ];
+    for name in capsules {
+        runtime_args.push(OsString::from("--capsule"));
+        runtime_args.push(OsString::from(name));
+    }
+    runtime_args.push(manifest_path.as_os_str().to_os_string());
+    if offline {
+        runtime_args.push(OsString::from("--offline"));
+    }
+    for value in vars {
+        runtime_args.push(OsString::from("--var"));
+        runtime_args.push(OsString::from(value));
+    }
+    runtime_args
+}
+
 fn handle_distro_apply(leading_principal: Option<String>, args: DistroApplyArgs) -> ExitCode {
     if !args.yes {
         eprintln!("aos: `distro apply` requires '--yes' for non-interactive application");
         return ExitCode::from(2);
     }
+    let lifecycle = match distro_apply_lifecycle(&args.capsules) {
+        Ok(lifecycle) => lifecycle,
+        Err(error) => {
+            eprintln!("aos: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let principal = match distro_principal(leading_principal, args.principal) {
         Ok(principal) => principal,
         Err(error) => {
@@ -875,7 +957,12 @@ fn handle_distro_apply(leading_principal: Option<String>, args: DistroApplyArgs)
             return ExitCode::FAILURE;
         }
     };
-    if let Err(error) = distro_trust::check_existing_receipt(&home, &verified, principal.as_str()) {
+    if let Err(error) = distro_trust::check_existing_receipt(
+        &home,
+        &verified,
+        principal.as_str(),
+        lifecycle.receipt_principal_policy,
+    ) {
         eprintln!("aos: refusing Distro Apply before dispatch: {error}");
         return ExitCode::FAILURE;
     }
@@ -902,21 +989,13 @@ fn handle_distro_apply(leading_principal: Option<String>, args: DistroApplyArgs)
         {
             apply_error = Some(format!("failed to seed runtime distro trust: {error}"));
         } else {
-            let mut runtime_args = vec![
-                OsString::from("--principal"),
-                OsString::from(principal.as_str()),
-                OsString::from("distro"),
-                OsString::from("apply"),
-                OsString::from("--yes"),
-                verified.manifest_path.clone().into_os_string(),
-            ];
-            if args.offline {
-                runtime_args.push(OsString::from("--offline"));
-            }
-            for value in args.vars {
-                runtime_args.push(OsString::from("--var"));
-                runtime_args.push(OsString::from(value));
-            }
+            let runtime_args = distro_apply_runtime_args(
+                principal.as_str(),
+                &verified.manifest_path,
+                args.offline,
+                &args.vars,
+                &args.capsules,
+            );
             let output_result =
                 home.runtime_command_with_args(&runtime_args)
                     .and_then(|mut command| {
@@ -948,25 +1027,38 @@ fn handle_distro_apply(leading_principal: Option<String>, args: DistroApplyArgs)
         apply_error = Some("bundled runtime did not start for Distro Apply".to_owned());
     }
 
-    let stop_error = stop_after_distro_apply(&home);
+    if lifecycle.stop_runtime {
+        let stop_error = stop_after_distro_apply(&home);
+        if let Some(error) = apply_error {
+            eprintln!("aos: Distro Apply failed: {error}");
+            if let Err(stop_error) = stop_error {
+                eprintln!("aos: Distro Apply shutdown failed: {stop_error}");
+            }
+            return apply_code;
+        }
+        if let Err(error) = stop_error {
+            eprintln!("aos: Distro Apply shutdown failed: {error}");
+            return ExitCode::FAILURE;
+        }
+        if lifecycle.require_stopped_volume {
+            if let Err(error) = distro_trust::require_stopped_volume(&home) {
+                eprintln!("aos: Distro Apply stopped without a required volume: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        if lifecycle.write_receipt {
+            if let Err(error) =
+                distro_trust::write_active_receipt(&home, &verified, principal.as_str())
+            {
+                eprintln!("aos: Distro Apply succeeded but receipt write failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
     if let Some(error) = apply_error {
         eprintln!("aos: Distro Apply failed: {error}");
-        if let Err(stop_error) = stop_error {
-            eprintln!("aos: Distro Apply shutdown failed: {stop_error}");
-        }
         return apply_code;
-    }
-    if let Err(error) = stop_error {
-        eprintln!("aos: Distro Apply shutdown failed: {error}");
-        return ExitCode::FAILURE;
-    }
-    if let Err(error) = distro_trust::require_stopped_volume(&home) {
-        eprintln!("aos: Distro Apply stopped without a required volume: {error}");
-        return ExitCode::FAILURE;
-    }
-    if let Err(error) = distro_trust::write_active_receipt(&home, &verified, principal.as_str()) {
-        eprintln!("aos: Distro Apply succeeded but receipt write failed: {error}");
-        return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
@@ -1194,9 +1286,12 @@ mod tests {
 
     use super::{
         DaemonCommand, DistroCommand, ProductCli, ProductCommand, child_exit_code,
-        distro_principal, handle_product_command, help_targets_product, is_owned_root,
-        leading_owned_root, product_init_requested, runtime_stop_requested,
+        distro_apply_lifecycle, distro_apply_runtime_args, distro_principal,
+        handle_product_command, help_targets_product, is_owned_root, leading_owned_root,
+        product_init_requested, reject_duplicate_capsule_names, runtime_stop_requested,
     };
+    use crate::distro_trust::ReceiptPrincipalPolicy;
+    use std::path::Path;
 
     #[test]
     fn product_cli_parses_owned_init_surface() {
@@ -1277,6 +1372,7 @@ mod tests {
         assert!(args.yes);
         assert!(args.offline);
         assert_eq!(args.vars, ["model=fixture"]);
+        assert!(args.capsules.is_empty());
         assert!(
             ProductCli::try_parse_from([
                 "aos",
@@ -1320,6 +1416,100 @@ mod tests {
         assert!(distro_principal(None, None).is_err());
         assert!(distro_principal(Some("operator".to_owned()), Some("other".to_owned())).is_err());
         assert!(distro_principal(None, Some("not/a/principal".to_owned())).is_err());
+    }
+
+    #[test]
+    fn product_cli_parses_repeated_capsule_flags_and_rejects_empty_names() {
+        let cli = ProductCli::try_parse_from([
+            "aos",
+            "--principal",
+            "claude-code",
+            "distro",
+            "apply",
+            "--yes",
+            "--capsule",
+            "aos-mcp",
+            "--capsule",
+            "aos-skills",
+        ])
+        .expect("parse filtered distro apply");
+        let Some(ProductCommand::Distro {
+            command: DistroCommand::Apply(args),
+        }) = cli.command
+        else {
+            panic!("expected distro apply command");
+        };
+        assert_eq!(args.capsules, ["aos-mcp", "aos-skills"]);
+        assert!(
+            ProductCli::try_parse_from([
+                "aos",
+                "distro",
+                "apply",
+                "--principal",
+                "claude-code",
+                "--yes",
+                "--capsule",
+                "",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn filtered_distro_apply_forwards_capsule_flags_and_preserves_the_live_runtime() {
+        let args = distro_apply_runtime_args(
+            "claude-code",
+            Path::new("/tmp/Distro.toml"),
+            true,
+            &["model=fixture".to_owned()],
+            &["aos-mcp".to_owned(), "aos-skills".to_owned()],
+        );
+        let rendered: Vec<String> = args
+            .into_iter()
+            .map(|value| value.into_string().expect("utf8 arg"))
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                "--principal",
+                "claude-code",
+                "distro",
+                "apply",
+                "--yes",
+                "--capsule",
+                "aos-mcp",
+                "--capsule",
+                "aos-skills",
+                "/tmp/Distro.toml",
+                "--offline",
+                "--var",
+                "model=fixture",
+            ]
+        );
+
+        let filtered = distro_apply_lifecycle(&["aos-mcp".to_owned()]).expect("filtered plan");
+        assert!(!filtered.stop_runtime);
+        assert!(!filtered.write_receipt);
+        assert!(!filtered.require_stopped_volume);
+        assert_eq!(
+            filtered.receipt_principal_policy,
+            ReceiptPrincipalPolicy::IgnoreMismatch
+        );
+
+        let unfiltered = distro_apply_lifecycle(&[]).expect("unfiltered plan");
+        assert!(unfiltered.stop_runtime);
+        assert!(unfiltered.write_receipt);
+        assert!(unfiltered.require_stopped_volume);
+        assert_eq!(
+            unfiltered.receipt_principal_policy,
+            ReceiptPrincipalPolicy::MustMatch
+        );
+
+        let duplicate =
+            reject_duplicate_capsule_names(&["aos-mcp".to_owned(), "aos-mcp".to_owned()])
+                .expect_err("duplicate --capsule names fail closed");
+        assert!(duplicate.contains("was specified more than once"));
+        assert!(distro_apply_lifecycle(&["aos-mcp".to_owned(), "aos-mcp".to_owned()]).is_err());
     }
 
     #[test]
