@@ -29,10 +29,13 @@ production-validate the app before compose:
    swift-builds the named architecture and ad-hoc signs a local app. Ad-hoc
    output is not production-valid.
 2. `scripts/sign-command-center.sh --app PATH --output DIR` copies that app,
-   codesigns it as `ai.unicity.aos.tray` with `--options runtime --timestamp`,
-   zips with `ditto` **before** `notarytool submit`, then staples and
-   validates. It never calls `security find-identity` and never exports
-   key material.
+   imports `AOS_MACOS_CERTIFICATE_P12_PATH` into an ephemeral keychain,
+   codesigns it as `ai.unicity.aos.tray` with `--keychain` bound to that
+   keychain plus `--options runtime --timestamp`, zips with `ditto`
+   **before** `notarytool submit`, then staples and validates. It never
+   calls `security find-identity`, never exports key material, and never
+   changes the runner default or search-list keychain. The keychain is
+   deleted on exit.
 3. `scripts/build-command-center.sh --mode production --app PATH --output DIR`
    copies the stapled app and fail-closes unless `codesign --verify` shows
    Developer ID Application authority and `stapler validate` succeeds. This
@@ -53,6 +56,8 @@ and this increment does not claim the secrets are configured:
 | --- | --- |
 | `AOS_MACOS_DEVELOPMENT_TEAM_ID` | `secrets.AOS_MACOS_DEVELOPMENT_TEAM_ID` |
 | `AOS_MACOS_DEVELOPER_ID_IDENTITY` | `secrets.AOS_MACOS_DEVELOPER_ID_IDENTITY` |
+| `AOS_MACOS_CERTIFICATE_P12_PATH` | workflow base64-decodes `secrets.AOS_MACOS_CERTIFICATE_P12` to `$RUNNER_TEMP/aos-command-center-signing.p12`, mode `0600`, then unsets the secret environment variable |
+| `AOS_MACOS_CERTIFICATE_PASSWORD` | `secrets.AOS_MACOS_CERTIFICATE_PASSWORD` |
 | `AOS_MACOS_NOTARY_KEY_ID` | `secrets.AOS_MACOS_NOTARY_KEY_ID` |
 | `AOS_MACOS_NOTARY_ISSUER_ID` | `secrets.AOS_MACOS_NOTARY_ISSUER_ID` |
 | `AOS_MACOS_NOTARY_KEY_PATH` | workflow writes `secrets.AOS_MACOS_NOTARY_KEY` to `$RUNNER_TEMP`, mode `0600`, then unsets the secret environment variable |
@@ -64,10 +69,13 @@ no fallback to `ASTRID_MACOS_*` or `ASTRID_FSKIT_*`. Missing AOS credentials
 fail closed. Creating the org/repo Apple secrets is reserved authority; none
 are assumed present.
 
-`scripts/test_sign_command_center.sh` covers fail-closed credentials, Astrid
-refusal, ad-hoc refusal, tool-dir wrappers, team/identifier mismatch, a
-success fixture, and the `release.yml` contract. It is not a live Apple
-notarization.
+`scripts/test_sign_command_center.sh` covers fail-closed credentials,
+missing PKCS12 path/password, Astrid refusal, ad-hoc refusal, tool-dir
+wrappers, exact-line team/identifier checks (including longer spoof
+values), ephemeral import plus `--keychain` binding and keychain
+cleanup, and the `release.yml` contract. It is not a live Apple
+notarization. Secrets are not configured in this increment; creating
+them remains reserved authority.
 
 Preview CI of `apps/aos-tray` is not packaged GO.
 
