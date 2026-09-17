@@ -531,7 +531,7 @@ runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
 replacements = {
     "version": 'version = "2026.9.2"',
     "tag": 'tag = "v2026.9.2"',
-    "version-requirement": 'version-requirement = "=2026.9.2"',
+    "version-requirement": 'version-requirement = ">=2026.9.2"',
     "release-workflow-identity": 'release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.2"',
     "source-commit": 'source-commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"',
     "release-metadata-asset": 'release-metadata-asset = "astrid-2026.9.2-release.toml"',

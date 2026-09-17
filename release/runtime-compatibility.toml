@@ -10,7 +10,7 @@ release-ready = true
 upgrade-self-heal-ready = true
 version = "2026.9.2"
 tag = "v2026.9.2"
-version-requirement = "=2026.9.2"
+version-requirement = ">=2026.9.2"
 release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.2"
 release-metadata-available = true
 source-commit = "e5361d119c5672eda08888f85fbd14e36166b055"

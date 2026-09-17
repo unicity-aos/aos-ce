@@ -24,6 +24,18 @@ SPEC.loader.exec_module(VALIDATOR)
 
 
 class ReleaseReadinessTests(unittest.TestCase):
+    def test_runtime_minimum_accepts_newer_stable_releases(self) -> None:
+        for runtime in ("2026.9.2", "2026.9.3", "2026.10.0", "2027.1.0"):
+            VALIDATOR.validate_runtime_minimum(">=2026.9.2", runtime)
+
+    def test_runtime_minimum_rejects_older_or_invalid_identity(self) -> None:
+        for runtime in ("2026.9.1", "2026.8.9", "2026.9.3-rc.1", "bad"):
+            with self.subTest(runtime=runtime), self.assertRaises(ValueError):
+                VALIDATOR.validate_runtime_minimum(">=2026.9.2", runtime)
+        for requirement in ("=2026.9.2", ">=2026.09.2", "*", "bad"):
+            with self.subTest(requirement=requirement), self.assertRaises(ValueError):
+                VALIDATOR.validate_runtime_minimum(requirement, "2026.9.2")
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
