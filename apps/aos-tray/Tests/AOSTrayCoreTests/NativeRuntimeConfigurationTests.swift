@@ -3,7 +3,7 @@ import Testing
 @testable import AOSTrayCore
 
 @Suite struct NativeRuntimeConfigurationTests {
-    @Test func missingSessionTokenIsTransientButInvalidCredentialsAreNot() async throws {
+    @Test func missingProjectedCredentialsAreTransientButInvalidCredentialsAreNot() async throws {
         let root = URL(fileURLWithPath: "/private/tmp/ani-reconnect-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -32,8 +32,18 @@ import Testing
         do {
             _ = try await config.connect()
             Issue.record("Missing device key connected")
+        } catch NativeRuntimeSocketError.unavailable {}
+        catch { Issue.record("Missing projected device key was classified as permanent") }
+
+        // A restored key is read again, not cached. The malformed token still
+        // prevents authentication after the projection comes back.
+        try Data(repeating: 7, count: 32).write(to: key)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: key.path)
+        do {
+            _ = try await config.connect()
+            Issue.record("Restored key bypassed malformed token")
         } catch NativeRuntimeConfigurationError.unavailableCredential {}
-        catch { Issue.record("Missing device key was not a permanent credential failure") }
+        catch { Issue.record("Restored credentials did not retain strict token validation") }
     }
 
     @Test func privateFilesAreBoundedAndRejectRedirects() throws {
