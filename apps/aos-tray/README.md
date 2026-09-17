@@ -90,7 +90,15 @@ Older AOS builds without this flag remain usable for Overview; Capsules shows
 unavailable. The list is package metadata, not effective grants or global inventory.
 
 The volume section reads `runtime/astrid.volume` metadata and can reveal that
-container file in Finder. File size is not allocation or capacity. “Open mounted
+container file in Finder. File size is not allocation or capacity. **Open files**
+mounts a fixed app-owned folder (`$AOS_HOME/mnt/files`) for the selected owned
+principal if it is not already `astridfs`, then verifies `aos status --json`
+plus a native `statfs` recheck before opening Finder. **Eject** unmounts that
+same captured path. Both spawn `aos --principal <id> storage mount|unmount`
+with `AOS_HOME` set; `storage` is inherited product passthrough, so AOS selects
+the runtime home and workspace-state layout. They do not pass `--admin`,
+`--fleet`, `--read-write`, or `--workspace`, do not auto-mount at launch, and
+do not start a daemon. A failed mount or unmount is not success. “Open mounted
 volume…” separately selects an existing macOS mount root, verifies its lease via
 `aos status --json --principal=default --mountpoint=<path>`, and rechecks the native
 filesystem before opening Finder. It never starts, mounts, or unmounts a runtime.

@@ -218,12 +218,44 @@ public enum NativeRuntimeSetup {
         return try decodeReceipt(out, principal: principal, connectionPath: expectedConnection)
     }
 
-    static func realHome(_ home: String) -> String? {
-        guard home.hasPrefix("/"), !home.contains("\0"), !home.hasSuffix("/") else { return nil }
-        let parts = home.split(separator: "/", omittingEmptySubsequences: true)
-        guard !parts.isEmpty, parts.allSatisfy({ $0 != "." && $0 != ".." && !$0.isEmpty }) else {
+    static func boundedAbsolutePath(_ path: String) -> Bool {
+        guard path.hasPrefix("/"), !path.contains("\0"), !path.hasSuffix("/") else { return false }
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true)
+        return !parts.isEmpty && parts.allSatisfy({ $0 != "." && $0 != ".." && !$0.isEmpty })
+    }
+
+    /// Darwin `/tmp` and `/var` firmlink spellings. Not a general symlink walker.
+    static func darwinAliasPath(_ path: String) -> String {
+        if path == "/tmp" || path.hasPrefix("/tmp/") || path == "/var" || path.hasPrefix("/var/") {
+            return "/private" + path
+        }
+        return path
+    }
+
+    /// Existing directory after libc `realpath`. `/tmp` and `/var` canonicalize
+    /// to `/private/...`; a user-created symlink component does not.
+    static func realExistingDirectory(_ path: String) -> String? {
+        guard boundedAbsolutePath(path) else { return nil }
+        var info = stat()
+        guard path.withCString({ lstat($0, &info) }) == 0,
+              (info.st_mode & S_IFMT) == S_IFDIR else {
             return nil
         }
+        var resolved = [CChar](repeating: 0, count: Int(PATH_MAX))
+        guard path.withCString({ realpath($0, &resolved) }) != nil else { return nil }
+        let canonical = String(cString: resolved)
+        var canonInfo = stat()
+        guard canonical.withCString({ stat($0, &canonInfo) }) == 0,
+              (canonInfo.st_mode & S_IFMT) == S_IFDIR else {
+            return nil
+        }
+        guard canonical == darwinAliasPath(path) else { return nil }
+        return canonical
+    }
+
+    static func realHome(_ home: String) -> String? {
+        guard boundedAbsolutePath(home) else { return nil }
+        let parts = home.split(separator: "/", omittingEmptySubsequences: true)
 
         var current = home
         var missing: [String] = []

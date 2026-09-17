@@ -23,17 +23,31 @@ public struct MountedVolume: Decodable, Equatable, Sendable {
     /// directory must not be presented as the mounted filesystem.
     public func verifiedNativeRoot() throws -> URL {
         try validate()
-        let url = URL(fileURLWithPath: mountpoint).resolvingSymlinksInPath()
-        guard url.path == mountpoint else { throw OverviewError.invalidStatus }
+        guard let canonical = NativeRuntimeSetup.realExistingDirectory(mountpoint),
+              Self.isExactAstridFS(canonical) else { throw OverviewError.invalidStatus }
+        return URL(fileURLWithPath: canonical, isDirectory: true)
+    }
+
+    /// True only when `path` is the live astridfs mount root, not a directory on another filesystem.
+    /// Identity is libc `realpath` versus Darwin `statfs` `f_mntonname`, not Foundation
+    /// `resolvingSymlinksInPath` (which presents `/private/tmp` as `/tmp`).
+    static func isExactAstridFS(_ path: String) -> Bool {
+        guard let canonical = NativeRuntimeSetup.realExistingDirectory(path) else { return false }
         var info = statfs()
-        guard statfs(mountpoint, &info) == 0 else { throw OverviewError.invalidStatus }
+        guard canonical.withCString({ statfs($0, &info) }) == 0 else { return false }
         let root = withUnsafeBytes(of: info.f_mntonname) {
             String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self)
         }
         let type = withUnsafeBytes(of: info.f_fstypename) {
             String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self)
         }
-        guard root == mountpoint, type == "astridfs" else { throw OverviewError.invalidStatus }
-        return url
+        return matchesReportedMountRoot(path, reportedRoot: root) && type == "astridfs"
+    }
+
+    /// Kernel mount-root identity. Foundation `/tmp` presentation is not a match
+    /// for a `/private/tmp` `f_mntonname`.
+    static func matchesReportedMountRoot(_ path: String, reportedRoot: String) -> Bool {
+        guard let canonical = NativeRuntimeSetup.realExistingDirectory(path) else { return false }
+        return canonical == reportedRoot
     }
 }
