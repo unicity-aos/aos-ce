@@ -27,6 +27,9 @@ implementations are consolidated into their final behavior.
 - Failed native-input setup now removes only files this attempt created and
   refuses preexisting device-key sidecars instead of deleting them. A
   successful pairing redeem is not rolled back in the daemon.
+- Native-input setup canonicalizes macOS `/tmp` home aliases before pairing
+  and binds setup receipts to the requested principal and expected
+  connection path.
 
 ## [2026.9.2] - 2026-09-13
 

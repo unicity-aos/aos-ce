@@ -68,9 +68,12 @@ fn native_setup_enrolls_local_personal_device_without_overwriting_or_leaking_tok
     assert_eq!(document["principal"], "alice");
     assert_eq!(document["restartRequired"], true);
     assert_eq!(document["connected"], false);
+    let expected_connection = fs::canonicalize(&fixture.home)
+        .expect("canonical home")
+        .join("native-input/connection.json");
     assert_eq!(
         document["connectionPath"],
-        connection.to_string_lossy().as_ref()
+        expected_connection.to_string_lossy().as_ref()
     );
     assert_no_token_in_product_output(&output, &receipt);
 
@@ -148,8 +151,10 @@ fn native_setup_refuses_existing_connection_key_or_responders_without_runtime_pa
         .output()
         .expect("refuse existing connection");
     assert_eq!(existing_connection.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&existing_connection.stderr)
-        .contains("a native-input connection already exists; not overwritten"));
+    assert!(
+        String::from_utf8_lossy(&existing_connection.stderr)
+            .contains("a native-input connection already exists; not overwritten")
+    );
     assert_eq!(
         fs::read(&connection).expect("preserve connection"),
         b"keep-me"
@@ -166,8 +171,10 @@ fn native_setup_refuses_existing_connection_key_or_responders_without_runtime_pa
         .output()
         .expect("refuse existing key");
     assert_eq!(existing_key.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&existing_key.stderr)
-        .contains("device key aos-tray already exists; not overwritten"));
+    assert!(
+        String::from_utf8_lossy(&existing_key.stderr)
+            .contains("device key aos-tray already exists; not overwritten")
+    );
     assert_eq!(fs::read(&key).expect("preserve key").len(), 32);
     assert!(!fixture.args.exists());
     fs::remove_file(&key).expect("clear key");
@@ -184,11 +191,15 @@ fn native_setup_refuses_existing_connection_key_or_responders_without_runtime_pa
         .output()
         .expect("refuse existing responders");
     assert_eq!(existing_route.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&existing_route.stderr)
-        .contains("native-input operator routing already exists; not overwritten"));
-    assert!(fs::read_to_string(&config)
-        .expect("preserve config")
-        .contains("bob = \"fedcba9876543210\""));
+    assert!(
+        String::from_utf8_lossy(&existing_route.stderr)
+            .contains("native-input operator routing already exists; not overwritten")
+    );
+    assert!(
+        fs::read_to_string(&config)
+            .expect("preserve config")
+            .contains("bob = \"fedcba9876543210\"")
+    );
     assert!(!fixture.args.exists());
 }
 
@@ -258,8 +269,10 @@ fn native_setup_fails_closed_without_confirms_json_or_a_valid_principal() {
         .output()
         .expect("reject missing confirms");
     assert_eq!(missing.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&missing.stderr)
-        .contains("requires --json --confirm-enroll --confirm-route"));
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("requires --json --confirm-enroll --confirm-route")
+    );
     assert!(!fixture.args.exists());
 
     let missing_principal = fixture
@@ -273,8 +286,10 @@ fn native_setup_fails_closed_without_confirms_json_or_a_valid_principal() {
         .output()
         .expect("reject missing principal");
     assert_eq!(missing_principal.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&missing_principal.stderr)
-        .contains("requires an explicit '--principal PRINCIPAL'"));
+    assert!(
+        String::from_utf8_lossy(&missing_principal.stderr)
+            .contains("requires an explicit '--principal PRINCIPAL'")
+    );
     assert!(!fixture.args.exists());
 
     let invalid = fixture
@@ -373,4 +388,75 @@ fn native_setup_does_not_fall_back_when_pair_device_is_unsupported_or_fails() {
     );
     assert!(!connection.exists());
     assert!(!fixture.home.join("runtime/config.toml").exists());
+}
+
+#[test]
+fn native_setup_canonicalizes_tmp_alias_home_before_pairing() {
+    let fixture = Fixture::new("native-setup-tmp-alias");
+    fixture.install_runtime(NATIVE_SETUP_RUNTIME);
+    let name = format!(
+        "aos-native-setup-alias-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let alias = PathBuf::from("/tmp").join(&name);
+    let canonical_home = fs::canonicalize("/tmp").expect("tmp").join(&name);
+    struct Remove(PathBuf, PathBuf);
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+            let _ = fs::remove_dir_all(&self.1);
+        }
+    }
+    let _guard = Remove(canonical_home.clone(), alias.clone());
+    assert!(!alias.exists());
+
+    let output = fixture
+        .command()
+        .env("AOS_HOME", &alias)
+        .args(native_setup_args())
+        .output()
+        .expect("run native-setup");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt = String::from_utf8(output.stdout.clone()).expect("utf8 receipt");
+    let document: serde_json::Value = serde_json::from_str(&receipt).expect("parse receipt");
+    let expected_connection = canonical_home.join("native-input/connection.json");
+    assert_eq!(
+        document["connectionPath"],
+        expected_connection.to_string_lossy().as_ref()
+    );
+    assert_no_token_in_product_output(&output, &receipt);
+    let connection_json = fs::read_to_string(&expected_connection).expect("read connection");
+    assert!(connection_json.contains(&format!(
+        "\"socketPath\": \"{}\"",
+        canonical_home.join("run/system.sock").display()
+    )));
+    assert!(connection_json.contains(&format!(
+        "\"privateKeyPath\": \"{}\"",
+        canonical_home.join("runtime/keys/local/aos-tray.ed25519").display()
+    )));
+    if alias != canonical_home {
+        // Quote the alias so `/private/tmp/<name>/` is not a false-positive
+        // substring of the canonical macOS path.
+        let leaked = format!("\"/tmp/{name}/");
+        assert!(
+            !connection_json.contains(&leaked),
+            "connection retained alias spelling {leaked}"
+        );
+    }
+    assert!(
+        !alias
+            .join("native-input")
+            .symlink_metadata()
+            .ok()
+            .is_some_and(|meta| meta.file_type().is_symlink()),
+        "must not strand a symlink-spelling tree beside the canonical home"
+    );
 }
