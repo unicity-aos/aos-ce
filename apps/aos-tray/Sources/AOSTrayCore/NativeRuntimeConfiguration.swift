@@ -68,6 +68,11 @@ public struct NativeRuntimeConfiguration: Codable, Sendable {
             }
         } catch NativeRuntimeSocketError.unavailable {
             throw NativeRuntimeSocketError.unavailable
+        } catch NativeRuntimeConfigurationError.credentialAbsent {
+            // The paired key may live in the runtime projection, which is
+            // retired into the volume on stop. Re-read and authenticate after
+            // restart; never cache the key or bypass its file checks.
+            throw NativeRuntimeSocketError.unavailable
         } catch { throw NativeRuntimeConfigurationError.unavailableCredential }
         let socket = try await NativeRuntimeSocket.connect(path: socketPath, timeout: ioTimeoutSeconds)
         try await socket.authenticate(principal: principal, token: token, signingKey: key, timeout: ioTimeoutSeconds)
