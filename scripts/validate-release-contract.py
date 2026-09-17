@@ -69,6 +69,19 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def validate_runtime_minimum(requirement: str, runtime: str) -> None:
+    """Check the stable minimum independently of the selected artifact identity."""
+    version = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    minimum = re.fullmatch(r">=" + version, requirement)
+    selected = re.fullmatch(version, runtime)
+    require(minimum is not None, "runtime requirement must be a canonical >= minimum")
+    require(selected is not None, "selected runtime must be canonical stable semver")
+    require(
+        tuple(map(int, selected.groups())) >= tuple(map(int, minimum.groups())),
+        "selected runtime is below the compatibility minimum",
+    )
+
+
 def validate_product_version(value: str, *, allow_nightly: bool) -> None:
     canonical = r"(?:202[6-9]|20[3-9][0-9])\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
     accepted = canonical
@@ -201,13 +214,11 @@ def main(argv: list[str] | None = None) -> int:
         compatibility[("runtime", "tag")] == f"v{runtime_version}",
         "runtime tag does not match the pinned runtime version",
     )
+    runtime_requirement = compatibility[("runtime", "version-requirement")]
+    validate_runtime_minimum(runtime_requirement, runtime_version)
     require(
-        compatibility[("runtime", "version-requirement")] == f"={runtime_version}",
-        "runtime version requirement must be an exact pin",
-    )
-    require(
-        distro[("distro", "astrid-version")] == f"={runtime_version}",
-        "distro Astrid requirement does not match the bundled runtime",
+        distro[("distro", "astrid-version")] == runtime_requirement,
+        "distro Astrid requirement does not match the compatibility minimum",
     )
     for dependency in ("astrid-core", "astrid-uplink"):
         require(

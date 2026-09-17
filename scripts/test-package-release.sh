@@ -396,7 +396,7 @@ runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
 replacements = {
     "version": 'version = "2026.9.2"',
     "tag": 'tag = "rehearsal-only-2026.9.2"',
-    "version-requirement": 'version-requirement = "=2026.9.2"',
+    "version-requirement": 'version-requirement = ">=2026.9.2"',
     "release-workflow-identity": 'release-workflow-identity = "rehearsal-only:test"',
 }
 in_runtime = False

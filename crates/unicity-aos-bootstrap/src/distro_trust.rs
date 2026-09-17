@@ -121,11 +121,7 @@ pub(crate) fn verify_selected_release(home: &AosHome) -> io::Result<VerifiedDist
         )));
     }
     let astrid_version = required_string(distro, "astrid-version", "Distro.toml [distro]")?;
-    if astrid_version != format!("={ASTRID_RUNTIME_VERSION}") {
-        return Err(invalid_data(format!(
-            "bundled distro requires Astrid {astrid_version:?}, expected ={ASTRID_RUNTIME_VERSION}"
-        )));
-    }
+    validate_runtime_requirement(&astrid_version, ASTRID_RUNTIME_VERSION)?;
     let signing = distro
         .get("signing")
         .and_then(toml::Value::as_table)
@@ -569,6 +565,46 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Compatibility is a requirement; release receipts still identify exact bytes.
+fn validate_runtime_requirement(requirement: &str, runtime: &str) -> io::Result<()> {
+    let requirement = semver::VersionReq::parse(requirement)
+        .map_err(|error| invalid_data(format!("invalid distro Astrid requirement: {error}")))?;
+    let version = semver::Version::parse(runtime)
+        .map_err(|error| invalid_data(format!("invalid bundled Astrid version: {error}")))?;
+    if !requirement.matches(&version) {
+        return Err(invalid_data(format!(
+            "bundled distro requires Astrid {requirement}, but bundled runtime is {version}"
+        )));
+    }
+    Ok(())
+}
+
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::validate_runtime_requirement;
+
+    #[test]
+    fn minimum_accepts_same_and_newer_releases() {
+        for version in ["2026.9.2", "2026.9.3", "2026.10.0", "2027.1.0"] {
+            validate_runtime_requirement(">=2026.9.2", version).unwrap();
+        }
+    }
+
+    #[test]
+    fn minimum_rejects_older_malformed_and_unrequested_prerelease() {
+        for version in ["2026.9.1", "2026.8.9", "invalid", "2026.9.3-rc.1"] {
+            assert!(validate_runtime_requirement(">=2026.9.2", version).is_err());
+        }
+        assert!(validate_runtime_requirement("invalid", "2026.9.2").is_err());
+    }
+
+    #[test]
+    fn historical_exact_requirements_remain_valid() {
+        validate_runtime_requirement("=2026.9.2", "2026.9.2").unwrap();
+        assert!(validate_runtime_requirement("=2026.9.2", "2026.9.3").is_err());
+    }
 }
