@@ -16,6 +16,11 @@ implementations are consolidated into their final behavior.
 
 ### Added
 
+- Add a developer-preview macOS AOS menu-bar app with permission dialogs,
+  typed private-input forms, runtime overview, searchable capsule inventory and
+  owned-principal selection. Explicit local setup pairs a dedicated responder;
+  disconnection and cancellation never approve. App distribution and automatic
+  launch are not yet integrated.
 - Intercept modern MCP `input_required` results in `aos mcp serve` native, auto
   (when the client lacks forms), and deny modes. The original `tools/call` is
   resumed to the runtime with echoed `requestState`; incomplete results stay off
@@ -33,6 +38,16 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- No-args AOS Tray launch binds the current user's `~/.aos/bin/aos` and
+  `~/.aos`, or a valid absolute `AOS_HOME`, instead of leaving Finder
+  launches unable to inventory or set up native input. `PATH` search,
+  app-adjacent binaries, and silent pairing remain out of scope.
+- Failed native-input setup now removes only files this attempt created and
+  refuses preexisting device-key sidecars instead of deleting them. A
+  successful pairing redeem is not rolled back in the daemon.
+- Native-input setup canonicalizes macOS `/tmp` home aliases before pairing
+  and binds setup receipts to the requested principal and expected
+  connection path.
 - Bind MCP tool results to the kernel-stamped identity selected during tool
   discovery as well as the call ID, including calls resumed after approval.
 - Preserve partial MCP frames when bidirectional reads are interrupted, rather

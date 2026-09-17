@@ -1,0 +1,51 @@
+[package]
+name = "native-input-probe"
+version = "0.1.0"
+description = "Disposable native input integration probe; never exports secret values"
+astrid-version = ">=2026.9.2"
+
+[[component]]
+id = "native-input-probe"
+file = "native_input_probe.wasm"
+type = "executable"
+
+[publish]
+"cli.v1.command.result.*" = { wit = "opaque" }
+
+[subscribe]
+"cli.v1.command.run.native-input-probe" = { wit = "opaque" }
+
+[[command]]
+name = "collect"
+kind = "cli"
+description = "Collect a synthetic token through native input"
+
+[[command]]
+name = "stored"
+kind = "cli"
+description = "Check existence without exposing the stored token"
+
+[[command]]
+name = "text"
+kind = "cli"
+description = "Check synthetic text input"
+
+[[command]]
+name = "empty-text"
+kind = "cli"
+description = "Check empty text differs from cancellation"
+
+[[command]]
+name = "select"
+kind = "cli"
+description = "Check an exact selection"
+
+[[command]]
+name = "array"
+kind = "cli"
+description = "Check list entries are not comma-split"
+
+[[command]]
+name = "empty-array"
+kind = "cli"
+description = "Check an empty list differs from cancellation"

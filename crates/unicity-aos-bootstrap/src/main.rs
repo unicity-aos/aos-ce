@@ -15,9 +15,13 @@ use astrid_core::PrincipalId;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use unicity_aos_bootstrap::{AOS_WORKSPACE_STATE_DIR, AosHome};
 
+mod cli;
 mod distro_trust;
 mod hook;
 mod mcp;
+#[cfg(unix)]
+mod native_setup;
+mod principals;
 
 // Product-owned commands are parsed here. Unknown roots bypass this parser and
 // are delegated byte-for-byte to the bundled runtime by `main`.
@@ -46,7 +50,7 @@ enum ProductCommand {
     /// Initialize Unicity CE using the manifest bundled with this release.
     Init(InitArgs),
     /// Show product status from the typed local runtime operation.
-    Status(StatusArgs),
+    Status(cli::StatusArgs),
     /// Import compatible state from a standalone runtime installation.
     Migrate {
         #[command(subcommand)]
@@ -67,6 +71,11 @@ enum ProductCommand {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// List principals the authenticated operator is permitted to discover.
+    Principals(cli::PrincipalsArgs),
+    /// Enroll this local machine for native input. Discovery is not acting authority.
+    #[command(name = "native-setup")]
+    NativeSetup(cli::NativeSetupArgs),
     /// Serve the loopback-only product health endpoint.
     ServeHealth,
     /// Run the bundled runtime daemon in the foreground.
@@ -122,21 +131,6 @@ struct DistroApplyArgs {
     /// Variable forwarded to Astrid's distro apply.
     #[arg(long = "var", value_name = "KEY=VALUE")]
     vars: Vec<String>,
-}
-
-#[derive(Args)]
-struct StatusArgs {
-    /// Authenticated runtime principal for this status request.
-    #[arg(
-        id = "status-principal",
-        long = "principal",
-        value_name = "PRINCIPAL",
-        value_parser = clap::builder::NonEmptyStringValueParser::new()
-    )]
-    principal: Option<String>,
-    /// Print a machine-readable JSON status object.
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Args)]
@@ -355,20 +349,26 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
                     | ProductCommand::Hook(_)
                     | ProductCommand::Mcp { .. }
                     | ProductCommand::Status(_)
+                    | ProductCommand::Principals(_)
+                    | ProductCommand::NativeSetup(_)
             )
         )
     {
         eprintln!(
-            "aos: '--principal' is supported for `aos init`, `aos status`, `aos hook`, and `aos mcp`; this AOS-owned command does not accept a runtime principal"
+            "aos: '--principal' is supported for `aos init`, `aos status`, `aos hook`, `aos mcp`, `aos principals`, and `aos native-setup`; this AOS-owned command does not accept a runtime principal"
         );
         return Some(ExitCode::from(2));
     }
 
     match cli.command {
         Some(ProductCommand::Init(_)) => None,
-        Some(ProductCommand::Status(args)) => {
-            Some(handle_status(cli.principal, args.principal, args.json))
-        }
+        Some(ProductCommand::Status(args)) => Some(cli::handle_status(
+            cli.principal,
+            args.principal,
+            args.json,
+            args.include_capsules,
+            args.mountpoint,
+        )),
         Some(ProductCommand::Migrate {
             command: MigrateCommand::Runtime { from },
         }) => Some(handle_migrate_runtime(&from)),
@@ -380,6 +380,14 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
         Some(ProductCommand::Mcp {
             command: McpCommand::Serve(args),
         }) => Some(mcp::handle_serve(cli.principal, args)),
+        Some(ProductCommand::Principals(args)) => Some(cli::handle_principals(
+            cli.principal,
+            args.principal,
+            args.json,
+        )),
+        Some(ProductCommand::NativeSetup(args)) => {
+            Some(cli::handle_native_setup(cli.principal, args))
+        }
         Some(ProductCommand::ServeHealth) => Some(handle_health_service()),
         Some(ProductCommand::Daemon {
             command: DaemonCommand::Foreground(args),
@@ -652,6 +660,8 @@ fn is_owned_root(value: &str) -> bool {
             | "hook"
             | "mcp"
             | "daemon"
+            | "principals"
+            | "native-setup"
             | "serve-health"
     )
 }
@@ -1062,86 +1072,6 @@ fn handle_hook(principal: Option<String>, args: hook::HookArgs) -> ExitCode {
     }
 }
 
-fn status_principal(
-    leading_principal: Option<String>,
-    trailing_principal: Option<String>,
-) -> Result<PrincipalId, String> {
-    let principal = match (leading_principal, trailing_principal) {
-        (Some(_), Some(_)) => {
-            return Err(
-                "'--principal' was provided both before and after `status`; provide it once"
-                    .to_owned(),
-            );
-        }
-        (Some(principal), None) | (None, Some(principal)) => Some(principal),
-        (None, None) => None,
-    };
-    principal.map_or_else(
-        || Ok(PrincipalId::default()),
-        |principal| {
-            PrincipalId::new(principal)
-                .map_err(|error| format!("invalid status principal: {error}"))
-        },
-    )
-}
-
-fn handle_status(
-    leading_principal: Option<String>,
-    command_principal: Option<String>,
-    json: bool,
-) -> ExitCode {
-    let principal = match status_principal(leading_principal, command_principal) {
-        Ok(principal) => principal,
-        Err(error) => {
-            eprintln!("aos: {error}");
-            return ExitCode::from(2);
-        }
-    };
-    let home = match resolve_home() {
-        Ok(home) => home,
-        Err(code) => return code,
-    };
-    set_runtime_environment(&home);
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("aos: failed to start status client: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let status = match runtime.block_on(unicity_aos_bootstrap::status::read_for_principal(
-        &home, principal,
-    )) {
-        Ok(status) => status,
-        Err(error) => {
-            eprintln!("aos: runtime status unavailable: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if json {
-        match serde_json::to_string(&status) {
-            Ok(json) => println!("{json}"),
-            Err(error) => {
-                eprintln!("aos: failed to encode status: {error}");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        println!("Unicity AOS");
-        println!("State: {}", status.state);
-        println!("PID: {}", status.pid);
-        println!("Uptime: {}s", status.uptime_secs);
-        println!("Runtime version: {}", status.runtime_version);
-        println!("Connected clients: {}", status.connected_clients);
-        println!("Loaded capsules: {}", status.loaded_capsules.len());
-    }
-    ExitCode::SUCCESS
-}
-
 fn set_runtime_environment(home: &AosHome) {
     // Safety: this runs before the current-thread client runtime starts and before this
     // dedicated CLI process creates any other threads.
@@ -1256,7 +1186,7 @@ mod tests {
     use super::{
         DaemonCommand, DistroCommand, ProductCli, ProductCommand, child_exit_code,
         distro_principal, handle_product_command, help_targets_product, is_owned_root,
-        leading_owned_root, product_init_requested, runtime_stop_requested, status_principal,
+        leading_owned_root, product_init_requested, runtime_stop_requested,
     };
 
     #[test]
@@ -1384,46 +1314,6 @@ mod tests {
     }
 
     #[test]
-    fn product_cli_parses_and_validates_status_principal() {
-        let cli = ProductCli::try_parse_from(["aos", "--principal", "alice", "status"])
-            .expect("parse principal-scoped product status");
-        assert_eq!(cli.principal.as_deref(), Some("alice"));
-        let Some(ProductCommand::Status(status)) = cli.command else {
-            panic!("expected status");
-        };
-        assert!(status.principal.is_none());
-
-        let cli = ProductCli::try_parse_from(["aos", "status", "--principal", "bob"])
-            .expect("parse status-local principal");
-        assert!(cli.principal.is_none());
-        let Some(ProductCommand::Status(status)) = cli.command else {
-            panic!("expected status");
-        };
-        assert_eq!(status.principal.as_deref(), Some("bob"));
-
-        assert_eq!(
-            status_principal(Some("alice".to_owned()), None)
-                .expect("valid explicit principal")
-                .as_str(),
-            "alice"
-        );
-        assert_eq!(
-            status_principal(None, Some("bob".to_owned()))
-                .expect("valid status-local principal")
-                .as_str(),
-            "bob"
-        );
-        assert_eq!(
-            status_principal(None, None)
-                .expect("omitted principal keeps compatibility default")
-                .as_str(),
-            "default"
-        );
-        assert!(status_principal(None, Some("not/a/principal".to_owned())).is_err());
-        assert!(status_principal(Some("alice".to_owned()), Some("bob".to_owned())).is_err());
-    }
-
-    #[test]
     fn product_version_preserves_the_installer_contract() {
         let Err(version) = ProductCli::try_parse_from(["aos", "--version"]) else {
             panic!("--version exits through Clap");
@@ -1505,6 +1395,7 @@ mod tests {
             "distro",
             "daemon",
             "serve-health",
+            "native-setup",
         ] {
             let args = [OsString::from("help"), OsString::from(root)];
             assert!(help_targets_product(&args));
