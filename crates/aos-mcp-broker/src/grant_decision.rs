@@ -125,6 +125,89 @@ fn parse_grant_decision(value: &[u8]) -> Option<GrantDecision> {
     }
 }
 
+/// Encode a grant-pending marker as `"{wall_ms} {request_id}"`.
+///
+/// Empty or whitespace-only `request_id` values, and values that themselves
+/// contain whitespace, cannot be paired later and so are refused. The stamp
+/// may be `0` (clock unavailable at mark time); that encodes as already-stale
+/// so the failure degrades to "no dedup", never a stuck marker.
+pub(crate) fn encode_grant_pending_marker(written: u64, request_id: &str) -> Option<String> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() || request_id.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(format!("{written} {request_id}"))
+}
+
+/// Parse a grant-pending marker into `(written_ms, request_id)`.
+///
+/// Accepts only the current encoding: one ASCII space separating a decimal
+/// timestamp from a non-empty, whitespace-free request id. Legacy
+/// timestamp-only values, garbage, and extra internal whitespace are
+/// `None` (malformed).
+pub(crate) fn parse_grant_pending_marker(value: &[u8]) -> Option<(u64, &str)> {
+    let text = std::str::from_utf8(value).ok()?.trim();
+    let (stamp, request_id) = text.split_once(' ')?;
+    if stamp.is_empty() || request_id.is_empty() || request_id.contains(char::is_whitespace) {
+        return None;
+    }
+    let written = stamp.parse::<u64>().ok()?;
+    Some((written, request_id))
+}
+
+/// Outcome of pairing a respond `request_id` against a stored grant marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrantMarkerDisposition {
+    /// Fresh marker whose stored request id equals the respond's.
+    Match,
+    /// Fresh marker for a different (or empty) request id. Must not be deleted.
+    Mismatch,
+    /// Value is not the current encoding (legacy timestamp-only, garbage).
+    Malformed,
+    /// TTL expired, clock unavailable, or future stamp. Safe to self-heal.
+    Stale,
+}
+
+/// Classify a stored marker against a candidate `request_id` at `now`.
+pub(crate) fn grant_marker_disposition(
+    value: &[u8],
+    request_id: &str,
+    now: u64,
+) -> GrantMarkerDisposition {
+    let Some((written, stored_id)) = parse_grant_pending_marker(value) else {
+        return GrantMarkerDisposition::Malformed;
+    };
+    if now == 0
+        || written == 0
+        || written > now
+        || now - written >= crate::execute::GRANT_PENDING_TTL_MS
+    {
+        return GrantMarkerDisposition::Stale;
+    }
+    if stored_id == request_id {
+        GrantMarkerDisposition::Match
+    } else {
+        GrantMarkerDisposition::Mismatch
+    }
+}
+
+/// Whether a grant-pending marker value is still within
+/// [`crate::execute::GRANT_PENDING_TTL_MS`] at `now`.
+///
+/// Reads as NOT fresh — fail toward re-prompting — when: the value does not
+/// parse as `"{wall_ms} {request_id}"` (including legacy timestamp-only); the
+/// stored stamp is `0`; `now` is `0`; or the stamp is in the future relative
+/// to `now`.
+pub(crate) fn marker_is_fresh_at(value: &[u8], now: u64) -> bool {
+    let Some((written, _)) = parse_grant_pending_marker(value) else {
+        return false;
+    };
+    now != 0
+        && written != 0
+        && written <= now
+        && now - written < crate::execute::GRANT_PENDING_TTL_MS
+}
+
 /// What (if anything) a `grant.respond` should durably record, given whether it
 /// carried an approve verb.
 ///
@@ -570,5 +653,169 @@ mod tests {
             Some(true)
         );
         assert!(reply_text(&reply).contains("'fs'"));
+    }
+
+    #[test]
+    fn encode_parse_grant_pending_marker_round_trip() {
+        install_test_profile();
+        let encoded = encode_grant_pending_marker(10_000_000, "req-1").unwrap();
+        assert_eq!(encoded, "10000000 req-1");
+        assert_eq!(
+            parse_grant_pending_marker(encoded.as_bytes()),
+            Some((10_000_000, "req-1"))
+        );
+        assert_eq!(
+            encode_grant_pending_marker(0, "req-1").as_deref(),
+            Some("0 req-1")
+        );
+        assert_eq!(encode_grant_pending_marker(1, "").as_deref(), None);
+        assert_eq!(encode_grant_pending_marker(1, "   ").as_deref(), None);
+        assert_eq!(encode_grant_pending_marker(1, "req 1").as_deref(), None);
+    }
+
+    #[test]
+    fn parse_grant_pending_marker_rejects_malformed() {
+        install_test_profile();
+        assert_eq!(parse_grant_pending_marker(b"1"), None);
+        assert_eq!(parse_grant_pending_marker(b"10000000"), None);
+        assert_eq!(parse_grant_pending_marker(b"not-a-number"), None);
+        assert_eq!(parse_grant_pending_marker(b""), None);
+        assert_eq!(parse_grant_pending_marker(b"10000000 "), None);
+        assert_eq!(parse_grant_pending_marker(b"10000000  req-1"), None);
+        assert_eq!(parse_grant_pending_marker(b"10000000 req-1 extra"), None);
+    }
+
+    #[test]
+    fn grant_marker_disposition_match() {
+        install_test_profile();
+        let now = 10_000_000;
+        let written = now - (crate::execute::GRANT_PENDING_TTL_MS - 1);
+        let encoded = encode_grant_pending_marker(written, "req-1").unwrap();
+        assert_eq!(
+            grant_marker_disposition(encoded.as_bytes(), "req-1", now),
+            GrantMarkerDisposition::Match
+        );
+    }
+
+    #[test]
+    fn grant_marker_disposition_mismatch_does_not_classify_as_match() {
+        install_test_profile();
+        let now = 10_000_000;
+        let encoded = encode_grant_pending_marker(now - 1, "req-live").unwrap();
+        assert_eq!(
+            grant_marker_disposition(encoded.as_bytes(), "req-other", now),
+            GrantMarkerDisposition::Mismatch
+        );
+        assert_eq!(
+            grant_marker_disposition(encoded.as_bytes(), "", now),
+            GrantMarkerDisposition::Mismatch
+        );
+        assert!(marker_is_fresh_at(encoded.as_bytes(), now));
+    }
+
+    #[test]
+    fn grant_marker_disposition_malformed_legacy_and_garbage() {
+        install_test_profile();
+        let now = 10_000_000;
+        assert_eq!(
+            grant_marker_disposition(b"1", "req-1", now),
+            GrantMarkerDisposition::Malformed
+        );
+        assert_eq!(
+            grant_marker_disposition(b"10000000", "req-1", now),
+            GrantMarkerDisposition::Malformed
+        );
+        assert_eq!(
+            grant_marker_disposition(b"not-a-number", "req-1", now),
+            GrantMarkerDisposition::Malformed
+        );
+        assert_eq!(
+            grant_marker_disposition(b"10000000  req-1", "req-1", now),
+            GrantMarkerDisposition::Malformed
+        );
+        assert!(!marker_is_fresh_at(b"1", now));
+        assert!(!marker_is_fresh_at(b"not-a-number", now));
+        assert!(!marker_is_fresh_at(b"", now));
+    }
+
+    #[test]
+    fn grant_marker_disposition_stale_ttl_clock_and_future() {
+        install_test_profile();
+        let now = 10_000_000;
+        let ttl = crate::execute::GRANT_PENDING_TTL_MS;
+        let at_ttl = encode_grant_pending_marker(now - ttl, "req-1").unwrap();
+        let past_ttl = encode_grant_pending_marker(now - (ttl + 60_000), "req-1").unwrap();
+        let future = encode_grant_pending_marker(20_000_000, "req-1").unwrap();
+        let written_zero = encode_grant_pending_marker(0, "req-1").unwrap();
+        let live = encode_grant_pending_marker(now - 1, "req-1").unwrap();
+        assert_eq!(
+            grant_marker_disposition(at_ttl.as_bytes(), "req-1", now),
+            GrantMarkerDisposition::Stale
+        );
+        assert_eq!(
+            grant_marker_disposition(past_ttl.as_bytes(), "req-1", now),
+            GrantMarkerDisposition::Stale
+        );
+        assert_eq!(
+            grant_marker_disposition(future.as_bytes(), "req-1", now),
+            GrantMarkerDisposition::Stale
+        );
+        assert_eq!(
+            grant_marker_disposition(written_zero.as_bytes(), "req-1", now),
+            GrantMarkerDisposition::Stale
+        );
+        assert_eq!(
+            grant_marker_disposition(live.as_bytes(), "req-1", 0),
+            GrantMarkerDisposition::Stale
+        );
+        assert!(!marker_is_fresh_at(at_ttl.as_bytes(), now));
+        assert!(!marker_is_fresh_at(past_ttl.as_bytes(), now));
+        assert!(!marker_is_fresh_at(future.as_bytes(), now));
+        assert!(!marker_is_fresh_at(written_zero.as_bytes(), now));
+        assert!(!marker_is_fresh_at(live.as_bytes(), 0));
+    }
+
+    #[test]
+    fn marker_fresh_within_ttl() {
+        install_test_profile();
+        let now = 10_000_000;
+        let written = now - (crate::execute::GRANT_PENDING_TTL_MS - 1);
+        let encoded = encode_grant_pending_marker(written, "req-1").unwrap();
+        assert!(marker_is_fresh_at(encoded.as_bytes(), now));
+    }
+
+    #[test]
+    fn marker_stale_at_or_past_ttl_self_heals() {
+        install_test_profile();
+        let now = 10_000_000;
+        let ttl = crate::execute::GRANT_PENDING_TTL_MS;
+        let at_ttl = encode_grant_pending_marker(now - ttl, "req-1").unwrap();
+        let past_ttl = encode_grant_pending_marker(now - (ttl + 60_000), "req-1").unwrap();
+        assert!(!marker_is_fresh_at(at_ttl.as_bytes(), now));
+        assert!(!marker_is_fresh_at(past_ttl.as_bytes(), now));
+    }
+
+    #[test]
+    fn marker_not_fresh_when_clock_unavailable_now_or_at_write() {
+        install_test_profile();
+        let live = encode_grant_pending_marker(10_000_000, "req-1").unwrap();
+        let written_zero = encode_grant_pending_marker(0, "req-1").unwrap();
+        assert!(!marker_is_fresh_at(live.as_bytes(), 0));
+        assert!(!marker_is_fresh_at(written_zero.as_bytes(), 10_000_000));
+    }
+
+    #[test]
+    fn marker_not_fresh_when_unparseable() {
+        install_test_profile();
+        assert!(!marker_is_fresh_at(b"1", 10_000_000));
+        assert!(!marker_is_fresh_at(b"not-a-number", 10_000_000));
+        assert!(!marker_is_fresh_at(b"", 10_000_000));
+    }
+
+    #[test]
+    fn marker_future_stamp_is_stale() {
+        install_test_profile();
+        let future = encode_grant_pending_marker(20_000_000, "req-1").unwrap();
+        assert!(!marker_is_fresh_at(future.as_bytes(), 10_000_000));
     }
 }

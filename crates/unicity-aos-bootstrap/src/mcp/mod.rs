@@ -5,13 +5,19 @@
 //! interaction policy. That lets hosts without MCP form elicitation use a
 //! trusted local decision surface without weakening or forking the runtime.
 
+#[cfg(test)]
+mod framing_tests;
 mod interaction;
+mod mrtr;
+#[cfg(test)]
+mod serve_tests;
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::{ExitCode, ExitStatus, Stdio};
 
 use clap::{Args, ValueEnum};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -143,6 +149,79 @@ pub(crate) struct ServeArgs {
     /// Runtime request timeout forwarded exactly by the product bridge.
     #[arg(long = "request-timeout", value_name = "DURATION")]
     request_timeout: Option<String>,
+    /// Unix socket for native tray presentation. Requires `--interaction native`.
+    #[arg(long = "interaction-socket", value_name = "PATH")]
+    interaction_socket: Option<PathBuf>,
+    /// Native tray prompt deadline in seconds. Distinct from `--request-timeout`.
+    #[arg(
+        long = "interaction-timeout",
+        value_name = "SECONDS",
+        default_value_t = interaction::DEFAULT_INTERACTION_TIMEOUT_SECONDS,
+        value_parser = interaction::parse_interaction_timeout
+    )]
+    interaction_timeout: u32,
+    /// Maximum tracked in-flight `tools/call` invocations for native MRTR.
+    #[arg(
+        long = "max-in-flight-calls",
+        value_name = "COUNT",
+        default_value_t = mrtr::DEFAULT_MAX_IN_FLIGHT_CALLS,
+        value_parser = mrtr::parse_max_in_flight_calls
+    )]
+    max_in_flight_calls: usize,
+    /// Maximum distinct consumed input rounds retained per tracked `tools/call`.
+    #[arg(
+        long = "max-input-rounds",
+        value_name = "COUNT",
+        default_value_t = mrtr::DEFAULT_MAX_INPUT_ROUNDS,
+        value_parser = mrtr::parse_max_input_rounds
+    )]
+    max_input_rounds: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NativeSurface {
+    Platform,
+    #[cfg(unix)]
+    Socket(PathBuf),
+}
+
+fn native_surface(args: &ServeArgs) -> Result<NativeSurface, String> {
+    match args.interaction_socket.as_ref() {
+        None => Ok(NativeSurface::Platform),
+        Some(_) if args.interaction != InteractionMode::Native => {
+            Err("--interaction-socket requires --interaction native".to_owned())
+        }
+        Some(path) => {
+            #[cfg(unix)]
+            {
+                Ok(NativeSurface::Socket(path.clone()))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                Err("--interaction-socket is only supported on Unix".to_owned())
+            }
+        }
+    }
+}
+
+enum ServePresenter {
+    Platform(interaction::NativePresenter),
+    #[cfg(unix)]
+    Socket(interaction::TrayPresenter),
+}
+
+impl interaction::Presenter for ServePresenter {
+    fn present(
+        &mut self,
+        request: &interaction::InteractionRequest,
+    ) -> Result<Option<usize>, interaction::InteractionError> {
+        match self {
+            Self::Platform(presenter) => presenter.present(request),
+            #[cfg(unix)]
+            Self::Socket(presenter) => presenter.present(request),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -159,6 +238,10 @@ enum InteractionMode {
 }
 
 pub(crate) fn handle_serve(principal: Option<String>, args: ServeArgs) -> ExitCode {
+    if let Err(error) = native_surface(&args) {
+        eprintln!("aos mcp serve: {error}");
+        return ExitCode::FAILURE;
+    }
     let home = match AosHome::resolve() {
         Ok(home) => home,
         Err(error) => {
@@ -213,6 +296,10 @@ async fn serve(
     principal: Option<&str>,
     args: &ServeArgs,
 ) -> Result<(), ServeFailure> {
+    home.ensure_runtime_transport_available()
+        .map_err(|error| ServeFailure::Io(format!("failed to prepare bundled runtime: {error}")))?;
+    #[cfg(not(unix))]
+    let _ = args.interaction_timeout;
     let mode = args.interaction;
     let runtime_args = runtime_arguments(principal, args);
 
@@ -245,7 +332,16 @@ async fn serve(
     let mut upstream_out = tokio::io::stdout();
     let mut downstream_in = Some(child_stdin);
     let mut client_supports_form = false;
-    let mut presenter = interaction::NativePresenter;
+    let mut presenter = match native_surface(args) {
+        Ok(NativeSurface::Platform) => ServePresenter::Platform(interaction::NativePresenter),
+        #[cfg(unix)]
+        Ok(NativeSurface::Socket(path)) => ServePresenter::Socket(interaction::TrayPresenter::new(
+            path,
+            args.interaction_timeout,
+        )),
+        Err(error) => return Err(ServeFailure::Io(error)),
+    };
+    let mut mrtr = mrtr::NativeMrtr::with_limits(args.max_in_flight_calls, args.max_input_rounds);
     let mut upstream_open = true;
     let mut interrupt_rx = Some(interrupt_receiver());
 
@@ -260,26 +356,35 @@ async fn serve(
                     upstream_open = false;
                     continue;
                 }
-                let Some(forwarded) =
-                    prepare_client_message(&client_frame, mode, &mut client_supports_form)
-                else {
-                    let transport_input = downstream_in.as_mut().ok_or_else(|| {
-                        ServeFailure::Io("bundled MCP transport input is closed".to_owned())
-                    })?;
-                    write_frame(transport_input, &client_frame)
-                        .await
-                        .map_err(|error| {
-                            ServeFailure::Io(format!(
-                                "failed to write bundled MCP transport: {error}"
-                            ))
+                let rewritten;
+                let outbound = match prepare_client_message(
+                    &client_frame,
+                    mode,
+                    &mut client_supports_form,
+                    &mut mrtr,
+                ) {
+                    UpstreamPrepare::Unchanged => client_frame.as_slice(),
+                    UpstreamPrepare::Rewrite(frame) => {
+                        rewritten = frame;
+                        rewritten.as_slice()
+                    }
+                    UpstreamPrepare::Reply(frame) => {
+                        write_frame(&mut upstream_out, &frame).await.map_err(|error| {
+                            ServeFailure::Io(format!("failed to write MCP client: {error}"))
                         })?;
-                    client_frame.clear();
-                    continue;
+                        client_frame.clear();
+                        continue;
+                    }
+                    UpstreamPrepare::Reject(error) => {
+                        return Err(ServeFailure::Io(format!(
+                            "refusing to forward tools/call: {error}"
+                        )));
+                    }
                 };
                 let transport_input = downstream_in.as_mut().ok_or_else(|| {
                     ServeFailure::Io("bundled MCP transport input is closed".to_owned())
                 })?;
-                write_frame(transport_input, &forwarded).await.map_err(|error| {
+                write_frame(transport_input, outbound).await.map_err(|error| {
                     ServeFailure::Io(format!("failed to write bundled MCP transport: {error}"))
                 })?;
                 client_frame.clear();
@@ -292,6 +397,74 @@ async fn serve(
                 })?;
                 if bytes_read == 0 {
                     break;
+                }
+                match intercept_downstream(
+                    &transport_frame,
+                    mode,
+                    client_supports_form,
+                    &mut mrtr,
+                    &mut presenter,
+                ) {
+                    DownstreamIntercept::Resume(resume) => {
+                        let frame = json_frame(&resume).ok_or_else(|| {
+                            ServeFailure::Io("failed to encode native input_required resume".to_owned())
+                        })?;
+                        let transport_input = downstream_in.as_mut().ok_or_else(|| {
+                            ServeFailure::Io("bundled MCP transport input is closed".to_owned())
+                        })?;
+                        write_frame(transport_input, &frame).await.map_err(|error| {
+                            ServeFailure::Io(format!(
+                                "failed to resume native input_required: {error}"
+                            ))
+                        })?;
+                        transport_frame.clear();
+                        continue;
+                    }
+                    DownstreamIntercept::Swallow => {
+                        transport_frame.clear();
+                        continue;
+                    }
+                    DownstreamIntercept::HostError(response) => {
+                        let frame = json_frame(&response).ok_or_else(|| {
+                            ServeFailure::Io(
+                                "failed to encode native input_required error".to_owned(),
+                            )
+                        })?;
+                        write_frame(&mut upstream_out, &frame).await.map_err(|error| {
+                            ServeFailure::Io(format!("failed to write MCP client: {error}"))
+                        })?;
+                        transport_frame.clear();
+                        continue;
+                    }
+                    DownstreamIntercept::Exhausted {
+                        response,
+                        runtime_cancel,
+                    } => {
+                        let frame = json_frame(&response).ok_or_else(|| {
+                            ServeFailure::Io(
+                                "failed to encode native input_required error".to_owned(),
+                            )
+                        })?;
+                        write_frame(&mut upstream_out, &frame).await.map_err(|error| {
+                            ServeFailure::Io(format!("failed to write MCP client: {error}"))
+                        })?;
+                        let cancel = json_frame(&runtime_cancel).ok_or_else(|| {
+                            ServeFailure::Io(
+                                "failed to encode exhausted-call cancellation".to_owned(),
+                            )
+                        })?;
+                        let transport_input = downstream_in.as_mut().ok_or_else(|| {
+                            ServeFailure::Io("bundled MCP transport input is closed".to_owned())
+                        })?;
+                        write_frame(transport_input, &cancel).await.map_err(|error| {
+                            ServeFailure::Io(format!(
+                                "failed to cancel exhausted native tools/call: {error}"
+                            ))
+                        })?;
+                        transport_frame.clear();
+                        continue;
+                    }
+                    DownstreamIntercept::None => {}
                 }
                 match transport_action(&transport_frame, mode, client_supports_form) {
                     TransportAction::Forward => {
@@ -326,7 +499,12 @@ async fn serve(
                         let frame = json_frame(&response).ok_or_else(|| {
                             ServeFailure::Io("failed to encode local interaction".to_owned())
                         })?;
-                        write_frame(&mut upstream_out, &frame).await.map_err(|error| {
+                        // The runtime issued this request. The host must only see
+                        // the resulting tool response, not our JSON-RPC answer.
+                        let transport_input = downstream_in.as_mut().ok_or_else(|| {
+                            ServeFailure::Io("bundled MCP transport input is closed".to_owned())
+                        })?;
+                        write_frame(transport_input, &frame).await.map_err(|error| {
                             ServeFailure::Io(format!(
                                 "failed to answer local interaction: {error}"
                             ))
@@ -341,7 +519,10 @@ async fn serve(
                         let frame = json_frame(&response).ok_or_else(|| {
                             ServeFailure::Io("failed to encode cancelled interaction".to_owned())
                         })?;
-                        write_frame(&mut upstream_out, &frame).await.map_err(|error| {
+                        let transport_input = downstream_in.as_mut().ok_or_else(|| {
+                            ServeFailure::Io("bundled MCP transport input is closed".to_owned())
+                        })?;
+                        write_frame(transport_input, &frame).await.map_err(|error| {
                             ServeFailure::Io(format!(
                                 "failed to answer local interaction: {error}"
                             ))
@@ -388,8 +569,12 @@ async fn read_frame(
     reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
     frame: &mut Vec<u8>,
 ) -> std::io::Result<usize> {
-    frame.clear();
-    reader.read_until(b'\n', frame).await
+    // The other select branch can win after read_until appends a prefix.
+    // Preserve that prefix across cancellation; the caller clears only after
+    // handling a complete frame. At EOF, retained bytes still form a final
+    // frame rather than an empty-stream indication.
+    reader.read_until(b'\n', frame).await?;
+    Ok(frame.len())
 }
 
 async fn next_interrupt(
@@ -446,24 +631,166 @@ fn json_frame(value: &Value) -> Option<Vec<u8>> {
     Some(frame)
 }
 
+fn jsonrpc_error_for(request: &Value, error: &mrtr::MrtrError) -> Option<Value> {
+    Some(json!({
+        "jsonrpc": request.get("jsonrpc").cloned().unwrap_or_else(|| {
+            Value::String("2.0".to_owned())
+        }),
+        "id": request.get("id")?.clone(),
+        "error": {
+            "code": -32603,
+            "message": error.to_string(),
+        }
+    }))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UpstreamPrepare {
+    Unchanged,
+    Rewrite(Vec<u8>),
+    Reply(Vec<u8>),
+    Reject(mrtr::MrtrError),
+}
+
 fn prepare_client_message(
     frame: &[u8],
     mode: InteractionMode,
     client_supports_form: &mut bool,
-) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(frame).ok()?;
-    let mut value = serde_json::from_str::<Value>(text).ok()?;
-    if value.get("method").and_then(Value::as_str) != Some("initialize") {
-        return None;
+    mrtr: &mut mrtr::NativeMrtr,
+) -> UpstreamPrepare {
+    let Ok(text) = std::str::from_utf8(frame) else {
+        return UpstreamPrepare::Unchanged;
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(text) else {
+        return UpstreamPrepare::Unchanged;
+    };
+    if value.get("method").and_then(Value::as_str) == Some("initialize") {
+        *client_supports_form = supports_form_elicitation(&value);
+        if matches!(mode, InteractionMode::Auto | InteractionMode::Native)
+            && (mode == InteractionMode::Native || !*client_supports_form)
+            && advertise_form_elicitation(&mut value)
+        {
+            return UpstreamPrepare::Rewrite(json_frame(&value).unwrap_or_else(|| frame.to_vec()));
+        }
+        return UpstreamPrepare::Unchanged;
     }
-    *client_supports_form = supports_form_elicitation(&value);
-    if matches!(mode, InteractionMode::Auto | InteractionMode::Native)
-        && (mode == InteractionMode::Native || !*client_supports_form)
-        && advertise_form_elicitation(&mut value)
+    if !intercepts_local_input(mode, *client_supports_form) {
+        return UpstreamPrepare::Unchanged;
+    }
+    if let Some(id) = mrtr::cancelled_request_id(&value) {
+        mrtr.forget(id);
+        return UpstreamPrepare::Unchanged;
+    }
+    if value.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return UpstreamPrepare::Unchanged;
+    }
+    let advertised = matches!(mode, InteractionMode::Auto | InteractionMode::Native)
+        && advertise_request_form_meta(&mut value);
+    if let Err(error) = mrtr.record(&value) {
+        if error == mrtr::MrtrError::TooManyInFlight
+            && let Some(response) = jsonrpc_error_for(&value, &error)
+            && let Some(frame) = json_frame(&response)
+        {
+            return UpstreamPrepare::Reply(frame);
+        }
+        return UpstreamPrepare::Reject(error);
+    }
+    if advertised {
+        UpstreamPrepare::Rewrite(json_frame(&value).unwrap_or_else(|| frame.to_vec()))
+    } else {
+        UpstreamPrepare::Unchanged
+    }
+}
+
+fn intercepts_local_input(mode: InteractionMode, client_supports_form: bool) -> bool {
+    match mode {
+        InteractionMode::Native | InteractionMode::Deny => true,
+        InteractionMode::Auto => !client_supports_form,
+        InteractionMode::Client => false,
+    }
+}
+
+enum DownstreamIntercept {
+    None,
+    Resume(Value),
+    Swallow,
+    HostError(Value),
+    Exhausted {
+        response: Value,
+        runtime_cancel: Value,
+    },
+}
+
+fn intercept_downstream(
+    frame: &[u8],
+    mode: InteractionMode,
+    client_supports_form: bool,
+    mrtr: &mut mrtr::NativeMrtr,
+    presenter: &mut dyn interaction::Presenter,
+) -> DownstreamIntercept {
+    if !intercepts_local_input(mode, client_supports_form) {
+        return DownstreamIntercept::None;
+    }
+    let Ok(text) = std::str::from_utf8(frame) else {
+        return DownstreamIntercept::None;
+    };
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return DownstreamIntercept::None;
+    };
+    if mrtr::is_input_required_result(&message) {
+        let resume = match mode {
+            InteractionMode::Deny => mrtr.decline(&message),
+            InteractionMode::Native | InteractionMode::Auto | InteractionMode::Client => {
+                mrtr.decide(&message, presenter)
+            }
+        };
+        return match resume {
+            Ok(resume) => DownstreamIntercept::Resume(resume),
+            Err(mrtr::MrtrError::UnknownId | mrtr::MrtrError::AlreadySettled) => {
+                DownstreamIntercept::Swallow
+            }
+            Err(mrtr::MrtrError::TooManyRounds) => {
+                let Some(id) = message.get("id") else {
+                    return DownstreamIntercept::Swallow;
+                };
+                let Some(response) = jsonrpc_error_for(&message, &mrtr::MrtrError::TooManyRounds)
+                else {
+                    return DownstreamIntercept::Swallow;
+                };
+                mrtr.complete(id);
+                DownstreamIntercept::Exhausted {
+                    response,
+                    runtime_cancel: json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": { "requestId": id },
+                    }),
+                }
+            }
+            Err(error) => match message.get("id") {
+                Some(id) => {
+                    mrtr.complete(id);
+                    DownstreamIntercept::HostError(json!({
+                        "jsonrpc": message.get("jsonrpc").cloned().unwrap_or_else(|| {
+                            Value::String("2.0".to_owned())
+                        }),
+                        "id": id,
+                        "error": {
+                            "code": -32603,
+                            "message": error.to_string(),
+                        }
+                    }))
+                }
+                None => DownstreamIntercept::Swallow,
+            },
+        };
+    }
+    if message.get("method").is_none()
+        && let Some(id) = message.get("id")
     {
-        return Some(json_frame(&value).unwrap_or_else(|| frame.to_vec()));
+        mrtr.complete(id);
     }
-    None
+    DownstreamIntercept::None
 }
 
 enum TransportAction {
@@ -511,6 +838,24 @@ fn advertise_form_elicitation(initialize: &mut Value) -> bool {
     let Some(capabilities) = object_entry(params, "capabilities") else {
         return false;
     };
+    advertise_form_on_capabilities(capabilities)
+}
+
+fn advertise_request_form_meta(message: &mut Value) -> bool {
+    let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let Some(capabilities) = object_entry(meta, "io.modelcontextprotocol/clientCapabilities")
+    else {
+        return false;
+    };
+    advertise_form_on_capabilities(capabilities)
+}
+
+fn advertise_form_on_capabilities(capabilities: &mut Map<String, Value>) -> bool {
     let Some(elicitation) = object_entry(capabilities, "elicitation") else {
         return false;
     };
@@ -594,169 +939,4 @@ fn rewrite_server_identity(message: &mut Value) -> bool {
         changed = true;
     }
     changed
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn initialize(capabilities: Value) -> String {
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": capabilities,
-                "clientInfo": { "name": "test", "version": "1" }
-            }
-        })
-        .to_string()
-    }
-
-    #[test]
-    fn auto_advertises_form_only_when_client_cannot_present_it() {
-        let mut supported = false;
-        let forwarded = prepare_client_message(
-            initialize(json!({ "roots": {} })).as_bytes(),
-            InteractionMode::Auto,
-            &mut supported,
-        )
-        .expect("initialize is transformed");
-        let forwarded: Value = serde_json::from_slice(&forwarded).expect("json");
-        assert!(!supported);
-        assert!(
-            forwarded
-                .pointer("/params/capabilities/elicitation/form")
-                .is_some()
-        );
-
-        for mode in [InteractionMode::Auto, InteractionMode::Native] {
-            let mut supported = false;
-            let forwarded = prepare_client_message(
-                initialize(json!({ "elicitation": { "form": {} } })).as_bytes(),
-                mode,
-                &mut supported,
-            );
-            assert!(supported);
-            assert!(
-                forwarded.is_none(),
-                "{mode:?} must preserve already-capable initialize bytes"
-            );
-        }
-    }
-
-    #[test]
-    fn client_and_deny_modes_never_invent_capabilities() {
-        for mode in [InteractionMode::Client, InteractionMode::Deny] {
-            let mut supported = false;
-            let forwarded =
-                prepare_client_message(initialize(json!({})).as_bytes(), mode, &mut supported);
-            assert!(
-                forwarded.is_none(),
-                "{mode:?} must preserve unchanged initialize bytes"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_initialize_capabilities_are_not_rewritten() {
-        let malformed = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": { "capabilities": "not-an-object" }
-        })
-        .to_string();
-        let mut supported = false;
-        let forwarded =
-            prepare_client_message(malformed.as_bytes(), InteractionMode::Auto, &mut supported);
-        assert!(
-            forwarded.is_none(),
-            "malformed capabilities must preserve raw bytes"
-        );
-        assert!(!supported);
-    }
-
-    #[test]
-    fn auto_intercepts_only_when_the_client_lacks_form_support() {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "elicitation/create",
-            "params": { "mode": "form" }
-        });
-        assert_eq!(
-            elicitation_handling(&request, InteractionMode::Auto, false),
-            ElicitationHandling::Present
-        );
-        assert_eq!(
-            elicitation_handling(&request, InteractionMode::Auto, true),
-            ElicitationHandling::Forward
-        );
-        assert_eq!(
-            elicitation_handling(&request, InteractionMode::Native, true),
-            ElicitationHandling::Present
-        );
-    }
-
-    #[test]
-    fn url_elicitation_is_never_intercepted_as_a_local_form() {
-        let request = json!({
-            "method": "elicitation/create",
-            "params": { "mode": "url" }
-        });
-        assert_eq!(
-            elicitation_handling(&request, InteractionMode::Native, false),
-            ElicitationHandling::Forward
-        );
-    }
-
-    #[test]
-    fn deny_mode_cancels_form_and_url_elicitation() {
-        for request in [
-            json!({ "method": "elicitation/create", "params": { "mode": "form" } }),
-            json!({ "method": "elicitation/create", "params": { "mode": "url" } }),
-        ] {
-            assert_eq!(
-                elicitation_handling(&request, InteractionMode::Deny, true),
-                ElicitationHandling::Cancel
-            );
-        }
-    }
-
-    #[test]
-    fn initialize_response_is_product_branded() {
-        let mut response = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "serverInfo": { "name": "astrid", "version": "0.10.4" }
-            }
-        });
-        assert!(rewrite_server_identity(&mut response));
-        assert_eq!(response["result"]["serverInfo"]["name"], "unicity-aos");
-        assert_eq!(response["result"]["serverInfo"]["title"], "Unicity AOS");
-    }
-
-    #[test]
-    fn initialize_response_with_correct_identity_is_not_rewritten() {
-        let mut response = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "serverInfo": {
-                    "name": "unicity-aos",
-                    "title": "Unicity AOS",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }
-        });
-        assert!(!rewrite_server_identity(&mut response));
-    }
 }

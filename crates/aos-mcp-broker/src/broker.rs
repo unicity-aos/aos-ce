@@ -416,6 +416,31 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
         return Ok(());
     }
 
+    // Resolve the exact live provider identity through the same discovery
+    // snapshot used by tools/list. A direct tools/call may arrive without a
+    // prior list, so this performs cache-or-discover rather than trusting the
+    // routed topic name alone. Missing provenance is a hard failure: call_id
+    // by itself is not sufficient result authority.
+    let Some(provider_source_id) = discovery::provider_source_id(&req.name, &req.req_id) else {
+        log::warn(format!(
+            "{}: broker route refused req_id={} tool={} reason=provider_identity_unavailable",
+            crate::profile::log_tag(),
+            req.req_id,
+            req.name
+        ));
+        let reply = json!({
+            "kind": "tool.call",
+            "req_id": req.req_id,
+            "content": mcp_content(Value::String(format!(
+                "{}: tool provider identity is unavailable",
+                crate::profile::log_tag()
+            ))),
+            "isError": true,
+        });
+        publish_reply(&reply_topic, &reply);
+        return Ok(());
+    };
+
     // Routing milestone — the broker is about to dispatch the execute to the
     // providing capsule via the routed `tool.v1.execute.<tool>` topic.
     log::info(format!(
@@ -442,7 +467,12 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
     // `astrid.v1.request.mcp.approval.respond` -> [`approval::handle_mcp_approval`],
     // which maps the choice onto `astrid.v1.approval.response.<id>` to
     // unblock the tool. See [`crate::approval`].
-    let reply = match execute::dispatch_with_approval(&req.name, &req.req_id, &req.arguments) {
+    let reply = match execute::dispatch_with_approval(
+        &req.name,
+        &req.req_id,
+        &req.arguments,
+        &provider_source_id,
+    ) {
         execute::DispatchOutcome::Result(content, is_error) => {
             log::info(format!(
                 "{}: broker response method=tool.call req_id={} tool={} outcome={} \
@@ -461,30 +491,48 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
             })
         }
         execute::DispatchOutcome::ApprovalRequired(required) => {
-            log::info(format!(
-                "{}: broker response method=tool.call req_id={} tool={} \
-                 outcome=approval_required elapsed_ms={}",
-                crate::profile::log_tag(),
-                req.req_id,
-                req.name,
-                discovery::wall_ms().saturating_sub(started)
-            ));
-            json!({
-                "kind": "tool.call",
-                "req_id": req.req_id,
-                // No tool result yet — the tool is parked on the approval. The
-                // shim MUST elicit the choice and respond on
-                // `astrid.v1.request.mcp.approval.respond` (echoing back the
-                // `tool_name` + `call_id` the flag carries) before a result can
-                // be produced. `content` is empty and `isError` false: this is
-                // a pending state, not a failure. The terminal result is
-                // delivered by `approval::handle_mcp_approval` once the decision
-                // lands — see [`crate::approval`]. `req.req_id` doubles as the
-                // dispatch `call_id` (it is the result-correlation token).
-                "content": mcp_content(Value::String(String::new())),
-                "isError": false,
-                "approval_required": required.to_reply_flag(&req.name, &req.req_id),
-            })
+            if approval::remember_pending_result_route(
+                &required.request_id,
+                &req.name,
+                &req.req_id,
+                &provider_source_id,
+            ) {
+                log::info(format!(
+                    "{}: broker response method=tool.call req_id={} tool={} \
+                     outcome=approval_required elapsed_ms={}",
+                    crate::profile::log_tag(),
+                    req.req_id,
+                    req.name,
+                    discovery::wall_ms().saturating_sub(started)
+                ));
+                json!({
+                    "kind": "tool.call",
+                    "req_id": req.req_id,
+                    // No tool result yet — the tool is parked on the approval.
+                    // The provider binding is retained in broker-owned KV;
+                    // the shim cannot choose which capsule may answer.
+                    "content": mcp_content(Value::String(String::new())),
+                    "isError": false,
+                    "approval_required": required.to_reply_flag(&req.name, &req.req_id),
+                })
+            } else {
+                approval::deny_untracked_approval(&required.request_id);
+                log::warn(format!(
+                    "{}: broker response method=tool.call req_id={} tool={} \
+                     outcome=provider_route_persist_failed",
+                    crate::profile::log_tag(),
+                    req.req_id,
+                    req.name
+                ));
+                json!({
+                    "kind": "tool.call",
+                    "req_id": req.req_id,
+                    "content": mcp_content(Value::String(
+                        "tool approval could not retain provider identity".to_string()
+                    )),
+                    "isError": true,
+                })
+            }
         }
         execute::DispatchOutcome::GrantRequired(grant) => {
             // The kernel access gate refused the call and DROPPED it (grant-on-use
@@ -555,7 +603,11 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
                         // First prompt for this pair — record it pending, then
                         // surface the flag. `mark` is best-effort: a lost marker
                         // only risks a duplicate prompt, never a spurious grant.
-                        execute::mark_grant_pending(&principal, &grant.capsule_id);
+                        execute::mark_grant_pending(
+                            &principal,
+                            &grant.capsule_id,
+                            &grant.request_id,
+                        );
                         outcome = "grant_required";
                         json!({
                             "kind": "tool.call",

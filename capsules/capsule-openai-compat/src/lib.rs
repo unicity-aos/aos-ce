@@ -344,14 +344,11 @@ impl OpenAICompatProvider {
             request_body["tools"] = Value::Array(api_tools);
         }
 
-        let api_key = env::var("api_key").unwrap_or_default();
-        if api_key.is_empty() {
-            return Err(SysError::ApiError("api_key not configured".into()));
+        let mut req = http::Request::post(&url);
+        if let Some(value) = Self::bearer_header(&env::var("api_key").unwrap_or_default()) {
+            req = req.header("authorization", value);
         }
-
-        let req = http::Request::post(&url)
-            .header("authorization", format!("Bearer {api_key}"))
-            .json(&request_body)?;
+        let req = req.json(&request_body)?;
 
         let stream = http::stream_start(&req)?;
 
