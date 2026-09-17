@@ -22,7 +22,12 @@ implementations are consolidated into their final behavior.
   the host stream.
 - Optional `aos mcp serve --interaction-socket PATH` for native tray presentation
   over a same-user Unix socket. Requires `--interaction native` and does not fall
-  back to AppKit or the MCP host. The initial prompt deadline is 120 seconds.
+  back to AppKit or the MCP host. The tray prompt deadline defaults to 120 seconds
+  via `--interaction-timeout` and is distinct from `--request-timeout`, which is
+  forwarded to the runtime.
+- Bound native MRTR tracking with `--max-in-flight-calls` (default 32) and
+  `--max-input-rounds` (default 8). Excess unique calls and distinct rounds fail
+  closed without dropping already-tracked requests.
 
 ### Fixed
 

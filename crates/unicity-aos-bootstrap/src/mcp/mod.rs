@@ -9,6 +9,8 @@
 mod framing_tests;
 mod interaction;
 mod mrtr;
+#[cfg(test)]
+mod serve_tests;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -150,6 +152,30 @@ pub(crate) struct ServeArgs {
     /// Unix socket for native tray presentation. Requires `--interaction native`.
     #[arg(long = "interaction-socket", value_name = "PATH")]
     interaction_socket: Option<PathBuf>,
+    /// Native tray prompt deadline in seconds. Distinct from `--request-timeout`.
+    #[arg(
+        long = "interaction-timeout",
+        value_name = "SECONDS",
+        default_value_t = interaction::DEFAULT_INTERACTION_TIMEOUT_SECONDS,
+        value_parser = interaction::parse_interaction_timeout
+    )]
+    interaction_timeout: u32,
+    /// Maximum tracked in-flight `tools/call` invocations for native MRTR.
+    #[arg(
+        long = "max-in-flight-calls",
+        value_name = "COUNT",
+        default_value_t = mrtr::DEFAULT_MAX_IN_FLIGHT_CALLS,
+        value_parser = mrtr::parse_max_in_flight_calls
+    )]
+    max_in_flight_calls: usize,
+    /// Maximum distinct consumed input rounds retained per tracked `tools/call`.
+    #[arg(
+        long = "max-input-rounds",
+        value_name = "COUNT",
+        default_value_t = mrtr::DEFAULT_MAX_INPUT_ROUNDS,
+        value_parser = mrtr::parse_max_input_rounds
+    )]
+    max_input_rounds: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +298,8 @@ async fn serve(
 ) -> Result<(), ServeFailure> {
     home.ensure_runtime_transport_available()
         .map_err(|error| ServeFailure::Io(format!("failed to prepare bundled runtime: {error}")))?;
+    #[cfg(not(unix))]
+    let _ = args.interaction_timeout;
     let mode = args.interaction;
     let runtime_args = runtime_arguments(principal, args);
 
@@ -307,12 +335,13 @@ async fn serve(
     let mut presenter = match native_surface(args) {
         Ok(NativeSurface::Platform) => ServePresenter::Platform(interaction::NativePresenter),
         #[cfg(unix)]
-        Ok(NativeSurface::Socket(path)) => {
-            ServePresenter::Socket(interaction::TrayPresenter::new(path))
-        }
+        Ok(NativeSurface::Socket(path)) => ServePresenter::Socket(interaction::TrayPresenter::new(
+            path,
+            args.interaction_timeout,
+        )),
         Err(error) => return Err(ServeFailure::Io(error)),
     };
-    let mut mrtr = mrtr::NativeMrtr::new();
+    let mut mrtr = mrtr::NativeMrtr::with_limits(args.max_in_flight_calls, args.max_input_rounds);
     let mut upstream_open = true;
     let mut interrupt_rx = Some(interrupt_receiver());
 
@@ -338,6 +367,13 @@ async fn serve(
                     UpstreamPrepare::Rewrite(frame) => {
                         rewritten = frame;
                         rewritten.as_slice()
+                    }
+                    UpstreamPrepare::Reply(frame) => {
+                        write_frame(&mut upstream_out, &frame).await.map_err(|error| {
+                            ServeFailure::Io(format!("failed to write MCP client: {error}"))
+                        })?;
+                        client_frame.clear();
+                        continue;
                     }
                     UpstreamPrepare::Reject(error) => {
                         return Err(ServeFailure::Io(format!(
@@ -567,10 +603,24 @@ fn json_frame(value: &Value) -> Option<Vec<u8>> {
     Some(frame)
 }
 
+fn jsonrpc_error_for(request: &Value, error: &mrtr::MrtrError) -> Option<Value> {
+    Some(json!({
+        "jsonrpc": request.get("jsonrpc").cloned().unwrap_or_else(|| {
+            Value::String("2.0".to_owned())
+        }),
+        "id": request.get("id")?.clone(),
+        "error": {
+            "code": -32603,
+            "message": error.to_string(),
+        }
+    }))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum UpstreamPrepare {
     Unchanged,
     Rewrite(Vec<u8>),
+    Reply(Vec<u8>),
     Reject(mrtr::MrtrError),
 }
 
@@ -609,6 +659,12 @@ fn prepare_client_message(
     let advertised = matches!(mode, InteractionMode::Auto | InteractionMode::Native)
         && advertise_request_form_meta(&mut value);
     if let Err(error) = mrtr.record(&value) {
+        if error == mrtr::MrtrError::TooManyInFlight
+            && let Some(response) = jsonrpc_error_for(&value, &error)
+            && let Some(frame) = json_frame(&response)
+        {
+            return UpstreamPrepare::Reply(frame);
+        }
         return UpstreamPrepare::Reject(error);
     }
     if advertised {
@@ -658,9 +714,11 @@ fn intercept_downstream(
         };
         return match resume {
             Ok(resume) => DownstreamIntercept::Resume(resume),
-            Err(mrtr::MrtrError::UnknownId | mrtr::MrtrError::AlreadySettled) => {
-                DownstreamIntercept::Swallow
-            }
+            Err(
+                mrtr::MrtrError::UnknownId
+                | mrtr::MrtrError::AlreadySettled
+                | mrtr::MrtrError::TooManyRounds,
+            ) => DownstreamIntercept::Swallow,
             Err(error) => match message.get("id") {
                 Some(id) => {
                     mrtr.complete(id);
@@ -833,552 +891,4 @@ fn rewrite_server_identity(message: &mut Value) -> bool {
         changed = true;
     }
     changed
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn initialize(capabilities: Value) -> String {
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": capabilities,
-                "clientInfo": { "name": "test", "version": "1" }
-            }
-        })
-        .to_string()
-    }
-
-    fn prepare(frame: &[u8], mode: InteractionMode, supported: &mut bool) -> Option<Vec<u8>> {
-        let mut mrtr = mrtr::NativeMrtr::new();
-        match prepare_client_message(frame, mode, supported, &mut mrtr) {
-            UpstreamPrepare::Rewrite(frame) => Some(frame),
-            UpstreamPrepare::Unchanged => None,
-            UpstreamPrepare::Reject(error) => panic!("unexpected tools/call reject: {error}"),
-        }
-    }
-
-    fn tools_call(id: Value, name: &str, arguments: Value) -> String {
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "tools/call",
-            "params": {
-                "name": name,
-                "arguments": arguments,
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2025-11-25",
-                    "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
-                }
-            }
-        })
-        .to_string()
-    }
-
-    #[test]
-    fn auto_advertises_form_only_when_client_cannot_present_it() {
-        let mut supported = false;
-        let forwarded = prepare(
-            initialize(json!({ "roots": {} })).as_bytes(),
-            InteractionMode::Auto,
-            &mut supported,
-        )
-        .expect("initialize is transformed");
-        let forwarded: Value = serde_json::from_slice(&forwarded).expect("json");
-        assert!(!supported);
-        assert!(
-            forwarded
-                .pointer("/params/capabilities/elicitation/form")
-                .is_some()
-        );
-
-        for mode in [InteractionMode::Auto, InteractionMode::Native] {
-            let mut supported = false;
-            let forwarded = prepare(
-                initialize(json!({ "elicitation": { "form": {} } })).as_bytes(),
-                mode,
-                &mut supported,
-            );
-            assert!(supported);
-            assert!(
-                forwarded.is_none(),
-                "{mode:?} must preserve already-capable initialize bytes"
-            );
-        }
-    }
-
-    #[test]
-    fn client_and_deny_modes_never_invent_capabilities() {
-        for mode in [InteractionMode::Client, InteractionMode::Deny] {
-            let mut supported = false;
-            let forwarded = prepare(initialize(json!({})).as_bytes(), mode, &mut supported);
-            assert!(
-                forwarded.is_none(),
-                "{mode:?} must preserve unchanged initialize bytes"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_initialize_capabilities_are_not_rewritten() {
-        let malformed = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": { "capabilities": "not-an-object" }
-        })
-        .to_string();
-        let mut supported = false;
-        let forwarded = prepare(malformed.as_bytes(), InteractionMode::Auto, &mut supported);
-        assert!(
-            forwarded.is_none(),
-            "malformed capabilities must preserve raw bytes"
-        );
-        assert!(!supported);
-    }
-
-    #[test]
-    fn auto_intercepts_only_when_the_client_lacks_form_support() {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "elicitation/create",
-            "params": { "mode": "form" }
-        });
-        assert_eq!(
-            elicitation_handling(&request, InteractionMode::Auto, false),
-            ElicitationHandling::Present
-        );
-        assert_eq!(
-            elicitation_handling(&request, InteractionMode::Auto, true),
-            ElicitationHandling::Forward
-        );
-        assert_eq!(
-            elicitation_handling(&request, InteractionMode::Native, true),
-            ElicitationHandling::Present
-        );
-    }
-
-    #[test]
-    fn url_elicitation_is_never_intercepted_as_a_local_form() {
-        let request = json!({
-            "method": "elicitation/create",
-            "params": { "mode": "url" }
-        });
-        assert_eq!(
-            elicitation_handling(&request, InteractionMode::Native, false),
-            ElicitationHandling::Forward
-        );
-    }
-
-    #[test]
-    fn deny_mode_cancels_form_and_url_elicitation() {
-        for request in [
-            json!({ "method": "elicitation/create", "params": { "mode": "form" } }),
-            json!({ "method": "elicitation/create", "params": { "mode": "url" } }),
-        ] {
-            assert_eq!(
-                elicitation_handling(&request, InteractionMode::Deny, true),
-                ElicitationHandling::Cancel
-            );
-        }
-    }
-
-    #[test]
-    fn initialize_response_is_product_branded() {
-        let mut response = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "serverInfo": { "name": "astrid", "version": "0.10.4" }
-            }
-        });
-        assert!(rewrite_server_identity(&mut response));
-        assert_eq!(response["result"]["serverInfo"]["name"], "unicity-aos");
-        assert_eq!(response["result"]["serverInfo"]["title"], "Unicity AOS");
-    }
-
-    #[test]
-    fn native_tracks_tools_call_and_advertises_per_request_form() {
-        let mut supported = false;
-        let mut session = mrtr::NativeMrtr::new();
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/call",
-            "params": {
-                "name": "fs.read",
-                "arguments": { "path": "/tmp/report" },
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2025-11-25",
-                    "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
-                }
-            }
-        })
-        .to_string();
-        let forwarded = match prepare_client_message(
-            request.as_bytes(),
-            InteractionMode::Native,
-            &mut supported,
-            &mut session,
-        ) {
-            UpstreamPrepare::Rewrite(frame) => frame,
-            other => panic!("per-request form is advertised, got {other:?}"),
-        };
-        let forwarded: Value = serde_json::from_slice(&forwarded).expect("json");
-        assert_eq!(
-            forwarded["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
-            "2025-11-25"
-        );
-        assert!(
-            forwarded["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["elicitation"]
-                ["form"]
-                .is_object()
-        );
-        assert!(!session.is_empty());
-    }
-
-    #[test]
-    fn native_does_not_invent_request_meta_or_protocol_version() {
-        let mut supported = false;
-        let mut session = mrtr::NativeMrtr::new();
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/call",
-            "params": {
-                "name": "fs.read",
-                "arguments": { "path": "/tmp/report" }
-            }
-        })
-        .to_string();
-        let forwarded = prepare_client_message(
-            request.as_bytes(),
-            InteractionMode::Native,
-            &mut supported,
-            &mut session,
-        );
-        assert_eq!(
-            forwarded,
-            UpstreamPrepare::Unchanged,
-            "missing _meta must keep original bytes"
-        );
-        assert!(!session.is_empty());
-    }
-
-    #[test]
-    fn client_mode_does_not_track_or_rewrite_tools_call() {
-        let mut supported = false;
-        let mut session = mrtr::NativeMrtr::new();
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/call",
-            "params": {
-                "name": "fs.read",
-                "_meta": { "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} } }
-            }
-        })
-        .to_string();
-        let forwarded = prepare_client_message(
-            request.as_bytes(),
-            InteractionMode::Client,
-            &mut supported,
-            &mut session,
-        );
-        assert_eq!(forwarded, UpstreamPrepare::Unchanged);
-        assert!(session.is_empty());
-    }
-
-    #[test]
-    fn deny_tracks_tools_call_without_inventing_form_meta() {
-        let mut supported = false;
-        let mut session = mrtr::NativeMrtr::new();
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/call",
-            "params": {
-                "name": "fs.read",
-                "_meta": { "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} } }
-            }
-        })
-        .to_string();
-        let forwarded = prepare_client_message(
-            request.as_bytes(),
-            InteractionMode::Deny,
-            &mut supported,
-            &mut session,
-        );
-        assert_eq!(forwarded, UpstreamPrepare::Unchanged);
-        assert!(!session.is_empty());
-    }
-
-    #[test]
-    fn native_duplicate_tools_call_id_is_rejected_without_replacing_tracking() {
-        let mut supported = false;
-        let mut session = mrtr::NativeMrtr::new();
-        let first = tools_call(json!(7), "fs.read", json!({ "path": "/tmp/report" }));
-        match prepare_client_message(
-            first.as_bytes(),
-            InteractionMode::Native,
-            &mut supported,
-            &mut session,
-        ) {
-            UpstreamPrepare::Rewrite(_) => {}
-            other => panic!("first tools/call should be tracked, got {other:?}"),
-        }
-
-        let second = tools_call(json!(7), "fs.write", json!({ "path": "/etc/passwd" }));
-        let prepared = prepare_client_message(
-            second.as_bytes(),
-            InteractionMode::Native,
-            &mut supported,
-            &mut session,
-        );
-        assert_eq!(
-            prepared,
-            UpstreamPrepare::Reject(mrtr::MrtrError::DuplicateId)
-        );
-        assert!(!session.is_empty());
-
-        let resume = session
-            .decline(&json!({
-                "jsonrpc": "2.0",
-                "id": 7,
-                "result": {
-                    "resultType": "input_required",
-                    "requestState": "opaque-token",
-                    "inputRequests": {
-                        "astrid-consent": {
-                            "method": "elicitation/create",
-                            "params": {
-                                "mode": "form",
-                                "message": "Allow this capsule to continue?",
-                                "requestedSchema": {
-                                    "type": "object",
-                                    "properties": { "grant": { "type": "boolean" } },
-                                    "required": ["grant"]
-                                }
-                            }
-                        }
-                    }
-                }
-            }))
-            .expect("original call remains tracked");
-        assert_eq!(resume["params"]["name"], "fs.read");
-        assert_eq!(resume["params"]["arguments"]["path"], "/tmp/report");
-    }
-
-    #[test]
-    fn intercepting_malformed_tools_call_is_rejected_without_tracking() {
-        let requests = [
-            json!({
-                "jsonrpc": "2.0",
-                "id": true,
-                "method": "tools/call",
-                "params": { "name": "fs.read" }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "method": "tools/call",
-                "params": { "name": "fs.read" }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 1.5,
-                "method": "tools/call",
-                "params": { "name": "fs.read" }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 7,
-                "method": "tools/call",
-                "params": {}
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 7,
-                "method": "tools/call",
-                "params": "not-an-object"
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "method": "tools/call",
-                "params": { "name": "fs.read" }
-            }),
-        ];
-        for request in requests {
-            for mode in [InteractionMode::Native, InteractionMode::Deny] {
-                let mut supported = false;
-                let mut session = mrtr::NativeMrtr::new();
-                let prepared = prepare_client_message(
-                    request.to_string().as_bytes(),
-                    mode,
-                    &mut supported,
-                    &mut session,
-                );
-                assert!(
-                    matches!(
-                        prepared,
-                        UpstreamPrepare::Reject(mrtr::MrtrError::Malformed(_))
-                    ),
-                    "{mode:?} must reject malformed tools/call {request}"
-                );
-                assert!(
-                    session.is_empty(),
-                    "{mode:?} must not track malformed tools/call"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn client_mode_bytepasses_duplicate_and_malformed_tools_call() {
-        let mut supported = false;
-        let mut session = mrtr::NativeMrtr::new();
-        let first = tools_call(json!(7), "fs.read", json!({ "path": "/tmp/report" }));
-        assert_eq!(
-            prepare_client_message(
-                first.as_bytes(),
-                InteractionMode::Client,
-                &mut supported,
-                &mut session,
-            ),
-            UpstreamPrepare::Unchanged
-        );
-        let duplicate = tools_call(json!(7), "fs.write", json!({ "path": "/etc/passwd" }));
-        assert_eq!(
-            prepare_client_message(
-                duplicate.as_bytes(),
-                InteractionMode::Client,
-                &mut supported,
-                &mut session,
-            ),
-            UpstreamPrepare::Unchanged
-        );
-        let malformed = json!({
-            "jsonrpc": "2.0",
-            "id": true,
-            "method": "tools/call",
-            "params": { "name": "fs.read" }
-        })
-        .to_string();
-        assert_eq!(
-            prepare_client_message(
-                malformed.as_bytes(),
-                InteractionMode::Client,
-                &mut supported,
-                &mut session,
-            ),
-            UpstreamPrepare::Unchanged
-        );
-        assert!(session.is_empty());
-    }
-
-    #[test]
-    fn native_cancel_notification_forwards_and_drops_tracking() {
-        let mut supported = false;
-        let mut session = mrtr::NativeMrtr::new();
-        let request = tools_call(json!(7), "fs.read", json!({ "path": "/tmp/report" }));
-        match prepare_client_message(
-            request.as_bytes(),
-            InteractionMode::Native,
-            &mut supported,
-            &mut session,
-        ) {
-            UpstreamPrepare::Rewrite(_) => {}
-            other => panic!("tools/call should be tracked, got {other:?}"),
-        }
-        let cancel = json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/cancelled",
-            "params": { "requestId": 7 }
-        })
-        .to_string();
-        let prepared = prepare_client_message(
-            cancel.as_bytes(),
-            InteractionMode::Native,
-            &mut supported,
-            &mut session,
-        );
-        assert_eq!(prepared, UpstreamPrepare::Unchanged);
-        assert!(session.is_empty());
-    }
-
-    fn serve_args(interaction: InteractionMode, socket: Option<&str>) -> ServeArgs {
-        ServeArgs {
-            interaction,
-            workspace: None,
-            request_timeout: None,
-            interaction_socket: socket.map(PathBuf::from),
-        }
-    }
-
-    #[test]
-    fn interaction_socket_requires_explicit_native_mode() {
-        for mode in [
-            InteractionMode::Auto,
-            InteractionMode::Client,
-            InteractionMode::Deny,
-        ] {
-            let error = native_surface(&serve_args(mode, Some("/tmp/aos-tray.sock")))
-                .expect_err("socket without native");
-            assert!(
-                error.contains("--interaction native"),
-                "{mode:?} must reject --interaction-socket: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn native_without_socket_keeps_the_platform_presenter() {
-        assert_eq!(
-            native_surface(&serve_args(InteractionMode::Native, None)).expect("native default"),
-            NativeSurface::Platform
-        );
-        assert_eq!(
-            native_surface(&serve_args(InteractionMode::Auto, None)).expect("auto default"),
-            NativeSurface::Platform
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn native_socket_selects_the_tray_surface() {
-        assert_eq!(
-            native_surface(&serve_args(
-                InteractionMode::Native,
-                Some("/tmp/aos-tray.sock")
-            ))
-            .expect("native socket"),
-            NativeSurface::Socket(PathBuf::from("/tmp/aos-tray.sock"))
-        );
-    }
-
-    #[test]
-    fn initialize_response_with_correct_identity_is_not_rewritten() {
-        let mut response = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "serverInfo": {
-                    "name": "unicity-aos",
-                    "title": "Unicity AOS",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }
-        });
-        assert!(!rewrite_server_identity(&mut response));
-    }
 }

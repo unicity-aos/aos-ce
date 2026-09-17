@@ -25,6 +25,23 @@ pub(super) use tray::TrayPresenter;
 const MAX_MESSAGE_BYTES: usize = 4096;
 const SAFE_APPROVAL_CHOICES: &[&str] =
     &["approve_once", "approve_session", "approve_always", "deny"];
+/// Human tray prompt deadline. Distinct from `--request-timeout`, which is an
+/// opaque runtime execution duration forwarded verbatim to the bundled MCP shim.
+pub(super) const DEFAULT_INTERACTION_TIMEOUT_SECONDS: u32 = 120;
+pub(super) const MIN_INTERACTION_TIMEOUT_SECONDS: u32 = 1;
+pub(super) const MAX_INTERACTION_TIMEOUT_SECONDS: u32 = 300;
+
+pub(super) fn parse_interaction_timeout(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| "interaction-timeout must be an integer number of seconds".to_owned())?;
+    if !(MIN_INTERACTION_TIMEOUT_SECONDS..=MAX_INTERACTION_TIMEOUT_SECONDS).contains(&parsed) {
+        return Err(format!(
+            "interaction-timeout must be between {MIN_INTERACTION_TIMEOUT_SECONDS} and {MAX_INTERACTION_TIMEOUT_SECONDS} seconds"
+        ));
+    }
+    Ok(parsed)
+}
 #[cfg(unix)]
 const GPG_ERR_CANCELED: u32 = 99;
 #[cfg(unix)]
@@ -726,5 +743,19 @@ mod tests {
             pinentry_selection(PinentryStatus::Error(60), 0, 1),
             Err(InteractionError::Unavailable(_))
         ));
+    }
+
+    #[test]
+    fn parse_interaction_timeout_rejects_zero_and_out_of_range() {
+        assert!(parse_interaction_timeout("0").is_err());
+        assert!(parse_interaction_timeout("301").is_err());
+        assert!(parse_interaction_timeout("").is_err());
+        assert!(parse_interaction_timeout("-1").is_err());
+        assert_eq!(parse_interaction_timeout("1").expect("min"), 1);
+        assert_eq!(
+            parse_interaction_timeout("120").expect("default"),
+            DEFAULT_INTERACTION_TIMEOUT_SECONDS
+        );
+        assert_eq!(parse_interaction_timeout("300").expect("max"), 300);
     }
 }

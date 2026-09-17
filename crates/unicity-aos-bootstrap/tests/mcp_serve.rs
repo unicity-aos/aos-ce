@@ -134,6 +134,9 @@ fn serve_rejects_flags_without_values_before_starting_the_runtime() {
         vec!["mcp", "serve", "--workspace"],
         vec!["mcp", "serve", "--request-timeout"],
         vec!["mcp", "serve", "--interaction-socket"],
+        vec!["mcp", "serve", "--interaction-timeout"],
+        vec!["mcp", "serve", "--max-in-flight-calls"],
+        vec!["mcp", "serve", "--max-input-rounds"],
     ] {
         let output = fixture
             .command()
@@ -144,6 +147,32 @@ fn serve_rejects_flags_without_values_before_starting_the_runtime() {
         assert!(
             !fixture.args.exists(),
             "invalid argv must not reach runtime"
+        );
+    }
+}
+
+#[test]
+fn serve_rejects_out_of_range_native_adapter_limits_before_starting_the_runtime() {
+    let fixture = Fixture::new("invalid-limits");
+    fixture.install_runtime(RECORDING_RUNTIME);
+
+    for arguments in [
+        vec!["mcp", "serve", "--interaction-timeout", "0"],
+        vec!["mcp", "serve", "--interaction-timeout", "301"],
+        vec!["mcp", "serve", "--max-in-flight-calls", "0"],
+        vec!["mcp", "serve", "--max-in-flight-calls", "1025"],
+        vec!["mcp", "serve", "--max-input-rounds", "0"],
+        vec!["mcp", "serve", "--max-input-rounds", "65"],
+    ] {
+        let output = fixture
+            .command()
+            .args(&arguments)
+            .output()
+            .expect("run invalid MCP bridge limits");
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        assert!(
+            !fixture.args.exists(),
+            "invalid adapter limits must not reach runtime: {arguments:?}"
         );
     }
 }

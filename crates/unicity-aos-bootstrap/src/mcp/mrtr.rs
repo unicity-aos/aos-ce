@@ -18,6 +18,13 @@ const ELICITATION_CREATE: &str = "elicitation/create";
 const RESULT_TYPE_INPUT_REQUIRED: &str = "input_required";
 const CANCELLED_NOTIFICATION: &str = "notifications/cancelled";
 const MAX_INPUT_REQUESTS: usize = 8;
+/// One MCP serve process is one host session. Parallel tool calls fit here;
+/// each entry retains cloned `tools/call` params, so this is also a memory bound.
+pub(super) const DEFAULT_MAX_IN_FLIGHT_CALLS: usize = 32;
+pub(super) const MAX_MAX_IN_FLIGHT_CALLS: usize = 1024;
+/// Distinct subsequent rounds remain possible; unbounded `requestState` retention does not.
+pub(super) const DEFAULT_MAX_INPUT_ROUNDS: usize = 8;
+pub(super) const MAX_MAX_INPUT_ROUNDS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum RpcId {
@@ -53,9 +60,11 @@ struct TrackedCall {
 }
 
 /// In-memory table of native MRTR invocations awaiting a local decision.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct NativeMrtr {
     calls: BTreeMap<RpcId, TrackedCall>,
+    max_in_flight: usize,
+    max_input_rounds: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +72,8 @@ pub(super) enum MrtrError {
     UnknownId,
     AlreadySettled,
     DuplicateId,
+    TooManyInFlight,
+    TooManyRounds,
     Malformed(&'static str),
     Unsupported(&'static str),
 }
@@ -75,6 +86,12 @@ impl fmt::Display for MrtrError {
                 formatter.write_str("tracked tools/call already consumed this input_required round")
             }
             Self::DuplicateId => formatter.write_str("tools/call id is already in flight"),
+            Self::TooManyInFlight => {
+                formatter.write_str("too many in-flight native tools/call invocations")
+            }
+            Self::TooManyRounds => {
+                formatter.write_str("tracked tools/call exceeded the native input round limit")
+            }
             Self::Malformed(message) | Self::Unsupported(message) => formatter.write_str(message),
         }
     }
@@ -87,8 +104,17 @@ struct Prepared {
 }
 
 impl NativeMrtr {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
-        Self::default()
+        Self::with_limits(DEFAULT_MAX_IN_FLIGHT_CALLS, DEFAULT_MAX_INPUT_ROUNDS)
+    }
+
+    pub(super) fn with_limits(max_in_flight: usize, max_input_rounds: usize) -> Self {
+        Self {
+            calls: BTreeMap::new(),
+            max_in_flight,
+            max_input_rounds,
+        }
     }
 
     #[cfg(test)]
@@ -117,6 +143,9 @@ impl NativeMrtr {
         }
         if self.calls.contains_key(&key) {
             return Err(MrtrError::DuplicateId);
+        }
+        if self.calls.len() >= self.max_in_flight {
+            return Err(MrtrError::TooManyInFlight);
         }
 
         let mut stored = params.clone();
@@ -232,6 +261,9 @@ impl NativeMrtr {
         if round_already_consumed(call, request_state.as_deref()) {
             return Err(MrtrError::AlreadySettled);
         }
+        if retained_rounds(call) >= self.max_input_rounds {
+            return Err(MrtrError::TooManyRounds);
+        }
         Ok(Prepared {
             key,
             request_state,
@@ -250,6 +282,9 @@ impl NativeMrtr {
             .ok_or(MrtrError::UnknownId)?;
         if round_already_consumed(call, prepared.request_state.as_deref()) {
             return Err(MrtrError::AlreadySettled);
+        }
+        if retained_rounds(call) >= self.max_input_rounds {
+            return Err(MrtrError::TooManyRounds);
         }
         match prepared.request_state.as_ref() {
             Some(state) => {
@@ -295,6 +330,30 @@ fn round_already_consumed(call: &TrackedCall, request_state: Option<&str>) -> bo
         Some(state) => call.consumed_states.contains(state),
         None => call.consumed_stateless,
     }
+}
+
+fn retained_rounds(call: &TrackedCall) -> usize {
+    call.consumed_states
+        .len()
+        .saturating_add(usize::from(call.consumed_stateless))
+}
+
+pub(super) fn parse_max_in_flight_calls(value: &str) -> Result<usize, String> {
+    parse_limit(value, 1, MAX_MAX_IN_FLIGHT_CALLS, "max-in-flight-calls")
+}
+
+pub(super) fn parse_max_input_rounds(value: &str) -> Result<usize, String> {
+    parse_limit(value, 1, MAX_MAX_INPUT_ROUNDS, "max-input-rounds")
+}
+
+fn parse_limit(value: &str, min: usize, max: usize, name: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("{name} must be an integer"))?;
+    if !(min..=max).contains(&parsed) {
+        return Err(format!("{name} must be between {min} and {max}"));
+    }
+    Ok(parsed)
 }
 
 fn present_all(
@@ -452,9 +511,13 @@ mod tests {
     }
 
     fn tool_call() -> Value {
+        tool_call_with_id(json!(7))
+    }
+
+    fn tool_call_with_id(id: Value) -> Value {
         json!({
             "jsonrpc": "2.0",
-            "id": 7,
+            "id": id,
             "method": "tools/call",
             "params": {
                 "_meta": {
@@ -803,5 +866,110 @@ mod tests {
             .expect_err("cancelled");
         assert_eq!(error, MrtrError::UnknownId);
         assert_eq!(presenter.calls, 0);
+    }
+
+    #[test]
+    fn excess_in_flight_call_is_rejected_without_dropping_existing() {
+        let mut session = NativeMrtr::with_limits(2, DEFAULT_MAX_INPUT_ROUNDS);
+        assert!(session.record(&tool_call_with_id(json!(1))).expect("first"));
+        assert!(
+            session
+                .record(&tool_call_with_id(json!(2)))
+                .expect("second")
+        );
+        assert_eq!(
+            session
+                .record(&tool_call_with_id(json!(3)))
+                .expect_err("limit+1"),
+            MrtrError::TooManyInFlight
+        );
+        assert_eq!(
+            session
+                .record(&tool_call_with_id(json!(2)))
+                .expect_err("duplicate still wins"),
+            MrtrError::DuplicateId
+        );
+
+        let resume = session
+            .decline(&input_required(json!(1), "keep-first", grant_schema()))
+            .expect("existing call remains");
+        assert_eq!(resume["params"]["name"], "fs.read");
+        assert_eq!(resume["params"]["requestState"], "keep-first");
+        assert!(session.complete(&json!(2)));
+        assert!(
+            session
+                .record(&tool_call_with_id(json!(3)))
+                .expect("cleanup frees a slot")
+        );
+        assert_eq!(
+            session
+                .record(&tool_call_with_id(json!(4)))
+                .expect_err("full again"),
+            MrtrError::TooManyInFlight
+        );
+    }
+
+    #[test]
+    fn excess_distinct_states_are_rejected_without_dropping_the_call() {
+        let mut session = NativeMrtr::with_limits(DEFAULT_MAX_IN_FLIGHT_CALLS, 2);
+        session.record(&tool_call()).expect("record");
+        let mut presenter = FakePresenter::accept(0);
+        session
+            .decide(
+                &input_required(json!(7), "round-a", grant_schema()),
+                &mut presenter,
+            )
+            .expect("first round");
+        session
+            .decide(
+                &input_required(json!(7), "round-b", grant_schema()),
+                &mut presenter,
+            )
+            .expect("second round");
+        assert_eq!(presenter.calls, 2);
+        let mut unused = FakePresenter::unused();
+        let error = session
+            .decide(
+                &input_required(json!(7), "round-c", grant_schema()),
+                &mut unused,
+            )
+            .expect_err("limit+1 round");
+        assert_eq!(error, MrtrError::TooManyRounds);
+        assert_eq!(unused.calls, 0);
+        let replay = session
+            .decide(
+                &input_required(json!(7), "round-a", grant_schema()),
+                &mut unused,
+            )
+            .expect_err("earlier round still consumed");
+        assert_eq!(replay, MrtrError::AlreadySettled);
+        assert!(!session.is_empty());
+        assert!(session.complete(&json!(7)));
+        assert!(session.is_empty());
+        session
+            .record(&tool_call())
+            .expect("cleanup starts a new call");
+        session
+            .decide(
+                &input_required(json!(7), "round-c", grant_schema()),
+                &mut presenter,
+            )
+            .expect("new call is not bound by the previous round set");
+        assert_eq!(presenter.calls, 3);
+    }
+
+    #[test]
+    fn in_flight_and_round_limits_reject_zero_and_overflow() {
+        assert!(parse_max_in_flight_calls("0").is_err());
+        assert!(parse_max_in_flight_calls("1025").is_err());
+        assert!(parse_max_in_flight_calls("nope").is_err());
+        assert_eq!(parse_max_in_flight_calls("1").expect("min"), 1);
+        assert_eq!(
+            parse_max_in_flight_calls("1024").expect("max"),
+            MAX_MAX_IN_FLIGHT_CALLS
+        );
+        assert!(parse_max_input_rounds("0").is_err());
+        assert!(parse_max_input_rounds("65").is_err());
+        assert_eq!(parse_max_input_rounds("8").expect("default"), 8);
     }
 }

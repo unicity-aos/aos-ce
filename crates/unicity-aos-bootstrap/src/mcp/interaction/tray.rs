@@ -17,20 +17,20 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{InteractionError, InteractionRequest, MAX_MESSAGE_BYTES, Presenter};
+use super::{
+    InteractionError, InteractionRequest, MAX_INTERACTION_TIMEOUT_SECONDS, MAX_MESSAGE_BYTES,
+    MIN_INTERACTION_TIMEOUT_SECONDS, Presenter,
+};
 
 const PROTOCOL_VERSION: u32 = 1;
-/// Initial tray prompt deadline. This is not a CLI knob.
-const TRAY_TIMEOUT_SECONDS: u32 = 120;
 const MAX_FRAME_BYTES: usize = 16384;
 const MAX_ID_BYTES: usize = 128;
 const MIN_ID_BYTES: usize = 1;
 const MAX_OPTIONS: usize = 4;
 const MIN_OPTIONS: usize = 1;
-const MIN_TIMEOUT_SECONDS: u32 = 1;
-const MAX_TIMEOUT_SECONDS: u32 = 300;
 const _: () = assert!(
-    TRAY_TIMEOUT_SECONDS >= MIN_TIMEOUT_SECONDS && TRAY_TIMEOUT_SECONDS <= MAX_TIMEOUT_SECONDS
+    super::DEFAULT_INTERACTION_TIMEOUT_SECONDS >= MIN_INTERACTION_TIMEOUT_SECONDS
+        && super::DEFAULT_INTERACTION_TIMEOUT_SECONDS <= MAX_INTERACTION_TIMEOUT_SECONDS
 );
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,24 +39,39 @@ const PARENT_MODE: u32 = 0o700;
 
 pub(in crate::mcp) struct TrayPresenter {
     socket: PathBuf,
+    timeout_seconds: u32,
 }
 
 impl TrayPresenter {
-    pub(in crate::mcp) fn new(socket: PathBuf) -> Self {
-        Self { socket }
+    pub(in crate::mcp) fn new(socket: PathBuf, timeout_seconds: u32) -> Self {
+        Self {
+            socket,
+            timeout_seconds,
+        }
     }
 }
 
 impl Presenter for TrayPresenter {
     fn present(&mut self, request: &InteractionRequest) -> Result<Option<usize>, InteractionError> {
-        present_on_socket(&self.socket, request)
+        present_on_socket(&self.socket, request, self.timeout_seconds)
     }
+}
+
+fn prompt_read_timeout(timeout_seconds: u32) -> Result<Duration, InteractionError> {
+    if !(MIN_INTERACTION_TIMEOUT_SECONDS..=MAX_INTERACTION_TIMEOUT_SECONDS)
+        .contains(&timeout_seconds)
+    {
+        return Err(unavailable("tray prompt timeout is out of range"));
+    }
+    Ok(Duration::from_secs(u64::from(timeout_seconds)))
 }
 
 fn present_on_socket(
     socket: &Path,
     request: &InteractionRequest,
+    timeout_seconds: u32,
 ) -> Result<Option<usize>, InteractionError> {
+    let read_timeout = prompt_read_timeout(timeout_seconds)?;
     if !(MIN_OPTIONS..=MAX_OPTIONS).contains(&request.options.len()) {
         return Err(unavailable("tray request has an invalid number of options"));
     }
@@ -64,7 +79,7 @@ fn present_on_socket(
         return Err(unavailable("tray request message is empty or too large"));
     }
     validate_socket_path(socket)?;
-    let stream = connect_unix(socket)?;
+    let stream = connect_unix(socket, read_timeout)?;
     let peer = peer_uid(&stream)?;
     if peer != current_uid() {
         return Err(unavailable("tray socket peer is not the current user"));
@@ -82,7 +97,7 @@ fn present_on_socket(
                 label: option.label.as_str(),
             })
             .collect(),
-        timeout_seconds: TRAY_TIMEOUT_SECONDS,
+        timeout_seconds,
         consent: request.consent.as_ref(),
     };
     let mut stream = stream;
@@ -213,7 +228,7 @@ fn permission_bits(metadata: &Metadata) -> u32 {
     metadata.mode() & 0o777
 }
 
-fn connect_unix(path: &Path) -> Result<UnixStream, InteractionError> {
+fn connect_unix(path: &Path, read_timeout: Duration) -> Result<UnixStream, InteractionError> {
     let path = path.to_owned();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -225,7 +240,7 @@ fn connect_unix(path: &Path) -> Result<UnixStream, InteractionError> {
     match receiver.recv_timeout(CONNECT_TIMEOUT) {
         Ok(Ok(stream)) => {
             stream
-                .set_read_timeout(Some(Duration::from_secs(TRAY_TIMEOUT_SECONDS.into())))
+                .set_read_timeout(Some(read_timeout))
                 .map_err(|error| unavailable(format!("failed to bound tray read: {error}")))?;
             stream
                 .set_write_timeout(Some(WRITE_TIMEOUT))
@@ -395,6 +410,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -456,6 +472,16 @@ mod tests {
     where
         F: FnOnce(Value) -> Option<String> + Send + 'static,
     {
+        present_with_timeout(super::super::DEFAULT_INTERACTION_TIMEOUT_SECONDS, respond)
+    }
+
+    fn present_with_timeout<F>(
+        timeout_seconds: u32,
+        respond: F,
+    ) -> Result<Option<usize>, InteractionError>
+    where
+        F: FnOnce(Value) -> Option<String> + Send + 'static,
+    {
         let fixture = Fixture::new("server");
         let listener = UnixListener::bind(&fixture.socket).expect("bind tray");
         set_mode(&fixture.socket, SOCKET_MODE);
@@ -478,7 +504,7 @@ mod tests {
             }
         });
         ready.recv().expect("server listening");
-        let mut presenter = TrayPresenter::new(fixture.socket.clone());
+        let mut presenter = TrayPresenter::new(fixture.socket.clone(), timeout_seconds);
         let result = presenter.present(&grant_request());
         let _ = UnixStream::connect(&fixture.socket);
         let _ = handle.join();
@@ -498,7 +524,10 @@ mod tests {
     fn tray_accept_returns_selected_index() {
         let selected = present_with(|request| {
             assert_eq!(request["version"], 1);
-            assert_eq!(request["timeoutSeconds"], 120);
+            assert_eq!(
+                request["timeoutSeconds"],
+                json!(super::super::DEFAULT_INTERACTION_TIMEOUT_SECONDS)
+            );
             assert_eq!(request["message"], "Allow this capsule to continue?");
             assert_eq!(
                 request["options"],
@@ -584,7 +613,10 @@ mod tests {
     #[test]
     fn tray_unavailable_socket_never_consents() {
         let fixture = Fixture::new("missing");
-        let mut presenter = TrayPresenter::new(fixture.socket.clone());
+        let mut presenter = TrayPresenter::new(
+            fixture.socket.clone(),
+            super::super::DEFAULT_INTERACTION_TIMEOUT_SECONDS,
+        );
         let error = presenter
             .present(&grant_request())
             .expect_err("missing socket");
@@ -594,6 +626,42 @@ mod tests {
     #[test]
     fn tray_eof_without_response_is_unavailable() {
         let error = present_with(|_| None).expect_err("eof");
+        assert!(matches!(error, InteractionError::Unavailable(_)));
+    }
+
+    #[test]
+    fn configured_prompt_deadlines_are_serialized_without_waiting() {
+        for timeout in [1_u32, 180] {
+            let selected = present_with_timeout(timeout, move |request| {
+                assert_eq!(request["timeoutSeconds"], json!(timeout));
+                Some(echo_selected(&request, json!(0)))
+            })
+            .expect("configured timeout");
+            assert_eq!(selected, Some(0));
+        }
+    }
+
+    #[test]
+    fn prompt_read_timeout_matches_configured_seconds() {
+        assert_eq!(
+            prompt_read_timeout(1).expect("short"),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            prompt_read_timeout(180).expect("long"),
+            Duration::from_secs(180)
+        );
+        assert!(prompt_read_timeout(0).is_err());
+        assert!(prompt_read_timeout(301).is_err());
+    }
+
+    #[test]
+    fn out_of_range_prompt_timeout_never_consents() {
+        let fixture = Fixture::new("bad-timeout");
+        let mut presenter = TrayPresenter::new(fixture.socket.clone(), 0);
+        let error = presenter
+            .present(&grant_request())
+            .expect_err("zero timeout");
         assert!(matches!(error, InteractionError::Unavailable(_)));
     }
 }
