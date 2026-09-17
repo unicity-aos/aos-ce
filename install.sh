@@ -1264,6 +1264,13 @@ if [ -d "$bundle/runtime/bin/AstridFS.app" ]; then
   cp -Rp "$bundle/runtime/bin/AstridFS.app" "$release_stage/runtime/bin/"
   cp -Rp "$bundle/runtime/bin/macos" "$release_stage/runtime/bin/"
 fi
+if [ -d "$bundle/share/AOS Command Center.app" ]; then
+  mkdir "$release_stage/share"
+  chmod 700 "$release_stage/share"
+  # The authenticated archive owns these signed bytes. Do not edit Info.plist
+  # or re-sign while installing the product. Do not copy to /Applications.
+  cp -Rp "$bundle/share/AOS Command Center.app" "$release_stage/share/"
+fi
 install -m 0600 "$bundle/release-manifest.json" "$release_stage/release-manifest.json"
 install -m 0600 "$bundle/Distro.toml" "$release_stage/Distro.toml"
 if [ "$distro_archive_signed" -eq 1 ]; then

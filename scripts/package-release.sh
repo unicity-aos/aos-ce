@@ -191,6 +191,7 @@ for relative, record in release_files.items():
             "runtime/bin/AstridFS.app/Contents/Extensions/AstridFSAppEx.appex/Contents/MacOS/AstridFSAppEx",
             "runtime/bin/macos/manage-macos-fskit.sh",
             "runtime/bin/macos/validate-macos-fskit.sh",
+            "share/AOS Command Center.app/Contents/MacOS/aos-tray",
         }
     )
     if isinstance(record, dict) and record.get("mode") == 0o755 and relative not in expected_executables and not filesystem_executable:
@@ -588,6 +589,13 @@ if [[ "$target" == *-apple-darwin ]]; then
   fi
   python3 "$repo_root/scripts/package_macos_filesystem.py" \
     "$runtime_root" "$work/$root/runtime/bin" "$filesystem_requirement"
+  if [[ -z "${AOS_COMMAND_CENTER_APP:-}" ]]; then
+    echo "Darwin release composer requires AOS_COMMAND_CENTER_APP" >&2
+    exit 1
+  fi
+  mkdir -p "$work/$root/share"
+  python3 "$repo_root/scripts/package_macos_command_center.py" \
+    "$AOS_COMMAND_CENTER_APP" "$work/$root/share"
 fi
 
 python3 "$repo_root/scripts/capsule_release.py" --print-assets > "$work/$root/capsule-assets.txt"
@@ -634,6 +642,13 @@ if [[ -d "$work/$root/runtime/bin/AstridFS.app" ]]; then
     record_release_file "$relative" "$mode"
   done < <(find "$work/$root/runtime/bin/AstridFS.app" \
     "$work/$root/runtime/bin/macos" -type f -print0)
+fi
+if [[ -d "$work/$root/share/AOS Command Center.app" ]]; then
+  while IFS= read -r -d '' member; do
+    relative=${member#"$work/$root/"}
+    mode=$(stat -c '%a' "$member" 2>/dev/null || stat -f '%Lp' "$member")
+    record_release_file "$relative" "$mode"
+  done < <(find "$work/$root/share/AOS Command Center.app" -type f -print0)
 fi
 record_release_file Distro.toml 600
 if [[ "$distro_signing" = yes ]]; then

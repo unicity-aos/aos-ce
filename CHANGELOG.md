@@ -21,6 +21,11 @@ implementations are consolidated into their final behavior.
   owned-principal selection. Explicit local setup pairs a dedicated responder;
   disconnection and cancellation never approve. App distribution and automatic
   launch are not yet integrated.
+- Package Darwin `share/AOS Command Center.app` from `AOS_COMMAND_CENTER_APP`
+  and copy it unchanged into the immutable release directory when present.
+  Archives without the member still install. The app is not placed in
+  `/Applications`, is not AOS Developer ID signed here, and is not launched or
+  default-connected yet. Developer preview builds are not packaged GO.
 
 ### Fixed
 

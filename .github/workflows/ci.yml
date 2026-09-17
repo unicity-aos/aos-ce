@@ -110,6 +110,8 @@ jobs:
       - run: python3 scripts/test_create_astrid_094_fixture.py
       - run: bash scripts/test-package-release.sh
       - run: python3 scripts/test_package_macos_filesystem.py
+      - run: python3 scripts/test_package_macos_command_center.py
+      - run: bash scripts/test_build_command_center.sh
       - run: bash scripts/test-install.sh
       - run: python3 scripts/capsule_release.py
       - run: python3 scripts/test_capsule_release.py
