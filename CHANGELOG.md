@@ -6,13 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [year.month.patch](release/VERSIONING.md). Repairs to unreleased
 implementations are consolidated into their final behavior.
 
-[Unreleased]: https://github.com/unicity-aos/aos-ce/compare/2026.9.2...HEAD
+[Unreleased]: https://github.com/unicity-aos/aos-ce/compare/2026.9.3...HEAD
+[2026.9.3]: https://github.com/unicity-aos/aos-ce/compare/2026.9.2...2026.9.3
 [2026.9.2]: https://github.com/unicity-aos/aos-ce/compare/2026.9.1...2026.9.2
 [2026.9.1]: https://github.com/unicity-aos/aos-ce/compare/2026.9.0...2026.9.1
 [2026.9.0]: https://github.com/unicity-aos/aos-ce/compare/2026.1.3...2026.9.0
 [2026.1.3]: https://github.com/unicity-aos/aos-ce/releases/tag/2026.1.3
 
 ## [Unreleased]
+
+## [2026.9.3] - 2026-09-18
 
 ### Added
 
