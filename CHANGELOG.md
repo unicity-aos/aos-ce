@@ -44,6 +44,9 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Repair permissions in existing legacy `runtime/secrets`, `runtime/home`, and
+  `runtime/cow` trees during upgrade so pre-2026.9 homes satisfy Astrid's
+  owner-only private-root contract without creating or following unsafe entries.
 - No-args AOS Tray launch binds the current user's `~/.aos/bin/aos` and
   `~/.aos`, or a valid absolute `AOS_HOME`, instead of leaving Finder
   launches unable to inventory or set up native input. `PATH` search,

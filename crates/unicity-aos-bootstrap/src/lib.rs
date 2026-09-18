@@ -14,6 +14,7 @@ use std::process::{Child, Command, ExitStatus};
 
 pub mod health;
 mod init_resume;
+mod legacy_private_permissions;
 mod migration;
 pub mod status;
 pub use migration::{LegacyDistro, MigrationOutcome};
@@ -542,6 +543,7 @@ impl AosHome {
             }
             self.repair_legacy_cross_generation_layout()?;
         }
+        legacy_private_permissions::repair_legacy_private_roots(&self.runtime_home())?;
         self.ensure_unicity_ce_manifest().map(drop)
     }
 
