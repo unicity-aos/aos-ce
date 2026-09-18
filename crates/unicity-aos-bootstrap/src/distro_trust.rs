@@ -21,6 +21,12 @@ const SIG_DOMAIN_TAG: &[u8] = b"astrid-distro-lock-sig-v1\x00";
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const RECEIPT_KIND: &str = "aos-distro-apply-active-v1";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReceiptPrincipalPolicy {
+    MustMatch,
+    IgnoreMismatch,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedDistro {
     pub(crate) manifest_path: PathBuf,
@@ -234,6 +240,7 @@ pub(crate) fn check_existing_receipt(
     home: &AosHome,
     distro: &VerifiedDistro,
     principal: &str,
+    principal_policy: ReceiptPrincipalPolicy,
 ) -> io::Result<()> {
     let path = receipt_path(home);
     let metadata = match fs::symlink_metadata(&path) {
@@ -262,11 +269,15 @@ pub(crate) fn check_existing_receipt(
         || receipt.pin_blake3 != blake3::hash(distro.signing_pubkey.as_bytes()).to_string()
         || receipt.lock_blake3 != distro.lock_blake3
         || receipt.signature_blake3 != distro.signature_blake3
-        || receipt.principal != principal
         || receipt.astrid_runtime_version != ASTRID_RUNTIME_VERSION
     {
         return Err(invalid_data(
-            "existing AOS Distro Apply receipt does not match the selected distro, key, or principal",
+            "existing AOS Distro Apply receipt does not match the selected distro or key",
+        ));
+    }
+    if principal_policy == ReceiptPrincipalPolicy::MustMatch && receipt.principal != principal {
+        return Err(invalid_data(
+            "existing AOS Distro Apply receipt does not match the selected principal",
         ));
     }
     Ok(())
@@ -606,5 +617,108 @@ mod compatibility_tests {
     fn historical_exact_requirements_remain_valid() {
         validate_runtime_requirement("=2026.9.2", "2026.9.2").unwrap();
         assert!(validate_runtime_requirement("=2026.9.2", "2026.9.3").is_err());
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::{
+        ReceiptPrincipalPolicy, VerifiedDistro, check_existing_receipt, write_active_receipt,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use unicity_aos_bootstrap::AosHome;
+
+    fn sample_distro() -> VerifiedDistro {
+        VerifiedDistro {
+            manifest_path: PathBuf::from("/tmp/Distro.toml"),
+            distro_id: "unicity-ce".to_owned(),
+            distro_version: "2026.9.2".to_owned(),
+            manifest_blake3: "blake3:manifest".to_owned(),
+            signing_pubkey: "ed25519:fixture".to_owned(),
+            lock_blake3: "blake3:lock".to_owned(),
+            signature_blake3: "blake3:sig".to_owned(),
+        }
+    }
+
+    fn temporary_home() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aos-distro-receipt-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn missing_receipt_does_not_fail_closed() {
+        let root = temporary_home();
+        let home = AosHome::from_root(&root);
+        check_existing_receipt(
+            &home,
+            &sample_distro(),
+            "claude-code",
+            ReceiptPrincipalPolicy::MustMatch,
+        )
+        .expect("absent Distro Apply receipt is not a refusal");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn filtered_apply_accepts_matching_identity_with_another_principal() {
+        let root = temporary_home();
+        let home = AosHome::from_root(&root);
+        let distro = sample_distro();
+        write_active_receipt(&home, &distro, "default").expect("write default receipt");
+        check_existing_receipt(
+            &home,
+            &distro,
+            "claude-code",
+            ReceiptPrincipalPolicy::IgnoreMismatch,
+        )
+        .expect("filtered apply may keep the existing default receipt principal");
+        check_existing_receipt(
+            &home,
+            &distro,
+            "claude-code",
+            ReceiptPrincipalPolicy::MustMatch,
+        )
+        .expect_err("unfiltered apply still requires the receipt principal");
+        let receipt = fs::read(root.join("receipts/unicity-ce.active.json")).expect("read receipt");
+        write_active_receipt(&home, &distro, "claude-code")
+            .expect("rewrite would change principal");
+        let rewritten = fs::read(root.join("receipts/unicity-ce.active.json")).expect("reread");
+        assert_ne!(
+            receipt, rewritten,
+            "sanity: rewriting the receipt changes bytes"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identity_mismatch_is_still_refused_when_principal_is_ignored() {
+        let root = temporary_home();
+        let home = AosHome::from_root(&root);
+        let distro = sample_distro();
+        write_active_receipt(&home, &distro, "default").expect("write default receipt");
+        let mut other = distro.clone();
+        other.lock_blake3 = "blake3:other-lock".to_owned();
+        let error = check_existing_receipt(
+            &home,
+            &other,
+            "claude-code",
+            ReceiptPrincipalPolicy::IgnoreMismatch,
+        )
+        .expect_err("filtered apply still binds distro identity and key");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the selected distro or key"),
+            "got: {error}"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
