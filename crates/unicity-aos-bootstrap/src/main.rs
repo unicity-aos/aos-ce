@@ -16,12 +16,15 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use unicity_aos_bootstrap::{AOS_WORKSPACE_STATE_DIR, AosHome};
 
 mod cli;
+mod command_center;
 mod distro_trust;
 mod hook;
 mod mcp;
 #[cfg(unix)]
 mod native_setup;
 mod principals;
+
+use command_center::{open_command_center, runtime_start_requested};
 
 // Product-owned commands are parsed here. Unknown roots bypass this parser and
 // are delegated byte-for-byte to the bundled runtime by `main`.
@@ -248,6 +251,9 @@ fn main() -> ExitCode {
         Ok(home) => home,
         Err(code) => return code,
     };
+    if runtime_start_requested(&args) {
+        open_command_center();
+    }
     match home.exec_runtime_with_args(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -379,7 +385,10 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
         Some(ProductCommand::Hook(args)) => Some(handle_hook(cli.principal, args)),
         Some(ProductCommand::Mcp {
             command: McpCommand::Serve(args),
-        }) => Some(mcp::handle_serve(cli.principal, args)),
+        }) => {
+            open_command_center();
+            Some(mcp::handle_serve(cli.principal, args))
+        }
         Some(ProductCommand::Principals(args)) => Some(cli::handle_principals(
             cli.principal,
             args.principal,

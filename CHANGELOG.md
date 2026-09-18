@@ -19,13 +19,14 @@ implementations are consolidated into their final behavior.
 - Add a developer-preview macOS AOS menu-bar app with permission dialogs,
   typed private-input forms, runtime overview, searchable capsule inventory and
   owned-principal selection. Explicit local setup pairs a dedicated responder;
-  disconnection and cancellation never approve. App distribution and automatic
-  launch are not yet integrated.
+  disconnection and cancellation never approve.
 - Package Darwin `share/AOS Command Center.app` from `AOS_COMMAND_CENTER_APP`
-  and copy it unchanged into the immutable release directory when present.
-  Archives without the member still install. The app is not placed in
-  `/Applications`, is not AOS Developer ID signed here, and is not launched or
-  default-connected yet. Developer preview builds are not packaged GO.
+  and copy it unchanged into both the immutable release directory and the
+  current user's Applications directory when present. The installer opens the
+  stable app, it registers as a login item, and `aos start`/`restart` plus
+  Oracle-facing `aos mcp serve` sessions reopen it so native approval and input
+  requests have a visible presenter. Archives without the member still install.
+  Developer preview builds are not packaged GO.
 - Intercept modern MCP `input_required` results in `aos mcp serve` native, auto
   (when the client lacks forms), and deny modes. The original `tools/call` is
   resumed to the runtime with echoed `requestState`; incomplete results stay off

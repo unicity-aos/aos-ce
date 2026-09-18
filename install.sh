@@ -1348,6 +1348,57 @@ if [ -d "$release_dir/runtime/bin/AstridFS.app" ]; then
   fi
 fi
 
+if [ "$os" = Darwin ] && [ -d "$release_dir/share/AOS Command Center.app" ]; then
+  command_center_parent="$HOME/Applications"
+  command_center="$command_center_parent/AOS Command Center.app"
+  command_center_stage="$command_center_parent/.AOS Command Center.app.new.$$"
+  command_center_backup="$command_center_parent/.AOS Command Center.app.rollback.$$"
+  [ ! -L "$command_center_parent" ] || {
+    echo "AOS runtime is installed; refusing symlinked Applications directory: $command_center_parent" >&2
+    exit 1
+  }
+  mkdir -p "$command_center_parent"
+  [ -d "$command_center_parent" ] || {
+    echo "AOS runtime is installed; Applications path is not a directory: $command_center_parent" >&2
+    exit 1
+  }
+  if [ -e "$command_center" ] || [ -L "$command_center" ]; then
+    [ -d "$command_center" ] && [ ! -L "$command_center" ] || {
+      echo "AOS runtime is installed; refusing non-directory Command Center: $command_center" >&2
+      exit 1
+    }
+    existing_id=$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - \
+      "$command_center/Contents/Info.plist" 2>/dev/null || :)
+    [ "$existing_id" = ai.unicity.aos.tray ] || {
+      echo "AOS runtime is installed; refusing to replace another application at $command_center" >&2
+      exit 1
+    }
+  fi
+  rm -rf "$command_center_stage" "$command_center_backup"
+  cp -Rp "$release_dir/share/AOS Command Center.app" "$command_center_stage"
+  if [ -d "$command_center" ]; then
+    mv "$command_center" "$command_center_backup"
+  fi
+  if ! mv "$command_center_stage" "$command_center"; then
+    [ ! -d "$command_center_backup" ] || mv "$command_center_backup" "$command_center"
+    echo "AOS runtime is installed; failed to install Command Center" >&2
+    exit 1
+  fi
+  rm -rf "$command_center_backup"
+
+  command_center_open=/usr/bin/open
+  if [ -n "${AOS_TEST_OPEN:-}" ]; then
+    [ -n "${AOS_TEST_FIXTURE:-}" ] || {
+      echo "AOS_TEST_OPEN is restricted to installer fixtures" >&2
+      exit 1
+    }
+    command_center_open=$AOS_TEST_OPEN
+  fi
+  if ! "$command_center_open" -g "$command_center"; then
+    echo "AOS is installed, but Command Center did not open. Open it from $command_center" >&2
+  fi
+fi
+
 echo "Installed Unicity AOS $staged_version."
 case ":$PATH:" in
   *":$AOS_BIN_DIR:"*) init_command="aos init" ;;

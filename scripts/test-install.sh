@@ -167,6 +167,14 @@ exit 1
 EOF
 chmod 755 "$fake_bin/ldd"
 
+cat > "$fake_bin/open" <<'EOF'
+#!/bin/sh
+set -eu
+: "${AOS_TEST_OPEN_LOG:?}"
+printf '<%s>\n' "$@" > "$AOS_TEST_OPEN_LOG"
+EOF
+chmod 755 "$fake_bin/open"
+
 cat > "$fake_bin/curl" <<'EOF'
 #!/bin/sh
 set -eu
@@ -396,6 +404,8 @@ AOS_TEST_FIXTURE="$darwin_fixture" \
 AOS_TEST_UNAME_S=Darwin \
 AOS_TEST_UNAME_M=arm64 \
 AOS_TEST_FSKIT_LOG="$work/fskit-calls" \
+AOS_TEST_OPEN="$fake_bin/open" \
+AOS_TEST_OPEN_LOG="$work/command-center-open" \
 ASTRID_FSKIT_APP_DEST="$work/AOS.app" \
 AOS_TEST_COSIGN_SHA256=94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5 \
 AOS_VERSION=2026.9.2 \
@@ -412,8 +422,10 @@ do
   test ! -e "$darwin_home/.aos/runtime/bin/$binary"
 done
 diff -r "$command_center_app" "$darwin_release_dir/share/AOS Command Center.app"
+diff -r "$command_center_app" "$darwin_home/Applications/AOS Command Center.app"
+grep -Fx '<-g>' "$work/command-center-open"
+grep -Fx "<$darwin_home/Applications/AOS Command Center.app>" "$work/command-center-open"
 test ! -e "$work/AOS.app/Contents/MacOS/aos-tray"
-test ! -e "$darwin_home/Applications/AOS Command Center.app"
 test ! -e "$darwin_home/.aos/Applications/AOS Command Center.app"
 test ! -e "$darwin_home/.aos/share/AOS Command Center.app"
 

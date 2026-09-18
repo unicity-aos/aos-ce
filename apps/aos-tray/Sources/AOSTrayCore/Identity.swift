@@ -126,7 +126,7 @@ public struct TrayLifecyclePolicy: Equatable, Codable, Sendable {
         closeWindowHides: true,
         terminateAfterLastWindowClosed: false,
         quitStopsRuntime: false,
-        autoLaunchAtLogin: false,
+        autoLaunchAtLogin: true,
         readsLiveHome: false,
         collectsCredentials: false,
         performsNetworking: false,

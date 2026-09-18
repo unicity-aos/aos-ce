@@ -9,7 +9,11 @@ or a valid absolute `AOS_HOME`. The binary is always that home's `bin/aos`.
 The tray does not search `PATH`, use an app-adjacent executable, or enroll a
 device. A missing binary is reported instead of inventing inventory. Explicit
 `--aos-binary` / `--aos-home` still select a pair together. There is no
-automatic daemon start, app installation or filesystem mount.
+automatic daemon start or filesystem mount. The macOS product installer places
+the signed app in `$HOME/Applications`, opens it once, and the installed app
+registers itself to open at login. On macOS, `aos start`, `aos restart`, and
+the Oracle-facing `aos mcp serve` entrypoint also reopen that stable app when it
+exists, without making the optional GUI a runtime-start dependency.
 
 ## Run
 
