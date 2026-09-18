@@ -3,6 +3,24 @@ import Testing
 @testable import AOSTrayCore
 
 @Suite
+struct LoginItemPolicyTests {
+    @Test func registersOnlyFromStableUserApplication() {
+        #expect(LoginItemPolicy.shouldRegister(
+            bundlePath: "/Users/alice/Applications/AOS Command Center.app",
+            userHome: "/Users/alice"
+        ))
+        #expect(!LoginItemPolicy.shouldRegister(
+            bundlePath: "/Users/alice/.aos/releases/2026.9.2/share/AOS Command Center.app",
+            userHome: "/Users/alice"
+        ))
+        #expect(!LoginItemPolicy.shouldRegister(
+            bundlePath: "/private/tmp/AOS Preview.app",
+            userHome: "/Users/alice"
+        ))
+    }
+}
+
+@Suite
 struct LaunchArgumentTests {
     @Test func defaultIsDisconnected() throws {
         let parsed = try LaunchArguments.parse(["aos-tray"]).get()
@@ -76,7 +94,7 @@ struct DisconnectedPresentationTests {
         #expect(policy.closeWindowHides)
         #expect(!policy.terminateAfterLastWindowClosed)
         #expect(!policy.quitStopsRuntime)
-        #expect(!policy.autoLaunchAtLogin)
+        #expect(policy.autoLaunchAtLogin)
         #expect(!policy.readsLiveHome)
         #expect(!policy.collectsCredentials)
         #expect(!policy.performsNetworking)

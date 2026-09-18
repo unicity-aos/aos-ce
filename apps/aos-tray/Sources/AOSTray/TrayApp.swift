@@ -79,6 +79,11 @@ final class TrayAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, 
         installStatusItem()
         installPanel()
         installPermissionPanel()
+        do {
+            try LoginItemRegistration.registerInstalledApplication()
+        } catch {
+            session.lastError = "AOS Command Center could not enable Open at Login. Enable it in System Settings > General > Login Items."
+        }
         adoptDefaultNativeInputIfNeeded()
         reconnectNativeInput(nil)
         if openOverview { showOverview(nil) }

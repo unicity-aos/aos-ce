@@ -3,8 +3,9 @@
 Darwin product archives may carry `share/AOS Command Center.app` as an extra
 release member, distinct from the signed filesystem bundle at
 `runtime/bin/AstridFS.app`. The Command Center bundle identifier remains
-`ai.unicity.aos.tray`. It is not installed to `/Applications` and is not
-merged into `AOS.app` / `AstridFS.app`.
+`ai.unicity.aos.tray`. It is installed for the current user under
+`$HOME/Applications`, not system-wide `/Applications`, and is not merged into
+`AOS.app` / `AstridFS.app`.
 
 ## Supply
 
@@ -81,10 +82,11 @@ Preview CI of `apps/aos-tray` is not packaged GO.
 
 ## Install
 
-When the archive member is present, `install.sh` copies it unchanged into
-`$AOS_HOME/releases/<version>/share/AOS Command Center.app`. Archives that
-predate this member still install. The installer does not `open` the app, does
-not write `/Applications`, and does not create a login item.
+When the archive member is present, `install.sh` retains it unchanged in
+`$AOS_HOME/releases/<version>/share/AOS Command Center.app`, atomically installs
+the same signed bundle at `$HOME/Applications/AOS Command Center.app`, and opens
+it in the background. The installed app registers itself as the current user's
+login item. Archives that predate this member still install without a GUI.
 
 Older AOS releases missing the tray remain installable.
 
@@ -96,9 +98,13 @@ absolute `AOS_HOME` overrides the home; the binary is always that home's
 are reported rather than guessed.
 
 `--aos-binary ABSOLUTE` and `--aos-home ABSOLUTE` still select an explicit
-pair together. `autoLaunchAtLogin` remains false. After a Darwin install:
+pair together. `aos start`, `aos restart`, and the `aos mcp serve` entrypoint
+used by Oracle hosts reopen the stable app in the background when it exists;
+they do not fail merely because the optional GUI is absent. After a Darwin
+install:
 
 - App bytes: `$AOS_HOME/releases/<version>/share/AOS Command Center.app`
+- User app: `$HOME/Applications/AOS Command Center.app`
 - Default CLI: `$HOME/.aos/bin/aos`
 - Default home: `$HOME/.aos`
 

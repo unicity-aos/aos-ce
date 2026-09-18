@@ -20,6 +20,7 @@ let package = Package(
             dependencies: ["AOSTrayCore"],
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("ServiceManagement"),
                 .linkedFramework("SwiftUI"),
             ]
         ),
