@@ -9,8 +9,12 @@ pre-2026.9 AOS release.
 The release also binds approvals and MCP results to the requesting identity,
 improves first-run and upgrade progress, refreshes the authenticated Community
 capsule selection, and makes filesystem mounting available through the macOS
-Command Center. The native Command Center remains a macOS feature in this
-release; Linux and Windows continue to use their existing CLI/runtime surfaces.
+Command Center. The native menu-bar app remains a macOS feature. On Unix,
+`aos console` provides a keyboard/mouse terminal presenter for approvals and
+private input, including SSH use on the machine running AOS. With the console
+connected, MCP calls report pending approval promptly and expose read-only
+status for the original operation; private values stay outside the agent chat.
+Windows archives remain outside this release.
 
 The final release commit must pin the exact published Astrid 2026.9.3 tag,
 source commit, release metadata assets, and BLAKE3 digests. Those values are not

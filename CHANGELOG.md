@@ -19,6 +19,10 @@ implementations are consolidated into their final behavior.
 
 ### Added
 
+- Add `aos console` on Unix: a keyboard/mouse Command Center for permission
+  decisions and masked private input. Connected console approvals return prompt
+  pending MCP results with directions to the correct local or remote AOS home;
+  a read-only status tool retrieves the original result without replaying work.
 - Add a developer-preview macOS AOS menu-bar app with permission dialogs,
   typed private-input forms, runtime overview, searchable capsule inventory and
   owned-principal selection. Explicit local setup pairs a dedicated responder;
