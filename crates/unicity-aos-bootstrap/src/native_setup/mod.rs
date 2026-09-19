@@ -66,6 +66,16 @@ struct SetupLock {
     _file: File,
 }
 
+impl Drop for SetupLock {
+    fn drop(&mut self) {
+        // Release at the operation boundary, not when the last duplicate file
+        // description closes (a concurrent fork may retain one until exec).
+        if let Err(error) = FileExt::unlock(&self._file) {
+            eprintln!("warning: failed to release native-input setup lock: {error}");
+        }
+    }
+}
+
 struct KeyArtifacts {
     private: PathBuf,
     public_hex: PathBuf,

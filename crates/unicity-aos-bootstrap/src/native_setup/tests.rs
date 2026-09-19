@@ -326,6 +326,26 @@ fn failed_setup_cleans_only_newly_created_key_files() {
 }
 
 #[test]
+fn setup_lock_release_does_not_wait_for_duplicate_descriptor() {
+    let root = temp_root("setup-lock-duplicate");
+    let home = AosHome::from_root(&root);
+    let held = SetupLock::acquire(&home).expect("first lock");
+    // A concurrent fork can temporarily retain the same open file description
+    // until exec closes CLOEXEC descriptors. Model that lifetime deterministically.
+    let duplicate = held._file.try_clone().expect("duplicate descriptor");
+    assert!(SetupLock::acquire(&home).is_err());
+    drop(held);
+    let released = SetupLock::acquire(&home).expect("guard releases lock immediately");
+    drop(duplicate);
+    assert!(
+        SetupLock::acquire(&home).is_err(),
+        "new owner remains locked"
+    );
+    drop(released);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn setup_lock_serializes_the_operation() {
     let root = temp_root("setup-lock");
     let home = AosHome::from_root(&root);
