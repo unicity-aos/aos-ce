@@ -181,6 +181,16 @@ impl NativeMrtr {
     }
 
     /// Turn a correlated `input_required` result into a resume `tools/call`.
+    pub(super) fn validate_presentation(&self, message: &Value) -> Result<(), MrtrError> {
+        let prepared = self.prepare(message)?;
+        let envelopes = collect_elicitations(prepared.input_requests.as_ref())?;
+        if envelopes.is_empty() {
+            return Err(MrtrError::Unsupported("no human decision in this round"));
+        }
+        Ok(())
+    }
+
+    /// Turn a correlated `input_required` result into a resume `tools/call`.
     ///
     /// Forms are parsed before the presenter runs. Unsupported, malformed, or
     /// presenter-failed input fail closed with cancel responses and no consent.

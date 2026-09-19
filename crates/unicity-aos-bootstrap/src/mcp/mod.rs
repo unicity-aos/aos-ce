@@ -7,8 +7,13 @@
 
 #[cfg(test)]
 mod framing_tests;
-mod interaction;
+pub(crate) mod interaction;
 mod mrtr;
+mod pending;
+mod presenter;
+use presenter::ServePresenter;
+#[cfg(test)]
+mod pending_tests;
 #[cfg(test)]
 mod serve_tests;
 
@@ -205,25 +210,6 @@ fn native_surface(args: &ServeArgs) -> Result<NativeSurface, String> {
     }
 }
 
-enum ServePresenter {
-    Platform(interaction::NativePresenter),
-    #[cfg(unix)]
-    Socket(interaction::TrayPresenter),
-}
-
-impl interaction::Presenter for ServePresenter {
-    fn present(
-        &mut self,
-        request: &interaction::InteractionRequest,
-    ) -> Result<Option<usize>, interaction::InteractionError> {
-        match self {
-            Self::Platform(presenter) => presenter.present(request),
-            #[cfg(unix)]
-            Self::Socket(presenter) => presenter.present(request),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 enum InteractionMode {
     /// Prefer the MCP client, falling back to the trusted local AOS provider.
@@ -237,7 +223,7 @@ enum InteractionMode {
     Deny,
 }
 
-pub(crate) fn handle_serve(principal: Option<String>, args: ServeArgs) -> ExitCode {
+pub(crate) fn handle_serve(principal: Option<String>, mut args: ServeArgs) -> ExitCode {
     if let Err(error) = native_surface(&args) {
         eprintln!("aos mcp serve: {error}");
         return ExitCode::FAILURE;
@@ -249,6 +235,8 @@ pub(crate) fn handle_serve(principal: Option<String>, args: ServeArgs) -> ExitCo
             return ExitCode::FAILURE;
         }
     };
+    #[cfg(unix)]
+    prefer_console(&mut args, home.root());
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -270,6 +258,30 @@ pub(crate) fn handle_serve(principal: Option<String>, args: ServeArgs) -> ExitCo
             eprintln!("aos mcp serve: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// An explicitly opened console takes precedence in automatic mode. Explicit
+/// client/deny modes and explicit presenter sockets retain their meaning.
+#[cfg(unix)]
+fn prefer_console(args: &mut ServeArgs, home: &std::path::Path) {
+    if args.interaction_socket.is_some()
+        || !matches!(
+            args.interaction,
+            InteractionMode::Auto | InteractionMode::Native
+        )
+    {
+        return;
+    }
+    let Ok(home) = home.canonicalize() else {
+        return;
+    };
+    let socket = home.join("console/approval.sock");
+    if std::fs::symlink_metadata(&socket).is_ok() {
+        // TrayPresenter verifies socket type, modes, path and peer at use time.
+        // An invalid existing endpoint cancels; it never silently reroutes consent.
+        args.interaction = InteractionMode::Native;
+        args.interaction_socket = Some(socket);
     }
 }
 
@@ -342,6 +354,8 @@ async fn serve(
         Err(error) => return Err(ServeFailure::Io(error)),
     };
     let mut mrtr = mrtr::NativeMrtr::with_limits(args.max_in_flight_calls, args.max_input_rounds);
+    let mut pending = pending::PendingApprovals::from_args(args, home.root());
+    let mut approval_tick = tokio::time::interval(std::time::Duration::from_millis(50));
     let mut upstream_open = true;
     let mut interrupt_rx = Some(interrupt_receiver());
 
@@ -384,7 +398,23 @@ async fn serve(
                 let transport_input = downstream_in.as_mut().ok_or_else(|| {
                     ServeFailure::Io("bundled MCP transport input is closed".to_owned())
                 })?;
-                write_frame(transport_input, outbound).await.map_err(|error| {
+                let mut outbound = outbound.to_vec();
+                if let Some(pending) = pending.as_mut()
+                    && let Ok(message) = serde_json::from_slice::<Value>(&outbound)
+                {
+                    if message.get("method").and_then(Value::as_str) == Some("tools/call")
+                        && let Some(id) = message.get("id") { mrtr.forget(id); }
+                    match pending.upstream(message) {
+                        pending::Upstream::Forward(message) => outbound = json_frame(&message).ok_or_else(|| ServeFailure::Io("failed to encode approval transport".into()))?,
+                        pending::Upstream::Reply(response) => {
+                            let frame = json_frame(&response).ok_or_else(|| ServeFailure::Io("failed to encode approval status".into()))?;
+                            write_frame(&mut upstream_out, &frame).await.map_err(|e| ServeFailure::Io(e.to_string()))?;
+                            client_frame.clear();
+                            continue;
+                        }
+                    }
+                }
+                write_frame(transport_input, &outbound).await.map_err(|error| {
                     ServeFailure::Io(format!("failed to write bundled MCP transport: {error}"))
                 })?;
                 client_frame.clear();
@@ -397,6 +427,16 @@ async fn serve(
                 })?;
                 if bytes_read == 0 {
                     break;
+                }
+                if let Some(pending) = pending.as_mut()
+                    && let Ok(message) = serde_json::from_slice::<Value>(&transport_frame)
+                {
+                    match pending.downstream(message) {
+                        pending::Downstream::Consumed => { transport_frame.clear(); continue; }
+                        pending::Downstream::Forward(message) => {
+                            transport_frame = json_frame(&message).ok_or_else(|| ServeFailure::Io("failed to encode approval outcome".into()))?;
+                        }
+                    }
                 }
                 match intercept_downstream(
                     &transport_frame,
@@ -530,6 +570,14 @@ async fn serve(
                     },
                 }
                 transport_frame.clear();
+            },
+            _ = approval_tick.tick(), if pending.is_some() && upstream_open => {
+                for message in pending.as_mut().expect("guarded pending bridge").decisions() {
+                    if let Some(input) = downstream_in.as_mut() {
+                        let frame = json_frame(&message).ok_or_else(|| ServeFailure::Io("failed to encode approval continuation".into()))?;
+                        write_frame(input, &frame).await.map_err(|e| ServeFailure::Io(e.to_string()))?;
+                    }
+                }
             },
             interrupt = next_interrupt(interrupt_rx.as_mut()), if interrupt_rx.is_some() => {
                 let Some(signal) = interrupt else {

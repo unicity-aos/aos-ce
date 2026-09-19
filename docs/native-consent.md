@@ -1,5 +1,46 @@
 # AOS native consent
 
+## Pending approvals in the terminal-console branch
+
+The sections below also contain the original integration plan. This branch now
+implements a session-local pending-result adapter for modern `input_required`
+responses when `aos mcp serve` uses a local Unix presentation socket. It does not
+change protocol negotiation or claim background support for older clients.
+
+The initial tool result says `awaiting_approval` and names `aos_approval_status`.
+The agent should tell the user to review the request in the AOS app or
+`aos console`, then check status after the user responds—not continuously poll.
+Decisions remain on that local surface. The status tool accepts only an opaque
+approval ID: it cannot approve, accept secrets, or repeat an operation.
+
+The bridge passes the local decision to Astrid using its original opaque
+continuation and retains the original runtime result. `completed` means an
+outcome exists, not that the action succeeded; callers must inspect that outcome.
+Duplicate status reads do not execute the action again. Original output schemas
+remain advertised alongside the bridge's pending-result shape.
+
+Limits are explicit:
+
+- Local decision time is capped at 240 seconds, below Astrid's five-minute
+  continuation lifetime. Late decisions do not resume expired requests.
+- Results belong to this MCP connection, not durable storage. After disconnect,
+  an unknown approval ID is not evidence that the action never happened. Do not
+  automatically repeat it.
+- Completed outcomes already read may be evicted when the bounded table fills.
+  Observed expired/unavailable entries are reclaimable after their presenter
+  worker exits; a still-blocked presenter cannot be evicted to spawn more workers.
+  Unread outcomes and active calls are not evicted to make room. An exhausted
+  table refuses new calls before starting them.
+- Retained outcomes are bounded to 1 MiB. Larger outcomes produce an explicit
+  retrieval error, never a retry of the action.
+- Older blocking elicitation, platform-only presenters, private input and HTTP
+  are unchanged. A local pending result does not guarantee a particular agent
+  host will proactively display a message.
+
+Regression coverage includes an actual `aos mcp serve` subprocess with a
+controlled runtime and secure local socket. That proves the bridge exchange;
+it is not a live Codex/Claude/Grok or real capsule sign-off.
+
 ## Current boundary
 
 `apps/aos-tray` is an AOS-specific macOS menu-bar shell. It is not the AstridFS
@@ -78,6 +119,23 @@ the actual connection, not demo state. Signing, installation, auto-start and
 cross-platform UI are not implemented by this shell.
 
 ## Development presenter connection
+
+The terminal pending adapter reports the blocked tool name and directions for
+the selected presentation surface. Console directions include a shell-quoted
+`AOS_HOME` so a second installation is not mistaken for the requesting runtime.
+If the MCP server runs remotely, the user must first connect to that machine
+using their existing SSH configuration; AOS does not infer an SSH destination.
+Custom presenter sockets do not advertise an unrelated terminal console.
+Neither tool arguments nor private answers are copied into these directions.
+The adapter advertises its own continuation support on the server-facing call;
+coding hosts need not supply modern per-call metadata. The host receives ordinary
+tool results, while opaque continuation state stays inside the adapter.
+
+On macOS, the MCP entry point requests launch of the installed
+`~/Applications/AOS Command Center.app` without blocking MCP stdio. Launch request
+is not confirmation that the application opened or displayed an approval. Host
+agents still need to surface pending results; an MCP result is not a guaranteed
+Codex, Claude, or Grok notification.
 
 The next integration uses an explicitly selected Unix socket, not a second
 approval-bus subscriber. `aos mcp serve --interaction native --interaction-socket

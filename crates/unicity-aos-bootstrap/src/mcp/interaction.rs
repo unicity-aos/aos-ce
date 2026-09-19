@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 mod consent;
 
 #[cfg(unix)]
-mod tray;
+pub(crate) mod tray;
 #[cfg(unix)]
 pub(super) use tray::TrayPresenter;
 

@@ -48,6 +48,9 @@ impl Fixture {
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_aos"));
         command
+            // Do not launch the developer's installed menu-bar app from a
+            // protocol fixture. This child does not run Cargo or rustup.
+            .env("HOME", &self.root)
             .env("AOS_HOME", &self.root)
             .env("UNICITY_AOS_RUNTIME_BIN", &self.runtime)
             .env("AOS_TEST_ARGS", &self.args)
@@ -73,6 +76,149 @@ printf '%s\n' "$ASTRID_WORKSPACE_STATE_DIR" > "$AOS_TEST_WORKSPACE"
 printf '%s\n' "$PWD" > "$AOS_TEST_PWD"
 exit "${AOS_TEST_EXIT:-0}"
 "#;
+
+#[test]
+fn socket_approval_returns_pending_and_resumes_once_after_human_decision() {
+    use serde_json::{Value, json};
+    use std::os::unix::net::UnixListener;
+    let fixture = Fixture::new("pending-native-approval");
+    fixture.install_runtime(r#"#!/usr/bin/env python3
+import sys, json, os
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get('method') != 'tools/call':
+        continue
+    with open(os.environ['AOS_TEST_ARGS'], 'a') as log:
+        log.write(json.dumps(request) + '\n')
+    if 'requestState' in request['params']:
+        assert request['params']['requestState'] == 'test-state'
+        assert request['params']['inputResponses']['consent']['content']['allow'] is True
+        result = {'content':[{'type':'text','text':'original-operation-complete'}], 'isError':False}
+    else:
+        result = {'resultType':'input_required','requestState':'test-state','inputRequests':{'consent':{'method':'elicitation/create','params':{'message':'Allow operation?', 'requestedSchema':{'type':'object','properties':{'allow':{'type':'boolean'}},'required':['allow']}}}}}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#);
+    // Darwin's Unix socket path limit is shorter than its default TMPDIR.
+    let private = PathBuf::from("/tmp").join(format!(
+        "aos-approval-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    struct SocketDirectory(PathBuf);
+    impl Drop for SocketDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _socket_directory = SocketDirectory(private.clone());
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = fs::canonicalize(private).unwrap().join("approval.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let (human_tx, human_rx) = mpsc::channel();
+    let ui = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            if let Ok((stream, _)) = listener.accept() {
+                break stream;
+            }
+            assert!(Instant::now() < deadline, "presenter did not connect");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        human_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({"version":1,"id":request["id"],"selected":0})
+        )
+        .unwrap();
+    });
+    let mut child = fixture
+        .command()
+        .args([
+            "mcp",
+            "serve",
+            "--interaction",
+            "native",
+            "--interaction-socket",
+            socket.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            if tx.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    writeln!(input, "{}", json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fs.write","arguments":{"path":"original"}}})).unwrap();
+    let first: Value =
+        serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+    assert_eq!(first["id"], 7);
+    let pending = &first["result"]["structuredContent"];
+    assert_eq!(pending["status"], "awaiting_approval");
+    assert_eq!(pending["tool"], "fs.write");
+    let instructions = pending["message"].as_str().unwrap();
+    assert!(instructions.contains("existing SSH connection first"));
+    assert!(
+        !instructions.contains("aos console"),
+        "custom socket must not route to another surface"
+    );
+    let status_call = json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"aos_approval_status","arguments":{"approval_id":pending["approval_id"]}}});
+    writeln!(input, "{status_call}").unwrap();
+    let before: Value =
+        serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+    assert_eq!(
+        before["result"]["structuredContent"]["status"],
+        "awaiting_approval"
+    );
+    human_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        writeln!(input, "{status_call}").unwrap();
+        let response: Value =
+            serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        if response["result"]["structuredContent"]["status"] == "completed" {
+            assert_eq!(
+                response["result"]["structuredContent"]["outcome"]["result"]["content"][0]["text"],
+                "original-operation-complete"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(input);
+    assert!(wait_for_child(&mut child, Duration::from_secs(5)).success());
+    reader.join().unwrap();
+    ui.join().unwrap();
+    let calls = fs::read_to_string(&fixture.args).unwrap();
+    assert_eq!(
+        calls.lines().count(),
+        2,
+        "one original invocation and exactly one continuation; status never forwards"
+    );
+}
 
 #[test]
 fn serve_forwards_host_arguments_exactly_and_separates_home_from_workspace() {

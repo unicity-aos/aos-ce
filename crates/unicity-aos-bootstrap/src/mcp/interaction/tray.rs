@@ -300,6 +300,10 @@ fn read_json_frame(stream: &UnixStream) -> Result<SocketResponse, InteractionErr
         .map_err(|_| unavailable("tray response is not a valid protocol object"))
 }
 
+pub(crate) fn local_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    peer_uid(stream).map_err(|_| std::io::Error::other("could not verify local peer"))
+}
+
 fn peer_uid(stream: &UnixStream) -> Result<u32, InteractionError> {
     peer_uid_from_fd(stream.as_raw_fd())
 }

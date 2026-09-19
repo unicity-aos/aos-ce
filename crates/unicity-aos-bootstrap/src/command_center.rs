@@ -13,7 +13,7 @@ pub(super) fn runtime_start_requested(args: &[OsString]) -> bool {
 
 #[cfg(target_os = "macos")]
 pub(super) fn open_command_center() {
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     let Some(home) = std::env::var_os("HOME") else {
         eprintln!("aos: HOME is unset; AOS Command Center was not opened");
@@ -37,8 +37,25 @@ pub(super) fn open_command_center() {
         return;
     }
 
-    if let Err(error) = Command::new("/usr/bin/open").arg("-g").arg(&app).spawn() {
-        eprintln!("aos: failed to open AOS Command Center: {error}");
+    match Command::new("/usr/bin/open")
+        .arg("-g")
+        .arg(&app)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Neither LaunchServices output nor inherited pipe ownership may
+            // interfere with MCP's stdio connection. Reap without blocking it.
+            std::thread::spawn(move || match child.wait() {
+                Ok(status) if status.success() => {}
+                _ => eprintln!(
+                    "aos: AOS Command Center could not be opened. Open the installed app manually to review requests."
+                ),
+            });
+        }
+        Err(error) => eprintln!("aos: failed to open AOS Command Center: {error}"),
     }
 }
 
