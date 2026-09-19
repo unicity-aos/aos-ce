@@ -245,6 +245,17 @@ pub(crate) fn run(args: ConsoleArgs) -> ExitCode {
     }
 }
 
+fn console_home(
+    home: unicity_aos_bootstrap::AosHome,
+) -> io::Result<unicity_aos_bootstrap::AosHome> {
+    // Resolve the operator-selected home once, as pairing does. Credential
+    // components beneath it still use the strict no-follow reader.
+    Ok(unicity_aos_bootstrap::AosHome::from_root(
+        crate::native_setup::canonical_setup_home(home.root())
+            .map_err(|_| io::Error::other("AOS home cannot be resolved"))?,
+    ))
+}
+
 fn run_inner(args: ConsoleArgs) -> io::Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::other(
@@ -260,6 +271,7 @@ fn run_inner(args: ConsoleArgs) -> io::Result<()> {
     };
     if !args.preview {
         let home = crate::resolve_home().map_err(|_| io::Error::other("AOS home unavailable"))?;
+        let home = console_home(home)?;
         let listener = transport::Listener::bind(home.root())?;
         let stop = backend.stop.clone();
         let sender = tx.clone();
@@ -374,6 +386,33 @@ fn run_inner(args: ConsoleArgs) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn private_connection_resolves_home_alias_but_rejects_credential_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use unicity_aos_bootstrap::AosHome;
+
+        let root = std::env::temp_dir().join(format!("aos-console-alias-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let real = root.join("real");
+        std::fs::create_dir_all(real.join("native-input")).unwrap();
+        let alias = root.join("alias");
+        symlink(&real, &alias).unwrap();
+        let credential = real.join("native-input/connection.json");
+        std::fs::write(&credential, b"{}").unwrap();
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let home = console_home(AosHome::from_root(alias)).unwrap();
+        let path = crate::native_setup::connection_path(&home);
+        assert_eq!(transport::private_read(&path, 1024).unwrap(), b"{}");
+
+        std::fs::remove_file(&credential).unwrap();
+        let target = root.join("other.json");
+        std::fs::write(&target, b"{}").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &credential).unwrap();
+        assert!(transport::private_read(&path, 1024).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn wheel_scrolls_without_submitting_a_request() {
         let mut app = App::new(true);

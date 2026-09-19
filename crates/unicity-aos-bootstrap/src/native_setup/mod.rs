@@ -102,7 +102,7 @@ struct OwnedCleanup {
 /// aliases match the tray loader's `O_NOFOLLOW` walk. Missing suffix names are
 /// appended without creating them. An existing prefix that cannot be
 /// canonicalized fails closed and is not skipped.
-fn canonical_setup_home(root: &Path) -> Result<PathBuf, SetupError> {
+pub(crate) fn canonical_setup_home(root: &Path) -> Result<PathBuf, SetupError> {
     if !root.is_absolute() {
         return Err(SetupError::Failed(
             "AOS_HOME must be an absolute path".to_owned(),
