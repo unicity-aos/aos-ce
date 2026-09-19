@@ -16,9 +16,10 @@ connected, MCP calls report pending approval promptly and expose read-only
 status for the original operation; private values stay outside the agent chat.
 Windows archives remain outside this release.
 
-The final release commit must pin the exact published Astrid 2026.9.3 tag,
-source commit, release metadata assets, and BLAKE3 digests. Those values are not
-guessed from an untagged candidate. GNU and musl Linux on x86_64 and ARM64 plus
+The release pins published Astrid `v2026.9.3`, source
+`46d10639eaed94f8af5e036d2d279409c90fdc8e`. The authenticated release metadata
+and musl extension digests are recorded in `release/runtime-compatibility.toml`
+and `release/runtime-musl-compatibility.toml`. GNU and musl Linux on x86_64 and ARM64 plus
 macOS on Intel and Apple Silicon remain the intended runtime matrix. Windows
 archives remain outside this release.
 

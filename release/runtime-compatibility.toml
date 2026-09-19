@@ -2,20 +2,20 @@ schema-version = 1
 
 [product]
 name = "Unicity AOS Community Edition"
-version = "2026.9.2"
+version = "2026.9.3"
 
 [runtime]
 repository = "astrid-runtime/astrid"
 release-ready = true
 upgrade-self-heal-ready = true
-version = "2026.9.2"
-tag = "v2026.9.2"
-version-requirement = ">=2026.9.2"
-release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.2"
+version = "2026.9.3"
+tag = "v2026.9.3"
+version-requirement = ">=2026.9.3"
+release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.3"
 release-metadata-available = true
-source-commit = "e5361d119c5672eda08888f85fbd14e36166b055"
-release-metadata-asset = "astrid-2026.9.2-release.toml"
-release-metadata-blake3 = "2c85ae4476a5987adb853a0c1841b3bb0a3f069bec6ddeb181eebbd781dcf29d"
+source-commit = "46d10639eaed94f8af5e036d2d279409c90fdc8e"
+release-metadata-asset = "astrid-2026.9.3-release.toml"
+release-metadata-blake3 = "790f060ddaf11db7a579bd27eca4e7f5195ab5d4d62d26374018179963961669"
 
 [contracts]
 repository = "astrid-runtime/wit"
