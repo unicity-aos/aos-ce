@@ -66,6 +66,16 @@ struct SetupLock {
     _file: File,
 }
 
+impl Drop for SetupLock {
+    fn drop(&mut self) {
+        // Release at the operation boundary, not when the last duplicate file
+        // description closes (a concurrent fork may retain one until exec).
+        if let Err(error) = FileExt::unlock(&self._file) {
+            eprintln!("warning: failed to release native-input setup lock: {error}");
+        }
+    }
+}
+
 struct KeyArtifacts {
     private: PathBuf,
     public_hex: PathBuf,
@@ -92,7 +102,7 @@ struct OwnedCleanup {
 /// aliases match the tray loader's `O_NOFOLLOW` walk. Missing suffix names are
 /// appended without creating them. An existing prefix that cannot be
 /// canonicalized fails closed and is not skipped.
-fn canonical_setup_home(root: &Path) -> Result<PathBuf, SetupError> {
+pub(crate) fn canonical_setup_home(root: &Path) -> Result<PathBuf, SetupError> {
     if !root.is_absolute() {
         return Err(SetupError::Failed(
             "AOS_HOME must be an absolute path".to_owned(),

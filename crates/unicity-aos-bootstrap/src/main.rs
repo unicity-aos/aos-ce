@@ -17,6 +17,8 @@ use unicity_aos_bootstrap::{AOS_WORKSPACE_STATE_DIR, AosHome};
 
 mod cli;
 mod command_center;
+#[cfg(unix)]
+mod console;
 mod distro_trust;
 mod hook;
 mod mcp;
@@ -50,6 +52,9 @@ struct ProductCli {
 
 #[derive(Subcommand)]
 enum ProductCommand {
+    /// Open the terminal Command Center for approvals and private input.
+    #[cfg(unix)]
+    Console(console::ConsoleArgs),
     /// Initialize Unicity CE using the manifest bundled with this release.
     Init(InitArgs),
     /// Show product status from the typed local runtime operation.
@@ -375,6 +380,8 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
     }
 
     match cli.command {
+        #[cfg(unix)]
+        Some(ProductCommand::Console(args)) => Some(console::run(args)),
         Some(ProductCommand::Init(_)) => None,
         Some(ProductCommand::Status(args)) => Some(cli::handle_status(
             cli.principal,
@@ -679,6 +686,7 @@ fn is_owned_root(value: &str) -> bool {
             | "daemon"
             | "principals"
             | "native-setup"
+            | "console"
             | "serve-health"
     )
 }
