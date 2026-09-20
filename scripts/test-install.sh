@@ -779,6 +779,63 @@ for distro_member in Distro.toml Distro.lock Distro.sig; do
 done
 test "$(cat "$signed_home/.astrid/sentinel")" = standalone-runtime-state
 
+# Current inventories must install without invoking an external BLAKE3 tool.
+# Keep the previous fixture unchanged to cover legacy BLAKE3-only records.
+sha_tree="$work/signed-sha-tree"
+mkdir "$sha_tree"
+tar -xzf "$signed_archive" -C "$sha_tree"
+sha_root="$sha_tree/$bundle_root_name"
+python3 - "$sha_root" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+path = root / "release-manifest.json"
+manifest = json.loads(path.read_text())
+for name in ("Distro.toml", "Distro.lock", "Distro.sig"):
+    manifest["release_files"][name]["sha256"] = hashlib.sha256((root / name).read_bytes()).hexdigest()
+path.write_text(json.dumps(manifest, indent=2) + "\n")
+PY
+no_b3_bin="$work/no-b3-bin"
+mkdir "$no_b3_bin"
+printf '#!/bin/sh\necho unexpected-b3sum >&2\nexit 99\n' > "$no_b3_bin/b3sum"
+chmod 755 "$no_b3_bin/b3sum"
+sha_archive="$work/signed-sha.tar.gz"
+COPYFILE_DISABLE=1 tar -czf "$sha_archive" -C "$sha_tree" "$bundle_root_name"
+set_fixture_asset "$sha_archive"
+PATH="$no_b3_bin:$fake_bin:$PATH" HOME="$work/sha-home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_VERSION=2026.9.2 sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+test -f "$work/sha-home/.aos/releases/2026.9.2/Distro.sig"
+
+for mutation in tampered malformed empty; do
+  python3 - "$sha_root" "$mutation" <<'PY'
+import json
+import pathlib
+import sys
+root, mutation = pathlib.Path(sys.argv[1]), sys.argv[2]
+if mutation == "tampered":
+    with (root / "Distro.lock").open("a") as file:
+        file.write("tampered\n")
+else:
+    path = root / "release-manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["release_files"]["Distro.toml"]["sha256"] = "bad" if mutation == "malformed" else ""
+    path.write_text(json.dumps(manifest, indent=2) + "\n")
+PY
+  COPYFILE_DISABLE=1 tar -czf "$sha_archive" -C "$sha_tree" "$bundle_root_name"
+  set_fixture_asset "$sha_archive"
+  if PATH="$no_b3_bin:$fake_bin:$PATH" HOME="$work/sha-$mutation-home" AOS_TEST_FIXTURE="$fixture" \
+    AOS_VERSION=2026.9.2 sh "$repo_root/install.sh" --yes --no-migrate-prompt >"$work/sha-$mutation.log" 2>&1; then
+    echo "installer accepted $mutation SHA-256 inventory" >&2
+    exit 1
+  fi
+  if grep -q unexpected-b3sum "$work/sha-$mutation.log"; then
+    echo "installer fell back from invalid SHA-256 to BLAKE3" >&2
+    exit 1
+  fi
+done
+
 # Signed archives must carry a complete, authenticated Distro inventory.  Keep
 # each mutation in the archive manifest so the installer exercises its own
 # fail-closed parser rather than a packaging helper.
