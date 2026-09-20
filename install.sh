@@ -996,7 +996,18 @@ release_inventory_entry() {
         sub(/[^0-9].*/, "", field)
         mode = field
       }
-      print "found|" digest "|" mode "|"
+      sha256 = ""
+      field = record
+      if (field ~ /"sha256"[[:space:]]*:/) {
+        sha256 = "invalid"
+        if (field ~ /"sha256"[[:space:]]*:[[:space:]]*"/) {
+          sub(/.*"sha256"[[:space:]]*:[[:space:]]*"/, "", field)
+          sub(/".*/, "", field)
+          sha256 = field
+          if (sha256 == "") sha256 = "invalid"
+        }
+      }
+      print "found|" digest "|" mode "|" sha256
     }
   ' "$manifest"
 }
@@ -1011,6 +1022,10 @@ release_inventory_digest() {
 
 release_inventory_mode() {
   printf '%s' "$1" | awk -F '|' '{print $3}'
+}
+
+release_inventory_sha256() {
+  printf '%s' "$1" | awk -F '|' '{print $4}'
 }
 
 distro_toml_inventory=$(release_inventory_entry "$bundle/release-manifest.json" Distro.toml)
@@ -1036,10 +1051,6 @@ if [ "$distro_archive_signed" -eq 1 ]; then
       exit 1
     }
   done
-  command -v b3sum >/dev/null 2>&1 || {
-    echo "b3sum is required to verify signed Distro member inventory" >&2
-    exit 1
-  }
   for distro_member in Distro.toml Distro.lock Distro.sig; do
     case "$distro_member" in
       Distro.toml) distro_inventory="$distro_toml_inventory" ;;
@@ -1056,7 +1067,24 @@ if [ "$distro_archive_signed" -eq 1 ]; then
       echo "signed release inventory has an invalid $distro_member mode" >&2
       exit 1
     }
-    actual_distro_digest=$(b3sum -- "$bundle/$distro_member" | awk '{print $1}')
+    # Current signed inventories carry SHA-256 as well as BLAKE3. Use the
+    # verifier already required for the outer archive on minimal Unix hosts.
+    # Older BLAKE3-only inventories still require their original verifier.
+    distro_sha256=$(release_inventory_sha256 "$distro_inventory")
+    if [ -n "$distro_sha256" ]; then
+      printf '%s\n' "$distro_sha256" | grep -Eq '^[0-9a-f]{64}$' || {
+        echo "signed release inventory has a malformed $distro_member SHA-256" >&2
+        exit 1
+      }
+      distro_digest=$distro_sha256
+      actual_distro_digest=$(sha256_file "$bundle/$distro_member")
+    else
+      command -v b3sum >/dev/null 2>&1 || {
+        echo "b3sum is required for this legacy BLAKE3-only Distro inventory" >&2
+        exit 1
+      }
+      actual_distro_digest=$(b3sum -- "$bundle/$distro_member" | awk '{print $1}')
+    fi
     [ "$actual_distro_digest" = "$distro_digest" ] || {
       echo "signed release inventory digest mismatch: $distro_member" >&2
       exit 1
