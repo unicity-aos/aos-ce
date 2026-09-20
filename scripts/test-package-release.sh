@@ -527,6 +527,16 @@ bash "$repo_root/scripts/package-release.sh" \
   "$darwin_output"
 
 darwin_archive="$darwin_output/unicity-aos-$product_version-$darwin_target.tar.gz"
+python3 - "$darwin_archive" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1]) as archive:
+    paths = [pathlib.PurePosixPath(member.name) for member in archive]
+assert len({path.parts[0] for path in paths}) == 1, "Darwin archive must have one product root"
+assert not any(part.startswith("._") for path in paths for part in path.parts), "AppleDouble metadata is not a product member"
+PY
 darwin_extract="$work/darwin-extract"
 mkdir "$darwin_extract"
 tar -xzf "$darwin_archive" -C "$darwin_extract"

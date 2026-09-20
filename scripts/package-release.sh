@@ -753,5 +753,5 @@ PY
 validate_schema_v2_membership "$work/$root/release-manifest.json" "$work/$root"
 chmod 0600 "$work/$root/release-manifest.json"
 
-tar -czf "$output_dir/$asset" -C "$work" "$root"
+COPYFILE_DISABLE=1 tar -czf "$output_dir/$asset" -C "$work" "$root"
 echo "$output_dir/$asset"
