@@ -24,6 +24,15 @@ SPEC.loader.exec_module(VALIDATOR)
 
 
 class ReleaseReadinessTests(unittest.TestCase):
+    def test_compiled_distro_runtime_matches_selected_release(self) -> None:
+        source = 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "2026.9.4";'
+        VALIDATOR.validate_distro_runtime_version(source, "2026.9.4")
+        for invalid in ("", source + "\n" + source, source.replace("9.4", "9.3")):
+            with self.subTest(source=invalid), self.assertRaisesRegex(
+                ValueError, "compiled Distro verifier"
+            ):
+                VALIDATOR.validate_distro_runtime_version(invalid, "2026.9.4")
+
     def test_runtime_minimum_accepts_newer_stable_releases(self) -> None:
         for runtime in ("2026.9.2", "2026.9.3", "2026.10.0", "2027.1.0"):
             VALIDATOR.validate_runtime_minimum(">=2026.9.2", runtime)

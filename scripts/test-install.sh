@@ -306,7 +306,7 @@ sh "$repo_root/install.sh" --yes --no-migrate-prompt
 test -x "$work/home/.aos/bin/aos"
 source "$repo_root/scripts/test-install-musl.sh"
 release_dir="$work/home/.aos/releases/2026.9.3"
-test "$runtime_version" = 2026.9.3
+test "$runtime_version" = 2026.9.4
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
   test -x "$release_dir/runtime/bin/$binary"
   test ! -e "$work/home/.aos/runtime/bin/$binary"
