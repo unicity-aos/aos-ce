@@ -16,8 +16,10 @@ connected, MCP calls report pending approval promptly and expose read-only
 status for the original operation; private values stay outside the agent chat.
 Windows archives remain outside this release.
 
-The release pins published Astrid `v2026.9.3`, source
-`46d10639eaed94f8af5e036d2d279409c90fdc8e`. The authenticated release metadata
+The release pins published Astrid `v2026.9.4`, source
+`892487d2dcc52c054184fa9b9b313bf113a234e0`. This runtime preserves existing
+configuration when initialization is repeated during upgrades; explicitly
+provided settings still take effect. The authenticated release metadata
 and musl extension digests are recorded in `release/runtime-compatibility.toml`
 and `release/runtime-musl-compatibility.toml`. GNU and musl Linux on x86_64 and ARM64 plus
 macOS on Intel and Apple Silicon remain the intended runtime matrix. Windows

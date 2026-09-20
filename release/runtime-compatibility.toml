@@ -8,14 +8,14 @@ version = "2026.9.3"
 repository = "astrid-runtime/astrid"
 release-ready = true
 upgrade-self-heal-ready = true
-version = "2026.9.3"
-tag = "v2026.9.3"
-version-requirement = ">=2026.9.3"
-release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.3"
+version = "2026.9.4"
+tag = "v2026.9.4"
+version-requirement = ">=2026.9.4"
+release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.4"
 release-metadata-available = true
-source-commit = "46d10639eaed94f8af5e036d2d279409c90fdc8e"
-release-metadata-asset = "astrid-2026.9.3-release.toml"
-release-metadata-blake3 = "790f060ddaf11db7a579bd27eca4e7f5195ab5d4d62d26374018179963961669"
+source-commit = "892487d2dcc52c054184fa9b9b313bf113a234e0"
+release-metadata-asset = "astrid-2026.9.4-release.toml"
+release-metadata-blake3 = "90dcc7a1509128f17fb11c4c45d9696dc99d65c27df767bbef0ab2465b3a8498"
 
 [contracts]
 repository = "astrid-runtime/wit"

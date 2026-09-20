@@ -15,7 +15,7 @@ support = "https://github.com/unicity-aos/aos-ce/discussions"
 bug-tracker = "https://github.com/unicity-aos/aos-ce/issues"
 repository = "https://github.com/unicity-aos/aos-ce"
 license = "MIT OR Apache-2.0"
-astrid-version = ">=2026.9.3"  # Minimum compatible runtime; exact packaged identity lives in release metadata.
+astrid-version = ">=2026.9.4"  # Minimum compatible runtime; exact packaged identity lives in release metadata.
 
 [distro.requires.astrid]
 llm = "^1.0"
