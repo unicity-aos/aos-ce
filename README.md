@@ -118,6 +118,12 @@ installations update with `aos update`. Direct installs resolve the signed
 all remain fail-closed until their signed metadata is actually published. See
 [Signed AOS release channels](docs/release-channels.md).
 
+For direct installations, `aos update --check` authenticates the signed stable
+channel and reports availability without installing, restarting the runtime,
+or changing accepted channel state. Use `--channel dev` or `--channel nightly`
+to check another channel. A failed check exits nonzero; it is not evidence that
+the installation is up to date. The check requires the installed product updater.
+
 ## Import an existing runtime
 
 The `aos` CLI can deliberately copy compatible state from a standalone runtime

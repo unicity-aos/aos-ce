@@ -994,6 +994,22 @@ python=${PYTHON3:-python3}
 cp "$good_bundle" "$fixture/channel.toml.sigstore.json"
 cp "$fixture/channel.toml" "$fixture/channel-good.toml"
 
+# A notification must authenticate metadata but never install, create the home,
+# advance channel state, or download a product archive.
+for installed_version in 2026.9.2 2026.9.3; do
+  check_home="$work/check-$installed_version"
+  PATH="$fake_bin:$PATH" AOS_HOME="$check_home" AOS_TEST_FIXTURE="$fixture" \
+    AOS_INSTALLED_VERSION="$installed_version" \
+    sh "$repo_root/install.sh" --check > "$work/check-$installed_version.log"
+  test ! -e "$check_home"
+  if grep -q '^Downloading Unicity AOS' "$work/check-$installed_version.log"; then
+    echo 'update check downloaded a product archive' >&2
+    exit 1
+  fi
+done
+grep -q '^Update available: AOS 2026.9.2 -> 2026.9.3' "$work/check-2026.9.2.log"
+grep -q '^AOS 2026.9.3 matches the signed stable channel' "$work/check-2026.9.3.log"
+
 PATH="$fake_bin:$PATH" HOME="$work/musl-channel-home" AOS_TEST_FIXTURE="$fixture" \
   AOS_TEST_LIBC=musl sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
 test -x "$work/musl-channel-home/.aos/bin/aos"
@@ -1017,6 +1033,12 @@ cp "$fixture/channel-good.toml" "$fixture/channel.toml"
 nightly_version="2026.9.3-nightly.20260717.gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 sed -i.bak "s/version = \"2026.9.3\"/version = \"$nightly_version\"/" "$fixture/channel.toml"
 rm "$fixture/channel.toml.bak"
+if PATH="$fake_bin:$PATH" AOS_HOME="$work/check-invalid-channel" AOS_TEST_FIXTURE="$fixture" \
+  AOS_INSTALLED_VERSION=2026.9.2 sh "$repo_root/install.sh" --check >/dev/null 2>&1; then
+  echo "update check accepted a nightly release through the stable channel" >&2
+  exit 1
+fi
+test ! -e "$work/check-invalid-channel"
 if PATH="$fake_bin:$PATH" HOME="$work/nightly-on-stable-home" AOS_TEST_FIXTURE="$fixture" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted a nightly release through the stable channel" >&2

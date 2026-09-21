@@ -12,6 +12,7 @@ AOS_VERSION="$AOS_VERSION_INPUT"
 AOS_CHANNEL_BASE_URL="${AOS_CHANNEL_BASE_URL:-https://github.com/${AOS_RELEASE_REPO}/releases/download}"
 COSIGN_VERSION=v3.1.1
 ASSUME_YES=0
+CHECK_ONLY=0
 SKIP_MIGRATION_PROMPT=0
 channel_explicit=0
 version_explicit=0
@@ -36,9 +37,10 @@ usage() {
   cat <<'EOF'
 Install or upgrade Unicity AOS Community Edition.
 
-Usage: install.sh [--yes] [--channel CHANNEL | --version VERSION] [--no-migrate-prompt]
+Usage: install.sh [--check] [--yes] [--channel CHANNEL | --version VERSION] [--no-migrate-prompt]
 
   --yes                do not ask before replacing an existing installation
+  --check              report signed channel availability without installing
   --channel CHANNEL    follow the signed stable, dev, or nightly channel
   --version VERSION    install a specific calendar-semver release
   --no-migrate-prompt  do not launch the optional Astrid state-import prompt
@@ -48,6 +50,7 @@ EOF
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -y|--yes) ASSUME_YES=1 ;;
+    --check) CHECK_ONLY=1 ;;
     --channel)
       [ "$#" -ge 2 ] || { echo "missing value for --channel" >&2; exit 2; }
       AOS_CHANNEL=$2
@@ -69,6 +72,10 @@ done
 
 if [ "$channel_explicit" -eq 1 ] && [ "$version_explicit" -eq 1 ]; then
   echo "--channel and --version are mutually exclusive" >&2
+  exit 2
+fi
+if [ "$CHECK_ONLY" -eq 1 ] && [ "$version_explicit" -eq 1 ]; then
+  echo "--check requires a channel, not an exact version" >&2
   exit 2
 fi
 case "$AOS_CHANNEL" in
@@ -830,6 +837,24 @@ if [ -f "$work/channel.toml" ]; then
       }
     done
   fi
+fi
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  validate_accepted_channel
+  installed_version=${AOS_INSTALLED_VERSION:-}
+  if [ -z "$installed_version" ]; then
+    [ -x "$AOS_BIN_DIR/aos" ] || { echo "no installed AOS to compare" >&2; exit 1; }
+    installed_version=$("$AOS_BIN_DIR/aos" --version | awk '{print $NF}')
+  fi
+  is_aos_release_version "$installed_version" || { echo "invalid installed AOS version" >&2; exit 1; }
+  if [ "$installed_version" != "$AOS_VERSION" ]; then
+    # shellcheck disable=SC2016 # Backticks are literal command formatting.
+    printf 'Update available: AOS %s -> %s (%s). Run `aos update --channel %s`.\n' \
+      "$installed_version" "$AOS_VERSION" "$AOS_CHANNEL" "$AOS_CHANNEL"
+  else
+    printf 'AOS %s matches the signed %s channel.\n' "$installed_version" "$AOS_CHANNEL"
+  fi
+  exit 0
 fi
 
 echo "Downloading Unicity AOS $AOS_VERSION for $target..."

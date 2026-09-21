@@ -151,6 +151,9 @@ struct DistroApplyArgs {
 
 #[derive(Args)]
 struct UpdateArgs {
+    /// Check the authenticated channel without installing or restarting anything.
+    #[arg(long, conflicts_with = "version")]
+    check: bool,
     /// Follow the signed stable, dev, or nightly product channel.
     #[arg(long, value_enum, conflicts_with = "version")]
     channel: Option<UpdateChannel>,
@@ -789,7 +792,9 @@ fn leading_runtime_root_index(args: &[OsString]) -> Result<Option<usize>, ()> {
 }
 
 fn handle_self_update(args: &UpdateArgs) -> ExitCode {
-    if std::env::var_os("UNICITY_AOS_INSTALL_METHOD").as_deref() == Some(OsStr::new("homebrew")) {
+    if !args.check
+        && std::env::var_os("UNICITY_AOS_INSTALL_METHOD").as_deref() == Some(OsStr::new("homebrew"))
+    {
         if args.version.is_some()
             || matches!(
                 args.channel,
@@ -843,7 +848,12 @@ fn handle_self_update(args: &UpdateArgs) -> ExitCode {
             args.channel.unwrap_or(UpdateChannel::Stable).as_str(),
         ]);
     }
-    command.args(["--yes", "--no-migrate-prompt"]);
+    if args.check {
+        command.arg("--check");
+        command.env("AOS_INSTALLED_VERSION", env!("CARGO_PKG_VERSION"));
+    } else {
+        command.args(["--yes", "--no-migrate-prompt"]);
+    }
     command_exit_code(command.status(), "run the installed signed AOS updater")
 }
 
