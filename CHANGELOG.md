@@ -15,6 +15,11 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Fixed
+
+- Support Apple-ID app-specific-password notarization for Command Center
+  release signing; retain API-key and keychain-profile support in the helper.
+
 ## [2026.9.3] - 2026-09-18
 
 ### Added
