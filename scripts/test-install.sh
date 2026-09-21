@@ -1010,6 +1010,34 @@ done
 grep -q '^Update available: AOS 2026.9.2 -> 2026.9.3' "$work/check-2026.9.2.log"
 grep -q '^AOS 2026.9.3 matches the signed stable channel' "$work/check-2026.9.3.log"
 
+# The machine interface must contain JSON only, preserve both version
+# identities (including an installed version ahead of stable), and write no home.
+for installed_version in 2026.9.2 2026.9.3 2026.9.4; do
+  check_home="$work/json-check-$installed_version"
+  PATH="$fake_bin:$PATH" AOS_HOME="$check_home" AOS_TEST_FIXTURE="$fixture" \
+    AOS_INSTALLED_VERSION="$installed_version" \
+    sh "$repo_root/install.sh" --check --json > "$work/check.json" 2> "$work/check.err"
+  test ! -e "$check_home"
+  "$python" - "$work/check.json" "$installed_version" <<'PY'
+import json, sys
+from pathlib import Path
+result = json.loads(Path(sys.argv[1]).read_text())
+assert result["schema_version"] == 1
+assert result["kind"] == "aos"
+assert result["installed_version"] == sys.argv[2]
+assert result["channel_version"] == "2026.9.3"
+assert result["channel"] == "stable"
+assert result["verification"] == "metadata"
+assert len(result["artifact_sha256"]) == 64
+assert result["target"] == "x86_64-unknown-linux-gnu"
+PY
+done
+if sh "$repo_root/install.sh" --json > "$work/invalid-json.out" 2>/dev/null; then
+  echo 'JSON output without read-only check was accepted' >&2
+  exit 1
+fi
+test ! -s "$work/invalid-json.out"
+
 PATH="$fake_bin:$PATH" HOME="$work/musl-channel-home" AOS_TEST_FIXTURE="$fixture" \
   AOS_TEST_LIBC=musl sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
 test -x "$work/musl-channel-home/.aos/bin/aos"
@@ -1039,6 +1067,13 @@ if PATH="$fake_bin:$PATH" AOS_HOME="$work/check-invalid-channel" AOS_TEST_FIXTUR
   exit 1
 fi
 test ! -e "$work/check-invalid-channel"
+if PATH="$fake_bin:$PATH" AOS_HOME="$work/json-invalid-channel" AOS_TEST_FIXTURE="$fixture" \
+  AOS_INSTALLED_VERSION=2026.9.2 sh "$repo_root/install.sh" --check --json > "$work/invalid-json.out" 2>/dev/null; then
+  echo 'JSON check accepted an invalid stable channel' >&2
+  exit 1
+fi
+test ! -s "$work/invalid-json.out"
+test ! -e "$work/json-invalid-channel"
 if PATH="$fake_bin:$PATH" HOME="$work/nightly-on-stable-home" AOS_TEST_FIXTURE="$fixture" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
   echo "installer accepted a nightly release through the stable channel" >&2

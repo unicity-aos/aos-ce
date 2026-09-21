@@ -13,6 +13,7 @@ AOS_CHANNEL_BASE_URL="${AOS_CHANNEL_BASE_URL:-https://github.com/${AOS_RELEASE_R
 COSIGN_VERSION=v3.1.1
 ASSUME_YES=0
 CHECK_ONLY=0
+JSON_OUTPUT=0
 SKIP_MIGRATION_PROMPT=0
 channel_explicit=0
 version_explicit=0
@@ -41,6 +42,7 @@ Usage: install.sh [--check] [--yes] [--channel CHANNEL | --version VERSION] [--n
 
   --yes                do not ask before replacing an existing installation
   --check              report signed channel availability without installing
+  --json               emit machine-readable metadata (requires --check)
   --channel CHANNEL    follow the signed stable, dev, or nightly channel
   --version VERSION    install a specific calendar-semver release
   --no-migrate-prompt  do not launch the optional Astrid state-import prompt
@@ -51,6 +53,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     -y|--yes) ASSUME_YES=1 ;;
     --check) CHECK_ONLY=1 ;;
+    --json) JSON_OUTPUT=1 ;;
     --channel)
       [ "$#" -ge 2 ] || { echo "missing value for --channel" >&2; exit 2; }
       AOS_CHANNEL=$2
@@ -69,6 +72,13 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ "$JSON_OUTPUT" -eq 1 ]; then
+  [ "$CHECK_ONLY" -eq 1 ] || { echo "--json requires --check" >&2; exit 2; }
+  # Keep progress and verifier output away from the structured result. Failure
+  # produces a nonzero exit and no successful result on the original stdout.
+  exec 3>&1 1>&2
+fi
 
 if [ "$channel_explicit" -eq 1 ] && [ "$version_explicit" -eq 1 ]; then
   echo "--channel and --version are mutually exclusive" >&2
@@ -847,6 +857,15 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     installed_version=$("$AOS_BIN_DIR/aos" --version | awk '{print $NF}')
   fi
   is_aos_release_version "$installed_version" || { echo "invalid installed AOS version" >&2; exit 1; }
+  if [ "$JSON_OUTPUT" -eq 1 ]; then
+    # Every interpolated value has already passed the canonical channel,
+    # version, target, or hexadecimal digest validator above. Report the
+    # authenticated channel identity, not a claim that its archive was fetched
+    # or that a differing version is necessarily an upgrade.
+    printf '{"schema_version":1,"kind":"aos","installed_version":"%s","channel_version":"%s","channel":"%s","target":"%s","artifact_sha256":"%s","verification":"metadata"}\n' \
+      "$installed_version" "$AOS_VERSION" "$AOS_CHANNEL" "$target" "$asset_sha256" >&3
+    exit 0
+  fi
   if [ "$installed_version" != "$AOS_VERSION" ]; then
     # shellcheck disable=SC2016 # Backticks are literal command formatting.
     printf 'Update available: AOS %s -> %s (%s). Run `aos update --channel %s`.\n' \

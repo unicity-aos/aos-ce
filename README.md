@@ -124,6 +124,16 @@ or changing accepted channel state. Use `--channel dev` or `--channel nightly`
 to check another channel. A failed check exits nonzero; it is not evidence that
 the installation is up to date. The check requires the installed product updater.
 
+`aos update --check --json` exposes the same authenticated check to integrations.
+On success stdout contains one JSON object with `schema_version: 1`, the installed
+and channel versions, channel, target, and channel-selected artifact SHA-256.
+`verification: "metadata"` means the signed metadata passed verification, **not**
+that the product archive was downloaded or installed. Diagnostics go to stderr;
+an unsuccessful check has a nonzero exit and must not be interpreted as current.
+The two versions are deliberately separate: a differing channel version may be
+older than the installed version. JSON output requires `--check` and never applies
+an update.
+
 ## Import an existing runtime
 
 The `aos` CLI can deliberately copy compatible state from a standalone runtime

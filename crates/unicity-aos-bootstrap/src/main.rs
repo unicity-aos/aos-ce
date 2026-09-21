@@ -154,6 +154,9 @@ struct UpdateArgs {
     /// Check the authenticated channel without installing or restarting anything.
     #[arg(long, conflicts_with = "version")]
     check: bool,
+    /// Emit authenticated channel metadata as JSON (requires --check).
+    #[arg(long, requires = "check")]
+    json: bool,
     /// Follow the signed stable, dev, or nightly product channel.
     #[arg(long, value_enum, conflicts_with = "version")]
     channel: Option<UpdateChannel>,
@@ -850,6 +853,9 @@ fn handle_self_update(args: &UpdateArgs) -> ExitCode {
     }
     if args.check {
         command.arg("--check");
+        if args.json {
+            command.arg("--json");
+        }
         command.env("AOS_INSTALLED_VERSION", env!("CARGO_PKG_VERSION"));
     } else {
         command.args(["--yes", "--no-migrate-prompt"]);
