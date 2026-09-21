@@ -48,6 +48,7 @@ imported=${FAKE_SECURITY_IMPORTED_FLAG:?}
 keychain_file=${FAKE_SECURITY_KEYCHAIN_FILE:?}
 printf '%s\n' "$*" >> "$log"
 if [ "$1" = "--force" ]; then
+  [ -f "$keychain_file.search" ] || { echo 'keychain not searchable' >&2; exit 1; }
   if [ ! -f "$imported" ]; then
     echo "codesign ran before PKCS12 import" >&2
     exit 1
@@ -137,11 +138,33 @@ case "$cmd" in
     rm -f "$keychain"
     exit 0
     ;;
-  list-keychains|default-keychain)
+  list-keychains)
+    if [ "$#" = 2 ]; then
+      printf '    "/fixture/login keychain-db"\n'
+    elif [ "$#" = 5 ]; then
+      [ "$3" = -s ] && [ "$4" = "$(cat "$keychain_file")" ] && [ "$5" = '/fixture/login keychain-db' ]
+      touch "$keychain_file.search"
+    elif [ "$#" = 4 ]; then
+      [ "$3" = -s ] && [ "$4" = '/fixture/login keychain-db' ]
+      rm -f "$keychain_file.search"
+    else
+      exit 1
+    fi
+    exit 0
+    ;;
+  find-identity)
+    if [ "${FAKE_INVALID_IDENTITY:-0}" = 1 ]; then
+      echo '0 valid identities found'
+    else
+      printf '1) AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "%s"\n' "$AOS_MACOS_DEVELOPER_ID_IDENTITY"
+    fi
+    exit 0
+    ;;
+  default-keychain)
     echo "security $cmd must not mutate the runner keychain search list" >&2
     exit 1
     ;;
-  find-identity|export)
+  export)
     echo "security $cmd is forbidden in Command Center signing" >&2
     exit 1
     ;;
@@ -246,7 +269,7 @@ unset AOS_MACOS_DEVELOPMENT_TEAM_ID AOS_MACOS_DEVELOPER_ID_IDENTITY \
 make_app "$work/missing.app"
 expect_fail "$work/missing-env" "AOS_MACOS_DEVELOPMENT_TEAM_ID is required" \
   env -u AOS_MACOS_DEVELOPMENT_TEAM_ID -u AOS_MACOS_DEVELOPER_ID_IDENTITY \
-  sh "$sign" --app "$work/missing.app" --output "$work/missing-out"
+  bash "$sign" --app "$work/missing.app" --output "$work/missing-out"
 
 # Astrid-only credentials are refused rather than borrowed.
 make_app "$work/astrid.app"
@@ -254,32 +277,32 @@ expect_fail "$work/astrid-only" "Command Center signing does not borrow Astrid c
   env -u AOS_MACOS_DEVELOPMENT_TEAM_ID -u AOS_MACOS_DEVELOPER_ID_IDENTITY \
     ASTRID_MACOS_DEVELOPMENT_TEAM_ID=ASTRIDTEAM \
     ASTRID_MACOS_DEVELOPER_ID_IDENTITY="Developer ID Application" \
-  sh "$sign" --app "$work/astrid.app" --output "$work/astrid-out"
+  bash "$sign" --app "$work/astrid.app" --output "$work/astrid-out"
 
 # Ad-hoc identities are refused.
 make_app "$work/adhoc.app"
 aos_env
 expect_fail "$work/adhoc-identity" "Command Center signing refuses an ad-hoc identity" \
   env AOS_MACOS_DEVELOPER_ID_IDENTITY="-" \
-  sh "$sign" --app "$work/adhoc.app" --output "$work/adhoc-out"
+  bash "$sign" --app "$work/adhoc.app" --output "$work/adhoc-out"
 expect_fail "$work/adhoc-name" "Command Center signing refuses an ad-hoc identity" \
   env AOS_MACOS_DEVELOPER_ID_IDENTITY="ad-hoc" \
-  sh "$sign" --app "$work/adhoc.app" --output "$work/adhoc-name-out"
+  bash "$sign" --app "$work/adhoc.app" --output "$work/adhoc-name-out"
 
 # PKCS12 path and password fail closed before tools.
 make_app "$work/missing-p12.app"
 aos_env
 expect_fail "$work/missing-p12" "AOS_MACOS_CERTIFICATE_P12_PATH is required" \
   env -u AOS_MACOS_CERTIFICATE_P12_PATH \
-  sh "$sign" --app "$work/missing-p12.app" --output "$work/missing-p12-out"
+  bash "$sign" --app "$work/missing-p12.app" --output "$work/missing-p12-out"
 write_p12 "$work/fixture.p12"
 expect_fail "$work/missing-p12-password" "AOS_MACOS_CERTIFICATE_PASSWORD is required" \
   env -u AOS_MACOS_CERTIFICATE_PASSWORD \
-  sh "$sign" --app "$work/missing-p12.app" --output "$work/missing-p12-password-out"
+  bash "$sign" --app "$work/missing-p12.app" --output "$work/missing-p12-password-out"
 ln -s "$work/fixture.p12" "$work/fixture.p12.link"
 expect_fail "$work/p12-symlink" "AOS_MACOS_CERTIFICATE_P12_PATH must be a regular file" \
   env AOS_MACOS_CERTIFICATE_P12_PATH="$work/fixture.p12.link" \
-  sh "$sign" --app "$work/missing-p12.app" --output "$work/p12-symlink-out"
+  bash "$sign" --app "$work/missing-p12.app" --output "$work/p12-symlink-out"
 
 # Tool wrappers live in AOS_MACOS_TOOL_DIR; PATH must not be used.
 tool_dir="$work/tools"
@@ -314,7 +337,7 @@ make_app "$work/team.app"
 expect_fail "$work/team-mismatch" \
   "Command Center TeamIdentifier must match AOS_MACOS_DEVELOPMENT_TEAM_ID" \
   env FAKE_CODESIGN_DUMP="$work/team.dump" \
-  sh "$sign" --app "$work/team.app" --output "$work/team-out"
+  bash "$sign" --app "$work/team.app" --output "$work/team-out"
 
 # Exact-line identity: a longer TeamIdentifier must not satisfy TEAMID12AB.
 write_dump "$work/team-spoof.dump" "TEAMID12ABEXTRA" "ai.unicity.aos.tray"
@@ -326,7 +349,7 @@ rm -f "$FAKE_SECURITY_KEYCHAIN_FILE" "$FAKE_SECURITY_IMPORTED_FLAG"
 expect_fail "$work/team-spoof" \
   "Command Center TeamIdentifier must match AOS_MACOS_DEVELOPMENT_TEAM_ID" \
   env FAKE_CODESIGN_DUMP="$work/team-spoof.dump" \
-  sh "$sign" --app "$work/team-spoof.app" --output "$work/team-spoof-out"
+  bash "$sign" --app "$work/team-spoof.app" --output "$work/team-spoof-out"
 
 write_dump "$work/id.dump" "TEAMID12AB" "ai.unicity.aos.wrong"
 install_tools "$tool_dir" "$work/id.dump"
@@ -337,7 +360,7 @@ rm -f "$FAKE_SECURITY_KEYCHAIN_FILE" "$FAKE_SECURITY_IMPORTED_FLAG"
 expect_fail "$work/id-mismatch" \
   "Command Center identifier must remain ai.unicity.aos.tray" \
   env FAKE_CODESIGN_DUMP="$work/id.dump" \
-  sh "$sign" --app "$work/id.app" --output "$work/id-out"
+  bash "$sign" --app "$work/id.app" --output "$work/id-out"
 
 # Exact-line identity: a longer Identifier must not satisfy ai.unicity.aos.tray.
 write_dump "$work/id-spoof.dump" "TEAMID12AB" "ai.unicity.aos.tray.spoof"
@@ -349,7 +372,7 @@ rm -f "$FAKE_SECURITY_KEYCHAIN_FILE" "$FAKE_SECURITY_IMPORTED_FLAG"
 expect_fail "$work/id-spoof" \
   "Command Center identifier must remain ai.unicity.aos.tray" \
   env FAKE_CODESIGN_DUMP="$work/id-spoof.dump" \
-  sh "$sign" --app "$work/id-spoof.app" --output "$work/id-spoof-out"
+  bash "$sign" --app "$work/id-spoof.app" --output "$work/id-spoof-out"
 
 # Success fixture: import into ephemeral keychain, bind codesign --keychain, cleanup.
 write_dump "$work/ok.dump" "TEAMID12AB" "ai.unicity.aos.tray"
@@ -363,7 +386,7 @@ rm -f "$FAKE_SECURITY_KEYCHAIN_FILE" "$FAKE_SECURITY_IMPORTED_FLAG"
 signed=$(
   FAKE_CODESIGN_DUMP="$work/ok.dump" \
   AOS_MACOS_NOTARY_KEY_PATH="$work/notary.p8" \
-  sh "$sign" --app "$work/ok.app" --output "$work/ok-out" 2>"$work/ok-sign.err"
+  bash "$sign" --app "$work/ok.app" --output "$work/ok-out" 2>"$work/ok-sign.err"
 )
 [ "$signed" = "$work/ok-out/AOS Command Center.app" ] || fail "success path did not print the signed app"
 [ -d "$signed" ] || fail "signed app missing"
@@ -379,9 +402,7 @@ grep -q '^unlock-keychain ' "$FAKE_SECURITY_LOG" || fail "security unlock-keycha
 grep -q '^import ' "$FAKE_SECURITY_LOG" || fail "security import was not invoked"
 grep -q '^set-key-partition-list ' "$FAKE_SECURITY_LOG" || fail "security set-key-partition-list was not invoked"
 grep -q '^delete-keychain ' "$FAKE_SECURITY_LOG" || fail "security delete-keychain was not invoked"
-if grep -Eq '^(list-keychains|default-keychain)( |$)' "$FAKE_SECURITY_LOG"; then
-  fail "helper mutated the runner keychain search list"
-fi
+[ ! -e "$FAKE_SECURITY_KEYCHAIN_FILE.search" ] || fail 'search list not restored'
 grep -Fq -- "-k $created_keychain" "$FAKE_SECURITY_LOG" \
   || fail "import did not target the created keychain"
 grep -Fq -- "-T $tool_dir/codesign" "$FAKE_SECURITY_LOG" || fail "import did not allow the codesign we invoke"
@@ -389,7 +410,7 @@ grep -Fq -- "--keychain $created_keychain" "$FAKE_CODESIGN_LOG" || fail "codesig
 if grep '^create-keychain ' "$FAKE_SECURITY_LOG" | grep -Fq 'p12-pass'; then
   fail "ephemeral keychain password reused the PKCS12 password"
 fi
-if grep -Eq '^(find-identity|export)( |$)' "$FAKE_SECURITY_LOG"; then
+if grep -Eq '^(export)( |$)' "$FAKE_SECURITY_LOG"; then
   fail "helper consulted or exported key material"
 fi
 
@@ -399,17 +420,21 @@ export AOS_MACOS_NOTARY_APPLE_ID=fixture@example.invalid
 export AOS_MACOS_NOTARY_APP_PASSWORD=fixture-app-password
 export FAKE_CODESIGN_DUMP="$work/ok.dump"
 export FAKE_STAPLER_LOG="$work/apple-stapler.log"
-sh "$sign" --app "$work/ok.app" --output "$work/apple-out" > "$work/apple.out" 2> "$work/apple.err"
+bash "$sign" --app "$work/ok.app" --output "$work/apple-out" > "$work/apple.out" 2> "$work/apple.err"
 grep -Fxq staple "$FAKE_STAPLER_LOG" || fail 'Apple-ID success did not staple'
 grep -Fxq validate "$FAKE_STAPLER_LOG" || fail 'Apple-ID success did not validate'
 expect_fail "$work/apple-missing-password" 'AOS_MACOS_NOTARY_APP_PASSWORD is required' \
-  env -u AOS_MACOS_NOTARY_APP_PASSWORD sh "$sign" --app "$work/ok.app" --output "$work/apple-no-password"
+  env -u AOS_MACOS_NOTARY_APP_PASSWORD bash "$sign" --app "$work/ok.app" --output "$work/apple-no-password"
 expect_fail "$work/apple-missing-id" 'AOS_MACOS_NOTARY_APPLE_ID is required' \
-  env -u AOS_MACOS_NOTARY_APPLE_ID sh "$sign" --app "$work/ok.app" --output "$work/apple-no-id"
+  env -u AOS_MACOS_NOTARY_APPLE_ID bash "$sign" --app "$work/ok.app" --output "$work/apple-no-id"
 : > "$FAKE_STAPLER_LOG"
 expect_fail "$work/apple-rejected" 'fixture notarization rejected' \
-  env FAKE_NOTARY_FAIL=1 sh "$sign" --app "$work/ok.app" --output "$work/apple-rejected-out"
+  env FAKE_NOTARY_FAIL=1 bash "$sign" --app "$work/ok.app" --output "$work/apple-rejected-out"
 [ ! -s "$FAKE_STAPLER_LOG" ] || fail 'Notarization rejection reached stapler'
+[ ! -e "$FAKE_SECURITY_KEYCHAIN_FILE.search" ] || fail 'failed notarization did not restore search list'
+expect_fail "$work/invalid-identity" 'Configured signing identity is not valid' \
+  env FAKE_INVALID_IDENTITY=1 bash "$sign" --app "$work/ok.app" --output "$work/invalid-identity-out"
+[ ! -e "$FAKE_SECURITY_KEYCHAIN_FILE.search" ] || fail 'invalid identity did not restore search list'
 
 # Workflow contract: Darwin-only AOS secrets, no Astrid names, no build environment,
 # unchanged 6-arg package-release.sh, Command Center path via GITHUB_ENV.
@@ -511,12 +536,12 @@ if "bash scripts/test_sign_command_center.sh" not in "\n".join(validate):
     raise SystemExit("validate-release must run test_sign_command_center.sh")
 PY
 
-# Helper contract: ephemeral import, exact identity, no search-list mutation.
-if grep -E -q 'security find-identity|security export' "$sign"; then
+# Helper contract: ephemeral import, exact identity, no key export/default change.
+if grep -E -q 'security export' "$sign"; then
   fail "sign-command-center.sh must not consult or export the keychain"
 fi
-if grep -E -q 'list-keychains|default-keychain' "$sign"; then
-  fail "sign-command-center.sh must not mutate the runner keychain search list"
+if grep -E -q 'default-keychain' "$sign"; then
+  fail "sign-command-center.sh must not change the default keychain"
 fi
 if ! grep -F -q -- '--keychain "$keychain"' "$sign"; then
   fail "sign-command-center.sh must bind codesign to the imported keychain"
