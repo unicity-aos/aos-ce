@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Developer ID sign, notarize, and staple an assembled AOS Command Center.app.
 # Production validation stays in build-command-center.sh --mode production.
 # This helper never reads ASTRID_* credentials and never exports key material.
@@ -16,14 +16,21 @@ output_dir=
 work=
 keychain=
 security=
+search_list_changed=0
+original_keychains=()
 
 cleanup() {
+  local cleanup_failed=0
+  if [ "$search_list_changed" = 1 ]; then
+    "$security" list-keychains -d user -s ${original_keychains[@]+"${original_keychains[@]}"} >&2 || cleanup_failed=1
+  fi
   if [ -n "${security-}" ] && [ -n "${keychain-}" ] && [ -e "$keychain" ]; then
     "$security" delete-keychain "$keychain" >&2 || true
   fi
   if [ -n "${work-}" ]; then
     rm -rf "$work"
   fi
+  return "$cleanup_failed"
 }
 
 while [ $# -gt 0 ]; do
@@ -146,11 +153,26 @@ if [ -z "$keychain_password" ] || [ "$keychain_password" = "$p12_password" ]; th
   exit 1
 fi
 
+# --keychain selects the identity but does not supply the certificate-chain
+# search list. Preserve the runner's entries and restore them on every exit.
+"$security" list-keychains -d user > "$work/search-list"
+while IFS= read -r entry; do
+  entry=$(printf '%s\n' "$entry" | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
+  [ -z "$entry" ] || original_keychains+=("$entry")
+done < "$work/search-list"
 "$security" create-keychain -p "$keychain_password" "$keychain" >&2
 "$security" set-keychain-settings -lut 21600 "$keychain" >&2
 "$security" unlock-keychain -p "$keychain_password" "$keychain" >&2
 "$security" import "$p12_path" -k "$keychain" -P "$p12_password" -T "$codesign" >&2
 "$security" set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >&2
+search_list_changed=1
+"$security" list-keychains -d user -s "$keychain" ${original_keychains[@]+"${original_keychains[@]}"} >&2
+"$security" find-identity -v -p codesigning "$keychain" > "$work/identities"
+if ! grep -Fq "$identity" "$work/identities"; then
+  echo "Configured signing identity is not valid in the imported keychain" >&2
+  cat "$work/identities" >&2
+  exit 1
+fi
 
 "$codesign" --force --options runtime --timestamp \
   --identifier "$bundle_identifier" \
