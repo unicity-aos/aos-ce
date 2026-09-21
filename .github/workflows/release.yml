@@ -302,30 +302,23 @@ jobs:
           AOS_MACOS_DEVELOPER_ID_IDENTITY: ${{ secrets.AOS_MACOS_DEVELOPER_ID_IDENTITY }}
           AOS_MACOS_CERTIFICATE_P12: ${{ secrets.AOS_MACOS_CERTIFICATE_P12 }}
           AOS_MACOS_CERTIFICATE_PASSWORD: ${{ secrets.AOS_MACOS_CERTIFICATE_PASSWORD }}
-          AOS_MACOS_NOTARY_KEY_ID: ${{ secrets.AOS_MACOS_NOTARY_KEY_ID }}
-          AOS_MACOS_NOTARY_ISSUER_ID: ${{ secrets.AOS_MACOS_NOTARY_ISSUER_ID }}
-          AOS_MACOS_NOTARY_KEY: ${{ secrets.AOS_MACOS_NOTARY_KEY }}
+          AOS_MACOS_NOTARY_APPLE_ID: ${{ secrets.AOS_MACOS_NOTARY_APPLE_ID }}
+          AOS_MACOS_NOTARY_APP_PASSWORD: ${{ secrets.AOS_MACOS_NOTARY_APP_PASSWORD }}
         run: |
           set -euo pipefail
           [[ -n "${AOS_MACOS_DEVELOPMENT_TEAM_ID}" ]]
           [[ -n "${AOS_MACOS_DEVELOPER_ID_IDENTITY}" ]]
           [[ -n "${AOS_MACOS_CERTIFICATE_P12}" ]]
           [[ -n "${AOS_MACOS_CERTIFICATE_PASSWORD}" ]]
-          [[ -n "${AOS_MACOS_NOTARY_KEY_ID}" ]]
-          [[ -n "${AOS_MACOS_NOTARY_ISSUER_ID}" ]]
-          [[ -n "${AOS_MACOS_NOTARY_KEY}" ]]
-          NOTARY_KEY_PATH="$RUNNER_TEMP/aos-command-center-notary.p8"
+          [[ -n "${AOS_MACOS_NOTARY_APPLE_ID}" ]]
+          [[ -n "${AOS_MACOS_NOTARY_APP_PASSWORD}" ]]
           P12_PATH="$RUNNER_TEMP/aos-command-center-signing.p12"
-          printf '%s' "$AOS_MACOS_NOTARY_KEY" > "$NOTARY_KEY_PATH"
-          chmod 0600 "$NOTARY_KEY_PATH"
           printf '%s' "$AOS_MACOS_CERTIFICATE_P12" | python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' > "$P12_PATH"
           chmod 0600 "$P12_PATH"
           [[ -s "$P12_PATH" ]]
-          export AOS_MACOS_NOTARY_KEY_PATH="$NOTARY_KEY_PATH"
           export AOS_MACOS_CERTIFICATE_P12_PATH="$P12_PATH"
-          unset AOS_MACOS_NOTARY_KEY
           unset AOS_MACOS_CERTIFICATE_P12
-          trap 'rm -f "$NOTARY_KEY_PATH" "$P12_PATH"' EXIT
+          trap 'rm -f "$P12_PATH"' EXIT
           DEV_OUT="$RUNNER_TEMP/aos-command-center-dev"
           SIGNED_OUT="$RUNNER_TEMP/aos-command-center-signed"
           PROD_OUT="$RUNNER_TEMP/aos-command-center-production"

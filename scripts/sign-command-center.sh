@@ -185,6 +185,15 @@ fi
 if [ -n "${AOS_MACOS_NOTARY_PROFILE-}" ]; then
   "$xcrun" notarytool submit "$zip" \
     --keychain-profile "$AOS_MACOS_NOTARY_PROFILE" --wait >&2
+elif [ -n "${AOS_MACOS_NOTARY_APPLE_ID-}" ] || [ -n "${AOS_MACOS_NOTARY_APP_PASSWORD-}" ]; then
+  # An incomplete Apple-ID pair must not silently fall back to another identity.
+  require_env AOS_MACOS_NOTARY_APPLE_ID
+  require_env AOS_MACOS_NOTARY_APP_PASSWORD
+  "$xcrun" notarytool submit "$zip" \
+    --apple-id "$AOS_MACOS_NOTARY_APPLE_ID" \
+    --team-id "$team_id" \
+    --password "$AOS_MACOS_NOTARY_APP_PASSWORD" \
+    --wait >&2
 else
   require_env AOS_MACOS_NOTARY_KEY_PATH
   require_env AOS_MACOS_NOTARY_KEY_ID

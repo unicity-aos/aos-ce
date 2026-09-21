@@ -175,6 +175,18 @@ for arg in "$@"; do
   [ "$arg" = "--wait" ] && saw_wait=1
 done
 [ "$saw_wait" = 1 ]
+if [ "${FAKE_NOTARY_MODE:-key}" = apple ]; then
+  shift 3
+  [ "$#" = 7 ]
+  [ "$1" = --apple-id ] && [ "$2" = fixture@example.invalid ]
+  [ "$3" = --team-id ] && [ "$4" = TEAMID12AB ]
+  [ "$5" = --password ] && [ "$6" = fixture-app-password ]
+  [ "$7" = --wait ]
+fi
+if [ "${FAKE_NOTARY_FAIL:-0}" = 1 ]; then
+  echo 'fixture notarization rejected' >&2
+  exit 1
+fi
 printf 'accepted\n' >&2
 exit 0
 SH
@@ -182,6 +194,7 @@ SH
 #!/bin/sh
 set -eu
 [ "$1" = staple ] || [ "$1" = validate ]
+[ -z "${FAKE_STAPLER_LOG:-}" ] || printf '%s\n' "$1" >> "$FAKE_STAPLER_LOG"
 exit 0
 SH
   chmod 755 "$dir/codesign" "$dir/security" "$dir/ditto" "$dir/xcrun" "$dir/stapler"
@@ -228,6 +241,7 @@ write_p12() {
 unset AOS_MACOS_DEVELOPMENT_TEAM_ID AOS_MACOS_DEVELOPER_ID_IDENTITY \
   AOS_MACOS_NOTARY_KEY_PATH AOS_MACOS_NOTARY_KEY_ID AOS_MACOS_NOTARY_ISSUER_ID \
   AOS_MACOS_NOTARY_PROFILE AOS_MACOS_TOOL_DIR \
+  AOS_MACOS_NOTARY_APPLE_ID AOS_MACOS_NOTARY_APP_PASSWORD \
   AOS_MACOS_CERTIFICATE_P12_PATH AOS_MACOS_CERTIFICATE_PASSWORD || true
 make_app "$work/missing.app"
 expect_fail "$work/missing-env" "AOS_MACOS_DEVELOPMENT_TEAM_ID is required" \
@@ -379,6 +393,24 @@ if grep -Eq '^(find-identity|export)( |$)' "$FAKE_SECURITY_LOG"; then
   fail "helper consulted or exported key material"
 fi
 
+# Apple-ID notarization uses the signing team and preserves rejection behavior.
+export FAKE_NOTARY_MODE=apple
+export AOS_MACOS_NOTARY_APPLE_ID=fixture@example.invalid
+export AOS_MACOS_NOTARY_APP_PASSWORD=fixture-app-password
+export FAKE_CODESIGN_DUMP="$work/ok.dump"
+export FAKE_STAPLER_LOG="$work/apple-stapler.log"
+sh "$sign" --app "$work/ok.app" --output "$work/apple-out" > "$work/apple.out" 2> "$work/apple.err"
+grep -Fxq staple "$FAKE_STAPLER_LOG" || fail 'Apple-ID success did not staple'
+grep -Fxq validate "$FAKE_STAPLER_LOG" || fail 'Apple-ID success did not validate'
+expect_fail "$work/apple-missing-password" 'AOS_MACOS_NOTARY_APP_PASSWORD is required' \
+  env -u AOS_MACOS_NOTARY_APP_PASSWORD sh "$sign" --app "$work/ok.app" --output "$work/apple-no-password"
+expect_fail "$work/apple-missing-id" 'AOS_MACOS_NOTARY_APPLE_ID is required' \
+  env -u AOS_MACOS_NOTARY_APPLE_ID sh "$sign" --app "$work/ok.app" --output "$work/apple-no-id"
+: > "$FAKE_STAPLER_LOG"
+expect_fail "$work/apple-rejected" 'fixture notarization rejected' \
+  env FAKE_NOTARY_FAIL=1 sh "$sign" --app "$work/ok.app" --output "$work/apple-rejected-out"
+[ ! -s "$FAKE_STAPLER_LOG" ] || fail 'Notarization rejection reached stapler'
+
 # Workflow contract: Darwin-only AOS secrets, no Astrid names, no build environment,
 # unchanged 6-arg package-release.sh, Command Center path via GITHUB_ENV.
 python3 - "$workflow" <<'PY'
@@ -418,10 +450,8 @@ required = [
     "secrets.AOS_MACOS_DEVELOPER_ID_IDENTITY",
     "secrets.AOS_MACOS_CERTIFICATE_P12",
     "secrets.AOS_MACOS_CERTIFICATE_PASSWORD",
-    "secrets.AOS_MACOS_NOTARY_KEY_ID",
-    "secrets.AOS_MACOS_NOTARY_ISSUER_ID",
-    "secrets.AOS_MACOS_NOTARY_KEY",
-    "unset AOS_MACOS_NOTARY_KEY",
+    "secrets.AOS_MACOS_NOTARY_APPLE_ID",
+    "secrets.AOS_MACOS_NOTARY_APP_PASSWORD",
     "unset AOS_MACOS_CERTIFICATE_P12",
     "aos-command-center-signing.p12",
     "AOS_MACOS_CERTIFICATE_P12_PATH",
@@ -432,6 +462,9 @@ required = [
 for item in required:
     if item not in block:
         raise SystemExit(f"build job missing {item!r}")
+for obsolete in ("secrets.AOS_MACOS_NOTARY_KEY", "secrets.AOS_MACOS_NOTARY_ISSUER_ID"):
+    if obsolete in block:
+        raise SystemExit(f"build job still requires unused API credential {obsolete}")
 
 compose_marker = "      - name: Compose product bundle"
 if compose_marker not in block:
