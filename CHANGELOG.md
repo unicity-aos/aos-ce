@@ -17,6 +17,7 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Grant the default CE fleet during the first `astrid init` instead of spawning a second runtime CLI after capsules are installed.
 - Support Apple-ID app-specific-password notarization for Command Center
   release signing; retain API-key and keychain-profile support in the helper.
 
