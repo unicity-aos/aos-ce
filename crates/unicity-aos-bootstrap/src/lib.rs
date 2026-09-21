@@ -16,6 +16,7 @@ pub mod health;
 mod init_resume;
 mod legacy_private_permissions;
 mod migration;
+mod runtime_environment;
 pub mod status;
 pub use migration::{LegacyDistro, MigrationOutcome};
 
@@ -386,6 +387,7 @@ impl AosHome {
                 Self::runtime_child_path(&path_prefix, std::env::var_os("PATH"))?,
             );
         command.args(args);
+        runtime_environment::configure(&mut command);
         Ok(command)
     }
 
