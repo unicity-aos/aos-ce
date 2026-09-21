@@ -323,6 +323,7 @@ mod tests {
             ephemeral: false,
             connected_clients: 3,
             connections_by_principal: Vec::new(),
+            capsule_install_batch_protocol: None,
             loaded_capsules: vec!["agents".to_owned(), "session".to_owned()],
         });
 
@@ -363,7 +364,7 @@ mod tests {
         let status = confirm_stopped(&home).expect("read stopped status");
         assert_eq!(status.state, "stopped");
         assert_eq!(status.pid, 0);
-        assert_eq!(status.runtime_version, "2026.9.2");
+        assert_eq!(status.runtime_version, "2026.9.4");
 
         fs::remove_dir_all(root).expect("remove stopped status fixture");
     }

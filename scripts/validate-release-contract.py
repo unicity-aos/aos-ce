@@ -99,6 +99,19 @@ def validate_product_version(value: str, *, allow_nightly: bool) -> None:
             raise ValueError("product nightly version contains an invalid date") from error
 
 
+def validate_distro_runtime_version(source: str, runtime_version: str) -> None:
+    """Keep the compiled Distro verifier bound to the packaged runtime."""
+    declarations = re.findall(
+        r'^pub\(crate\) const ASTRID_RUNTIME_VERSION: &str = "([^"]+)";$',
+        source,
+        re.MULTILINE,
+    )
+    require(
+        declarations == [runtime_version],
+        "compiled Distro verifier runtime version does not match the runtime pin",
+    )
+
+
 def validate_release_readiness(
     metadata: dict[str, Any], *, require_release_ready: bool
 ) -> bool:
@@ -182,6 +195,12 @@ def main(argv: list[str] | None = None) -> int:
 
     product_version = product[("package", "version")]
     runtime_version = compatibility[("runtime", "version")]
+    validate_distro_runtime_version(
+        (ROOT / "crates/unicity-aos-bootstrap/src/distro_trust.rs").read_text(
+            encoding="utf-8"
+        ),
+        runtime_version,
+    )
     sdk_version = compatibility[("contracts", "sdk-rust-version")]
     canonical_semver = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 
