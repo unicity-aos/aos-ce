@@ -283,4 +283,34 @@ import Testing
             _ = try CommandCenterVolume.prepare(home: canonicalHome)
         }
     }
+
+    @Test func finderVolumeMountRequiresMacOS26() {
+        #expect(DarwinPlatform.finderVolumeMountAvailable(
+            version: OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0)))
+        #expect(DarwinPlatform.finderVolumeMountAvailable(
+            version: OperatingSystemVersion(majorVersion: 26, minorVersion: 6, patchVersion: 2)))
+        #expect(!DarwinPlatform.finderVolumeMountAvailable(
+            version: OperatingSystemVersion(majorVersion: 15, minorVersion: 4, patchVersion: 0)))
+        #expect(!DarwinPlatform.finderVolumeMountAvailable(
+            version: OperatingSystemVersion(majorVersion: 13, minorVersion: 6, patchVersion: 1)))
+        #expect(!DarwinPlatform.finderVolumeMountAvailable(
+            version: OperatingSystemVersion(majorVersion: 11, minorVersion: 0, patchVersion: 0)))
+        #expect(!DarwinPlatform.finderVolumeMountAvailable(
+            version: OperatingSystemVersion(majorVersion: 25, minorVersion: 0, patchVersion: 0)))
+    }
+
+    @Test func unavailableFinderMountDoesNotSpawn() throws {
+        try withHome { home in
+            try fixture("echo spawned > \"$AOS_HOME/spawned\"; exit 0\n", home: home) { command in
+                #expect(throws: CommandCenterVolumeError.requiresMacOS26) {
+                    try CommandCenterVolume.openFilesBlocking(
+                        binary: command, home: home.path, selectedPrincipal: "alice",
+                        discovery: .owned([alice]), runtimeState: .running,
+                        finderMountAvailable: false
+                    )
+                }
+                #expect(!FileManager.default.fileExists(atPath: home.path + "/spawned"))
+            }
+        }
+    }
 }

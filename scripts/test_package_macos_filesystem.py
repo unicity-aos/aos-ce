@@ -3,11 +3,25 @@
 
 from pathlib import Path
 import os
+import plistlib
 import subprocess
 import tempfile
 import unittest
 
 from package_macos_filesystem import stage
+
+
+APP_MINIMUM_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>CFBundleIdentifier</key>
+\t<string>org.astrid.runtime.fs.storage-provider-fskit</string>
+\t<key>LSMinimumSystemVersion</key>
+\t<string>26.0</string>
+</dict>
+</plist>
+"""
 
 
 def fixture(root: Path) -> None:
@@ -18,12 +32,19 @@ def fixture(root: Path) -> None:
         for name in ("Info.plist", f"MacOS/{binary}", "_CodeSignature/CodeResources"):
             path = root / prefix / "Contents" / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(f"fixture-only:{prefix}:{name}".encode())
+            if prefix == "AstridFS.app" and name == "Info.plist":
+                path.write_text(APP_MINIMUM_PLIST)
+            else:
+                path.write_bytes(f"fixture-only:{prefix}:{name}".encode())
             path.chmod(0o755 if name.startswith("MacOS/") else 0o644)
+    manager = """#!/bin/sh
+[ -z "${AOS_TEST_FSKIT_LOG:-}" ] || printf "%s|%s\\n" "$ASTRID_FSKIT_APP_DEST" "$1" >> "$AOS_TEST_FSKIT_LOG"
+[ -z "${AOS_TEST_FSKIT_FAIL:-}" ] || exit 19
+"""
     for name in ("manage-macos-fskit.sh", "validate-macos-fskit.sh"):
         path = root / "macos" / name
         path.parent.mkdir(exist_ok=True)
-        path.write_text('#!/bin/sh\n[ -z "${AOS_TEST_FSKIT_LOG:-}" ] || printf "%s|%s\\n" "$ASTRID_FSKIT_APP_DEST" "$1" >> "$AOS_TEST_FSKIT_LOG"\n')
+        path.write_text(manager)
         path.chmod(0o755)
 
 
@@ -80,6 +101,14 @@ class PackagingTests(unittest.TestCase):
             signature.symlink_to(root / "outside")
             with self.assertRaises(ValueError):
                 stage(root / "source", root / "output", True)
+
+    def test_fixture_info_plist_declares_macos_26_minimum(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture(root)
+            plist = root / "AstridFS.app/Contents/Info.plist"
+            data = plistlib.loads(plist.read_bytes())
+            self.assertEqual(data["LSMinimumSystemVersion"], "26.0")
 
 
 if __name__ == "__main__":

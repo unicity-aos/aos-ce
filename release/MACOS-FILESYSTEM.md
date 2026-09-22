@@ -16,10 +16,15 @@ must pass the upstream signature/identity validator before replacement.
 
 The website base installer and Oracle first-install bootstrap use this same
 path. Already-installed AOS versions need an AOS upgrade to receive it.
-macOS 26 and extension approval are required. A permission, signature, or
-election failure returns a nonzero installer result with explicit retry
-commands; the installed runtime is retained. No automatic sudo, Gatekeeper
-bypass, or fallback unsigned signing is performed.
+
+Finder/FSKit mounting is optional. It requires macOS 26 and extension
+approval; see `release/MACOS-SUPPORT.md`. On older Darwin, the product
+installer warns, skips `install`/`enable`, and still completes the
+runtime. Command Center copy is independent of this skip and follows the
+tray bundle minimum. On macOS 26, a permission, signature, or election
+failure returns a nonzero installer result with explicit retry commands;
+the installed runtime is retained. No automatic sudo, Gatekeeper bypass,
+or fallback unsigned signing is performed.
 
 The managed app is not a general control UI. Menu-bar Command Center packaging
 is documented in `release/MACOS-COMMAND-CENTER.md` and does not change the

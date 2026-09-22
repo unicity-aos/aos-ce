@@ -27,6 +27,13 @@ curl --proto '=https' --tlsv1.2 -fsSL https://aos.unicity.ai/install.sh | sh
 aos init
 ```
 
+On macOS, packaged `aos` and bundled `astrid`/`astrid-daemon` binaries declare
+`LC_BUILD_VERSION` minos 11.0. Command Center declares `LSMinimumSystemVersion`
+13.0 and is not copied onto older hosts. Optional Finder volume mounts follow
+`AstridFS.app` `LSMinimumSystemVersion` (currently 26.0). Those floors are
+separate: an older Mac can still install the CLI. Native execution on macOS
+11–15 is untested. Details: `release/MACOS-SUPPORT.md`.
+
 `aos init`, including `aos init --offline`, provisions from those local,
 product-versioned capsule assets. A fresh Community installation automatically
 resumes Astrid's ten-capsule batches after each rate-limit window; installing
