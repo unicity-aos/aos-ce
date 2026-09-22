@@ -18,6 +18,7 @@ final class TraySession: ObservableObject {
     @Published private(set) var updates: UpdateInventory?
     @Published private(set) var updatesBusy = false
     @Published private(set) var updatesError: String?
+    private(set) var updateRetry: UpdateCommand?
     @Published private(set) var capsuleUpdates: UpdateInventory?
     @Published private(set) var libraryPrincipal = "default"
     @Published private(set) var principalDiscovery: PrincipalDiscovery?
@@ -34,13 +35,17 @@ final class TraySession: ObservableObject {
         guard !updatesBusy, let aosBinary, let aosHome else { return }
         updatesBusy = true
         updatesError = nil
+        updateRetry = nil
         defer { updatesBusy = false }
         do {
             let result = try await UpdateCommandReader.run(binary: aosBinary, home: aosHome, command: command)
             if case .capsules = command { capsuleUpdates = result } else { updates = result }
             onUpdatesChanged?()
         }
-        catch { updatesError = error.localizedDescription }
+        catch {
+            updateRetry = command.retryCommand
+            updatesError = error.localizedDescription
+        }
     }
 
     func selectLibraryPrincipal(_ input: String) async {

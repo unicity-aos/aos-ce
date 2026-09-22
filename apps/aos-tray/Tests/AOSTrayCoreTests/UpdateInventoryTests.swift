@@ -28,6 +28,10 @@ struct UpdateInventoryTests {
             try UpdateInventory.decode(Data("{\"schema_version\":99,\"channel\":\"stable\",\"items\":[]}".utf8))
         }
     }
+    @Test func retryPreservesCapsuleScopeButNeverRepeatsAnInstall() {
+        #expect(UpdateCommand.capsules(principal: "alice").retryCommand.arguments == ["updates", "capsules", "--principal=alice", "--json"])
+        #expect(UpdateCommand.apply(selection: "all", channel: "dev").retryCommand.arguments == ["updates", "check", "--channel=dev", "--json"])
+    }
 
     @Test func commandFailureKeepsActionableMessageWithoutReplacingInventory() {
         let failure = Data(#"{"schema_version":1,"error":"Update channel changed; check again"}"#.utf8)

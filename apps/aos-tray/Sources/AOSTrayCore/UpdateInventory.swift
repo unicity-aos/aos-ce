@@ -66,6 +66,12 @@ public enum UpdateCommand: Sendable {
     case check(channel: String)
     case apply(selection: String, channel: String? = nil)
     case capsules(principal: String)
+    public var retryCommand: UpdateCommand {
+        switch self {
+        case .apply(_, let channel): .check(channel: channel ?? "stable")
+        default: self
+        }
+    }
     var arguments: [String] {
         switch self {
         case .refresh: ["updates", "refresh", "--json"]

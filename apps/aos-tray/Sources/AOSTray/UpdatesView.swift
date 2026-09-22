@@ -22,7 +22,7 @@ struct UpdatesView: View {
                 }.labelsHidden().frame(width: 110)
                 Spacer()
                 Button(session.updatesError == nil ? "Check for Updates" : "Retry") {
-                    Task { await session.runUpdates(.check(channel: channel)) }
+                    Task { await session.runUpdates(session.updateRetry ?? .check(channel: channel)) }
                 }.disabled(session.updatesBusy)
             }
             if let error = session.updatesError {
