@@ -292,15 +292,17 @@ mod tests {
     #[test]
     fn stalled_resume_stops_instead_of_looping() {
         let mut calls = 0;
-        assert!(resume(
-            22,
-            || {
-                calls += 1;
-                Ok(partial(10))
-            },
-            |_, _| {}
-        )
-        .is_err());
+        assert!(
+            resume(
+                22,
+                || {
+                    calls += 1;
+                    Ok(partial(10))
+                },
+                |_, _| {}
+            )
+            .is_err()
+        );
         assert_eq!(calls, 2);
     }
 
@@ -308,12 +310,14 @@ mod tests {
     fn package_failure_is_not_treated_as_batch_exhaustion() {
         let (_, partial) = partial(10);
         let error = format!("Failed to install aos-shell: invalid signature\n{partial}");
-        assert!(resume(
-            22,
-            || Ok((false, error.clone())),
-            |_, _| panic!("unexpected wait")
-        )
-        .is_err());
+        assert!(
+            resume(
+                22,
+                || Ok((false, error.clone())),
+                |_, _| panic!("unexpected wait")
+            )
+            .is_err()
+        );
     }
 
     #[test]
