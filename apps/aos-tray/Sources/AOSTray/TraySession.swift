@@ -15,6 +15,10 @@ final class TraySession: ObservableObject {
     @Published private(set) var library: CapsuleLibrary?
     @Published private(set) var refreshingLibrary = false
     @Published private(set) var libraryError: String?
+    @Published private(set) var updates: UpdateInventory?
+    @Published private(set) var updatesBusy = false
+    @Published private(set) var updatesError: String?
+    @Published private(set) var capsuleUpdates: UpdateInventory?
     @Published private(set) var libraryPrincipal = "default"
     @Published private(set) var principalDiscovery: PrincipalDiscovery?
     @Published private(set) var checkingMount = false
@@ -24,12 +28,27 @@ final class TraySession: ObservableObject {
     var aosHome: String?
     var expectedAosBinary: String?
     var volumeBusy: Bool { checkingMount || filesBusy }
+    var onUpdatesChanged: (() -> Void)?
+
+    func runUpdates(_ command: UpdateCommand) async {
+        guard !updatesBusy, let aosBinary, let aosHome else { return }
+        updatesBusy = true
+        updatesError = nil
+        defer { updatesBusy = false }
+        do {
+            let result = try await UpdateCommandReader.run(binary: aosBinary, home: aosHome, command: command)
+            if case .capsules = command { capsuleUpdates = result } else { updates = result }
+            onUpdatesChanged?()
+        }
+        catch { updatesError = error.localizedDescription }
+    }
 
     func selectLibraryPrincipal(_ input: String) async {
         guard !refreshingLibrary else { return }
         let principal = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard OwnedPrincipal.isValidID(principal), principal != "anonymous" else { return }
         libraryPrincipal = principal
+        capsuleUpdates = nil
         await refreshLibrary()
     }
 

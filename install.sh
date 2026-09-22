@@ -824,6 +824,14 @@ printf '%s\n' "$asset_blake3" | grep -Eq '^[0-9a-f]{64}$' || {
   echo "release metadata contains a malformed target digest" >&2
   exit 1
 }
+# A UI can bind an explicit install to the candidate the person reviewed.
+# This is an additional constraint, never an alternative to signature checks.
+if [ -n "${AOS_EXPECTED_ARTIFACT_SHA256:-}" ]; then
+  [ "$asset_sha256" = "$AOS_EXPECTED_ARTIFACT_SHA256" ] || {
+    echo "release artifact changed since update discovery; check for updates again" >&2
+    exit 1
+  }
+fi
 if [ -f "$work/channel.toml" ]; then
   [ "$(toml_value "$work/$release_metadata_asset" "[gates]" release-ready)" = true ] || {
     echo "signed channel points to release metadata whose release-ready gate is false" >&2
@@ -862,7 +870,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     # version, target, or hexadecimal digest validator above. Report the
     # authenticated channel identity, not a claim that its archive was fetched
     # or that a differing version is necessarily an upgrade.
-    printf '{"schema_version":1,"kind":"aos","installed_version":"%s","channel_version":"%s","channel":"%s","target":"%s","artifact_sha256":"%s","verification":"metadata"}\n' \
+    printf '{"schema_version":1,"kind":"aos","installed_version":"%s","channel_version":"%s","channel":"%s","target":"%s","artifact_sha256":"%s","verification":"metadata","binds_candidate_digest":true}\n' \
       "$installed_version" "$AOS_VERSION" "$AOS_CHANNEL" "$target" "$asset_sha256" >&3
     exit 0
   fi
