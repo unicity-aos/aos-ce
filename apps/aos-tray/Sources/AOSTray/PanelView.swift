@@ -36,6 +36,7 @@ struct PanelView: View {
                 Text("Overview").tag(PanelSection.overview)
                 Text("Requests").tag(PanelSection.requests)
                 Text("Capsules").tag(PanelSection.capsules)
+                Text("Updates").tag(PanelSection.updates)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -53,6 +54,8 @@ struct PanelView: View {
                     OverviewView(session: session)
                 } else if session.section == .requests {
                     requestList(presentation)
+                } else if session.section == .updates {
+                    UpdatesView(session: session)
                 } else if session.aosHome != nil {
                     CapsuleLibraryView(session: session)
                 } else {

@@ -1721,6 +1721,7 @@ exit 23
     for args in [
         vec!["update", "--version", "2026.01.0"],
         vec!["update", "--check", "--version", "2026.9.3"],
+        vec!["update", "--json"],
         vec!["update", "--version", "2025.9.0"],
         vec!["update", "--channel", "dev", "--version", "2026.1.3"],
     ] {
@@ -1756,6 +1757,34 @@ exit 0
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
+    assert!(!fixture.args.exists(), "must not dispatch to the runtime");
+}
+
+#[test]
+fn update_json_check_forwards_only_read_only_arguments() {
+    let fixture = Fixture::new("update-json-check");
+    let libexec = fixture.home.join("libexec");
+    fs::create_dir_all(&libexec).unwrap();
+    fs::write(
+        libexec.join("install.sh"),
+        r#"#!/bin/sh
+test "$*" = '--channel dev --check --json' || exit 91
+test "$AOS_INSTALLED_VERSION" = "$EXPECTED_PRODUCT_VERSION" || exit 92
+printf '%s\n' '{"schema_version":1}'
+"#,
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .args(["update", "--check", "--json", "--channel", "dev"])
+        .env("EXPECTED_PRODUCT_VERSION", env!("CARGO_PKG_VERSION"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["schema_version"],
+        1
+    );
     assert!(!fixture.args.exists(), "must not dispatch to the runtime");
 }
 

@@ -2,6 +2,7 @@
 mod model;
 mod native;
 mod transport;
+mod updates_view;
 mod view;
 
 use std::io::{self, IsTerminal};
@@ -36,12 +37,20 @@ pub(crate) struct ConsoleArgs {
 }
 
 enum Event {
+    Updates(Result<crate::updates::Inventory, String>),
     Request(Request),
     Disconnected(u64),
     Delivered { id: String, delivered: bool },
 }
 
 struct App {
+    updates_open: bool,
+    updates_busy: bool,
+    updates_confirm: bool,
+    updates: Option<crate::updates::Inventory>,
+    updates_notice: String,
+    updates_scroll: u16,
+    updates_sender: Option<mpsc::SyncSender<Event>>,
     requests: Vec<Request>,
     selected: usize,
     action: usize,
@@ -60,6 +69,13 @@ struct App {
 impl App {
     fn new(preview: bool) -> Self {
         Self {
+            updates_open: false,
+            updates_busy: false,
+            updates_confirm: false,
+            updates: None,
+            updates_notice: String::new(),
+            updates_scroll: 0,
+            updates_sender: None,
             requests: if preview {
                 model::preview()
             } else {
@@ -137,7 +153,42 @@ impl App {
     }
     fn key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+            if self.updates_busy {
+                self.updates_notice =
+                    "An update operation is running. Wait for its result before closing.".into();
+                return true;
+            }
             return false;
+        }
+        if code == KeyCode::F(2) {
+            self.updates_open = !self.updates_open;
+            self.updates_confirm = false;
+            if self.updates_open && self.updates.is_none() {
+                self.update_operation(0);
+            }
+            return true;
+        }
+        if self.updates_open {
+            match code {
+                KeyCode::Down => self.updates_scroll = self.updates_scroll.saturating_add(1),
+                KeyCode::Up => self.updates_scroll = self.updates_scroll.saturating_sub(1),
+                KeyCode::PageDown => self.updates_scroll = self.updates_scroll.saturating_add(8),
+                KeyCode::PageUp => self.updates_scroll = self.updates_scroll.saturating_sub(8),
+                KeyCode::Char('r') => self.update_operation(1),
+                KeyCode::Char('u') if !self.updates_busy => {
+                    self.updates_confirm = self
+                        .updates
+                        .as_ref()
+                        .is_some_and(|v| v.items.iter().any(|i| i.action == "apply"));
+                }
+                KeyCode::Enter if self.updates_confirm => {
+                    self.updates_confirm = false;
+                    self.update_operation(2);
+                }
+                KeyCode::Esc => self.updates_confirm = false,
+                _ => {}
+            }
+            return true;
         }
         match code {
             KeyCode::F(1) => self.show_help = !self.show_help,
@@ -182,6 +233,38 @@ impl App {
             _ => {}
         }
         true
+    }
+
+    fn update_operation(&mut self, operation: u8) {
+        if self.updates_busy {
+            return;
+        }
+        if self.preview {
+            self.updates_notice = "Preview only · no update operation was executed".into();
+            return;
+        }
+        let Some(sender) = self.updates_sender.clone() else {
+            return;
+        };
+        self.updates_busy = true;
+        self.updates_notice = match operation {
+            2 => "Installing reviewed updates…",
+            1 => "Checking authenticated metadata…",
+            _ => "Reading cached updates…",
+        }
+        .into();
+        let expected_channel = self
+            .updates
+            .as_ref()
+            .map(|inventory| inventory.channel.clone());
+        std::thread::spawn(move || {
+            let result = match operation {
+                2 => crate::updates::apply("all", expected_channel.as_deref()),
+                1 => crate::updates::check(None),
+                _ => crate::updates::list(),
+            };
+            let _ = sender.send(Event::Updates(result));
+        });
     }
     fn wheel(&mut self, column: u16, row: u16, down: bool) {
         if self.detail_area.contains((column, row).into()) {
@@ -264,6 +347,7 @@ fn run_inner(args: ConsoleArgs) -> io::Result<()> {
     }
     let mut app = App::new(args.preview);
     let (tx, rx) = mpsc::sync_channel(CAPACITY);
+    app.updates_sender = Some(tx.clone());
     let mut backend = Backend {
         stop: Arc::new(AtomicBool::new(false)),
         listener: None,
@@ -317,6 +401,16 @@ fn run_inner(args: ConsoleArgs) -> io::Result<()> {
     loop {
         while let Ok(event) = rx.try_recv() {
             match event {
+                Event::Updates(result) => {
+                    app.updates_busy = false;
+                    match result {
+                        Ok(inventory) => {
+                            app.updates = Some(inventory);
+                            app.updates_notice.clear();
+                        }
+                        Err(message) => app.updates_notice = message,
+                    }
+                }
                 Event::Request(request) => {
                     if app.requests.len() < CAPACITY
                         && !app.requests.iter().any(|r| r.id == request.id)
@@ -349,7 +443,7 @@ fn run_inner(args: ConsoleArgs) -> io::Result<()> {
                 {
                     break;
                 }
-                TerminalEvent::Paste(text) => app.append(&text),
+                TerminalEvent::Paste(text) if !app.updates_open => app.append(&text),
                 TerminalEvent::Mouse(mouse)
                     if matches!(
                         mouse.kind,
@@ -366,6 +460,22 @@ fn run_inner(args: ConsoleArgs) -> io::Result<()> {
                     if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
                 {
                     let pos = (mouse.column, mouse.row).into();
+                    if app.updates_open {
+                        if let Some(i) = app.buttons.iter().position(|r| r.contains(pos)) {
+                            if i == 0 {
+                                app.update_operation(1);
+                            } else if app.updates_confirm {
+                                app.updates_confirm = false;
+                                app.update_operation(2);
+                            } else {
+                                app.updates_confirm = app
+                                    .updates
+                                    .as_ref()
+                                    .is_some_and(|v| v.items.iter().any(|i| i.action == "apply"));
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(i) = app.rows.iter().position(|r| r.contains(pos)) {
                         app.select(i);
                     } else if let Some(i) = app.buttons.iter().position(|r| r.contains(pos)) {

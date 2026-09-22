@@ -25,6 +25,7 @@ mod mcp;
 #[cfg(unix)]
 mod native_setup;
 mod principals;
+mod updates;
 
 use command_center::{open_command_center, runtime_start_requested};
 
@@ -67,6 +68,8 @@ enum ProductCommand {
     /// Update AOS and its coordinated runtime executable set.
     #[command(name = "update", alias = "self-update", alias = "self_update")]
     Update(UpdateArgs),
+    /// Discover and apply updates from the shared Command Center inventory.
+    Updates(updates::Arguments),
     /// Apply the signed Unicity CE distribution bundled with this AOS release.
     Distro {
         #[command(subcommand)]
@@ -154,6 +157,9 @@ struct UpdateArgs {
     /// Check the authenticated channel without installing or restarting anything.
     #[arg(long, conflicts_with = "version")]
     check: bool,
+    /// Emit authenticated channel metadata as JSON (requires --check).
+    #[arg(long, requires = "check")]
+    json: bool,
     /// Follow the signed stable, dev, or nightly product channel.
     #[arg(long, value_enum, conflicts_with = "version")]
     channel: Option<UpdateChannel>,
@@ -397,6 +403,7 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
             command: MigrateCommand::Runtime { from },
         }) => Some(handle_migrate_runtime(&from)),
         Some(ProductCommand::Update(args)) => Some(handle_self_update(&args)),
+        Some(ProductCommand::Updates(args)) => Some(updates::run(args)),
         Some(ProductCommand::Distro {
             command: DistroCommand::Apply(args),
         }) => Some(handle_distro_apply(cli.principal, args)),
@@ -681,6 +688,7 @@ fn is_owned_root(value: &str) -> bool {
             | "status"
             | "migrate"
             | "update"
+            | "updates"
             | "self-update"
             | "self_update"
             | "distro"
@@ -850,6 +858,9 @@ fn handle_self_update(args: &UpdateArgs) -> ExitCode {
     }
     if args.check {
         command.arg("--check");
+        if args.json {
+            command.arg("--json");
+        }
         command.env("AOS_INSTALLED_VERSION", env!("CARGO_PKG_VERSION"));
     } else {
         command.args(["--yes", "--no-migrate-prompt"]);
