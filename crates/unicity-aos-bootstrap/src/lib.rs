@@ -226,14 +226,14 @@ impl AosHome {
         Ok(path)
     }
 
-    /// Initialize the trusted CE system fleet before the runtime performs its
-    /// daemon-backed grant preflight.
+    /// Initialize the trusted CE system fleet before any later targeted init.
     ///
     /// A completely fresh Astrid home has no capsule capable of accepting CLI
     /// connections. Astrid installs through the daemon in bounded batches.
     /// Resume partial batches after the kernel's rate-limit window, leaving
-    /// completed-install detection to Astrid itself. Finalize the default
-    /// system fleet's grants through Astrid's idempotent admin command.
+    /// completed-install detection to Astrid itself. Grant the embedded Distro
+    /// fleet to default in that same initializer so first-start does not spawn
+    /// a second runtime CLI after capsules are already installed.
     ///
     /// # Errors
     /// Returns an error when the bundled runtime or exact CE capsule set is
@@ -245,15 +245,10 @@ impl AosHome {
     {
         self.ensure_runtime_available()?;
         let assets = capsule_assets_from_manifest()?;
-        init_resume::initialize(self.runtime_command_with_args(args)?, assets.len())?;
-        let status = self
-            .runtime_command_with_args(init_resume::grant_args(&assets))?
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::other(
-                "CE capsules installed but default fleet grant failed",
-            ));
-        }
+        init_resume::initialize(
+            self.runtime_command_with_args(init_resume::with_default_fleet_grant(args))?,
+            assets.len(),
+        )?;
         eprintln!(
             "  ◆ AOS ready\n    {} capsules · default agent fleet connected\n",
             assets.len()

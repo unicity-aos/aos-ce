@@ -959,17 +959,13 @@ fn product_default_init_completes_without_a_second_runtime_init() {
         stderr.contains("◆ AOS ready\n    22 capsules · default agent fleet connected"),
         "missing product-ready summary: {stderr}"
     );
-    let args = fs::read_to_string(&fixture.args).expect("read init args");
     assert!(
-        args.starts_with(
-            "<--principal>\n<default>\n<agent>\n<modify>\n<default>\n<--add-capsule>\n"
-        ),
-        "final preparation action must be the default-fleet grant: {args}"
+        !fixture.args.exists(),
+        "default init must not dispatch a second runtime command"
     );
-    assert!(!args.contains("<init>"), "wrapper ran init twice: {args}");
     assert_eq!(
         fs::read_to_string(&fixture.bootstrap_args).expect("read bootstrap args"),
-        "<--principal>\n<default>\n<init>\n<--target-principal>\n<default>\n"
+        "<--principal>\n<default>\n<init>\n<--target-principal>\n<default>\n<--grant-capsules>\n"
     );
     assert_eq!(
         fs::read_to_string(fixture.root.join("child-distro")).expect("read enforced distro"),
@@ -1009,14 +1005,19 @@ fn product_init_stops_before_runtime_dispatch_when_system_fleet_init_fails() {
 fn product_init_stops_when_default_fleet_grant_fails() {
     let fixture = Fixture::new("init-grant-failure");
     fixture.install_runtime(&RECORDING_RUNTIME.replace(
-        "if [ \"$1\" = \"start\" ]; then",
-        "if [ \"$1\" = \"--principal\" ] && [ \"$3\" = \"agent\" ]; then\nexit 42\nelif [ \"$1\" = \"start\" ]; then",
+        "printf '%s\\n' \"$PATH\" > \"$AOS_TEST_PATH\"",
+        "printf '%s\\n' \"$PATH\" > \"$AOS_TEST_PATH\"\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--grant-capsules\" ]; then exit 42; fi\ndone",
     ));
     let output = fixture.command().arg("init").output().expect("run init");
     assert!(!output.status.success());
     assert!(fixture.bootstrap_args.exists());
     assert!(!fixture.args.exists());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("default fleet grant failed"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("system-fleet initializer exited"));
+    assert!(
+        fs::read_to_string(&fixture.bootstrap_args)
+            .unwrap()
+            .contains("<--grant-capsules>")
+    );
 }
 
 #[test]
@@ -1043,7 +1044,7 @@ fn product_non_default_init_delegates_principal_and_capsule_grants() {
     );
     assert_eq!(
         fs::read_to_string(&fixture.bootstrap_args).expect("read bootstrap args"),
-        "<--principal>\n<default>\n<init>\n<--target-principal>\n<default>\n<--yes>\n<--var>\n<model=gpt-5>\n"
+        "<--principal>\n<default>\n<init>\n<--target-principal>\n<default>\n<--yes>\n<--var>\n<model=gpt-5>\n<--grant-capsules>\n"
     );
 }
 
@@ -1058,20 +1059,13 @@ fn offline_init_keeps_the_runtime_offline_flag_and_uses_only_local_capsules() {
         .status()
         .expect("run offline product init");
     assert!(status.success());
-    let args = fs::read_to_string(&fixture.args).expect("read offline args");
     assert!(
-        args.starts_with(
-            "<--principal>\n<default>\n<agent>\n<modify>\n<default>\n<--add-capsule>\n"
-        ),
-        "offline init must finish at the default-fleet grant: {args}"
-    );
-    assert!(
-        !args.contains("<init>"),
-        "offline wrapper ran init twice: {args}"
+        !fixture.args.exists(),
+        "offline init must not dispatch a second runtime command"
     );
     assert_eq!(
         fs::read_to_string(&fixture.bootstrap_args).expect("read bootstrap args"),
-        "<--principal>\n<default>\n<init>\n<--target-principal>\n<default>\n<--offline>\n"
+        "<--principal>\n<default>\n<init>\n<--target-principal>\n<default>\n<--offline>\n<--grant-capsules>\n"
     );
     let manifest_path = fixture.home.join("distributions/unicity-ce/Distro.toml");
     let manifest: toml::Value = fs::read_to_string(manifest_path)
