@@ -129,6 +129,19 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+
+fn item_summary(item: &Item) -> String {
+    let version = match item.candidate_version.as_deref() {
+        Some(candidate) if candidate != item.installed_version => {
+            format!("{} → {candidate}", item.installed_version)
+        }
+        _ => item.installed_version.clone(),
+    };
+    format!(
+        "{} {version}: {}\n  {}",
+        item.name, item.availability, item.message
+    )
+}
 fn state_path(home: &AosHome) -> PathBuf {
     home.root().join("update/command-center")
 }
@@ -474,11 +487,9 @@ pub(crate) fn run(args: Arguments) -> ExitCode {
                     serde_json::to_string(&inventory).expect("serializable inventory")
                 );
             } else {
+                println!("Channel: {}", inventory.channel);
                 for item in &inventory.items {
-                    println!(
-                        "{} {}: {}\n  {}",
-                        item.name, item.installed_version, item.availability, item.message
-                    );
+                    println!("{}", item_summary(item));
                 }
             }
             if inventory.items.iter().any(|i| i.availability == "failed") {
@@ -504,6 +515,14 @@ pub(crate) fn run(args: Arguments) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plain_inventory_displays_the_proposed_version() {
+        let mut item = initial().items.remove(0);
+        item.candidate_version = Some("2026.10.0".into());
+        assert!(item_summary(&item).contains("→ 2026.10.0"));
+        item.candidate_version = Some(item.installed_version.clone());
+        assert!(!item_summary(&item).contains('→'));
+    }
     fn metadata(version: &str) -> ChannelMetadata {
         ChannelMetadata {
             schema_version: 1,
