@@ -52,6 +52,9 @@ enum Action {
     Apply {
         /// Item identifier from `updates list`, or `all`.
         selection: String,
+        /// Refuse a cached channel changed since the confirmation was shown.
+        #[arg(long, value_enum)]
+        expected_channel: Option<super::UpdateChannel>,
         #[arg(long)]
         yes: bool,
         #[arg(long)]
@@ -360,13 +363,18 @@ fn refresh() -> Result<Inventory, String> {
     check(Some(&previous.channel))
 }
 
-pub(crate) fn apply(selection: &str) -> Result<Inventory, String> {
+pub(crate) fn apply(selection: &str, expected_channel: Option<&str>) -> Result<Inventory, String> {
     if !["aos", "all", "oracle:codex", "oracle:claude", "oracle:grok"].contains(&selection) {
         return Err(error("Unknown update selection"));
     }
     let home = AosHome::resolve().map_err(|e| e.to_string())?;
     let _lock = lock(&home)?;
     let mut inventory = list()?;
+    if expected_channel.is_some_and(|channel| channel != inventory.channel) {
+        return Err(error(
+            "Update channel changed; check and confirm the selected channel again",
+        ));
+    }
     let selected: Vec<usize> = inventory
         .items
         .iter()
@@ -441,11 +449,15 @@ pub(crate) fn run(args: Arguments) -> ExitCode {
         Action::Check { channel, json } => (check(channel.map(super::UpdateChannel::as_str)), json),
         Action::Apply {
             selection,
+            expected_channel,
             yes,
             json,
         } => (
             if yes {
-                apply(&selection)
+                apply(
+                    &selection,
+                    expected_channel.map(super::UpdateChannel::as_str),
+                )
             } else {
                 Err(error(
                     "Applying updates requires --yes. Active sessions may need reconnection.",
@@ -476,7 +488,14 @@ pub(crate) fn run(args: Arguments) -> ExitCode {
             }
         }
         Err(message) => {
-            eprintln!("aos updates: {message}");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version": 1, "error": message})
+                );
+            } else {
+                eprintln!("aos updates: {message}");
+            }
             ExitCode::FAILURE
         }
     }

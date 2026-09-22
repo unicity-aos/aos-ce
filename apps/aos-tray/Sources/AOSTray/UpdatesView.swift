@@ -93,7 +93,7 @@ struct UpdatesView: View {
             get: { selection != nil }, set: { if !$0 { selection = nil } }
         ), titleVisibility: .visible) {
             Button("Install Updates") {
-                if let chosen = selection { Task { await session.runUpdates(.apply(selection: chosen)) } }
+                if let chosen = selection { Task { await session.runUpdates(.apply(selection: chosen, channel: channel)) } }
                 selection = nil
             }
             Button("Cancel", role: .cancel) { selection = nil }

@@ -27,7 +27,7 @@ pub(super) fn check(principal: &str) -> Result<Inventory, String> {
     let owned = process::capture(
         Command::new(&binary).args(["principals", "--json"]),
         Duration::from_secs(30),
-    )?;
+    ).map_err(|_| "Cannot read your owned principals. Check the AOS installation with `aos principals --json`; no runtime was started or changed.".to_owned())?;
     let owned: crate::principals::OwnedDiscovery = serde_json::from_slice(&owned)
         .map_err(|_| "Owned-principal discovery is unavailable".to_owned())?;
     if owned.scope != "owned"
@@ -49,7 +49,7 @@ pub(super) fn check(principal: &str) -> Result<Inventory, String> {
             "--json",
         ]),
         Duration::from_mins(5),
-    )?;
+    ).map_err(|_| "Capsule update discovery is unavailable. Start AOS if stopped, then retry. If it still fails, run `aos capsule update --check --json` to check runtime support and publisher access.".to_owned())?;
     let runtime: RuntimeInventory = serde_json::from_slice(&bytes)
         .map_err(|_| "The bundled runtime does not support capsule update discovery".to_owned())?;
     if runtime.schema_version != 1 || runtime.principal != principal.as_str() {
@@ -71,7 +71,7 @@ pub(super) fn check(principal: &str) -> Result<Inventory, String> {
         let message = if managed { "Matches the verified AOS distribution. Update it together with AOS; no independent override is offered.".into() }
         else if member.is_some() { "This capsule differs from its distribution record. Review its ownership before updating; it is excluded from Update All.".into() }
             else if locked.is_none() { "Distribution ownership could not be verified. This capsule is excluded from automatic updates; repair the signed AOS installation before deciding ownership.".into() }
-            else { format!("{} Review with: aos --principal {} capsule update {}. New capabilities or publisher trust require approval.", entry.message, principal, entry.name) };
+            else { format!("{} Review with: aos --principal {} capsule update -- {}. New capabilities or publisher trust require approval.", entry.message, shell_argument(principal.as_str()), shell_argument(&entry.name)) };
         Item { id: format!("capsule:{}:{}", principal, entry.name), name: entry.name, installed_version: entry.installed_version,
             candidate_version: if managed { None } else { entry.candidate_version }, availability: if managed { "managed".into() } else { entry.availability },
             verification: if managed { "distribution".into() } else { "unverified".into() }, action: "review".into(), message, artifact_sha256: None, candidate_digest: None }
@@ -88,9 +88,17 @@ fn lock_matches(bytes: &[u8], verified_digest: &str) -> bool {
     format!("blake3:{}", blake3::hash(bytes).to_hex()) == verified_digest
 }
 
+fn shell_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn suggested_command_keeps_names_as_literal_arguments() {
+        assert_eq!(shell_argument("a'b;$(id)"), "'a'\\''b;$(id)'");
+    }
     #[test]
     fn reread_lock_must_match_the_verified_prefixed_digest() {
         let bytes = b"authenticated lock";

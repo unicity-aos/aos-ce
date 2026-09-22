@@ -51,8 +51,12 @@ public struct UpdateItem: Decodable, Sendable, Identifiable {
 
 public enum UpdateError: Error, LocalizedError {
     case invalidResponse
+    case operation(String)
     public var errorDescription: String? {
-        "Update information is unavailable. Check that this AOS version supports Command Center updates, or run aos updates check."
+        switch self {
+        case .invalidResponse: "Update information is unavailable. Check that this AOS version supports Command Center updates, or run aos updates check."
+        case .operation(let message): message
+        }
     }
 }
 
@@ -60,20 +64,36 @@ public enum UpdateCommand: Sendable {
     case refresh
     case list
     case check(channel: String)
-    case apply(selection: String)
+    case apply(selection: String, channel: String? = nil)
     case capsules(principal: String)
     var arguments: [String] {
         switch self {
         case .refresh: ["updates", "refresh", "--json"]
         case .list: ["updates", "list", "--json"]
         case .check(let channel): ["updates", "check", "--channel=\(channel)", "--json"]
-        case .apply(let selection): ["updates", "apply", selection, "--yes", "--json"]
+        case .apply(let selection, let channel): ["updates", "apply", selection, "--yes", "--json"] + (channel.map { ["--expected-channel=\($0)"] } ?? [])
         case .capsules(let principal): ["updates", "capsules", "--principal=\(principal)", "--json"]
         }
     }
 }
 
 public enum UpdateCommandReader {
+    static func decodeResult(_ data: Data, status: Int32) throws -> UpdateInventory {
+        struct Failure: Decodable {
+            let schema_version: Int
+            let error: String
+        }
+        if status != 0, let failure = try? JSONDecoder().decode(Failure.self, from: data),
+           failure.schema_version == 1, !failure.error.isEmpty, failure.error.utf8.count <= 4096 {
+            throw UpdateError.operation(failure.error)
+        }
+        guard let inventory = try? UpdateInventory.decode(data),
+              status == 0 || inventory.items.contains(where: { $0.availability == "failed" }) else {
+            throw UpdateError.invalidResponse
+        }
+        return inventory
+    }
+
     public static func run(binary: String, home: String, command: UpdateCommand) async throws -> UpdateInventory {
         try await Task.detached {
             guard binary.hasPrefix("/"), home.hasPrefix("/") else { throw UpdateError.invalidResponse }
@@ -101,11 +121,7 @@ public enum UpdateCommandReader {
             try pipe.fileHandleForReading.close()
             // Failed operations return a structured failure inventory with a
             // nonzero exit status. Decode it rather than hiding the failure.
-            let inventory = try UpdateInventory.decode(data)
-            guard process.terminationStatus == 0 || inventory.items.contains(where: { $0.availability == "failed" }) else {
-                throw UpdateError.invalidResponse
-            }
-            return inventory
+            return try decodeResult(data, status: process.terminationStatus)
         }.value
     }
 }

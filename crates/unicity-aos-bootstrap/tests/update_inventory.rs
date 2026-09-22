@@ -78,6 +78,28 @@ fn read_check_confirm_and_apply_are_distinct() {
 }
 
 #[test]
+fn changed_channel_requires_new_confirmation() {
+    let fixture = Fixture::new();
+    assert!(
+        fixture
+            .run(&["updates", "check", "--channel", "dev"])
+            .status
+            .success()
+    );
+    let output = fixture.run(&[
+        "updates",
+        "apply",
+        "all",
+        "--expected-channel",
+        "stable",
+        "--yes",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("channel changed"));
+    assert!(!fixture.0.join("applied").exists());
+}
+
+#[test]
 fn changed_candidate_refuses_installation() {
     let fixture = Fixture::new();
     assert!(fixture.run(&["updates", "check"]).status.success());

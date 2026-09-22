@@ -253,9 +253,13 @@ impl App {
             _ => "Reading cached updates…",
         }
         .into();
+        let expected_channel = self
+            .updates
+            .as_ref()
+            .map(|inventory| inventory.channel.clone());
         std::thread::spawn(move || {
             let result = match operation {
-                2 => crate::updates::apply("all"),
+                2 => crate::updates::apply("all", expected_channel.as_deref()),
                 1 => crate::updates::check(None),
                 _ => crate::updates::list(),
             };

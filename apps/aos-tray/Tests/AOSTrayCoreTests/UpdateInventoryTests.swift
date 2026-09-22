@@ -21,10 +21,24 @@ struct UpdateInventoryTests {
         #expect(UpdateCommand.list.arguments == ["updates", "list", "--json"])
         #expect(UpdateCommand.check(channel: "dev").arguments == ["updates", "check", "--channel=dev", "--json"])
         #expect(UpdateCommand.apply(selection: "oracle:codex").arguments == ["updates", "apply", "oracle:codex", "--yes", "--json"])
+        #expect(UpdateCommand.apply(selection: "all", channel: "stable").arguments.last == "--expected-channel=stable")
     }
     @Test func rejectsUnknownSchema() {
         #expect(throws: (any Error).self) {
             try UpdateInventory.decode(Data("{\"schema_version\":99,\"channel\":\"stable\",\"items\":[]}".utf8))
+        }
+    }
+
+    @Test func commandFailureKeepsActionableMessageWithoutReplacingInventory() {
+        let failure = Data(#"{"schema_version":1,"error":"Update channel changed; check again"}"#.utf8)
+        do {
+            _ = try UpdateCommandReader.decodeResult(failure, status: 1)
+            Issue.record("A failed operation must not decode as an inventory")
+        } catch {
+            #expect(error.localizedDescription == "Update channel changed; check again")
+        }
+        #expect(throws: UpdateError.self) {
+            try UpdateCommandReader.decodeResult(Data("not JSON".utf8), status: 1)
         }
     }
 }
