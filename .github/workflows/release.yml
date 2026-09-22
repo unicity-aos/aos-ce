@@ -192,6 +192,8 @@ jobs:
           PY
       - name: Build product binary
         if: ${{ endsWith(matrix.target, 'apple-darwin') }}
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
         run: |
           cargo build --locked --release --target "${{ matrix.target }}" -p unicity-aos-bootstrap
           echo "AOS_BINARY=target/${{ matrix.target }}/release/aos" >> "$GITHUB_ENV"

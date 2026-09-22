@@ -1390,9 +1390,113 @@ installation_started=0
 rm -rf "$release_backup"
 release_install_lock
 
+# Optional Finder/FSKit mounts follow AstridFS.app LSMinimumSystemVersion
+# (currently 26.0). Unknown host or bundle versions keep the existing
+# install+enable fail-closed path so fixtures and current Macs still
+# exercise the manager. Older hosts keep the runtime and do not launch
+# an application Launch Services would reject.
+darwin_product_version() {
+  if [ "${AOS_TEST_MACOS_VERSION+set}" = set ]; then
+    [ -n "${AOS_TEST_FIXTURE:-}" ] || {
+      echo "AOS_TEST_MACOS_VERSION is restricted to installer fixtures" >&2
+      exit 1
+    }
+    printf '%s\n' "$AOS_TEST_MACOS_VERSION"
+    return 0
+  fi
+  if [ -x /usr/bin/sw_vers ]; then
+    /usr/bin/sw_vers -productVersion
+  fi
+}
+
+darwin_version_parts() {
+  version=$1
+  printf '%s\n' "$version" | grep -Eq '^[0-9]+([.][0-9]+){0,3}$' || return 1
+  darwin_ver_major=${version%%.*}
+  if [ "$darwin_ver_major" = "$version" ]; then
+    printf '%s 0 0\n' "$darwin_ver_major"
+    return 0
+  fi
+  darwin_ver_rest=${version#*.}
+  darwin_ver_minor=${darwin_ver_rest%%.*}
+  if [ "$darwin_ver_minor" = "$darwin_ver_rest" ]; then
+    printf '%s %s 0\n' "$darwin_ver_major" "$darwin_ver_minor"
+    return 0
+  fi
+  darwin_ver_patch=${darwin_ver_rest#*.}
+  darwin_ver_patch=${darwin_ver_patch%%.*}
+  printf '%s %s %s\n' "$darwin_ver_major" "$darwin_ver_minor" "$darwin_ver_patch"
+}
+
+darwin_version_lt() {
+  darwin_lt_left=$(darwin_version_parts "$1") || return 1
+  darwin_lt_right=$(darwin_version_parts "$2") || return 1
+  darwin_lt_a1=${darwin_lt_left%% *}
+  darwin_lt_tmp=${darwin_lt_left#* }
+  darwin_lt_a2=${darwin_lt_tmp%% *}
+  darwin_lt_a3=${darwin_lt_tmp#* }
+  darwin_lt_b1=${darwin_lt_right%% *}
+  darwin_lt_tmp=${darwin_lt_right#* }
+  darwin_lt_b2=${darwin_lt_tmp%% *}
+  darwin_lt_b3=${darwin_lt_tmp#* }
+  [ "$darwin_lt_a1" -lt "$darwin_lt_b1" ] && return 0
+  [ "$darwin_lt_a1" -gt "$darwin_lt_b1" ] && return 1
+  [ "$darwin_lt_a2" -lt "$darwin_lt_b2" ] && return 0
+  [ "$darwin_lt_a2" -gt "$darwin_lt_b2" ] && return 1
+  [ "$darwin_lt_a3" -lt "$darwin_lt_b3" ]
+}
+
+darwin_xml_minimum() {
+  # Next-line <string> after LSMinimumSystemVersion. XML plists only; used
+  # when /usr/bin/plutil is absent so Linux installer fixtures can still
+  # prove the skip path. Binary plists stay fail-closed.
+  awk '
+    found {
+      if (match($0, /<string>[^<]*<\/string>/)) {
+        print substr($0, RSTART + 8, RLENGTH - 17)
+      }
+      exit
+    }
+    index($0, "<key>LSMinimumSystemVersion</key>") { found = 1 }
+  ' "$1"
+}
+
+darwin_bundle_minimum() {
+  darwin_bundle_plist="$1/Contents/Info.plist"
+  [ -f "$darwin_bundle_plist" ] && [ ! -L "$darwin_bundle_plist" ] || return 1
+  darwin_bundle_min=
+  if [ -x /usr/bin/plutil ]; then
+    darwin_bundle_min=$(/usr/bin/plutil -extract LSMinimumSystemVersion raw -o - "$darwin_bundle_plist" 2>/dev/null) || darwin_bundle_min=
+  fi
+  if [ -z "$darwin_bundle_min" ]; then
+    darwin_bundle_min=$(darwin_xml_minimum "$darwin_bundle_plist") || darwin_bundle_min=
+  fi
+  [ -n "$darwin_bundle_min" ] || return 1
+  printf '%s\n' "$darwin_bundle_min"
+}
+
 if [ -d "$release_dir/runtime/bin/AstridFS.app" ]; then
   filesystem_manager="$release_dir/runtime/bin/macos/aos-filesystem.sh"
-  if ! /bin/sh "$filesystem_manager" install || ! /bin/sh "$filesystem_manager" enable; then
+  skip_fskit=0
+  reported_macos=
+  bundle_min=
+  if [ "$os" = Darwin ]; then
+    reported_macos=$(darwin_product_version) || reported_macos=
+    bundle_min=$(darwin_bundle_minimum "$release_dir/runtime/bin/AstridFS.app") || bundle_min=
+    if [ -n "$reported_macos" ] && [ -n "$bundle_min" ]; then
+      if darwin_version_lt "$reported_macos" "$bundle_min"; then
+        skip_fskit=1
+      fi
+    fi
+  fi
+  if [ "$skip_fskit" -eq 1 ]; then
+    echo "AOS is installed. Finder volume mounting needs macOS ${bundle_min} and an approved Astrid filesystem extension." >&2
+    echo "This Mac reports macOS $reported_macos, which is older than AstridFS.app LSMinimumSystemVersion ${bundle_min}." >&2
+    echo "The CLI and runtime do not require that mount. The extension cannot be registered or approved on this macOS version." >&2
+    echo "After upgrading to macOS ${bundle_min} or later, run:" >&2
+    echo "/bin/sh '$filesystem_manager' install" >&2
+    echo "/bin/sh '$filesystem_manager' enable" >&2
+  elif ! /bin/sh "$filesystem_manager" install || ! /bin/sh "$filesystem_manager" enable; then
     echo "AOS runtime is installed; macOS filesystem setup is incomplete." >&2
     echo "Allow the Astrid filesystem extension in macOS settings, then run:" >&2
     echo "/bin/sh '$filesystem_manager' install" >&2
@@ -1401,54 +1505,73 @@ if [ -d "$release_dir/runtime/bin/AstridFS.app" ]; then
   fi
 fi
 
+# Optional menu-bar Command Center follows its own bundle minimum
+# (currently 13.0). Copy/open on an older host is skipped so a 13.0 app
+# cannot fail the CLI/runtime install. Unknown host or bundle versions
+# keep the previous copy/open path. Supported-host copy/mv failures stay
+# fatal; a failed `open` still warns and continues.
 if [ "$os" = Darwin ] && [ -d "$release_dir/share/AOS Command Center.app" ]; then
-  command_center_parent="$HOME/Applications"
-  command_center="$command_center_parent/AOS Command Center.app"
-  command_center_stage="$command_center_parent/.AOS Command Center.app.new.$$"
-  command_center_backup="$command_center_parent/.AOS Command Center.app.rollback.$$"
-  [ ! -L "$command_center_parent" ] || {
-    echo "AOS runtime is installed; refusing symlinked Applications directory: $command_center_parent" >&2
-    exit 1
-  }
-  mkdir -p "$command_center_parent"
-  [ -d "$command_center_parent" ] || {
-    echo "AOS runtime is installed; Applications path is not a directory: $command_center_parent" >&2
-    exit 1
-  }
-  if [ -e "$command_center" ] || [ -L "$command_center" ]; then
-    [ -d "$command_center" ] && [ ! -L "$command_center" ] || {
-      echo "AOS runtime is installed; refusing non-directory Command Center: $command_center" >&2
+  skip_command_center=0
+  reported_macos=$(darwin_product_version) || reported_macos=
+  command_center_min=$(darwin_bundle_minimum "$release_dir/share/AOS Command Center.app") || command_center_min=
+  if [ -n "$reported_macos" ] && [ -n "$command_center_min" ]; then
+    if darwin_version_lt "$reported_macos" "$command_center_min"; then
+      skip_command_center=1
+    fi
+  fi
+  if [ "$skip_command_center" -eq 1 ]; then
+    echo "AOS is installed. Command Center needs macOS ${command_center_min}." >&2
+    echo "This Mac reports macOS $reported_macos, which is older than AOS Command Center.app LSMinimumSystemVersion ${command_center_min}." >&2
+    echo "The CLI and runtime do not require the menu-bar app. It remains in this release and can be copied after upgrading." >&2
+  else
+    command_center_parent="$HOME/Applications"
+    command_center="$command_center_parent/AOS Command Center.app"
+    command_center_stage="$command_center_parent/.AOS Command Center.app.new.$$"
+    command_center_backup="$command_center_parent/.AOS Command Center.app.rollback.$$"
+    [ ! -L "$command_center_parent" ] || {
+      echo "AOS runtime is installed; refusing symlinked Applications directory: $command_center_parent" >&2
       exit 1
     }
-    existing_id=$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - \
-      "$command_center/Contents/Info.plist" 2>/dev/null || :)
-    [ "$existing_id" = ai.unicity.aos.tray ] || {
-      echo "AOS runtime is installed; refusing to replace another application at $command_center" >&2
+    mkdir -p "$command_center_parent"
+    [ -d "$command_center_parent" ] || {
+      echo "AOS runtime is installed; Applications path is not a directory: $command_center_parent" >&2
       exit 1
     }
-  fi
-  rm -rf "$command_center_stage" "$command_center_backup"
-  cp -Rp "$release_dir/share/AOS Command Center.app" "$command_center_stage"
-  if [ -d "$command_center" ]; then
-    mv "$command_center" "$command_center_backup"
-  fi
-  if ! mv "$command_center_stage" "$command_center"; then
-    [ ! -d "$command_center_backup" ] || mv "$command_center_backup" "$command_center"
-    echo "AOS runtime is installed; failed to install Command Center" >&2
-    exit 1
-  fi
-  rm -rf "$command_center_backup"
+    if [ -e "$command_center" ] || [ -L "$command_center" ]; then
+      [ -d "$command_center" ] && [ ! -L "$command_center" ] || {
+        echo "AOS runtime is installed; refusing non-directory Command Center: $command_center" >&2
+        exit 1
+      }
+      existing_id=$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - \
+        "$command_center/Contents/Info.plist" 2>/dev/null || :)
+      [ "$existing_id" = ai.unicity.aos.tray ] || {
+        echo "AOS runtime is installed; refusing to replace another application at $command_center" >&2
+        exit 1
+      }
+    fi
+    rm -rf "$command_center_stage" "$command_center_backup"
+    cp -Rp "$release_dir/share/AOS Command Center.app" "$command_center_stage"
+    if [ -d "$command_center" ]; then
+      mv "$command_center" "$command_center_backup"
+    fi
+    if ! mv "$command_center_stage" "$command_center"; then
+      [ ! -d "$command_center_backup" ] || mv "$command_center_backup" "$command_center"
+      echo "AOS runtime is installed; failed to install Command Center" >&2
+      exit 1
+    fi
+    rm -rf "$command_center_backup"
 
-  command_center_open=/usr/bin/open
-  if [ -n "${AOS_TEST_OPEN:-}" ]; then
-    [ -n "${AOS_TEST_FIXTURE:-}" ] || {
-      echo "AOS_TEST_OPEN is restricted to installer fixtures" >&2
-      exit 1
-    }
-    command_center_open=$AOS_TEST_OPEN
-  fi
-  if ! "$command_center_open" -g "$command_center"; then
-    echo "AOS is installed, but Command Center did not open. Open it from $command_center" >&2
+    command_center_open=/usr/bin/open
+    if [ -n "${AOS_TEST_OPEN:-}" ]; then
+      [ -n "${AOS_TEST_FIXTURE:-}" ] || {
+        echo "AOS_TEST_OPEN is restricted to installer fixtures" >&2
+        exit 1
+      }
+      command_center_open=$AOS_TEST_OPEN
+    fi
+    if ! "$command_center_open" -g "$command_center"; then
+      echo "AOS is installed, but Command Center did not open. Open it from $command_center" >&2
+    fi
   fi
 fi
 

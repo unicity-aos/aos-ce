@@ -15,6 +15,17 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Changed
+
+- Treat Finder/FSKit mounting as optional on Darwin. Product install no
+  longer fails closed when the host is older than the bundled
+  `AstridFS.app` `LSMinimumSystemVersion` (currently 26.0); native volume
+  mounts still require that minimum and extension approval.
+- Skip copying `AOS Command Center.app` into `~/Applications` when the
+  host is older than the tray bundle `LSMinimumSystemVersion` (currently
+  13.0). The CLI still installs; the app remains in the release `share/`
+  directory.
+
 ### Fixed
 
 - Support Apple-ID app-specific-password notarization for Command Center
