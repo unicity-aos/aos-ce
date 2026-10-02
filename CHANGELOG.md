@@ -28,6 +28,8 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Do not mistake regular Finder `.DS_Store` metadata for unfinished runtime
+  shutdown; genuine leftover state and redirected entries still block confirmation.
 - Support Apple-ID app-specific-password notarization for Command Center
   release signing; retain API-key and keychain-profile support in the helper.
 
