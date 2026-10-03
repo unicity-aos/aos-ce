@@ -3,11 +3,12 @@
 use std::io::Read;
 use std::time::Duration;
 
+use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 use astrid_core::{PrincipalId, SessionId};
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
-use astrid_uplink::SocketClient;
-use clap::Args;
+use astrid_uplink::{KernelClient, SocketClient};
+use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -16,10 +17,19 @@ const MAX_PAYLOAD_BYTES: u64 = 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 
+mod output;
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum OutputFormat {
+    #[default]
+    Context,
+    Json,
+}
+
 /// A private, session-targeted hook delivery from a host plugin.
 #[derive(Debug, Args)]
 pub struct HookArgs {
-    /// Host adapter producing this event: codex, claude, or grok.
+    /// Adapter identifier producing this event.
     #[arg(long, value_parser = parse_host)]
     host: String,
     /// Exact host session receiving any returned context.
@@ -34,6 +44,9 @@ pub struct HookArgs {
     /// Maximum time to wait for a targeted hook response.
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_MS, value_parser = parse_timeout)]
     timeout_ms: u64,
+    /// Return a host-neutral authenticated reply instead of context text.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Context)]
+    format: OutputFormat,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,6 +80,8 @@ struct HostHookResponse {
     delivery_id: String,
     #[serde(default)]
     context: Option<String>,
+    #[serde(default)]
+    decision: Option<output::Decision>,
 }
 
 pub(crate) fn handle(principal: String, args: HookArgs) -> Result<Option<String>, String> {
@@ -120,18 +135,56 @@ pub(crate) fn handle(principal: String, args: HookArgs) -> Result<Option<String>
         .enable_all()
         .build()
         .map_err(|error| format!("could not start hook client: {error}"))?;
-    runtime.block_on(deliver(
-        principal,
-        request,
-        Duration::from_millis(args.timeout_ms),
-    ))
+    let timeout = Duration::from_millis(args.timeout_ms);
+    runtime.block_on(async {
+        tokio::time::timeout(timeout, deliver(principal, request, timeout, args.format))
+            .await
+            .map_err(|_| "hook delivery exceeded its deadline".to_owned())?
+    })
+}
+
+async fn installed_responder(principal: PrincipalId) -> Result<Uuid, String> {
+    // The daemon registry is authoritative. Do not trust a UUID supplied by
+    // another capsule, a hook payload, or a disposable filesystem projection.
+    let mut client = KernelClient::connect(principal)
+        .await
+        .map_err(|error| format!("could not discover hook responder: {error}"))?;
+    let response = client
+        .request(KernelRequest::GetCapsuleMetadata)
+        .await
+        .map_err(|error| format!("could not read hook responder metadata: {error}"))?;
+    match response {
+        KernelResponse::CapsuleMetadata(entries) => select_responder(
+            entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.source_id)),
+        ),
+        _ => Err("runtime did not return hook responder metadata".into()),
+    }
+}
+
+fn select_responder<'a>(
+    entries: impl Iterator<Item = (&'a str, Option<Uuid>)>,
+) -> Result<Uuid, String> {
+    let mut matches = entries.filter(|(name, _)| *name == "aos-mcp");
+    let source = matches.next().and_then(|(_, source)| source);
+    if matches.next().is_some() {
+        return Err("ambiguous aos-mcp registry identity".into());
+    }
+    source.ok_or_else(|| "aos-mcp is not loaded for the hook principal".into())
 }
 
 async fn deliver(
     principal: PrincipalId,
     request: HostHookRequest,
     timeout: Duration,
+    format: OutputFormat,
 ) -> Result<Option<String>, String> {
+    let responder_source = if matches!(format, OutputFormat::Json) {
+        Some(installed_responder(principal.clone()).await?)
+    } else {
+        None
+    };
     let connection_id = Uuid::new_v4();
     let mut client = SocketClient::connect(SessionId::from_uuid(connection_id), principal.clone())
         .await
@@ -164,9 +217,32 @@ async fn deliver(
     let response: HostHookResponse = serde_json::from_value(extract_raw_payload(&raw)?)
         .map_err(|error| format!("hook response is malformed: {error}"))?;
     validate_response(&request, &response)?;
+    if matches!(format, OutputFormat::Json) {
+        validate_source(&raw, responder_source)?;
+        if response.event.as_deref() != Some(request.event.as_str()) {
+            return Err("hook response is missing the exact event".into());
+        }
+        return output::reply(
+            &request.event,
+            response.decision.as_ref(),
+            response.context.as_deref(),
+        );
+    }
     Ok(response
         .context
         .filter(|context| !context.trim().is_empty()))
+}
+
+fn validate_source(raw: &Value, expected: Option<Uuid>) -> Result<(), String> {
+    let actual = raw
+        .get("source_id")
+        .and_then(Value::as_str)
+        .and_then(|source| Uuid::parse_str(source).ok());
+    if expected.is_some() && actual == expected {
+        Ok(())
+    } else {
+        Err("hook response did not come from the installed aos-mcp source".into())
+    }
 }
 
 fn extract_raw_payload(raw: &Value) -> Result<Value, String> {
@@ -226,10 +302,7 @@ fn value_as_identifier(value: &Value) -> Option<String> {
 }
 
 fn parse_host(value: &str) -> Result<String, String> {
-    match value {
-        "codex" | "claude" | "grok" => Ok(value.to_owned()),
-        _ => Err("host must be codex, claude, or grok".to_owned()),
-    }
+    parse_segment(value)
 }
 
 fn parse_segment(value: &str) -> Result<String, String> {
@@ -274,6 +347,27 @@ fn parse_timeout(value: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_identifiers_are_not_a_host_product_allowlist() {
+        assert_eq!(parse_host("custom_editor").as_deref(), Ok("custom_editor"));
+        assert!(parse_host("custom.editor").is_err());
+        assert!(parse_host("../editor").is_err());
+    }
+
+    #[test]
+    fn responder_must_be_one_loaded_registry_entry() {
+        let source = Uuid::new_v4();
+        assert_eq!(
+            select_responder([("aos-mcp", Some(source))].into_iter()).unwrap(),
+            source
+        );
+        assert!(select_responder([("other", Some(source))].into_iter()).is_err());
+        assert!(select_responder([("aos-mcp", None)].into_iter()).is_err());
+        assert!(
+            select_responder([("aos-mcp", Some(source)), ("aos-mcp", None)].into_iter()).is_err()
+        );
+    }
 
     #[test]
     fn route_is_stable_and_secret_bound() {
@@ -325,6 +419,7 @@ mod tests {
             route_id: request.route_id.clone(),
             delivery_id: request.delivery_id.clone(),
             context: Some("context".to_owned()),
+            decision: None,
         };
         assert!(validate_response(&request, &response).is_ok());
         response.event = None;
@@ -339,5 +434,28 @@ mod tests {
         assert!(parse_segment("codex.session").is_err());
         assert!(parse_segment("../session").is_err());
         assert!(parse_segment("").is_err());
+    }
+
+    #[test]
+    fn native_response_requires_kernel_stamped_relay_identity() {
+        let expected = Uuid::new_v4();
+        assert!(
+            validate_source(&serde_json::json!({"source_id": expected}), Some(expected)).is_ok()
+        );
+        assert!(
+            validate_source(
+                &serde_json::json!({"source_id": Uuid::new_v4()}),
+                Some(expected)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_source(
+                &serde_json::json!({"payload": {"source_id": expected}}),
+                Some(expected)
+            )
+            .is_err()
+        );
+        assert!(validate_source(&serde_json::json!({}), None).is_err());
     }
 }

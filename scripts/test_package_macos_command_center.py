@@ -2,6 +2,7 @@
 """Packaging fixtures prove byte preservation, not Apple signature validity."""
 
 from pathlib import Path
+import plistlib
 import tempfile
 import unittest
 
@@ -23,6 +24,8 @@ FIXTURE_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>2026.9.2</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
 </dict>
 </plist>
 """
@@ -58,6 +61,14 @@ class PackagingTests(unittest.TestCase):
                     staged = copied / path.relative_to(source)
                     self.assertEqual(path.read_bytes(), staged.read_bytes())
                     self.assertEqual(path.stat().st_mode, staged.stat().st_mode)
+
+    def test_fixture_info_plist_declares_macos_13_minimum(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "supplied.app"
+            fixture(source)
+            data = plistlib.loads((source / "Contents/Info.plist").read_bytes())
+            self.assertEqual(data["LSMinimumSystemVersion"], "13.0")
 
     def test_missing_required_app(self):
         with tempfile.TemporaryDirectory() as temporary:

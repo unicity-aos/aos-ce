@@ -15,9 +15,22 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Changed
+
+- Treat Finder/FSKit mounting as optional on Darwin. Product install no
+  longer fails closed when the host is older than the bundled
+  `AstridFS.app` `LSMinimumSystemVersion` (currently 26.0); native volume
+  mounts still require that minimum and extension approval.
+- Skip copying `AOS Command Center.app` into `~/Applications` when the
+  host is older than the tray bundle `LSMinimumSystemVersion` (currently
+  13.0). The CLI still installs; the app remains in the release `share/`
+  directory.
+
 ### Fixed
 
 - Grant the default CE fleet during the first `astrid init` instead of spawning a second runtime CLI after capsules are installed.
+- Do not mistake regular Finder `.DS_Store` metadata for unfinished runtime
+  shutdown; genuine leftover state and redirected entries still block confirmation.
 - Support Apple-ID app-specific-password notarization for Command Center
   release signing; retain API-key and keychain-profile support in the helper.
 

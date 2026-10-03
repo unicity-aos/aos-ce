@@ -2,7 +2,9 @@
 
 Native macOS menu-bar shell for AOS. Accessory process, no Dock icon. Closing
 the panel hides it. Quit AOS Tray does not stop the AOS runtime, mounts,
-agents, or MCP sessions.
+agents, or MCP sessions. The app declares macOS 13. Finder volume mounting is
+optional and still requires macOS 26 plus an approved Astrid filesystem
+extension; older supported macOS versions keep the tray and runtime.
 
 Default no-args launch binds the current user's `~/.aos/bin/aos` and `~/.aos`,
 or a valid absolute `AOS_HOME`. The binary is always that home's `bin/aos`.

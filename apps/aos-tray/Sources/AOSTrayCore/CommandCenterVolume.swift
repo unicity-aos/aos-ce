@@ -18,6 +18,7 @@ public enum CommandCenterVolumeError: Equatable, Error, Sendable {
     case unverified
     case notMounted
     case stillMounted
+    case requiresMacOS26
 }
 
 public enum CommandCenterVolumeCopy {
@@ -43,6 +44,7 @@ public enum CommandCenterVolumeCopy {
         "Eject did not unmount the AOS folder."
     public static let ejectPrincipal =
         "Choose an owned principal before ejecting. Nothing was unmounted."
+    public static let requiresMacOS26 = DarwinPlatform.finderVolumeMountUnavailable
     public static let openCaption =
         "Open files mounts this Command Center’s folder if needed, then opens it in Finder. Eject unmounts that same folder. This is the selected principal’s view, not admin or root."
 
@@ -57,6 +59,7 @@ public enum CommandCenterVolumeCopy {
         case .unverified: return unverified
         case .notMounted: return notMounted
         case .stillMounted: return stillMounted
+        case .requiresMacOS26: return requiresMacOS26
         }
     }
 }
@@ -167,7 +170,8 @@ public enum CommandCenterVolume {
         try await Task.detached {
             try openFilesBlocking(
                 binary: binary, home: home, selectedPrincipal: selectedPrincipal,
-                discovery: discovery, runtimeState: runtimeState
+                discovery: discovery, runtimeState: runtimeState,
+                finderMountAvailable: DarwinPlatform.finderVolumeMountAvailable()
             )
         }.value
     }
@@ -177,7 +181,8 @@ public enum CommandCenterVolume {
         home: String,
         selectedPrincipal: String,
         discovery: PrincipalDiscovery,
-        runtimeState: RuntimeOverview.State
+        runtimeState: RuntimeOverview.State,
+        finderMountAvailable: Bool = true
     ) throws -> URL {
         let principal = try resolvePrincipal(selected: selectedPrincipal, discovery: discovery)
         guard runtimeState == .running else { throw CommandCenterVolumeError.runtimeStopped }
@@ -195,6 +200,9 @@ public enum CommandCenterVolume {
         case .openExisting:
             break
         case .mountThenOpen:
+            guard finderMountAvailable else {
+                throw CommandCenterVolumeError.requiresMacOS26
+            }
             try run(
                 binary: binary, home: canonicalHome, principal: principal,
                 arguments: mountArguments(principal: principal, mountpoint: prepared.path),
