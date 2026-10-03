@@ -14,6 +14,9 @@ use astrid_sdk::contracts::hook::HookEventRequest;
 use astrid_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
+mod decision;
+use decision::{Decision, RequiredReplies};
+
 const HOST_HOOK_COLLECT_DEADLINE_MS: u64 = 1_000;
 const HOOK_QUIESCENCE_MS: u64 = 25;
 const MAX_HOST_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -52,8 +55,8 @@ impl Frontend {
 enum ResponseMode {
     /// Publish the canonical event but do not solicit a reply.
     Observe,
-    /// Collect bounded `additional_context` for the exact host turn.
-    AdditionalContext,
+    /// Require a verdict from every configured policy source before returning.
+    Binding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,21 +72,10 @@ const fn observe(hook: &'static str) -> HookMapping {
     }
 }
 
-const fn context(hook: &'static str) -> HookMapping {
-    HookMapping {
-        hook,
-        response: ResponseMode::AdditionalContext,
-    }
-}
-
 fn common_mapping(event: &str) -> Option<HookMapping> {
     match event {
         "session_start" => Some(observe("session_start")),
         "session_end" => Some(observe("session_end")),
-        "user_prompt_submit" => Some(context("message_received")),
-        // This relay's outer response schema carries context only. These are
-        // observations here; binding native-tool decisions use astrid-gate.
-        "pre_tool_use" | "permission_request" => Some(observe("before_tool_call")),
         "post_tool_use" => Some(observe("after_tool_call")),
         "pre_compact" => Some(observe("on_compaction_started")),
         "post_compact" => Some(observe("on_compaction_completed")),
@@ -93,8 +85,17 @@ fn common_mapping(event: &str) -> Option<HookMapping> {
     }
 }
 
+const fn binding(hook: &'static str) -> HookMapping {
+    HookMapping {
+        hook,
+        response: ResponseMode::Binding,
+    }
+}
+
 fn codex_mapping(event: &str) -> Option<HookMapping> {
     match event {
+        "pre_tool_use" | "permission_request" => Some(binding("before_tool_call")),
+        "user_prompt_submit" => Some(binding("message_received")),
         // Codex Stop is per-turn and carries `last_assistant_message`.
         "stop" => Some(observe("message_sent")),
         _ => common_mapping(event),
@@ -103,6 +104,8 @@ fn codex_mapping(event: &str) -> Option<HookMapping> {
 
 fn claude_mapping(event: &str) -> Option<HookMapping> {
     match event {
+        "pre_tool_use" | "permission_request" => Some(binding("before_tool_call")),
+        "user_prompt_submit" => Some(binding("message_received")),
         // Claude Stop is per-turn and carries `last_assistant_message`.
         "stop" => Some(observe("message_sent")),
         // Claude MessageDisplay carries response text in `delta` while it is
@@ -114,9 +117,13 @@ fn claude_mapping(event: &str) -> Option<HookMapping> {
 
 fn grok_mapping(event: &str) -> Option<HookMapping> {
     match event {
-        // Preserve the existing Grok interpretation until its upstream hook
-        // contract supplies a distinct, verified per-turn response event.
-        "stop" => Some(observe("session_end")),
+        "pre_tool_use" => Some(binding("before_tool_call")),
+        "user_prompt_submit" => Some(binding("message_received")),
+        // Grok has PermissionDenied observations, not PermissionRequest.
+        "permission_request" => None,
+        // Grok Stop completes a turn, not the session. Retiring the route here
+        // loses authentication for subsequent events in that same session.
+        "stop" => Some(observe("message_sent")),
         _ => common_mapping(event),
     }
 }
@@ -153,6 +160,8 @@ struct OracleHookResponse<'a> {
     delivery_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision: Option<Decision>,
 }
 
 #[derive(Debug, Serialize)]
@@ -328,7 +337,7 @@ fn canonical_request(
     let request = HookEventRequest {
         hook: mapping.hook.to_owned(),
         payload: serde_json::to_string(&payload)?,
-        correlation_id: matches!(mapping.response, ResponseMode::AdditionalContext)
+        correlation_id: (!matches!(mapping.response, ResponseMode::Observe))
             .then(|| event.correlation_id.clone()),
     };
     if serde_json::to_vec(&request)?.len() > MAX_CANONICAL_EVENT_BYTES {
@@ -342,18 +351,71 @@ fn canonical_request(
 fn dispatch_oracle_hook(
     event: &OracleHookEvent,
     mapping: HookMapping,
-) -> Result<Option<String>, SysError> {
+) -> Result<(Option<String>, Option<Decision>), SysError> {
     let event_topic = format!("hook.v1.event.{}", mapping.hook);
     let request = canonical_request(event, mapping)?;
     if matches!(mapping.response, ResponseMode::Observe) {
         ipc::publish_json(&event_topic, &request)?;
-        return Ok(None);
+        return Ok((None, None));
     }
 
     let reply_topic = format!("hook.v1.response.{}.{}", mapping.hook, event.correlation_id);
     let subscription = ipc::subscribe(&reply_topic)?;
     ipc::publish_json(&event_topic, &request)?;
-    collect_additional_context(&subscription, &reply_topic, &event.principal_id)
+    collect_binding_response(&subscription, &reply_topic, &event.principal_id)
+}
+
+fn collect_binding_response(
+    subscription: &ipc::Subscription,
+    reply_topic: &str,
+    principal: &str,
+) -> Result<(Option<String>, Option<Decision>), SysError> {
+    // Read the invocation's principal overlay, never a process-global cache.
+    let config = match env::var("AOS_ORACLE_REQUIRED_HOOK_SOURCES") {
+        Ok(config) => config,
+        Err(_) => return Ok((None, Some(Decision::unavailable()))),
+    };
+    let Ok(mut replies) = RequiredReplies::parse(&config) else {
+        return Ok((None, Some(Decision::unavailable())));
+    };
+    if replies.complete() {
+        return collect_additional_context(subscription, reply_topic, principal)
+            .map(|context| (context, Some(Decision::default())));
+    }
+    let mut contexts = Vec::new();
+    let mut context_bytes = 0;
+    let start = time::monotonic();
+    loop {
+        let elapsed = u64::try_from(time::monotonic().saturating_sub(start).as_millis())
+            .unwrap_or(HOST_HOOK_COLLECT_DEADLINE_MS);
+        let Some(wait) =
+            replies.next_wait(elapsed, HOST_HOOK_COLLECT_DEADLINE_MS, HOOK_QUIESCENCE_MS)
+        else {
+            break;
+        };
+        let poll = match subscription.recv(wait) {
+            Ok(poll) if poll.messages.is_empty() => break,
+            Ok(poll) if poll.dropped == 0 && poll.lagged == 0 => poll,
+            _ => return Ok((None, Some(Decision::unavailable()))),
+        };
+        for message in poll.messages {
+            if message.topic != reply_topic || message.principal.verified() != Some(principal) {
+                continue;
+            }
+            replies.accept(&message.source_id, &message.payload);
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.payload)
+                && let Some(context) = value
+                    .get("additional_context")
+                    .and_then(serde_json::Value::as_str)
+            {
+                push_context(&mut contexts, &mut context_bytes, context);
+            }
+        }
+    }
+    Ok((
+        (!contexts.is_empty()).then(|| contexts.join("\n\n")),
+        Some(replies.finish()),
+    ))
 }
 
 fn handle_oracle_hook(expected: Frontend, payload: serde_json::Value) -> Result<(), SysError> {
@@ -387,7 +449,7 @@ fn handle_oracle_hook(expected: Frontend, payload: serde_json::Value) -> Result<
         return Ok(());
     }
 
-    let context = dispatch_oracle_hook(&event, mapping)?;
+    let (context, decision) = dispatch_oracle_hook(&event, mapping)?;
     ipc::publish_json(
         &format!("oracle.v1.hook.response.{}", event.delivery_id),
         &OracleHookResponse {
@@ -401,6 +463,7 @@ fn handle_oracle_hook(expected: Frontend, payload: serde_json::Value) -> Result<
             route_id: &event.route_id,
             delivery_id: &event.delivery_id,
             context,
+            decision,
         },
     )
 }
@@ -462,15 +525,42 @@ mod tests {
     }
 
     #[test]
-    fn prompt_is_context_bearing_but_pretool_is_observation_only() {
+    fn claude_prompt_and_pretool_carry_binding_decisions() {
         assert_eq!(
             Frontend::Claude.mapping("user_prompt_submit"),
-            Some(context("message_received"))
+            Some(HookMapping {
+                hook: "message_received",
+                response: ResponseMode::Binding
+            })
         );
         assert_eq!(
             Frontend::Claude.mapping("pre_tool_use"),
-            Some(observe("before_tool_call"))
+            Some(HookMapping {
+                hook: "before_tool_call",
+                response: ResponseMode::Binding
+            })
         );
+    }
+
+    #[test]
+    fn every_host_collects_prompt_and_pretool_verdicts() {
+        for host in [Frontend::Codex, Frontend::Claude, Frontend::Grok] {
+            assert_eq!(
+                host.mapping("pre_tool_use"),
+                Some(binding("before_tool_call"))
+            );
+            assert_eq!(
+                host.mapping("user_prompt_submit"),
+                Some(binding("message_received"))
+            );
+        }
+        for host in [Frontend::Codex, Frontend::Claude] {
+            assert_eq!(
+                host.mapping("permission_request"),
+                Some(binding("before_tool_call"))
+            );
+        }
+        assert_eq!(Frontend::Grok.mapping("permission_request"), None);
     }
 
     #[test]
@@ -494,8 +584,15 @@ mod tests {
     }
 
     #[test]
-    fn grok_stop_remains_an_explicit_session_termination_exception() {
-        assert_eq!(Frontend::Grok.mapping("stop"), Some(observe("session_end")));
+    fn grok_stop_preserves_the_session_route() {
+        assert_eq!(
+            Frontend::Grok.mapping("stop"),
+            Some(observe("message_sent"))
+        );
+        assert_eq!(
+            Frontend::Grok.mapping("session_end"),
+            Some(observe("session_end"))
+        );
     }
 
     #[test]
@@ -594,7 +691,7 @@ mod tests {
         let event = host_event("codex");
         let request = canonical_request(&event, observe("before_tool_call")).unwrap();
         assert!(request.correlation_id.is_none());
-        let request = canonical_request(&event, context("message_received")).unwrap();
+        let request = canonical_request(&event, binding("message_received")).unwrap();
         assert_eq!(request.correlation_id, Some(event.correlation_id));
     }
 }

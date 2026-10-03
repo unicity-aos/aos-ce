@@ -10,6 +10,9 @@ id = "hook-adapter-oracle"
 file = "aos_hook_adapter_oracle.wasm"
 type = "executable"
 
+[env]
+AOS_ORACLE_REQUIRED_HOOK_SOURCES = { type = "array", default = "[]", request = "Required native Oracle policies as capsule-name=source-UUID registrations; later revisions replace the same named policy" }
+
 [publish]
 "hook.v1.event.*" = { wit = "@unicity-astrid/wit/hook/hook-event-request" }
 "oracle.v1.hook.response.*" = { wit = "opaque" }
@@ -23,3 +26,4 @@ type = "executable"
 
 # Dynamic, correlation-scoped response collection for prompt-context hooks.
 "hook.v1.response.message_received.*" = { wit = "opaque" }
+"hook.v1.response.before_tool_call.*" = { wit = "opaque" }
