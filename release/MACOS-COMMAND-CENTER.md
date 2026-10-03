@@ -83,10 +83,16 @@ Preview CI of `apps/aos-tray` is not packaged GO.
 ## Install
 
 When the archive member is present, `install.sh` retains it unchanged in
-`$AOS_HOME/releases/<version>/share/AOS Command Center.app`, atomically installs
-the same signed bundle at `$HOME/Applications/AOS Command Center.app`, and opens
-it in the background. The installed app registers itself as the current user's
-login item. Archives that predate this member still install without a GUI.
+`$AOS_HOME/releases/<version>/share/AOS Command Center.app`. If the host is at
+or above the bundle `LSMinimumSystemVersion` (currently 13.0), it atomically
+copies the same signed bundle to `$HOME/Applications/AOS Command Center.app`
+and opens it in the background. If the host is older than that minimum, copy
+and `open` are skipped, the installer still exits 0, and the app stays in
+`share/` for a later OS upgrade. Unknown host versions or unreadable bundle
+minima keep the previous copy/open path. Copy/mv failures on a supported host
+remain fatal; a failed `open` still warns and continues. The installed app
+registers itself as the current user's login item. Archives that predate this
+member still install without a GUI.
 
 Older AOS releases missing the tray remain installable.
 

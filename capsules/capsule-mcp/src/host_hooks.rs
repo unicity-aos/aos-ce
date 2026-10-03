@@ -59,6 +59,10 @@ struct HostHookResponse {
     delivery_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context: Option<String>,
+    // Preserve policy output for the native host renderer; dropping this field
+    // turns a veto into apparent success. The renderer validates its schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision: Option<serde_json::Value>,
 }
 
 pub(crate) fn handle(expected_host: &str, payload: serde_json::Value) -> Result<(), SysError> {
@@ -148,6 +152,14 @@ pub(crate) fn relay_response(payload: serde_json::Value) -> Result<(), SysError>
         return Ok(());
     }
 
+    if response.decision.is_some() {
+        let expected = env::var("AOS_ORACLE_ADAPTER_SOURCE_ID")?;
+        if !binding_source_matches(&expected, &caller.source_id) {
+            reject(&response.host, event, "policy_source_mismatch");
+            return Ok(());
+        }
+    }
+
     let token_key = token_key(&response.host, &response.session_id);
     let Some(token) = kv::get_bytes_opt(&token_key)? else {
         reject(&response.host, event, "unknown_session_route");
@@ -196,6 +208,10 @@ fn authenticate_token(key: &str, request: &HostHookRequest) -> Result<bool, SysE
 
 fn can_register(event: &str) -> bool {
     matches!(event, "session_start" | "user_prompt_submit")
+}
+
+fn binding_source_matches(expected: &str, actual: &str) -> bool {
+    !expected.is_empty() && expected == actual
 }
 
 fn retires_session_route(response: &HostHookResponse) -> bool {
@@ -421,6 +437,7 @@ mod tests {
             route_id: request.route_id.clone(),
             delivery_id: request.delivery_id.clone(),
             context: Some("same-turn context".to_owned()),
+            decision: None,
         }
     }
 
@@ -443,6 +460,29 @@ mod tests {
         );
         value.delivery_id = format!("{}-{}", "c".repeat(64), value.correlation_id);
         assert_eq!(validate_response_shape(&value), Err("delivery_mismatch"));
+    }
+
+    #[test]
+    fn relay_preserves_native_policy_verdict() {
+        let mut value = response(&request());
+        value.decision = Some(serde_json::json!({"skip": true, "reason": "blocked"}));
+        let encoded = serde_json::to_value(&value).unwrap();
+        let decoded: HostHookResponse = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.decision, value.decision);
+        assert!(validate_response_shape(&decoded).is_ok());
+    }
+
+    #[test]
+    fn native_verdict_requires_installed_adapter_source() {
+        assert!(binding_source_matches(
+            "installed-adapter",
+            "installed-adapter"
+        ));
+        assert!(!binding_source_matches(
+            "installed-adapter",
+            "other-capsule"
+        ));
+        assert!(!binding_source_matches("", ""));
     }
 
     #[test]

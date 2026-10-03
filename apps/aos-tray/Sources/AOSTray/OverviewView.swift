@@ -45,6 +45,10 @@ struct OverviewView: View {
                 }
                 Text(CommandCenterVolumeCopy.openCaption)
                     .font(.caption).foregroundStyle(.secondary)
+                if !DarwinPlatform.finderVolumeMountAvailable() {
+                    Text(DarwinPlatform.finderVolumeMountUnavailable)
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 HStack {
                     Button("Open mounted volume…") { session.chooseMountedVolume() }
                         .disabled(session.aosBinary == nil || session.volumeBusy)

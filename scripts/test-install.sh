@@ -429,6 +429,130 @@ test ! -e "$work/AOS.app/Contents/MacOS/aos-tray"
 test ! -e "$darwin_home/.aos/Applications/AOS Command Center.app"
 test ! -e "$darwin_home/.aos/share/AOS Command Center.app"
 
+# Hosts older than Command Center LSMinimumSystemVersion (13.0) keep CLI
+# and skip both FSKit registration and tray copy/open. Issue #201: optional
+# desktop apps must not block CLI/Oracle.
+for macos_version in 11.0 12.7; do
+  old_home="$work/darwin-old-$macos_version-home"
+  old_dest="$work/AOS-old-$macos_version.app"
+  old_calls="$work/fskit-old-$macos_version-calls"
+  old_open="$work/command-center-open-old-$macos_version"
+  old_stderr="$work/darwin-old-$macos_version-stderr"
+  mkdir "$old_home"
+  PATH="$fake_bin:$PATH" HOME="$old_home" AOS_TEST_FIXTURE="$darwin_fixture" \
+    AOS_TEST_UNAME_S=Darwin AOS_TEST_UNAME_M=arm64 \
+    AOS_TEST_MACOS_VERSION="$macos_version" AOS_TEST_FSKIT_LOG="$old_calls" \
+    AOS_TEST_OPEN="$fake_bin/open" AOS_TEST_OPEN_LOG="$old_open" \
+    ASTRID_FSKIT_APP_DEST="$old_dest" \
+    AOS_TEST_COSIGN_SHA256=94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5 \
+    AOS_VERSION=2026.9.3 \
+    sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>"$old_stderr"
+  test ! -e "$old_calls"
+  test ! -e "$old_dest"
+  test ! -e "$old_open"
+  test ! -e "$old_home/Applications/AOS Command Center.app"
+  grep -F 'Finder volume mounting needs macOS 26.0' "$old_stderr"
+  grep -F "This Mac reports macOS $macos_version, which is older than AstridFS.app LSMinimumSystemVersion 26.0" "$old_stderr"
+  grep -F 'cannot be registered or approved' "$old_stderr"
+  grep -F 'Command Center needs macOS 13.0' "$old_stderr"
+  grep -F "This Mac reports macOS $macos_version, which is older than AOS Command Center.app LSMinimumSystemVersion 13.0" "$old_stderr"
+  grep -F 'The CLI and runtime do not require the menu-bar app' "$old_stderr"
+  test -x "$old_home/.aos/releases/2026.9.3/runtime/bin/astrid"
+  test -x "$old_home/.aos/releases/2026.9.3/runtime/bin/astrid-storage-provider-fskit"
+  test -d "$old_home/.aos/releases/2026.9.3/share/AOS Command Center.app"
+done
+
+# Hosts older than AstridFS.app LSMinimumSystemVersion (26.0) but at or
+# above Command Center 13.0 keep CLI + tray copy/open and must not invoke
+# the filesystem manager. Issue #201 observed this on 15.7.7.
+for macos_version in 13.6.1 15.4 15.7.7; do
+  old_home="$work/darwin-old-$macos_version-home"
+  old_dest="$work/AOS-old-$macos_version.app"
+  old_calls="$work/fskit-old-$macos_version-calls"
+  old_open="$work/command-center-open-old-$macos_version"
+  old_stderr="$work/darwin-old-$macos_version-stderr"
+  mkdir "$old_home"
+  PATH="$fake_bin:$PATH" HOME="$old_home" AOS_TEST_FIXTURE="$darwin_fixture" \
+    AOS_TEST_UNAME_S=Darwin AOS_TEST_UNAME_M=arm64 \
+    AOS_TEST_MACOS_VERSION="$macos_version" AOS_TEST_FSKIT_LOG="$old_calls" \
+    AOS_TEST_OPEN="$fake_bin/open" AOS_TEST_OPEN_LOG="$old_open" \
+    ASTRID_FSKIT_APP_DEST="$old_dest" \
+    AOS_TEST_COSIGN_SHA256=94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5 \
+    AOS_VERSION=2026.9.3 \
+    sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>"$old_stderr"
+  test ! -e "$old_calls"
+  test ! -e "$old_dest"
+  grep -F 'Finder volume mounting needs macOS 26.0' "$old_stderr"
+  grep -F "This Mac reports macOS $macos_version, which is older than AstridFS.app LSMinimumSystemVersion 26.0" "$old_stderr"
+  grep -F 'cannot be registered or approved' "$old_stderr"
+  if grep -F 'Command Center needs macOS' "$old_stderr"; then
+    echo "Command Center skipped on a host at or above the tray minimum" >&2
+    exit 1
+  fi
+  test -x "$old_home/.aos/releases/2026.9.3/runtime/bin/astrid"
+  test -x "$old_home/.aos/releases/2026.9.3/runtime/bin/astrid-storage-provider-fskit"
+  diff -r "$command_center_app" "$old_home/.aos/releases/2026.9.3/share/AOS Command Center.app"
+  diff -r "$command_center_app" "$old_home/Applications/AOS Command Center.app"
+  grep -Fx "<$old_home/Applications/AOS Command Center.app>" "$old_open"
+done
+
+# Host equal to or newer than the bundle minimum still invokes install+enable.
+for macos_version in 26.0 26.6.2; do
+  current_home="$work/darwin-$macos_version-home"
+  current_dest="$work/AOS-$macos_version.app"
+  current_calls="$work/fskit-$macos_version-calls"
+  current_open="$work/command-center-open-$macos_version"
+  mkdir "$current_home"
+  PATH="$fake_bin:$PATH" HOME="$current_home" AOS_TEST_FIXTURE="$darwin_fixture" \
+    AOS_TEST_UNAME_S=Darwin AOS_TEST_UNAME_M=arm64 \
+    AOS_TEST_MACOS_VERSION="$macos_version" AOS_TEST_FSKIT_LOG="$current_calls" \
+    AOS_TEST_OPEN="$fake_bin/open" AOS_TEST_OPEN_LOG="$current_open" \
+    ASTRID_FSKIT_APP_DEST="$current_dest" \
+    AOS_TEST_COSIGN_SHA256=94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5 \
+    AOS_VERSION=2026.9.3 \
+    sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+  grep -Fx "$current_dest|install" "$current_calls"
+  grep -Fx "$current_dest|enable" "$current_calls"
+  test -x "$current_home/.aos/releases/2026.9.3/runtime/bin/astrid"
+  diff -r "$command_center_app" "$current_home/Applications/AOS Command Center.app"
+done
+
+# Supported host with a genuine manager failure stays nonzero and incomplete.
+fail_home="$work/darwin-fskit-fail-home"
+fail_dest="$work/AOS-fskit-fail.app"
+fail_calls="$work/fskit-fail-calls"
+fail_open="$work/command-center-open-fskit-fail"
+fail_stderr="$work/darwin-fskit-fail-stderr"
+mkdir "$fail_home"
+if PATH="$fake_bin:$PATH" HOME="$fail_home" AOS_TEST_FIXTURE="$darwin_fixture" \
+  AOS_TEST_UNAME_S=Darwin AOS_TEST_UNAME_M=arm64 \
+  AOS_TEST_MACOS_VERSION=26.6.2 AOS_TEST_FSKIT_FAIL=1 \
+  AOS_TEST_FSKIT_LOG="$fail_calls" AOS_TEST_OPEN="$fake_bin/open" \
+  AOS_TEST_OPEN_LOG="$fail_open" ASTRID_FSKIT_APP_DEST="$fail_dest" \
+  AOS_TEST_COSIGN_SHA256=94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5 \
+  AOS_VERSION=2026.9.3 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>"$fail_stderr"
+then
+  echo "supported Darwin filesystem failure succeeded" >&2
+  exit 1
+fi
+grep -F 'macOS filesystem setup is incomplete' "$fail_stderr"
+grep -Fx "$fail_dest|install" "$fail_calls"
+test ! -e "$fail_dest"
+test -x "$fail_home/.aos/releases/2026.9.3/runtime/bin/astrid"
+
+# Unknown Darwin version keeps the fail-closed manager path.
+unknown_home="$work/darwin-unknown-home"
+unknown_dest="$work/AOS-unknown.app"
+unknown_calls="$work/fskit-unknown-calls"
+unknown_open="$work/command-center-open-unknown"
+mkdir "$unknown_home"
+PATH="$fake_bin:$PATH" HOME="$unknown_home" AOS_TEST_FIXTURE="$darwin_fixture" AOS_TEST_UNAME_S=Darwin AOS_TEST_UNAME_M=arm64 AOS_TEST_MACOS_VERSION=not-a-version AOS_TEST_FSKIT_LOG="$unknown_calls" AOS_TEST_OPEN="$fake_bin/open" AOS_TEST_OPEN_LOG="$unknown_open" ASTRID_FSKIT_APP_DEST="$unknown_dest" AOS_TEST_COSIGN_SHA256=94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5 AOS_VERSION=2026.9.3 sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
+grep -Fx "$unknown_dest|install" "$unknown_calls"
+grep -Fx "$unknown_dest|enable" "$unknown_calls"
+diff -r "$command_center_app" "$unknown_home/Applications/AOS Command Center.app"
+grep -Fx "<$unknown_home/Applications/AOS Command Center.app>" "$unknown_open"
+
 compat_root="$work/darwin-compat-bundle"
 compat_extract="$compat_root/unicity-aos-2026.9.3-aarch64-apple-darwin"
 mkdir "$compat_root"

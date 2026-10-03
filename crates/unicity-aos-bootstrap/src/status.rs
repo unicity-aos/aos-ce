@@ -237,6 +237,14 @@ fn validate_stopped_runtime_layout(home: &AosHome) -> Result<(), String> {
         let name = entry.file_name();
         if name == OsStr::new("astrid.volume") {
             volume_path = Some(entry.path());
+        } else if name == OsStr::new(".DS_Store")
+            && entry
+                .file_type()
+                .map_err(|error| format!("could not inspect Finder metadata: {error}"))?
+                .is_file()
+        {
+            // Finder may write this after retirement. It is not runtime state;
+            // directory/symlink lookalikes still fail below. Keep this read-only.
         } else {
             unexpected.push(name.to_string_lossy().into_owned());
         }
@@ -381,6 +389,44 @@ mod tests {
         fs::create_dir_all(empty_home.runtime_home()).expect("create empty runtime home");
         confirm_stopped(&empty_home).expect("empty runtime is stopped before first volume");
         fs::remove_dir_all(empty_root).expect("remove empty runtime fixture");
+    }
+
+    #[test]
+    fn finder_metadata_is_not_runtime_state() {
+        let root = temporary_status_home("finder-metadata");
+        let home = AosHome::from_root(&root);
+        let runtime = home.runtime_home();
+        fs::create_dir_all(&runtime).unwrap();
+        write_private_volume(&runtime);
+        fs::write(runtime.join(".DS_Store"), b"Finder metadata").unwrap();
+        assert_eq!(confirm_stopped(&home).unwrap().state, "stopped");
+        fs::create_dir(runtime.join("var")).unwrap();
+        let error = confirm_stopped(&home).expect_err("real residual state must fail");
+        assert!(error.contains("unexpected state: var"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finder_named_directory_is_not_ignored() {
+        let root = temporary_status_home("finder-directory");
+        let home = AosHome::from_root(&root);
+        fs::create_dir_all(home.runtime_home().join(".DS_Store")).unwrap();
+        assert!(confirm_stopped(&home).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finder_named_symlink_is_not_ignored() {
+        let root = temporary_status_home("finder-symlink");
+        let home = AosHome::from_root(&root);
+        fs::create_dir_all(home.runtime_home()).unwrap();
+        fs::write(root.join("target"), b"preserve").unwrap();
+        std::os::unix::fs::symlink(root.join("target"), home.runtime_home().join(".DS_Store"))
+            .unwrap();
+        assert!(confirm_stopped(&home).is_err());
+        assert_eq!(fs::read(root.join("target")).unwrap(), b"preserve");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
