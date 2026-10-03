@@ -28,6 +28,7 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Grant the default CE fleet during the first `astrid init` instead of spawning a second runtime CLI after capsules are installed.
 - Do not mistake regular Finder `.DS_Store` metadata for unfinished runtime
   shutdown; genuine leftover state and redirected entries still block confirmation.
 - Support Apple-ID app-specific-password notarization for Command Center

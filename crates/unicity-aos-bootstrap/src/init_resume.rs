@@ -1,5 +1,6 @@
 //! Complete Astrid's bounded installer batches without reimplementing receipts.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
@@ -10,15 +11,20 @@ use std::time::Duration;
 const INSTALL_BATCH: usize = 10;
 const INSTALL_WINDOW: Duration = Duration::from_secs(61);
 
-// The preparation pass always installs the embedded fleet for default, not
-// the caller's Oracle principal. Do not extend host-specific grant sets here.
-pub(super) fn grant_args(assets: &[String]) -> Vec<String> {
-    let mut args = ["--principal", "default", "agent", "modify", "default"]
-        .map(str::to_owned)
-        .to_vec();
-    for asset in assets {
-        args.push("--add-capsule".to_owned());
-        args.push(asset.trim_end_matches(".capsule").to_owned());
+/// Grant the embedded Distro fleet to default in the same `astrid init`
+/// invocation. Do not add host-specific capsules here; Oracle principals are
+/// granted by a later targeted init, not this default preparation pass.
+pub(super) fn with_default_fleet_grant<I, S>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut args: Vec<OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect();
+    if !args.iter().any(|arg| arg == "--grant-capsules") {
+        args.push(OsString::from("--grant-capsules"));
     }
     args
 }
@@ -182,20 +188,36 @@ mod tests {
     }
 
     #[test]
-    fn final_grant_uses_only_the_embedded_default_fleet() {
+    fn first_init_grants_the_embedded_fleet_in_the_same_runtime_invocation() {
         assert_eq!(
-            grant_args(&["aos-cli.capsule".into(), "aos-mcp.capsule".into()]),
+            with_default_fleet_grant([
+                "--principal",
+                "default",
+                "init",
+                "--target-principal",
+                "default",
+                "--yes",
+                "--offline",
+            ]),
             [
                 "--principal",
                 "default",
-                "agent",
-                "modify",
+                "init",
+                "--target-principal",
                 "default",
-                "--add-capsule",
-                "aos-cli",
-                "--add-capsule",
-                "aos-mcp"
+                "--yes",
+                "--offline",
+                "--grant-capsules",
             ]
+        );
+    }
+
+    #[test]
+    fn grant_flag_is_not_duplicated() {
+        let args = with_default_fleet_grant(["init", "--grant-capsules"]);
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "--grant-capsules").count(),
+            1
         );
     }
 
