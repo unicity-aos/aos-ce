@@ -56,6 +56,7 @@ final class TrayAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, 
     private var nativeInputStatusItem: NSMenuItem?
     private var nativeSetupWindow: NativeRuntimeSetupWindow?
     private let nativeInput = NativeRuntimeInputService()
+    private var updateRefresh: Task<Void, Never>?
 
     init(session: TraySession, openOverview: Bool = false, nativeInputConfig: String? = nil, launchError: String? = nil) {
         self.session = session
@@ -67,11 +68,20 @@ final class TrayAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, 
             guard let self else { return }
             let shouldReveal = !self.hadPendingRequests && !rows.isEmpty
             self.hadPendingRequests = !rows.isEmpty
-            self.statusItem?.button?.title = rows.isEmpty ? "AOS" : "AOS · \(rows.count)"
+            self.refreshStatusTitle()
             if rows.isEmpty { self.permissionPanel?.orderOut(nil) }
             guard shouldReveal else { return }
             self.revealPermission()
         }
+        session.onUpdatesChanged = { [weak self] in self?.refreshStatusTitle() }
+    }
+
+    private func refreshStatusTitle() {
+        let requests = session.runtimePrompts.count
+        // Permission requests take priority. No private capsule names appear
+        // in the menu bar, and update discovery never opens a modal prompt.
+        statusItem?.button?.title = requests > 0 ? "AOS · \(requests)" :
+            (session.updates?.items.contains(where: \.canApply) == true ? "AOS ↑" : "AOS")
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -79,6 +89,15 @@ final class TrayAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, 
         installStatusItem()
         installPanel()
         installPermissionPanel()
+        updateRefresh = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.session.runUpdates(.refresh)
+                // The backend owns the daily freshness policy and shared lock.
+                // This wakeup only keeps a long-running tray's badge current.
+                do { try await Task.sleep(for: .seconds(14_400)) } catch { return }
+            }
+        }
         do {
             try LoginItemRegistration.registerInstalledApplication()
         } catch {
@@ -100,6 +119,7 @@ final class TrayAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, 
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        updateRefresh?.cancel()
         nativeInput.stop()
         session.stopSocket()
     }
@@ -138,6 +158,12 @@ final class TrayAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, 
     @objc
     func quitTray(_ sender: Any?) {
         NSApp.terminate(nil)
+    }
+
+    @objc
+    func showUpdates(_ sender: Any?) {
+        session.show(.updates)
+        revealPanel()
     }
 
     @objc
@@ -266,6 +292,9 @@ final class TrayAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, 
         capsules.target = self
         capsules.setAccessibilityLabel("Open Capsules")
         menu.addItem(capsules)
+        let updates = NSMenuItem(title: "Updates…", action: #selector(showUpdates(_:)), keyEquivalent: "")
+        updates.target = self
+        menu.addItem(updates)
 
         menu.addItem(.separator())
 

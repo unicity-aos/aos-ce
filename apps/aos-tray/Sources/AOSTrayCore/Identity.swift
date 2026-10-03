@@ -139,6 +139,7 @@ public enum PanelSection: String, Codable, Sendable {
     case overview
     case requests
     case capsules
+    case updates
 }
 
 public struct LaunchArguments: Equatable, Sendable {

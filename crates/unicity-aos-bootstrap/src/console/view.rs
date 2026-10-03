@@ -15,6 +15,10 @@ const BG: Color = Color::Rgb(18, 24, 32);
 const PANEL: Color = Color::Rgb(24, 32, 43);
 
 pub(super) fn draw(frame: &mut Frame, app: &mut App) {
+    if app.updates_open {
+        super::updates_view::draw(frame, app);
+        return;
+    }
     let viewport = frame.area();
     let area = Rect::new(
         viewport.x + viewport.width.saturating_sub(88) / 2,
@@ -273,7 +277,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.show_help {
         " ↑↓ Requests · Tab Action · Enter Confirm · Esc Cancel · PgUp/PgDn Scroll · Ctrl+C Quit"
     } else {
-        " Click to choose · PgDn Scroll · F1 Help · Ctrl+C Quit"
+        " Click to choose · F2 Updates · F1 Help · Ctrl+C Quit"
     };
     frame.render_widget(
         Paragraph::new(vec![

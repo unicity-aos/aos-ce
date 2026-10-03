@@ -15,6 +15,13 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Added
+
+- Add a shared software-update inventory to Command Center and `aos console`,
+  with signed-channel checks, explicit candidate-bound AOS/Oracle installation,
+  per-item failures, and honest activation status. Principal-scoped capsule
+  discovery keeps distribution-managed capsules out of independent updates.
+
 ### Changed
 
 - Treat Finder/FSKit mounting as optional on Darwin. Product install no
