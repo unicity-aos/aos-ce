@@ -403,6 +403,7 @@ HOME="$darwin_home" \
 AOS_TEST_FIXTURE="$darwin_fixture" \
 AOS_TEST_UNAME_S=Darwin \
 AOS_TEST_UNAME_M=arm64 \
+AOS_TEST_MACOS_VERSION=26.0 \
 AOS_TEST_FSKIT_LOG="$work/fskit-calls" \
 AOS_TEST_OPEN="$fake_bin/open" \
 AOS_TEST_OPEN_LOG="$work/command-center-open" \
@@ -638,9 +639,9 @@ test ! -e "$work/AOS-compat.app/Contents/MacOS/aos-tray"
 
 # Build a second package through the real composer with an isolated
 # compatibility overlay.  The checked-in production contract above remains the
-# historical control; this fixture exercises the versioned 2026.9.3 GNU
+# historical control; this fixture exercises the versioned 2026.9.5 GNU
 # membership that requires the FUSE provider.
-fuse_repo="$work/aos-2026.9.3-contract"
+fuse_repo="$work/aos-2026.9.5-contract"
 mkdir -p \
   "$fuse_repo/scripts" \
   "$fuse_repo/crates/unicity-aos-bootstrap" \
@@ -665,12 +666,12 @@ import sys
 runtime_path, distro_path = map(pathlib.Path, sys.argv[1:])
 runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
 replacements = {
-    "version": 'version = "2026.9.3"',
-    "tag": 'tag = "v2026.9.3"',
-    "version-requirement": 'version-requirement = ">=2026.9.3"',
-    "release-workflow-identity": 'release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.3"',
+    "version": 'version = "2026.9.5"',
+    "tag": 'tag = "v2026.9.5"',
+    "version-requirement": 'version-requirement = ">=2026.9.5"',
+    "release-workflow-identity": 'release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.5"',
     "source-commit": 'source-commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"',
-    "release-metadata-asset": 'release-metadata-asset = "astrid-2026.9.3-release.toml"',
+    "release-metadata-asset": 'release-metadata-asset = "astrid-2026.9.5-release.toml"',
     "release-metadata-blake3": 'release-metadata-blake3 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"',
 }
 in_runtime = False
@@ -687,14 +688,14 @@ for index, line in enumerate(runtime_lines):
 runtime_path.write_text("\n".join(runtime_lines) + "\n", encoding="utf-8")
 distro_text = distro_path.read_text(encoding="utf-8")
 distro_path.write_text(
-    distro_text.replace('astrid-version = "=0.10.4"', 'astrid-version = "=2026.9.3"'),
+    distro_text.replace('astrid-version = "=0.10.4"', 'astrid-version = "=2026.9.5"'),
     encoding="utf-8",
 )
 PY
 
-fuse_runtime_root="$work/astrid-2026.9.3-x86_64-unknown-linux-gnu"
-fuse_runtime_archive="$work/runtime-2026.9.3.tar.gz"
-fuse_output="$work/output-2026.9.3"
+fuse_runtime_root="$work/astrid-2026.9.5-x86_64-unknown-linux-gnu"
+fuse_runtime_archive="$work/runtime-2026.9.5.tar.gz"
+fuse_output="$work/output-2026.9.5"
 mkdir -p "$fuse_runtime_root" "$fuse_output"
 for binary in \
   astrid astrid-daemon astrid-build astrid-emit \
@@ -733,12 +734,12 @@ release-workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workf
 
 [runtime]
 repository = "astrid-runtime/astrid"
-version = "2026.9.3"
-tag = "v2026.9.3"
-release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.3"
+version = "2026.9.5"
+tag = "v2026.9.5"
+release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.5"
 release-metadata-available = true
 source-commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-release-metadata-asset = "astrid-2026.9.3-release.toml"
+release-metadata-asset = "astrid-2026.9.5-release.toml"
 release-metadata-blake3 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
 [contracts]
