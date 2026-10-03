@@ -49,6 +49,11 @@ be true before a tag can publish. The latter is approved only after the exact
 candidate preserves a frozen standalone-home clone and boots with freshly
 generated runtime coordination state.
 
+Release builds also qualify the exact pinned Astrid source for recovery after
+interrupted capsule calls on Linux and macOS. See
+[runtime recovery qualification](release/RUNTIME-RECOVERY.md) for the signed
+release dependency and final artifact rehearsals.
+
 ## Command boundary
 
 AOS owns its product roots, including `init`, `status`, `migrate`, `update`,

@@ -104,6 +104,7 @@ jobs:
       - run: python3 scripts/test_channel_publication.py
       - run: python3 scripts/test_release_publication.py
       - run: python3 scripts/test_runtime_command_surface.py
+      - run: python3 scripts/test_runtime_recovery.py
       - run: bash scripts/test-pinned-runtime-command-surface.sh
       - run: bash scripts/test-channel-workflow-contract.sh
       - run: bash scripts/test-rehearsal-sign-workflow-contract.sh

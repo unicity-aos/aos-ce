@@ -367,9 +367,9 @@ assert manifest["verifier"] == {
 }
 PY
 
-# Rehearsal runtime 2026.9.3 has an explicit GNU FUSE provider contract while
+# Rehearsal runtime 2026.9.5 has an explicit GNU FUSE provider contract while
 # the pinned stable GNU archive above includes its FUSE provider.
-versioned_repo="$work/aos-2026.9.3-contract"
+versioned_repo="$work/aos-2026.9.5-contract"
 mkdir -p \
   "$versioned_repo/scripts" \
   "$versioned_repo/crates/unicity-aos-bootstrap" \
@@ -394,9 +394,9 @@ import sys
 runtime_path, distro_path = map(pathlib.Path, sys.argv[1:])
 runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
 replacements = {
-    "version": 'version = "2026.9.3"',
-    "tag": 'tag = "rehearsal-only-2026.9.3"',
-    "version-requirement": 'version-requirement = ">=2026.9.3"',
+    "version": 'version = "2026.9.5"',
+    "tag": 'tag = "rehearsal-only-2026.9.5"',
+    "version-requirement": 'version-requirement = ">=2026.9.5"',
     "release-workflow-identity": 'release-workflow-identity = "rehearsal-only:test"',
 }
 in_runtime = False
@@ -413,14 +413,14 @@ for index, line in enumerate(runtime_lines):
 runtime_path.write_text("\n".join(runtime_lines) + "\n", encoding="utf-8")
 distro_text = distro_path.read_text(encoding="utf-8")
 distro_path.write_text(
-    distro_text.replace('astrid-version = "=0.10.4"', 'astrid-version = "=2026.9.3"'),
+    distro_text.replace('astrid-version = "=0.10.4"', 'astrid-version = "=2026.9.5"'),
     encoding="utf-8",
 )
 PY
 
-versioned_runtime_root="$work/astrid-2026.9.3-$target"
-versioned_runtime_archive="$work/runtime-2026.9.3.tar.gz"
-versioned_output="$work/output-2026.9.3"
+versioned_runtime_root="$work/astrid-2026.9.5-$target"
+versioned_runtime_archive="$work/runtime-2026.9.5.tar.gz"
+versioned_output="$work/output-2026.9.5"
 mkdir -p "$versioned_runtime_root" "$versioned_output"
 for binary in astrid astrid-daemon astrid-build astrid-emit astrid-storage-provider-fuse; do
   printf '#!/bin/sh\nexit 0\n' > "$versioned_runtime_root/$binary"
@@ -454,7 +454,7 @@ import sys
 manifest_path, provider_path = map(pathlib.Path, sys.argv[1:])
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 provider = "runtime/bin/astrid-storage-provider-fuse"
-assert manifest["runtime"]["version"] == "2026.9.3"
+assert manifest["runtime"]["version"] == "2026.9.5"
 assert manifest["executables"] == [
     "bin/aos",
     "runtime/bin/astrid",
@@ -474,21 +474,21 @@ assert record == {
 PY
 
 versioned_runtime_name=$(basename "$versioned_runtime_root")
-missing_versioned_root="$work/missing-2026.9.3-fuse/$versioned_runtime_name"
-mkdir -p "$missing_versioned_root" "$work/missing-2026.9.3-output"
+missing_versioned_root="$work/missing-2026.9.5-fuse/$versioned_runtime_name"
+mkdir -p "$missing_versioned_root" "$work/missing-2026.9.5-output"
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
   cp "$versioned_runtime_root/$binary" "$missing_versioned_root/$binary"
 done
-COPYFILE_DISABLE=1 tar -czf "$work/missing-2026.9.3-runtime.tar.gz" \
-  -C "$work/missing-2026.9.3-fuse" "$(basename "$versioned_runtime_root")"
+COPYFILE_DISABLE=1 tar -czf "$work/missing-2026.9.5-runtime.tar.gz" \
+  -C "$work/missing-2026.9.5-fuse" "$(basename "$versioned_runtime_root")"
 if bash "$versioned_repo/scripts/package-release.sh" \
   "$target" \
   "$work/aos" \
-  "$work/missing-2026.9.3-runtime.tar.gz" \
+  "$work/missing-2026.9.5-runtime.tar.gz" \
   0000000000000000000000000000000000000000000000000000000000000000 \
   "$work/capsules" \
-  "$work/missing-2026.9.3-output" >/dev/null 2>&1; then
-  echo "2026.9.3 GNU package accepted a runtime without the FUSE provider" >&2
+  "$work/missing-2026.9.5-output" >/dev/null 2>&1; then
+  echo "2026.9.5 GNU package accepted a runtime without the FUSE provider" >&2
   exit 1
 fi
 
