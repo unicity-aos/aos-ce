@@ -53,8 +53,8 @@ not conflate a per-turn response event with session termination:
   `delta`;
 - Codex and Claude map only their explicit `session_end` event to canonical
   `session_end`; and
-- Grok currently maps `stop` to canonical `session_end` because its installed
-  hook contract does not expose a distinct verified termination event.
+- Grok also maps `stop` to `message_sent`; only explicit `session_end` retires
+  its route.
 
 Adapter responses preserve both names: `event` is the source frontend event,
 while `canonical_hook` is the semantic classification used by authenticated
@@ -66,11 +66,25 @@ These hooks expose the submitted user prompt and rendered assistant text, not
 the frontend's complete provider-bound prompt with hidden system, developer,
 tool, or harness context.
 
-`pre_tool_use` and `permission_request` are also observations on the current
-Oracle relay because its outer response schema can return context only. Binding
-native-tool denial stays on `astrid-gate` plus the broker policy responder,
-which has a host-specific deny response. Treating an unrepresentable generic
-reply as binding would be fail-open theater.
+### Oracle policy decisions
+
+The Oracle relay preserves a neutral decision for binding events. `aos hook
+--format json` returns schema version, source event, decision and optional
+context; its default context format remains available. Oracle, not the AOS CLI,
+renders host-native responses and handles unsupported host decision types.
+
+The principal-scoped `AOS_ORACLE_REQUIRED_HOOK_SOURCES` configuration is a JSON
+list of `policy-name=source-uuid` revisions. Later revisions replace only the
+same named policy; `policy-name=-` unregisters it. Required replies must come
+from the configured kernel-stamped source and verified invoking principal on
+the exact correlation topic. Missing, malformed or lost required replies deny.
+A denial wins over an ask, and an ask wins over no objection. Optional
+same-principal context remains collected for a 25ms quiescence window after
+quorum, bounded by the original one-second collection deadline.
+
+This is distinct from the Astrid-native lifecycle collection described below.
+It also does not replace administrator-protected service custody: Oracle's
+protected adapter must preserve that deployment's service/principal pins.
 
 ### Additional context
 

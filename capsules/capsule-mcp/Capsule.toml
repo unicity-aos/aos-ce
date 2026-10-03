@@ -37,6 +37,7 @@ kv = []
 # evadable) — the robust shapes are allowlist-style eq/prefix. See
 # `crate::policy`.
 [env]
+AOS_ORACLE_ADAPTER_SOURCE_ID = { type = "text", default = "", request = "Installed Oracle adapter source UUID permitted to return native policy decisions" }
 policy_rules = { type = "string", default = "", request = "Per-principal policy rules as a JSON array (leave blank for none); see aos-mcp policy docs" }
 
 # aos-mcp describes the tool surface the host agent sees by querying the tool
