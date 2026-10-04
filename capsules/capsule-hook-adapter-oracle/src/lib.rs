@@ -325,6 +325,7 @@ fn canonical_request(
     event: &OracleHookEvent,
     mapping: HookMapping,
 ) -> Result<HookEventRequest, SysError> {
+    let normalized = normalized_payload(&event.payload)?;
     let payload = CanonicalOraclePayload {
         principal_id: &event.principal_id,
         host: &event.host,
@@ -332,7 +333,7 @@ fn canonical_request(
         source_event: &event.event,
         turn_id: event.turn_id.as_deref(),
         workspace_id: event.workspace_id.as_deref(),
-        payload: &event.payload,
+        payload: &normalized,
     };
     let request = HookEventRequest {
         hook: mapping.hook.to_owned(),
@@ -346,6 +347,37 @@ fn canonical_request(
         ));
     }
     Ok(request)
+}
+
+/// Keep native fields for compatibility, adding consistent names for consumers.
+/// Conflicting aliases are ambiguous policy input, never a precedence rule.
+fn normalized_payload(payload: &serde_json::Value) -> Result<serde_json::Value, SysError> {
+    let mut normalized = payload.clone();
+    let object = normalized
+        .as_object_mut()
+        .ok_or_else(|| SysError::HostError("host hook payload must be an object".to_owned()))?;
+    for (canonical, native) in [
+        ("tool_name", "toolName"),
+        ("tool_input", "toolInput"),
+        ("tool_use_id", "toolUseId"),
+        ("tool_response", "toolResponse"),
+        ("permission_mode", "permissionMode"),
+        ("tool_input_truncated", "toolInputTruncated"),
+        ("workspace_root", "workspaceRoot"),
+    ] {
+        if let Some(value) = object.get(native).cloned() {
+            if object
+                .get(canonical)
+                .is_some_and(|existing| existing != &value)
+            {
+                return Err(SysError::HostError(format!(
+                    "conflicting host hook fields: {canonical}/{native}"
+                )));
+            }
+            object.insert(canonical.to_owned(), value);
+        }
+    }
+    Ok(normalized)
 }
 
 fn dispatch_oracle_hook(
@@ -561,6 +593,53 @@ mod tests {
             );
         }
         assert_eq!(Frontend::Grok.mapping("permission_request"), None);
+    }
+
+    #[test]
+    fn one_pretool_consumer_receives_identical_fields_from_every_frontend() {
+        let fields = serde_json::json!({
+            "tool_name": "Bash", "tool_input": {"command": "printf hello"},
+            "tool_use_id": "call-one"
+        });
+        for host in [Frontend::Codex, Frontend::Claude, Frontend::Grok] {
+            let mut event = host_event(host.name());
+            event.event = "pre_tool_use".to_owned();
+            event.payload = if host == Frontend::Grok {
+                serde_json::json!({
+                    "toolName": "Bash", "toolInput": {"command": "printf hello"},
+                    "toolUseId": "call-one"
+                })
+            } else {
+                fields.clone()
+            };
+            let request = canonical_request(&event, host.mapping(&event.event).unwrap()).unwrap();
+            assert_eq!(request.hook, "before_tool_call");
+            assert_eq!(
+                request.correlation_id.as_deref(),
+                Some(event.correlation_id.as_str())
+            );
+            let value: serde_json::Value = serde_json::from_str(&request.payload).unwrap();
+            for key in ["tool_name", "tool_input", "tool_use_id"] {
+                assert_eq!(value["payload"][key], fields[key]);
+            }
+            assert_eq!(value["principal_id"], event.principal_id);
+            assert_eq!(value["session_id"], event.session_id);
+        }
+    }
+
+    #[test]
+    fn normalization_preserves_extensions_and_rejects_conflicting_aliases() {
+        let payload = serde_json::json!({
+            "toolName": "Bash", "tool_name": "Bash", "extension": {"custom": true}
+        });
+        assert_eq!(normalized_payload(&payload).unwrap(), payload);
+        assert!(
+            normalized_payload(&serde_json::json!({
+                "toolName": "Bash", "tool_name": "Read"
+            }))
+            .is_err()
+        );
+        assert!(normalized_payload(&serde_json::json!(["Bash"])).is_err());
     }
 
     #[test]
