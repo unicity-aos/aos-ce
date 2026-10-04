@@ -12,6 +12,7 @@ type = "executable"
 
 [env]
 AOS_ORACLE_REQUIRED_HOOK_SOURCES = { type = "array", default = "[]", request = "Required native Oracle policies as capsule-name=source-UUID registrations; later revisions replace the same named policy" }
+AOS_ORACLE_REQUIRED_HOOK_POLICIES = { type = "string", default = "{}", request = "JSON object mapping canonical hook names to arrays of capsule-name=source-UUID policy registrations" }
 
 [publish]
 "hook.v1.event.*" = { wit = "@unicity-astrid/wit/hook/hook-event-request" }
@@ -24,6 +25,5 @@ AOS_ORACLE_REQUIRED_HOOK_SOURCES = { type = "array", default = "[]", request = "
 "oracle.v1.hook.validated.claude" = { wit = "opaque", handler = "on_claude_hook" }
 "oracle.v1.hook.validated.grok" = { wit = "opaque", handler = "on_grok_hook" }
 
-# Dynamic, correlation-scoped response collection for prompt-context hooks.
-"hook.v1.response.message_received.*" = { wit = "opaque" }
-"hook.v1.response.before_tool_call.*" = { wit = "opaque" }
+# Dynamic, correlation-scoped collection; source and principal are validated.
+"hook.v1.response.*" = { wit = "opaque" }

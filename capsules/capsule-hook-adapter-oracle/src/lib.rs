@@ -55,6 +55,8 @@ impl Frontend {
 enum ResponseMode {
     /// Publish the canonical event but do not solicit a reply.
     Observe,
+    /// Collect optional context without turning an observation into authority.
+    Context,
     /// Require a verdict from every configured policy source before returning.
     Binding,
 }
@@ -74,14 +76,21 @@ const fn observe(hook: &'static str) -> HookMapping {
 
 fn common_mapping(event: &str) -> Option<HookMapping> {
     match event {
-        "session_start" => Some(observe("session_start")),
+        "session_start" => Some(context("session_start")),
         "session_end" => Some(observe("session_end")),
-        "post_tool_use" => Some(observe("after_tool_call")),
+        "post_tool_use" => Some(binding("after_tool_call")),
         "pre_compact" => Some(observe("on_compaction_started")),
         "post_compact" => Some(observe("on_compaction_completed")),
-        "subagent_start" => Some(observe("subagent_start")),
-        "subagent_stop" => Some(observe("subagent_stop")),
+        "subagent_start" => Some(context("subagent_start")),
+        "subagent_stop" => Some(binding("subagent_stop")),
         _ => None,
+    }
+}
+
+const fn context(hook: &'static str) -> HookMapping {
+    HookMapping {
+        hook,
+        response: ResponseMode::Context,
     }
 }
 
@@ -97,7 +106,9 @@ fn codex_mapping(event: &str) -> Option<HookMapping> {
         "pre_tool_use" | "permission_request" => Some(binding("before_tool_call")),
         "user_prompt_submit" => Some(binding("message_received")),
         // Codex Stop is per-turn and carries `last_assistant_message`.
-        "stop" => Some(observe("message_sent")),
+        "stop" => Some(binding("message_sent")),
+        "interrupt" => Some(observe("message_cancelled")),
+        "pre_compact" => Some(binding("on_compaction_started")),
         _ => common_mapping(event),
     }
 }
@@ -107,7 +118,29 @@ fn claude_mapping(event: &str) -> Option<HookMapping> {
         "pre_tool_use" | "permission_request" => Some(binding("before_tool_call")),
         "user_prompt_submit" => Some(binding("message_received")),
         // Claude Stop is per-turn and carries `last_assistant_message`.
-        "stop" => Some(observe("message_sent")),
+        "stop" => Some(binding("message_sent")),
+        "setup" => Some(observe("session_setup")),
+        "user_prompt_expansion" => Some(binding("message_expanded")),
+        "permission_denied" => Some(observe("permission_denied")),
+        "post_tool_use_failure" => Some(binding("after_tool_call_failed")),
+        "post_tool_batch" => Some(binding("after_tool_batch")),
+        "notification" => Some(observe("notification")),
+        "task_created" => Some(binding("task_created")),
+        "task_completed" => Some(binding("task_completed")),
+        "teammate_idle" => Some(binding("teammate_idle")),
+        "stop_failure" => Some(observe("message_failed")),
+        "instructions_loaded" => Some(observe("instructions_loaded")),
+        "config_change" => Some(binding("config_changed")),
+        "cwd_changed" => Some(observe("cwd_changed")),
+        "directory_added" => Some(observe("directory_added")),
+        "file_changed" => Some(observe("file_changed")),
+        "worktree_create" => Some(observe("worktree_create_requested")),
+        "worktree_remove" => Some(observe("worktree_removed")),
+        "pre_model_switch" => Some(binding("before_model_switch")),
+        "post_model_switch" => Some(context("after_model_switch")),
+        "elicitation" => Some(binding("elicitation_requested")),
+        "elicitation_result" => Some(binding("elicitation_resolved")),
+        "pre_compact" => Some(binding("on_compaction_started")),
         // Claude MessageDisplay carries response text in `delta` while it is
         // rendered. It is observation-only on this relay.
         "message_display" => Some(observe("message_displayed")),
@@ -123,7 +156,13 @@ fn grok_mapping(event: &str) -> Option<HookMapping> {
         "permission_request" => None,
         // Grok Stop completes a turn, not the session. Retiring the route here
         // loses authentication for subsequent events in that same session.
-        "stop" => Some(observe("message_sent")),
+        "stop" => Some(binding("message_sent")),
+        "post_tool_use" => Some(context("after_tool_call")),
+        "post_tool_use_failure" => Some(context("after_tool_call_failed")),
+        "permission_denied" => Some(observe("permission_denied")),
+        "stop_failure" => Some(observe("message_failed")),
+        "stop_cancelled" => Some(observe("message_cancelled")),
+        "notification" => Some(observe("notification")),
         _ => common_mapping(event),
     }
 }
@@ -325,7 +364,10 @@ fn canonical_request(
     event: &OracleHookEvent,
     mapping: HookMapping,
 ) -> Result<HookEventRequest, SysError> {
-    let normalized = normalized_payload(&event.payload)?;
+    let mut normalized = normalized_payload(&event.payload)?;
+    if event.event == "elicitation_result" && normalized.get("content").is_some() {
+        normalized["content"] = serde_json::json!({"redacted": true});
+    }
     let payload = CanonicalOraclePayload {
         principal_id: &event.principal_id,
         host: &event.host,
@@ -394,18 +436,41 @@ fn dispatch_oracle_hook(
     let reply_topic = format!("hook.v1.response.{}.{}", mapping.hook, event.correlation_id);
     let subscription = ipc::subscribe(&reply_topic)?;
     ipc::publish_json(&event_topic, &request)?;
-    collect_binding_response(&subscription, &reply_topic, &event.principal_id)
+    if mapping.response == ResponseMode::Context {
+        return collect_additional_context(&subscription, &reply_topic, &event.principal_id).map(
+            |context| {
+                (
+                    context,
+                    matches!(event.event.as_str(), "stop" | "subagent_stop")
+                        .then(Decision::default),
+                )
+            },
+        );
+    }
+    collect_binding_response(
+        &subscription,
+        &reply_topic,
+        &event.principal_id,
+        mapping.hook,
+    )
 }
 
 fn collect_binding_response(
     subscription: &ipc::Subscription,
     reply_topic: &str,
     principal: &str,
+    hook: &str,
 ) -> Result<(Option<String>, Option<Decision>), SysError> {
     // Read the invocation's principal overlay, never a process-global cache.
     let config = match env::var("AOS_ORACLE_REQUIRED_HOOK_SOURCES") {
         Ok(config) => config,
         Err(_) => return Ok((None, Some(Decision::unavailable()))),
+    };
+    // Legacy registrations protect prompt/pre-tool only. Expanding the event
+    // inventory must not require those responders to answer unrelated hooks.
+    let scoped = env::var("AOS_ORACLE_REQUIRED_HOOK_POLICIES").unwrap_or_else(|_| "{}".into());
+    let Ok(config) = decision::registrations_for_hook(hook, &config, &scoped) else {
+        return Ok((None, Some(Decision::unavailable())));
     };
     let Ok(mut replies) = RequiredReplies::parse(&config) else {
         return Ok((None, Some(Decision::unavailable())));
@@ -472,6 +537,7 @@ fn handle_oracle_hook(expected: Frontend, payload: serde_json::Value) -> Result<
             return Ok(());
         }
     };
+    let mapping = lifecycle_mapping(expected, &event, mapping);
     let caller = runtime::caller()?;
     if caller.principal.as_deref() != Some(event.principal_id.as_str()) {
         log::warn(format!(
@@ -498,6 +564,42 @@ fn handle_oracle_hook(expected: Frontend, payload: serde_json::Value) -> Result<
             decision,
         },
     )
+}
+
+fn lifecycle_mapping(
+    expected: Frontend,
+    event: &OracleHookEvent,
+    mut mapping: HookMapping,
+) -> HookMapping {
+    // Stop hooks can ask the model to continue, which invokes Stop again. The
+    // client's explicit recursion marker makes that second event observational.
+    // This does not affect pre-tool decisions or authorization.
+    if matches!(event.event.as_str(), "stop" | "subagent_stop")
+        && (event
+            .payload
+            .get("stop_hook_active")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            || event
+                .payload
+                .get("stopHookActive")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true))
+    {
+        mapping.response = ResponseMode::Context;
+    }
+    // A child's teardown must not retire the parent's shared host route.
+    if expected == Frontend::Grok
+        && event.event == "session_end"
+        && event
+            .payload
+            .get("subagentType")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    {
+        mapping = observe("subagent_session_end");
+    }
+    mapping
 }
 
 /// Oracle hook protocol adapter.
@@ -528,6 +630,27 @@ impl OracleHookAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_native_codec_event_has_matching_canonical_response_semantics() {
+        // Generated from Oracles' shipped codec, not a second handwritten map.
+        let inventory: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/native-hook-inventory.json")).unwrap();
+        for host in [Frontend::Claude, Frontend::Codex, Frontend::Grok] {
+            for (event, entry) in inventory[host.name()].as_object().unwrap() {
+                let mode = entry[2].as_str().unwrap();
+                let expected = match mode {
+                    "observe" | "worktree" => ResponseMode::Observe,
+                    "context" => ResponseMode::Context,
+                    _ => ResponseMode::Binding,
+                };
+                let mapping = host.mapping(event).unwrap();
+                assert_eq!(mapping.hook, entry[1].as_str().unwrap(), "{host:?}/{event}");
+                assert_eq!(mapping.response, expected, "{host:?}/{event}");
+            }
+            assert_eq!(host.mapping("invented_event"), None);
+        }
+    }
 
     fn host_event(host: &str) -> OracleHookEvent {
         let route_id = "a".repeat(64);
@@ -646,11 +769,11 @@ mod tests {
     fn codex_and_claude_stop_are_response_events_not_session_termination() {
         assert_eq!(
             Frontend::Codex.mapping("stop"),
-            Some(observe("message_sent"))
+            Some(binding("message_sent"))
         );
         assert_eq!(
             Frontend::Claude.mapping("stop"),
-            Some(observe("message_sent"))
+            Some(binding("message_sent"))
         );
         assert_eq!(
             Frontend::Codex.mapping("session_end"),
@@ -666,7 +789,7 @@ mod tests {
     fn grok_stop_preserves_the_session_route() {
         assert_eq!(
             Frontend::Grok.mapping("stop"),
-            Some(observe("message_sent"))
+            Some(binding("message_sent"))
         );
         assert_eq!(
             Frontend::Grok.mapping("session_end"),
@@ -772,5 +895,40 @@ mod tests {
         assert!(request.correlation_id.is_none());
         let request = canonical_request(&event, binding("message_received")).unwrap();
         assert_eq!(request.correlation_id, Some(event.correlation_id));
+    }
+
+    #[test]
+    fn repeated_stop_is_context_only_and_child_teardown_keeps_parent_route() {
+        for host in [Frontend::Codex, Frontend::Claude, Frontend::Grok] {
+            let mut event = host_event(host.name());
+            event.event = "stop".into();
+            event.payload = serde_json::json!({"stop_hook_active": true});
+            assert_eq!(
+                lifecycle_mapping(host, &event, host.mapping("stop").unwrap()),
+                context("message_sent")
+            );
+        }
+        let mut child = host_event("grok");
+        child.event = "session_end".into();
+        child.payload = serde_json::json!({"subagentType": "explore"});
+        assert_eq!(
+            lifecycle_mapping(Frontend::Grok, &child, grok_mapping("session_end").unwrap()),
+            observe("subagent_session_end")
+        );
+    }
+
+    #[test]
+    fn elicitation_values_are_not_published_to_generic_subscribers() {
+        let mut event = host_event("claude");
+        event.event = "elicitation_result".into();
+        event.payload = serde_json::json!({"mcp_server_name": "test", "action": "accept", "content": {"password": "not-on-bus"}});
+        let request = canonical_request(&event, claude_mapping(&event.event).unwrap()).unwrap();
+        assert!(!request.payload.contains("not-on-bus"));
+        let value: serde_json::Value = serde_json::from_str(&request.payload).unwrap();
+        assert_eq!(
+            value["payload"]["content"],
+            serde_json::json!({"redacted": true})
+        );
+        assert_eq!(value["payload"]["action"], "accept");
     }
 }

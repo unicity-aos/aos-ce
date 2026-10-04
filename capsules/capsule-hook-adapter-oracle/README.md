@@ -5,10 +5,9 @@ the canonical AOS `hook.v1.event.*` protocol.
 
 The adapter owns protocol translation only. It does not own downstream hook
 policy and it does not turn observation events into authorization decisions.
-`user_prompt_submit`, `pre_tool_use`, and supported `permission_request` events
-collect authenticated, bounded policy replies. Required responders are named
-by `AOS_ORACLE_REQUIRED_HOOK_SOURCES`; missing or malformed required replies are
-not approval. Oracle translates the neutral verdict to each client's format.
+Events with native decision control collect authenticated, bounded policy
+replies. Missing or malformed required replies are not approval. Oracle
+translates the neutral verdict to each client's format.
 
 ## One handler for all clients
 
@@ -44,8 +43,47 @@ does not retire its session route. Claude
 `message_displayed`. Adapter responses preserve the source `event` separately
 from this `canonical_hook`, so authenticated route cleanup follows canonical
 lifecycle semantics without erasing frontend provenance. These response events
-are observational on this relay: downstream policy may inspect and report
-them, but cannot claim to retract text that the frontend has already produced.
+cannot retract text that the frontend has already produced. Where supported,
+Stop and post-tool decisions supply feedback or request continuation, not an
+undo of a completed operation. A repeated Stop with the client's
+`stop_hook_active` marker collects context only, preventing a continuation loop.
+
+## Event-specific policy requirements
+
+`AOS_ORACLE_REQUIRED_HOOK_SOURCES` retains its existing prompt/pre-tool scope
+(including PermissionRequest). Expanding the event inventory does not force
+existing policies to answer events they never subscribed to.
+
+For additional decision events, set `AOS_ORACLE_REQUIRED_HOOK_POLICIES` to a
+JSON object mapping canonical hook names to registration arrays, for example:
+
+```json
+{"config_changed":["configuration-policy=11111111-1111-4111-8111-111111111111"]}
+```
+
+These are installed capsule source UUIDs, not caller-supplied names. The same
+principal/source validation, registration revisions, bounded wait, and
+fail-closed behavior apply. Scoped configuration cannot remove an existing
+legacy prompt/pre-tool requirement. No required policy means no objection;
+optional subscribers do not gain veto authority by replying.
+
+Common events include session start/end, prompt, pre/post tool use, subagent
+start/stop, turn stop, and pre/post compaction. Claude additionally carries
+setup, prompt expansion, failed/batched tools, permission denial, notification,
+display, tasks, idle teammates, instruction loading, configuration/directory/
+file changes, model switching, and elicitation. Codex adds Interrupt; Grok
+adds tool failure, permission denial, notification, failure, and cancellation.
+The Oracle codec inventory defines each client's supported registrations and
+native response semantics; nonexistent equivalents are not synthesized.
+
+Grok child SessionEnd publishes `subagent_session_end` and does not retire its
+parent route. ElicitationResult preserves metadata but redacts `content` before
+canonical publication; subscribers must not receive entered secrets. Declining
+elicitation is supported; supplying or approving a secret is not automated.
+
+Claude worktree creation/removal are replacement operations, not listeners.
+Default Oracle registrations preserve native ownership of both. FileChanged
+observes paths already watched by Claude; it does not start a wildcard watcher.
 
 Canonical hook subscribers should normally omit `priority`, preserving
 independent fan-out. See [`docs/hooks.md`](../../docs/hooks.md) for the complete

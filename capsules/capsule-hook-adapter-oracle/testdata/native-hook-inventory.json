@@ -1,0 +1,308 @@
+{
+  "claude": {
+    "config_change": [
+      "ConfigChange",
+      "config_changed",
+      "block"
+    ],
+    "cwd_changed": [
+      "CwdChanged",
+      "cwd_changed",
+      "observe"
+    ],
+    "directory_added": [
+      "DirectoryAdded",
+      "directory_added",
+      "observe"
+    ],
+    "elicitation": [
+      "Elicitation",
+      "elicitation_requested",
+      "elicitation"
+    ],
+    "elicitation_result": [
+      "ElicitationResult",
+      "elicitation_resolved",
+      "elicitation"
+    ],
+    "file_changed": [
+      "FileChanged",
+      "file_changed",
+      "observe"
+    ],
+    "instructions_loaded": [
+      "InstructionsLoaded",
+      "instructions_loaded",
+      "observe"
+    ],
+    "message_display": [
+      "MessageDisplay",
+      "message_displayed",
+      "observe"
+    ],
+    "notification": [
+      "Notification",
+      "notification",
+      "observe"
+    ],
+    "permission_denied": [
+      "PermissionDenied",
+      "permission_denied",
+      "observe"
+    ],
+    "permission_request": [
+      "PermissionRequest",
+      "before_tool_call",
+      "permission"
+    ],
+    "post_compact": [
+      "PostCompact",
+      "on_compaction_completed",
+      "observe"
+    ],
+    "post_model_switch": [
+      "PostModelSwitch",
+      "after_model_switch",
+      "context"
+    ],
+    "post_tool_batch": [
+      "PostToolBatch",
+      "after_tool_batch",
+      "block"
+    ],
+    "post_tool_use": [
+      "PostToolUse",
+      "after_tool_call",
+      "block"
+    ],
+    "post_tool_use_failure": [
+      "PostToolUseFailure",
+      "after_tool_call_failed",
+      "block"
+    ],
+    "pre_compact": [
+      "PreCompact",
+      "on_compaction_started",
+      "block"
+    ],
+    "pre_model_switch": [
+      "PreModelSwitch",
+      "before_model_switch",
+      "block"
+    ],
+    "pre_tool_use": [
+      "PreToolUse",
+      "before_tool_call",
+      "pretool"
+    ],
+    "session_end": [
+      "SessionEnd",
+      "session_end",
+      "observe"
+    ],
+    "session_start": [
+      "SessionStart",
+      "session_start",
+      "context"
+    ],
+    "setup": [
+      "Setup",
+      "session_setup",
+      "observe"
+    ],
+    "stop": [
+      "Stop",
+      "message_sent",
+      "block"
+    ],
+    "stop_failure": [
+      "StopFailure",
+      "message_failed",
+      "observe"
+    ],
+    "subagent_start": [
+      "SubagentStart",
+      "subagent_start",
+      "context"
+    ],
+    "subagent_stop": [
+      "SubagentStop",
+      "subagent_stop",
+      "block"
+    ],
+    "task_completed": [
+      "TaskCompleted",
+      "task_completed",
+      "exit2"
+    ],
+    "task_created": [
+      "TaskCreated",
+      "task_created",
+      "block"
+    ],
+    "teammate_idle": [
+      "TeammateIdle",
+      "teammate_idle",
+      "exit2"
+    ],
+    "user_prompt_expansion": [
+      "UserPromptExpansion",
+      "message_expanded",
+      "block"
+    ],
+    "user_prompt_submit": [
+      "UserPromptSubmit",
+      "message_received",
+      "block"
+    ],
+    "worktree_create": [
+      "WorktreeCreate",
+      "worktree_create_requested",
+      "worktree"
+    ],
+    "worktree_remove": [
+      "WorktreeRemove",
+      "worktree_removed",
+      "worktree"
+    ]
+  },
+  "codex": {
+    "interrupt": [
+      "Interrupt",
+      "message_cancelled",
+      "observe"
+    ],
+    "permission_request": [
+      "PermissionRequest",
+      "before_tool_call",
+      "permission"
+    ],
+    "post_compact": [
+      "PostCompact",
+      "on_compaction_completed",
+      "observe"
+    ],
+    "post_tool_use": [
+      "PostToolUse",
+      "after_tool_call",
+      "block"
+    ],
+    "pre_compact": [
+      "PreCompact",
+      "on_compaction_started",
+      "continue"
+    ],
+    "pre_tool_use": [
+      "PreToolUse",
+      "before_tool_call",
+      "pretool"
+    ],
+    "session_end": [
+      "SessionEnd",
+      "session_end",
+      "observe"
+    ],
+    "session_start": [
+      "SessionStart",
+      "session_start",
+      "context"
+    ],
+    "stop": [
+      "Stop",
+      "message_sent",
+      "block"
+    ],
+    "subagent_start": [
+      "SubagentStart",
+      "subagent_start",
+      "context"
+    ],
+    "subagent_stop": [
+      "SubagentStop",
+      "subagent_stop",
+      "block"
+    ],
+    "user_prompt_submit": [
+      "UserPromptSubmit",
+      "message_received",
+      "block"
+    ]
+  },
+  "grok": {
+    "notification": [
+      "Notification",
+      "notification",
+      "observe"
+    ],
+    "permission_denied": [
+      "PermissionDenied",
+      "permission_denied",
+      "observe"
+    ],
+    "post_compact": [
+      "PostCompact",
+      "on_compaction_completed",
+      "observe"
+    ],
+    "post_tool_use": [
+      "PostToolUse",
+      "after_tool_call",
+      "context"
+    ],
+    "post_tool_use_failure": [
+      "PostToolUseFailure",
+      "after_tool_call_failed",
+      "context"
+    ],
+    "pre_compact": [
+      "PreCompact",
+      "on_compaction_started",
+      "observe"
+    ],
+    "pre_tool_use": [
+      "PreToolUse",
+      "before_tool_call",
+      "pretool"
+    ],
+    "session_end": [
+      "SessionEnd",
+      "session_end",
+      "observe"
+    ],
+    "session_start": [
+      "SessionStart",
+      "session_start",
+      "context"
+    ],
+    "stop": [
+      "Stop",
+      "message_sent",
+      "block"
+    ],
+    "stop_cancelled": [
+      "StopCancelled",
+      "message_cancelled",
+      "observe"
+    ],
+    "stop_failure": [
+      "StopFailure",
+      "message_failed",
+      "observe"
+    ],
+    "subagent_start": [
+      "SubagentStart",
+      "subagent_start",
+      "context"
+    ],
+    "subagent_stop": [
+      "SubagentStop",
+      "subagent_stop",
+      "block"
+    ],
+    "user_prompt_submit": [
+      "UserPromptSubmit",
+      "message_received",
+      "block"
+    ]
+  }
+}
