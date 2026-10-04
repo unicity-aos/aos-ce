@@ -19,6 +19,7 @@
 //! - Fireworks: `https://api.fireworks.ai/inference`
 
 mod schemas;
+mod text_batch;
 
 use astrid_sdk::prelude::*;
 use astrid_sdk::types::{IpcPayload, Message, MessageContent, MessageRole, StreamEvent};
@@ -377,6 +378,8 @@ impl OpenAICompatProvider {
     fn parse_sse_stream_live(request_id: Uuid, stream: &http::HttpStream) -> Result<(), SysError> {
         let mut active_tools: Vec<(String, String)> = Vec::new();
         let mut line_buffer = String::new();
+        let mut batch = text_batch::TextBatch::default();
+        let mut publish = |event| Self::publish_stream(request_id, event);
 
         while let Some(chunk) = stream.read_chunk()? {
             let chunk_str = String::from_utf8_lossy(&chunk);
@@ -403,16 +406,27 @@ impl OpenAICompatProvider {
                     continue;
                 };
 
-                match Self::parse_sse_data(data)? {
+                let parsed = match Self::parse_sse_data(data) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        batch.flush(&mut publish)?;
+                        return Err(error);
+                    }
+                };
+                match parsed {
                     SseData::Done => {
-                        Self::publish_stream(request_id, StreamEvent::Done)?;
+                        batch.push(StreamEvent::Done, &mut publish)?;
                         return Ok(());
                     }
                     SseData::Chunk(chunk) => {
-                        Self::process_chunk(request_id, &chunk, &mut active_tools)?;
+                        Self::process_chunk(&chunk, &mut active_tools, &mut |event| {
+                            batch.push(event, &mut publish)
+                        })?;
                     }
                 }
             }
+            // Never retain display text while awaiting another network read.
+            batch.flush(&mut publish)?;
         }
 
         if line_buffer.trim().is_empty() {
@@ -445,19 +459,16 @@ impl OpenAICompatProvider {
 
     /// Process a single parsed SSE chunk, emitting the appropriate stream events.
     fn process_chunk(
-        request_id: Uuid,
         chunk: &ChatCompletionChunk,
         active_tools: &mut Vec<(String, String)>,
+        emit: &mut impl FnMut(StreamEvent) -> Result<(), SysError>,
     ) -> Result<(), SysError> {
         // Handle usage (final chunk with empty choices).
         if let Some(usage) = &chunk.usage {
-            Self::publish_stream(
-                request_id,
-                StreamEvent::Usage {
-                    input_tokens: usage.prompt_tokens,
-                    output_tokens: usage.completion_tokens,
-                },
-            )?;
+            emit(StreamEvent::Usage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+            })?;
         }
 
         let Some(choice) = chunk.choices.first() else {
@@ -468,7 +479,7 @@ impl OpenAICompatProvider {
         if let Some(ref text) = choice.delta.content
             && !text.is_empty()
         {
-            Self::publish_stream(request_id, StreamEvent::TextDelta(text.clone()))?;
+            emit(StreamEvent::TextDelta(text.clone()))?;
         }
 
         // Handle tool call deltas.
@@ -486,25 +497,19 @@ impl OpenAICompatProvider {
                 if let Some(ref func) = tc.function {
                     if let Some(ref name) = func.name {
                         active_tools[tc.index].1 = name.clone();
-                        Self::publish_stream(
-                            request_id,
-                            StreamEvent::ToolCallStart {
-                                id: active_tools[tc.index].0.clone(),
-                                name: name.clone(),
-                            },
-                        )?;
+                        emit(StreamEvent::ToolCallStart {
+                            id: active_tools[tc.index].0.clone(),
+                            name: name.clone(),
+                        })?;
                     }
 
                     if let Some(ref args) = func.arguments
                         && !args.is_empty()
                     {
-                        Self::publish_stream(
-                            request_id,
-                            StreamEvent::ToolCallDelta {
-                                id: active_tools[tc.index].0.clone(),
-                                args_delta: args.clone(),
-                            },
-                        )?;
+                        emit(StreamEvent::ToolCallDelta {
+                            id: active_tools[tc.index].0.clone(),
+                            args_delta: args.clone(),
+                        })?;
                     }
                 }
             }
@@ -516,7 +521,7 @@ impl OpenAICompatProvider {
         {
             for (id, _name) in active_tools.iter() {
                 if !id.is_empty() {
-                    Self::publish_stream(request_id, StreamEvent::ToolCallEnd { id: id.clone() })?;
+                    emit(StreamEvent::ToolCallEnd { id: id.clone() })?;
                 }
             }
             active_tools.clear();

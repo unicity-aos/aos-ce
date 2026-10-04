@@ -756,6 +756,7 @@ impl ReactLoop {
             &serde_json::json!({
                 "workspace_root": env::var("workspace_root").unwrap_or_default(),
                 "session_id": state.session_id,
+                "request_id": state.request_id.to_string(),
             }),
         )?;
 
@@ -833,6 +834,12 @@ impl ReactLoop {
             .unwrap_or(DEFAULT_SESSION_ID);
 
         let mut state = TurnState::load(session_id);
+
+        // A cancelled turn can reply after the next turn has entered the same
+        // phase. Session and phase alone cannot identify the owning turn.
+        if !state.request_id.is_nil() && !response_matches_turn(&payload, state.request_id) {
+            return Ok(());
+        }
 
         // Opportunistic timeout check on every interceptor invocation
         if Self::check_timeout_with_cleanup(&mut state)? {
@@ -920,6 +927,10 @@ impl ReactLoop {
             .unwrap_or(DEFAULT_SESSION_ID);
 
         let mut state = TurnState::load(session_id);
+
+        if !state.request_id.is_nil() && !response_matches_turn(&payload, state.request_id) {
+            return Ok(());
+        }
 
         if Self::check_timeout_with_cleanup(&mut state)? {
             return Ok(());
@@ -2120,9 +2131,43 @@ fn parse_json_array_field<T: serde::de::DeserializeOwned>(
         .unwrap_or_default()
 }
 
+/// Correlation is turn-specific; a session may contain multiple cancelled or
+/// completed generations whose replies are still in flight.
+fn response_matches_turn(payload: &serde_json::Value, request_id: Uuid) -> bool {
+    !request_id.is_nil()
+        && payload
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok())
+            == Some(request_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orchestration_replies_must_match_the_current_turn() {
+        let cancelled = Uuid::new_v4();
+        let current = Uuid::new_v4();
+        assert!(!response_matches_turn(
+            &serde_json::json!({"request_id": cancelled}),
+            current
+        ));
+        assert!(response_matches_turn(
+            &serde_json::json!({"request_id": current}),
+            current
+        ));
+        assert!(!response_matches_turn(&serde_json::json!({}), current));
+        assert!(!response_matches_turn(
+            &serde_json::json!({"request_id": "invalid"}),
+            current
+        ));
+        assert!(!response_matches_turn(
+            &serde_json::json!({"request_id": Uuid::nil()}),
+            Uuid::nil()
+        ));
+    }
 
     /// Build an `ActiveLlm` for tests without going through the registry.
     fn active(topic: &str, model: Option<&str>) -> ActiveLlm {
