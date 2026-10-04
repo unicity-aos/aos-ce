@@ -854,7 +854,7 @@ impl ReactLoop {
 
         // A cancelled turn can reply after the next turn has entered the same
         // phase. Session and phase alone cannot identify the owning turn.
-        if !state.request_id.is_nil() && !response_matches_turn(&payload, state.request_id) {
+        if orchestration_reply_is_stale(&state, &payload) {
             return Ok(());
         }
 
@@ -945,7 +945,7 @@ impl ReactLoop {
 
         let mut state = TurnState::load(session_id);
 
-        if !state.request_id.is_nil() && !response_matches_turn(&payload, state.request_id) {
+        if orchestration_reply_is_stale(&state, &payload) {
             return Ok(());
         }
 
@@ -2150,6 +2150,15 @@ fn parse_json_array_field<T: serde::de::DeserializeOwned>(
 
 /// Correlation is turn-specific; a session may contain multiple cancelled or
 /// completed generations whose replies are still in flight.
+fn orchestration_reply_is_stale(state: &TurnState, payload: &serde_json::Value) -> bool {
+    // Idle may be the previous persisted turn observed before the new state
+    // becomes visible. Let the existing bounded re-drive retry it; only an
+    // active state can authoritatively reject another generation's reply.
+    state.phase != Phase::Idle
+        && !state.request_id.is_nil()
+        && !response_matches_turn(payload, state.request_id)
+}
+
 fn response_matches_turn(payload: &serde_json::Value, request_id: Uuid) -> bool {
     !request_id.is_nil()
         && payload
@@ -2158,6 +2167,9 @@ fn response_matches_turn(payload: &serde_json::Value, request_id: Uuid) -> bool 
             .and_then(|id| Uuid::parse_str(id).ok())
             == Some(request_id)
 }
+
+#[cfg(test)]
+mod correlation_tests;
 
 #[cfg(test)]
 mod tests {
