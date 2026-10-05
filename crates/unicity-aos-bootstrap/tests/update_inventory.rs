@@ -9,6 +9,11 @@ use std::{
 
 struct Fixture(PathBuf);
 impl Fixture {
+    fn candidate_version() -> String {
+        let mut version = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        version.patch += 1;
+        version.to_string()
+    }
     fn new() -> Self {
         let home =
             std::env::temp_dir().join(format!("aos-update-journey-{}", uuid::Uuid::new_v4()));
@@ -20,7 +25,7 @@ set -eu
 case "$*" in
   *--check*)
     case "$*" in *'--channel dev'*) channel=dev;; *) channel=stable;; esac
-    printf '{"schema_version":1,"kind":"aos","installed_version":"%s","channel_version":"2026.10.0","channel":"%s","target":"test","artifact_sha256":"%s","verification":"metadata","binds_candidate_digest":true}\n' "$AOS_INSTALLED_VERSION" "$channel" "${TEST_DIGEST:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+    printf '{"schema_version":1,"kind":"aos","installed_version":"%s","channel_version":"%s","channel":"%s","target":"test","artifact_sha256":"%s","verification":"metadata","binds_candidate_digest":true}\n' "$AOS_INSTALLED_VERSION" "$TEST_CANDIDATE_VERSION" "$channel" "${TEST_DIGEST:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
     ;;
   *) printf '%s\n' "$*" "$AOS_EXPECTED_ARTIFACT_SHA256" > "$AOS_HOME/applied"; exit "${TEST_APPLY_EXIT:-0}";;
 esac
@@ -31,6 +36,7 @@ esac
         let mut command = Command::new(env!("CARGO_BIN_EXE_aos"));
         command
             .env("AOS_HOME", &self.0)
+            .env("TEST_CANDIDATE_VERSION", Self::candidate_version())
             .env_remove("UNICITY_AOS_INSTALL_METHOD");
         command
     }
@@ -72,7 +78,7 @@ fn read_check_confirm_and_apply_are_distinct() {
     let result: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
     assert_eq!(result["items"][0]["availability"], "activation_required");
     let args = fs::read_to_string(fixture.0.join("applied")).unwrap();
-    assert!(args.contains("--version 2026.10.0"));
+    assert!(args.contains(&format!("--version {}", Fixture::candidate_version())));
     assert!(args.contains(&"a".repeat(64)));
     assert!(!fixture.0.join("runtime").exists());
 }
