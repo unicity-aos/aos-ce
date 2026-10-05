@@ -687,6 +687,7 @@ test_fuse_musl_install() {
   local original_work="$work"
   local work="$work/musl-runtime-$fuse_version"
   local repo_root="$fuse_repo" fixture="$fuse_fixture"
+  local package_repo="$fuse_repo"
   local release_metadata="$fuse_release_metadata"
   local runtime_version="$fuse_version" runtime_root="$fuse_runtime_root"
   local m_target m_root m_metadata m_arch m_verifier m_failure
