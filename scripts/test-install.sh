@@ -26,6 +26,7 @@ root = pathlib.Path(sys.argv[1])
 for relative, section in (
     ("crates/unicity-aos-bootstrap/Cargo.toml", "package"),
     ("distros/community/unicity-ce/Distro.toml", "distro"),
+    ("release/runtime-compatibility.toml", "product"),
 ):
     path = root / relative
     text = path.read_text(encoding="utf-8")
@@ -33,6 +34,19 @@ for relative, section in (
     needle = f'version = "{current}"'
     assert text.count(needle) == 1, relative
     path.write_text(text.replace(needle, 'version = "2026.9.3"'), encoding="utf-8")
+path = root / "distros/community/unicity-ce/Distro.toml"
+text = path.read_text(encoding="utf-8")
+pretty_name = tomllib.loads(text)["distro"]["pretty-name"]
+version = tomllib.loads((root / "crates/unicity-aos-bootstrap/Cargo.toml").read_text())["package"]["version"]
+replacement = f"Unicity CE {version} (Genesis)"
+text = text.replace(f'pretty-name = "{pretty_name}"', f'pretty-name = "{replacement}"')
+path.write_text(text, encoding="utf-8")
+# Assert the composed fixture's identity, not only the fields we rewrote.
+crate = tomllib.loads((root / "crates/unicity-aos-bootstrap/Cargo.toml").read_text())
+distro = tomllib.loads(path.read_text())
+compatibility = tomllib.loads((root / "release/runtime-compatibility.toml").read_text())
+assert crate["package"]["version"] == distro["distro"]["version"] == compatibility["product"]["version"] == "2026.9.3"
+assert distro["distro"]["pretty-name"] == replacement
 PY
 mkdir -p "$fixture" "$fake_bin" "$work/home" "$work/capsules"
 mkdir -p "$work/home/.astrid"
