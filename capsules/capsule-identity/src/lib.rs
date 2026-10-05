@@ -116,6 +116,9 @@ pub struct BuildRequest {
     /// Session ID for correlation.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Turn generation, echoed unchanged so callers can reject delayed replies.
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 /// Response payload containing the assembled system prompt.
@@ -126,6 +129,8 @@ struct BuildResponse {
     /// Session ID echoed from the request for correlation.
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
 }
 
 /// Identity capsule state — persisted to KV via `#[capsule(state)]`.
@@ -148,6 +153,7 @@ impl IdentityBuilder {
         let response = BuildResponse {
             prompt,
             session_id: req.session_id,
+            request_id: req.request_id,
         };
         ipc::publish_json("spark.v1.response.ready", &response)?;
 
@@ -442,6 +448,27 @@ fn parse_spark_toml(content: &str) -> SparkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_correlation_is_optional_for_legacy_callers_and_echoed_unchanged() {
+        let legacy: BuildRequest = serde_json::from_value(serde_json::json!({
+            "workspace_root": "/workspace", "session_id": "session"
+        }))
+        .unwrap();
+        assert!(legacy.request_id.is_none());
+        let request: BuildRequest = serde_json::from_value(serde_json::json!({
+            "workspace_root": "/workspace", "session_id": "session", "request_id": "turn"
+        }))
+        .unwrap();
+        let response = BuildResponse {
+            prompt: "prompt".into(),
+            session_id: request.session_id,
+            request_id: request.request_id,
+        };
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["session_id"], "session");
+        assert_eq!(wire["request_id"], "turn");
+    }
 
     fn configured_identity() -> SparkConfig {
         SparkConfig {
