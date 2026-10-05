@@ -9,6 +9,7 @@ import tempfile
 import tarfile
 import textwrap
 import unittest
+import io
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -17,6 +18,44 @@ ROOT = Path(__file__).resolve().parent.parent
 class MuslReleaseWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflow = (ROOT / ".github/workflows/release.yml").read_text()
+
+    def test_gnu_production_gate_checks_provider_abi(self):
+        step = self.workflow.split("      - name: Verify Linux runtime glibc compatibility\n", 1)[1]
+        block = step.split("        run: |\n", 1)[1].split("      - name:", 1)[0]
+        script = "set -euo pipefail\n" + textwrap.dedent(block).replace(
+            "${{ matrix.target }}", "x86_64-unknown-linux-gnu")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            readelf = root / "readelf"
+            readelf.write_text(
+                '#!/bin/sh\ncase "$*" in\n'
+                '  *astrid-storage-provider-fuse*) echo "GLIBC_${PROVIDER_GLIBC}" ;;\n'
+                '  *) echo GLIBC_2.31 ;;\nesac\n')
+            readelf.chmod(0o700)
+            for version in ("0.10.4", "2026.9.0", "2026.10.0", "2027.1.0"):
+                archive = root / f"{version}.tar.gz"
+                prefix = f"astrid-{version}-x86_64-unknown-linux-gnu"
+                members = ["astrid", "astrid-daemon", "astrid-build", "astrid-emit"]
+                if version != "0.10.4":
+                    members.append("astrid-storage-provider-fuse")
+                with tarfile.open(archive, "w:gz") as tar:
+                    for name in members:
+                        member = tarfile.TarInfo(f"{prefix}/{name}")
+                        member.mode, member.size = 0o755, 1
+                        tar.addfile(member, io.BytesIO(b"x"))
+                for provider_glibc in ("2.31", "2.35"):
+                    with self.subTest(version=version, provider_glibc=provider_glibc):
+                        run_root = root / f"{version}-{provider_glibc}"
+                        run_root.mkdir()
+                        env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}",
+                                   RUNTIME_VERSION=version, RUNTIME_ASSET=str(archive),
+                                   RUNNER_TEMP=str(run_root), PROVIDER_GLIBC=provider_glibc)
+                        result = subprocess.run(["bash", "-c", script], cwd=ROOT,
+                                                env=env, text=True, capture_output=True)
+                        reject = version != "0.10.4" and provider_glibc == "2.35"
+                        self.assertEqual(result.returncode != 0, reject, result.stderr)
+                        if reject:
+                            self.assertIn("astrid-storage-provider-fuse requires GLIBC_2.35", result.stderr)
 
     def test_signed_archive_listing_drains_tar_and_rejects_missing_signature(self):
         block = self.workflow.split("          signed_archives=0\n", 1)[1].split(

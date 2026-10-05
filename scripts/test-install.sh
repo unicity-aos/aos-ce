@@ -638,9 +638,24 @@ test ! -e "$work/AOS-compat.app/Contents/MacOS/aos-tray"
 
 # Build a second package through the real composer with an isolated
 # compatibility overlay.  The checked-in production contract above remains the
-# historical control; this fixture exercises the versioned 2026.9.3 GNU
-# membership that requires the FUSE provider.
-fuse_repo="$work/aos-2026.9.3-contract"
+# historical control; these fixtures install past, October and future GNU
+# runtimes through the public installer, including missing-provider failures.
+test_fuse_musl_install() {
+  local musl_test_script="$repo_root/scripts/test-install-musl.sh"
+  local original_work="$work"
+  local work="$work/musl-runtime-$fuse_version"
+  local repo_root="$fuse_repo" fixture="$fuse_fixture"
+  local release_metadata="$fuse_release_metadata"
+  local runtime_version="$fuse_version" runtime_root="$fuse_runtime_root"
+  local m_target m_root m_metadata m_arch m_verifier m_failure
+  mkdir -p "$work"
+  cp "$original_work/aos" "$work/aos"
+  cp -R "$original_work/capsules" "$work/capsules"
+  # shellcheck source=scripts/test-install-musl.sh
+  source "$musl_test_script"
+}
+for fuse_version in 2026.9.3 2026.10.0 2027.1.0; do
+fuse_repo="$work/aos-$fuse_version-contract"
 mkdir -p \
   "$fuse_repo/scripts" \
   "$fuse_repo/crates/unicity-aos-bootstrap" \
@@ -659,19 +674,20 @@ cp "$repo_root/scripts/capsule_release.py" \
   "$repo_root/scripts/validate-runtime-archive.py" \
   "$fuse_repo/scripts/"
 python3 - "$fuse_repo/release/runtime-compatibility.toml" \
-  "$fuse_repo/distros/community/unicity-ce/Distro.toml" <<'PY'
+  "$fuse_repo/distros/community/unicity-ce/Distro.toml" "$fuse_version" <<'PY'
 import pathlib
 import sys
 
-runtime_path, distro_path = map(pathlib.Path, sys.argv[1:])
+runtime_path, distro_path = map(pathlib.Path, sys.argv[1:3])
+version = sys.argv[3]
 runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
 replacements = {
-    "version": 'version = "2026.9.3"',
-    "tag": 'tag = "v2026.9.3"',
-    "version-requirement": 'version-requirement = ">=2026.9.3"',
-    "release-workflow-identity": 'release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.3"',
+    "version": f'version = "{version}"',
+    "tag": f'tag = "v{version}"',
+    "version-requirement": f'version-requirement = ">={version}"',
+    "release-workflow-identity": f'release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v{version}"',
     "source-commit": 'source-commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"',
-    "release-metadata-asset": 'release-metadata-asset = "astrid-2026.9.3-release.toml"',
+    "release-metadata-asset": f'release-metadata-asset = "astrid-{version}-release.toml"',
     "release-metadata-blake3": 'release-metadata-blake3 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"',
 }
 in_runtime = False
@@ -688,14 +704,14 @@ for index, line in enumerate(runtime_lines):
 runtime_path.write_text("\n".join(runtime_lines) + "\n", encoding="utf-8")
 distro_text = distro_path.read_text(encoding="utf-8")
 distro_path.write_text(
-    distro_text.replace('astrid-version = "=0.10.4"', 'astrid-version = "=2026.9.3"'),
+    distro_text.replace('astrid-version = "=0.10.4"', f'astrid-version = "={version}"'),
     encoding="utf-8",
 )
 PY
 
-fuse_runtime_root="$work/astrid-2026.9.3-x86_64-unknown-linux-gnu"
-fuse_runtime_archive="$work/runtime-2026.9.3.tar.gz"
-fuse_output="$work/output-2026.9.3"
+fuse_runtime_root="$work/astrid-$fuse_version-x86_64-unknown-linux-gnu"
+fuse_runtime_archive="$work/runtime-$fuse_version.tar.gz"
+fuse_output="$work/output-$fuse_version"
 mkdir -p "$fuse_runtime_root" "$fuse_output"
 for binary in \
   astrid astrid-daemon astrid-build astrid-emit \
@@ -715,7 +731,7 @@ bash "$fuse_repo/scripts/package-release.sh" \
   "$fuse_output" >/dev/null
 fuse_asset_name=unicity-aos-2026.9.3-x86_64-unknown-linux-gnu.tar.gz
 fuse_asset="$fuse_output/$fuse_asset_name"
-fuse_fixture="$work/fuse-fixture"
+fuse_fixture="$work/fuse-fixture-$fuse_version"
 mkdir -p "$fuse_fixture"
 cp "$fuse_asset" "$fuse_fixture/$fuse_asset_name"
 fuse_asset_sha256=$(shasum -a 256 "$fuse_asset" | awk '{print $1}')
@@ -734,12 +750,12 @@ release-workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workf
 
 [runtime]
 repository = "astrid-runtime/astrid"
-version = "2026.9.3"
-tag = "v2026.9.3"
-release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.3"
+version = "$fuse_version"
+tag = "v$fuse_version"
+release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v$fuse_version"
 release-metadata-available = true
 source-commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-release-metadata-asset = "astrid-2026.9.3-release.toml"
+release-metadata-asset = "astrid-$fuse_version-release.toml"
 release-metadata-blake3 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
 [contracts]
@@ -769,7 +785,7 @@ cp "$good_bundle" "$fuse_fixture/$fuse_asset_name.sigstore.json"
 cp "$good_bundle" "$fuse_fixture/unicity-aos-2026.9.3-release.toml.sigstore.json"
 cp "$fixture/cosign-linux-amd64" "$fuse_fixture/cosign-linux-amd64"
 
-fuse_home="$work/fuse-home"
+fuse_home="$work/fuse-home-$fuse_version"
 mkdir -p "$fuse_home/.astrid"
 printf 'standalone-runtime-state\n' > "$fuse_home/.astrid/sentinel"
 PATH="$fake_bin:$PATH" HOME="$fuse_home" AOS_TEST_FIXTURE="$fuse_fixture" \
@@ -789,9 +805,9 @@ test "$(stat -c '%a' "$fuse_release_dir/runtime/bin/astrid-storage-provider-fuse
 # metadata digest and size are updated for this fixture, so the installer gets
 # past signature/digest checks and fails closed on its versioned member list
 # before touching an existing release or channel pointer.
-fuse_missing_fixture="$work/fuse-missing-fixture"
+fuse_missing_fixture="$work/fuse-missing-fixture-$fuse_version"
 cp -R "$fuse_fixture" "$fuse_missing_fixture"
-fuse_missing_tree="$work/fuse-missing-tree"
+fuse_missing_tree="$work/fuse-missing-tree-$fuse_version"
 mkdir "$fuse_missing_tree"
 tar -xzf "$fuse_asset" -C "$fuse_missing_tree"
 rm "$fuse_missing_tree/unicity-aos-2026.9.3-x86_64-unknown-linux-gnu/runtime/bin/astrid-storage-provider-fuse"
@@ -821,7 +837,7 @@ for index, line in enumerate(lines):
             lines[index] = f"size = {size}"
 pathlib.Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
-fuse_missing_home="$work/fuse-missing-home"
+fuse_missing_home="$work/fuse-missing-home-$fuse_version"
 mkdir -p "$fuse_missing_home/.aos/releases/2026.9.3" \
   "$fuse_missing_home/.aos/update/channels/stable"
 printf 'preexisting release\n' > "$fuse_missing_home/.aos/releases/2026.9.3/release-manifest.json"
@@ -829,13 +845,41 @@ printf '41\n' > "$fuse_missing_home/.aos/update/channels/stable/current"
 if PATH="$fake_bin:$PATH" HOME="$fuse_missing_home" \
   AOS_TEST_FIXTURE="$fuse_missing_fixture" AOS_VERSION=2026.9.3 \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null 2>&1; then
-  echo "installer accepted a 2026.9.3 GNU archive missing the FUSE provider" >&2
+  echo "installer accepted a $fuse_version GNU runtime missing the FUSE provider" >&2
   exit 1
 fi
 test "$(cat "$fuse_missing_home/.aos/releases/2026.9.3/release-manifest.json")" = 'preexisting release'
 test "$(cat "$fuse_missing_home/.aos/update/channels/stable/current")" = 41
 test ! -e "$fuse_missing_home/.aos/runtime"
 test ! -e "$fuse_missing_home/.aos/update/install.lock"
+
+# Reuse the authenticated two-target musl extension journey with this runtime
+# identity, rather than inferring installer behavior from GNU composition.
+cp "$repo_root/scripts/musl_release_metadata.py" \
+  "$repo_root/scripts/release_metadata.py" "$fuse_repo/scripts/"
+python3 - "$fuse_repo/release/runtime-musl-compatibility.toml" \
+  "$fuse_repo/release/runtime-compatibility.toml" <<'PY'
+from pathlib import Path
+import sys
+import tomllib
+path = Path(sys.argv[1])
+runtime = tomllib.loads(Path(sys.argv[2]).read_text())["runtime"]
+fields = {key: runtime[key] for key in
+          ("repository", "version", "tag", "release-workflow-identity", "source-commit")}
+fields.update({
+    "legacy-release-metadata-asset": runtime["release-metadata-asset"],
+    "legacy-release-metadata-blake3": runtime["release-metadata-blake3"],
+    "musl-release-metadata-asset": f'astrid-{runtime["version"]}-musl-release.toml',
+})
+lines = path.read_text().splitlines()
+for index, line in enumerate(lines):
+    key = line.split("=", 1)[0].strip()
+    if key in fields:
+        lines[index] = f'{key} = "{fields[key]}"'
+path.write_text("\n".join(lines) + "\n")
+PY
+test_fuse_musl_install
+done
 
 unsigned_asset="$work/unsigned-asset.tar.gz"
 unsigned_metadata="$work/release-unsigned.toml"
