@@ -515,11 +515,17 @@ pub(crate) fn run(args: Arguments) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn next_version() -> String {
+        let mut version = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        version.patch += 1;
+        version.to_string()
+    }
     #[test]
     fn plain_inventory_displays_the_proposed_version() {
         let mut item = initial().items.remove(0);
-        item.candidate_version = Some("2026.10.0".into());
-        assert!(item_summary(&item).contains("→ 2026.10.0"));
+        let candidate = next_version();
+        item.candidate_version = Some(candidate.clone());
+        assert!(item_summary(&item).contains(&format!("→ {candidate}")));
         item.candidate_version = Some(item.installed_version.clone());
         assert!(!item_summary(&item).contains('→'));
     }
@@ -551,7 +557,7 @@ mod tests {
             "current"
         );
         assert_eq!(
-            item_from_metadata(metadata("2026.10.0"), "stable")
+            item_from_metadata(metadata(&next_version()), "stable")
                 .unwrap()
                 .availability,
             "available"
@@ -560,13 +566,13 @@ mod tests {
     #[test]
     fn rejects_wrong_channel_and_invalid_digest() {
         assert!(item_from_metadata(metadata("2026.10.0"), "dev").is_err());
-        let mut value = metadata("2026.10.0");
+        let mut value = metadata(&next_version());
         value.artifact_sha256 = "bad".into();
         assert!(item_from_metadata(value, "stable").is_err());
     }
     #[test]
     fn legacy_updater_cannot_apply_an_unbound_candidate() {
-        let mut value = metadata("2026.10.0");
+        let mut value = metadata(&next_version());
         value.binds_candidate_digest = false;
         let item = item_from_metadata(value, "stable").unwrap();
         assert_eq!(item.availability, "available");
