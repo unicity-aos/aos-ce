@@ -722,6 +722,7 @@ import sys
 
 runtime_path, distro_path = map(pathlib.Path, sys.argv[1:3])
 version = sys.argv[3]
+import tomllib
 runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
 replacements = {
     "version": f'version = "{version}"',
@@ -745,10 +746,14 @@ for index, line in enumerate(runtime_lines):
             runtime_lines[index] = replacements[key]
 runtime_path.write_text("\n".join(runtime_lines) + "\n", encoding="utf-8")
 distro_text = distro_path.read_text(encoding="utf-8")
+current_requirement = tomllib.loads(distro_text)["distro"]["astrid-version"]
+needle = f'astrid-version = "{current_requirement}"'
+assert distro_text.count(needle) == 1
 distro_path.write_text(
-    distro_text.replace('astrid-version = "=0.10.4"', f'astrid-version = "={version}"'),
+    distro_text.replace(needle, f'astrid-version = ">={version}"'),
     encoding="utf-8",
 )
+assert tomllib.loads(distro_path.read_text())["distro"]["astrid-version"] == tomllib.loads(runtime_path.read_text())["runtime"]["version-requirement"] == f">={version}"
 PY
 
 fuse_runtime_root="$work/astrid-$fuse_version-x86_64-unknown-linux-gnu"

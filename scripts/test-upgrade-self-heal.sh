@@ -579,6 +579,8 @@ import pathlib
 import sys
 
 runtime_path, distro_path = map(pathlib.Path, sys.argv[1:])
+import tomllib
+
 runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
 replacements = {
     "version": 'version = "2026.9.3"',
@@ -602,10 +604,14 @@ for index, line in enumerate(runtime_lines):
             runtime_lines[index] = replacements[key]
 runtime_path.write_text("\n".join(runtime_lines) + "\n", encoding="utf-8")
 distro_text = distro_path.read_text(encoding="utf-8")
+current_requirement = tomllib.loads(distro_text)["distro"]["astrid-version"]
+needle = f'astrid-version = "{current_requirement}"'
+assert distro_text.count(needle) == 1
 distro_path.write_text(
-    distro_text.replace('astrid-version = "=0.10.4"', 'astrid-version = "=2026.9.3"'),
+    distro_text.replace(needle, 'astrid-version = ">=2026.9.3"'),
     encoding="utf-8",
 )
+assert tomllib.loads(distro_path.read_text())["distro"]["astrid-version"] == tomllib.loads(runtime_path.read_text())["runtime"]["version-requirement"] == ">=2026.9.3"
 PY
 
 strict_provider=astrid-storage-provider-fuse
