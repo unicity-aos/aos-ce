@@ -18,6 +18,8 @@ use astrid_sdk::prelude::*;
 
 use crate::cache::{self, McpToolDescriptor};
 
+mod drain;
+
 /// Fan-out topic — every tool-providing capsule subscribes to this and
 /// replies on its own `tool.v1.response.describe.<source_id>`.
 const DESCRIBE_REQUEST_TOPIC: &str = "tool.v1.request.describe";
@@ -39,9 +41,9 @@ fn mcp_tool_prefix() -> &'static str {
 /// fan-out against WASM instantiation + kernel broadcast latency, and the
 /// old 500 ms lost that race — which matters because an MCP client fetches
 /// `tools/list` once at connect, so an empty first answer sticks for the
-/// session. The loop below still returns as soon as responders go quiet
-/// AFTER replying, so this is headroom for a slow cold start, not a fixed
-/// wait on the warm path.
+/// session. Without an authoritative responder count, a quiet slice cannot
+/// prove completion. Cache hits and captured static metadata bypass this
+/// cold discovery window entirely.
 const DISCOVERY_TIMEOUT_MS: u64 = 2_500;
 /// Slice size for the drain loop. A single `recv(timeout)` would only
 /// pick up the first batch; the loop keeps polling in shorter slices
@@ -359,56 +361,32 @@ fn discover(req_id: &str) -> Vec<McpToolDescriptor> {
     let mut responders: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut dropped: u64 = 0;
     let mut lagged: u64 = 0;
-    let mut remaining = DISCOVERY_TIMEOUT_MS;
-    loop {
-        let step = remaining.min(DISCOVERY_SLICE_MS);
-        match sub.recv(step) {
-            Ok(result) if !result.messages.is_empty() => {
-                seen_any = true;
-                dropped = dropped.saturating_add(result.dropped);
-                lagged = lagged.saturating_add(result.lagged);
-                for msg in &result.messages {
-                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.payload) else {
-                        continue;
-                    };
-                    let tools = bind_provider(parse_describe_response(&value), &msg.source_id);
-                    responders.insert(msg.source_id.clone());
-                    log::debug(format!(
-                        "{}: broker fan-out collected req_id={req_id} \
+    let drained = drain::collect(
+        std::time::Duration::from_millis(DISCOVERY_TIMEOUT_MS),
+        std::time::Duration::from_millis(DISCOVERY_SLICE_MS),
+        |timeout| drain::quiet_receive(sub.recv(timeout)),
+        |result| {
+            seen_any |= !result.messages.is_empty();
+            dropped = dropped.saturating_add(result.dropped);
+            lagged = lagged.saturating_add(result.lagged);
+            for msg in &result.messages {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.payload) else {
+                    continue;
+                };
+                let tools = bind_provider(parse_describe_response(&value), &msg.source_id);
+                responders.insert(msg.source_id.clone());
+                log::debug(format!(
+                    "{}: broker fan-out collected req_id={req_id} \
                          responder={} tool_count={}",
-                        crate::profile::log_tag(),
-                        msg.source_id,
-                        tools.len()
-                    ));
-                    acc.extend(tools);
-                }
+                    crate::profile::log_tag(),
+                    msg.source_id,
+                    tools.len()
+                ));
+                acc.extend(tools);
             }
-            // A quiet slice — the host returned early-empty, OR `recv` timed
-            // out on this slice. Two cases: if responders have ALREADY replied,
-            // this is quiescence → stop. If NOT, we're still racing a cold
-            // start (WASM instantiation + broadcast latency), so keep polling
-            // until the budget closes rather than breaking at the first 100 ms
-            // gap — otherwise widening `DISCOVERY_TIMEOUT_MS` buys nothing,
-            // because the loop would bail before the first response arrives.
-            Ok(result) => {
-                // Quiet but non-error slice may still carry drop/lag counters.
-                dropped = dropped.saturating_add(result.dropped);
-                lagged = lagged.saturating_add(result.lagged);
-                if seen_any {
-                    break;
-                }
-            }
-            Err(_) => {
-                if seen_any {
-                    break;
-                }
-            }
-        }
-        remaining = remaining.saturating_sub(step);
-        if remaining == 0 {
-            break;
-        }
-    }
+        },
+        time::monotonic,
+    );
 
     // Dedupe by name, last-write-wins. We iterate in reverse so the
     // final retain preserves the last occurrence.
@@ -418,13 +396,10 @@ fn discover(req_id: &str) -> Vec<McpToolDescriptor> {
     acc.reverse();
 
     let elapsed = wall_ms().saturating_sub(started);
-    let timed_out = remaining == 0;
-    // Incomplete iff the bus dropped/lagged messages (a responder's reply was
-    // missed), OR we exhausted the whole budget without quiescence (a slow /
-    // never-replying responder — the known first-call fan-out drop). Either
-    // way the answer below may be missing tools, so surface it at WARN rather
-    // than letting an under-count look like a clean result.
-    if dropped > 0 || lagged > 0 || (timed_out && !seen_any) {
+    let timed_out = drained.is_ok();
+    // No responder census exists on this fallback. Draining the deadline is
+    // evidence of bounded collection, not proof every provider responded.
+    if dropped > 0 || lagged > 0 || drained.is_err() || !seen_any {
         log::warn(format!(
             "{}: broker fan-out incomplete req_id={req_id} responders={} tools={} \
              dropped={dropped} lagged={lagged} timed_out={timed_out} elapsed_ms={elapsed}",
@@ -434,7 +409,7 @@ fn discover(req_id: &str) -> Vec<McpToolDescriptor> {
         ));
     } else {
         log::info(format!(
-            "{}: broker fan-out complete req_id={req_id} responders={} tools={} \
+            "{}: broker fan-out drained req_id={req_id} responders={} tools={} \
              elapsed_ms={elapsed}",
             crate::profile::log_tag(),
             responders.len(),
