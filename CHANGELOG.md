@@ -35,6 +35,9 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Keep cold MCP tool discovery open through its bounded collection deadline,
+  including providers delayed behind other capsule calls. Warm cached discovery
+  stays immediate; receive failures are reported instead of called complete.
 - Grant the default CE fleet during the first `astrid init` instead of spawning a second runtime CLI after capsules are installed.
 - Do not mistake regular Finder `.DS_Store` metadata for unfinished runtime
   shutdown; genuine leftover state and redirected entries still block confirmation.
