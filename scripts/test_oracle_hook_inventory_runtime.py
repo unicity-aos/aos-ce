@@ -11,7 +11,17 @@ from pathlib import Path
 import runpy
 import subprocess
 import time
+import tomllib
 import uuid
+
+
+def resolve_qa_paths(root, astrid, aos, oracle):
+    root = root.resolve(strict=True)
+    document = tomllib.loads((root / "Distro.toml").read_text())
+    if document.get("distro", {}).get("id") != "oracle-bus-qa":
+        raise RuntimeError("refusing an unmarked application home")
+    return (root, astrid.resolve(strict=True), aos.resolve(strict=True),
+            oracle.resolve(strict=True))
 
 
 def main():
@@ -21,10 +31,8 @@ def main():
     parser.add_argument("--aos", type=Path, required=True)
     parser.add_argument("--oracle-root", type=Path, required=True)
     args = parser.parse_args()
-    root = args.root.resolve(strict=True)
-    if 'id = "oracle-bus-qa"' not in (root / "Distro.toml").read_text():
-        raise RuntimeError("refusing an unmarked application home")
-    oracle = args.oracle_root.resolve(strict=True)
+    root, astrid, aos, oracle = resolve_qa_paths(
+        args.root, args.astrid, args.aos, args.oracle_root)
     codec = runpy.run_path(str(oracle / "plugins/common/bin/aos-native-hook"))
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("AOS_", "ASTRID_", "GROK_", "CLAUDE_", "CODEX_", "PLUGIN_"))}
@@ -33,7 +41,7 @@ def main():
                ASTRID_HOOK_TOKEN="d" * 64)
 
     def runtime(*argv):
-        result = subprocess.run([str(args.astrid), *argv], cwd=root, env=env,
+        result = subprocess.run([str(astrid), *argv], cwd=root, env=env,
                                 text=True, capture_output=True, timeout=45)
         if result.returncode:
             raise RuntimeError((argv, result.stdout, result.stderr))
@@ -71,7 +79,7 @@ def main():
         config("aos-mcp", "AOS_ORACLE_ADAPTER_SOURCE_ID", source("aos-hook-adapter-oracle"))
         config("aos-hook-adapter-oracle", "AOS_ORACLE_REQUIRED_HOOK_POLICIES", json.dumps(scoped))
         plugin = oracle / "plugins" / directory
-        hook_env = dict(env, AOS_BIN=str(args.aos), AOS_PLUGIN_ROOT=str(plugin), PLUGIN_ROOT=str(plugin))
+        hook_env = dict(env, AOS_BIN=str(aos), AOS_PLUGIN_ROOT=str(plugin), PLUGIN_ROOT=str(plugin))
         hook_env[host.upper() + "_PLUGIN_ROOT"] = str(plugin)
         hooks = json.loads((plugin / "hooks/hooks.json").read_text())["hooks"]
         session = "inventory-" + uuid.uuid4().hex
