@@ -45,9 +45,11 @@ Every mapping declares one response class.
 The adapter publishes without a correlation ID. Subscribers may observe but
 cannot affect the frontend operation. Examples include explicit session end,
 notifications and Claude's streamed message display. Event classes depend on
-the frontend's supported response contract: session/subagent start collect
-optional context, while turn completion and subagent stop are binding events.
-Codex/Claude post-tool events are binding; Grok post-tool events collect context.
+the frontend's supported response contract: Codex/Claude session/subagent start
+collect optional context, while turn completion and subagent stop are binding
+events. Codex/Claude post-tool events are binding. Grok session/subagent start,
+prompt submission and post-tool events are observation-only because Grok
+ignores their output; policies cannot block those native operations.
 Frontend adapters must not conflate a per-turn response event with session termination:
 
 - Codex and Claude `stop` map to `message_sent` and retain
@@ -84,7 +86,8 @@ the exact correlation topic. Missing, malformed or lost required replies deny.
 A denial wins over an ask, and an ask wins over no objection. Optional
 same-principal context remains collected for a 25ms quiescence window after
 quorum, bounded by the original one-second collection deadline. This legacy
-list applies only to prompt/pre-tool events (including permission requests).
+list applies only to decision-capable prompt/pre-tool events (including
+permission requests); Grok's passive prompt callback is not an enforcement gate.
 For other binding events, `AOS_ORACLE_REQUIRED_HOOK_POLICIES` maps canonical
 hook names to registration arrays, for example
 `{"config_changed":["configuration-policy=11111111-1111-4111-8111-111111111111"]}`.
@@ -104,7 +107,7 @@ canonical event with the exact host correlation ID. Subscribers may publish
 the response topic. The adapter accepts same-principal replies, combines them
 within 64 KiB, and drops the entire partial result if the response subscription
 reports lag or loss. Prompt submission also collects context, but is a binding
-`message_received` event: configured required policies must answer before it is
+`message_received` event on Codex/Claude: configured required policies must answer before it is
 allowed. Consult the adapter inventory for frontend-specific classes rather
 than inferring authority from the event name.
 

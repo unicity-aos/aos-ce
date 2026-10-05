@@ -247,12 +247,12 @@
     "post_tool_use": [
       "PostToolUse",
       "after_tool_call",
-      "context"
+      "observe"
     ],
     "post_tool_use_failure": [
       "PostToolUseFailure",
       "after_tool_call_failed",
-      "context"
+      "observe"
     ],
     "pre_compact": [
       "PreCompact",
@@ -272,7 +272,7 @@
     "session_start": [
       "SessionStart",
       "session_start",
-      "context"
+      "observe"
     ],
     "stop": [
       "Stop",
@@ -292,7 +292,7 @@
     "subagent_start": [
       "SubagentStart",
       "subagent_start",
-      "context"
+      "observe"
     ],
     "subagent_stop": [
       "SubagentStop",
@@ -302,7 +302,7 @@
     "user_prompt_submit": [
       "UserPromptSubmit",
       "message_received",
-      "block"
+      "observe"
     ]
   }
 }

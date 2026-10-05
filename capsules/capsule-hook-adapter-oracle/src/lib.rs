@@ -151,14 +151,18 @@ fn claude_mapping(event: &str) -> Option<HookMapping> {
 fn grok_mapping(event: &str) -> Option<HookMapping> {
     match event {
         "pre_tool_use" => Some(binding("before_tool_call")),
-        "user_prompt_submit" => Some(binding("message_received")),
+        // Grok ignores stdout for passive events; only pre-tool and stopping
+        // events support decisions. Do not collect unusable replies.
+        "user_prompt_submit" => Some(observe("message_received")),
+        "session_start" => Some(observe("session_start")),
+        "subagent_start" => Some(observe("subagent_start")),
         // Grok has PermissionDenied observations, not PermissionRequest.
         "permission_request" => None,
         // Grok Stop completes a turn, not the session. Retiring the route here
         // loses authentication for subsequent events in that same session.
         "stop" => Some(binding("message_sent")),
-        "post_tool_use" => Some(context("after_tool_call")),
-        "post_tool_use_failure" => Some(context("after_tool_call_failed")),
+        "post_tool_use" => Some(observe("after_tool_call")),
+        "post_tool_use_failure" => Some(observe("after_tool_call_failed")),
         "permission_denied" => Some(observe("permission_denied")),
         "stop_failure" => Some(observe("message_failed")),
         "stop_cancelled" => Some(observe("message_cancelled")),
@@ -698,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn every_host_collects_prompt_and_pretool_verdicts() {
+    fn every_host_collects_pretool_and_supported_prompt_verdicts() {
         for host in [Frontend::Codex, Frontend::Claude, Frontend::Grok] {
             assert_eq!(
                 host.mapping("pre_tool_use"),
@@ -706,7 +710,11 @@ mod tests {
             );
             assert_eq!(
                 host.mapping("user_prompt_submit"),
-                Some(binding("message_received"))
+                Some(if host == Frontend::Grok {
+                    observe("message_received")
+                } else {
+                    binding("message_received")
+                })
             );
         }
         for host in [Frontend::Codex, Frontend::Claude] {
