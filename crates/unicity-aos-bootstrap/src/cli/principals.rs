@@ -76,7 +76,12 @@ pub(crate) fn handle_principals(
             return ExitCode::FAILURE;
         }
     };
-    command.stdin(Stdio::null());
+    // This product-owned discovery describes the installation, not the
+    // caller's project. Preserve Astrid's workspace identity check by selecting
+    // the same runtime root used by Oracle launches.
+    command
+        .current_dir(home.runtime_home())
+        .stdin(Stdio::null());
     let output = match command.output() {
         Ok(output) => output,
         Err(error) => {

@@ -153,6 +153,7 @@ impl Fixture {
     }
 
     fn install_runtime(&self, body: &str) {
+        fs::create_dir_all(self.home.join("runtime")).expect("create fixture runtime home");
         fs::write(&self.runtime, body).expect("write fake runtime");
         Self::make_executable(&self.runtime);
     }

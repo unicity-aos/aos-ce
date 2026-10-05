@@ -2,6 +2,43 @@ use std::fs;
 
 use super::{DISCOVERY_RUNTIME, Fixture, RECORDING_RUNTIME};
 
+#[test]
+fn product_principal_discovery_selects_runtime_home_not_the_callers_project() {
+    let fixture = Fixture::new("principals-workspace");
+    let runtime_home = fixture.home.join("runtime");
+    let caller_project = fixture.root.join("unrelated-project");
+    fs::create_dir_all(&runtime_home).unwrap();
+    fs::create_dir_all(&caller_project).unwrap();
+    fixture.install_runtime(
+        r#"#!/bin/sh
+set -eu
+if [ "$PWD" != "$AOS_TEST_EXPECTED_WORKSPACE" ]; then
+    echo "discovery selected the caller's project rather than the product runtime" >&2
+    exit 1
+fi
+printf '[]\n'
+"#,
+    );
+    let output = fixture
+        .command()
+        .current_dir(&caller_project)
+        .env(
+            "AOS_TEST_EXPECTED_WORKSPACE",
+            fs::canonicalize(&runtime_home).unwrap(),
+        )
+        .args(["principals", "--json"])
+        .output()
+        .expect("discover product principals from an unrelated project");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["scope"], "owned");
+    assert_eq!(document["principals"], serde_json::json!([]));
+}
+
 fn assert_discovery_args(args: &str, principal: &str) {
     assert_eq!(
         args,
