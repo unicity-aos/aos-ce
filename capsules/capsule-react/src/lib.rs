@@ -333,6 +333,10 @@ pub(crate) struct TurnState {
     system_prompt: String,
     /// Request ID for the current LLM generation.
     request_id: Uuid,
+    /// Stable completion nonce for this conversation turn, including callbacks
+    /// initiated by the watchdog rather than by the original invocation.
+    #[serde(default)]
+    completion_id: Uuid,
     /// Accumulated response text from the current LLM stream.
     response_text: String,
     /// Tool calls being accumulated from stream deltas.
@@ -366,6 +370,7 @@ impl Default for TurnState {
             phase: Phase::Idle,
             system_prompt: String::new(),
             request_id: Uuid::nil(),
+            completion_id: Uuid::nil(),
             response_text: String::new(),
             pending_stream_tools: Vec::new(),
             dispatched_tools: Vec::new(),
@@ -437,6 +442,7 @@ impl TurnState {
     /// Fully reset turn state for a new conversation turn (new user prompt).
     fn reset_conversation_turn(&mut self) {
         self.reset_turn();
+        self.completion_id = Uuid::new_v4();
         self.current_tools.clear();
         self.iteration_count = 0;
         // A new user prompt is a new turn — the previous prompt's
@@ -494,13 +500,10 @@ impl TurnState {
             ));
             let _ = ipc::publish_json(
                 "agent.v1.response",
-                &IpcPayload::AgentResponse {
-                    text: format!(
-                        "Request timed out ({phase_name} phase exceeded {timeout}s limit)"
-                    ),
-                    is_final: true,
-                    session_id: self.session_id.clone(),
-                },
+                &self.completion_event(
+                    format!("Request timed out ({phase_name} phase exceeded {timeout}s limit)"),
+                    true,
+                ),
             );
             self.reset_conversation_turn();
             self.set_phase(Phase::Idle);
@@ -508,6 +511,13 @@ impl TurnState {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn completion_event(&self, text: String, is_final: bool) -> IpcPayload {
+        IpcPayload::RawJson(serde_json::json!({
+            "text": text, "is_final": is_final, "session_id": self.session_id,
+            "request_id": self.completion_id.to_string(),
+        }))
     }
 }
 
@@ -751,11 +761,19 @@ impl ReactLoop {
 
         // Request system prompt from the identity capsule.
         // session_id is threaded through so the response echoes it back.
+        // Bind the autonomous-completion nonce while the host still stamps
+        // this invocation with the admitted turn owner. The empty nonterminal
+        // frame emits no user-visible text and binds even pre-stream timeouts.
+        ipc::publish_json(
+            "agent.v1.response",
+            &state.completion_event(String::new(), false),
+        )?;
         ipc::publish_json(
             "spark.v1.request.build",
             &serde_json::json!({
                 "workspace_root": env::var("workspace_root").unwrap_or_default(),
                 "session_id": state.session_id,
+                "request_id": state.request_id.to_string(),
             }),
         )?;
 
@@ -833,6 +851,12 @@ impl ReactLoop {
             .unwrap_or(DEFAULT_SESSION_ID);
 
         let mut state = TurnState::load(session_id);
+
+        // A cancelled turn can reply after the next turn has entered the same
+        // phase. Session and phase alone cannot identify the owning turn.
+        if orchestration_reply_is_stale(&state, &payload) {
+            return Ok(());
+        }
 
         // Opportunistic timeout check on every interceptor invocation
         if Self::check_timeout_with_cleanup(&mut state)? {
@@ -920,6 +944,10 @@ impl ReactLoop {
             .unwrap_or(DEFAULT_SESSION_ID);
 
         let mut state = TurnState::load(session_id);
+
+        if orchestration_reply_is_stale(&state, &payload) {
+            return Ok(());
+        }
 
         if Self::check_timeout_with_cleanup(&mut state)? {
             return Ok(());
@@ -2120,9 +2148,72 @@ fn parse_json_array_field<T: serde::de::DeserializeOwned>(
         .unwrap_or_default()
 }
 
+/// Correlation is turn-specific; a session may contain multiple cancelled or
+/// completed generations whose replies are still in flight.
+fn orchestration_reply_is_stale(state: &TurnState, payload: &serde_json::Value) -> bool {
+    // Idle may be the previous persisted turn observed before the new state
+    // becomes visible. Let the existing bounded re-drive retry it; only an
+    // active state can authoritatively reject another generation's reply.
+    state.phase != Phase::Idle
+        && !state.request_id.is_nil()
+        && !response_matches_turn(payload, state.request_id)
+}
+
+fn response_matches_turn(payload: &serde_json::Value, request_id: Uuid) -> bool {
+    !request_id.is_nil()
+        && payload
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok())
+            == Some(request_id)
+}
+
+#[cfg(test)]
+mod correlation_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_nonce_survives_iterations_but_not_new_turns() {
+        let mut state = TurnState::default();
+        state.reset_conversation_turn();
+        let first = state.completion_id;
+        assert!(!first.is_nil());
+        state.reset_turn();
+        assert_eq!(state.completion_id, first);
+        let IpcPayload::RawJson(event) = state.completion_event("timeout".into(), true) else {
+            panic!("correlated response wire payload");
+        };
+        assert_eq!(event["request_id"], first.to_string());
+        assert_eq!(event["is_final"], true);
+        state.reset_conversation_turn();
+        assert_ne!(state.completion_id, first);
+    }
+
+    #[test]
+    fn orchestration_replies_must_match_the_current_turn() {
+        let cancelled = Uuid::new_v4();
+        let current = Uuid::new_v4();
+        assert!(!response_matches_turn(
+            &serde_json::json!({"request_id": cancelled}),
+            current
+        ));
+        assert!(response_matches_turn(
+            &serde_json::json!({"request_id": current}),
+            current
+        ));
+        assert!(!response_matches_turn(&serde_json::json!({}), current));
+        assert!(!response_matches_turn(
+            &serde_json::json!({"request_id": "invalid"}),
+            current
+        ));
+        assert!(!response_matches_turn(
+            &serde_json::json!({"request_id": Uuid::nil()}),
+            Uuid::nil()
+        ));
+    }
 
     /// Build an `ActiveLlm` for tests without going through the registry.
     fn active(topic: &str, model: Option<&str>) -> ActiveLlm {
