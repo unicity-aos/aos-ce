@@ -555,6 +555,7 @@ cp "$repo_root/distros/community/unicity-ce/Distro.toml" \
 cp "$repo_root/install.sh" "$repo_root/README.md" "$fuse_repo/"
 cp "$repo_root/scripts/capsule_release.py" \
   "$repo_root/scripts/package-release.sh" \
+  "$repo_root/scripts/runtime_filesystem_contract.py" \
   "$repo_root/scripts/package_macos_filesystem.py" \
   "$repo_root/scripts/package_macos_command_center.py" \
   "$repo_root/scripts/aos-filesystem.sh" \
