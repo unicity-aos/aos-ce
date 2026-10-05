@@ -267,17 +267,22 @@ jobs:
         run: |
           RUNTIME_ROOT="astrid-${RUNTIME_VERSION}-${{ matrix.target }}"
           CHECK_ROOT="$RUNNER_TEMP/runtime-glibc-check"
+          runtime_binaries=(astrid astrid-daemon astrid-build astrid-emit)
+          filesystem_requirement=$(python3 scripts/runtime_filesystem_contract.py "$RUNTIME_VERSION")
+          if [[ "$filesystem_requirement" == required ]]; then
+            runtime_binaries+=(astrid-storage-provider-fuse)
+          fi
           python3 scripts/validate-runtime-archive.py \
             "$RUNTIME_ASSET" \
             "$RUNTIME_ROOT" \
-            astrid astrid-daemon astrid-build astrid-emit
+            "${runtime_binaries[@]}"
           mkdir "$CHECK_ROOT"
           tar -xzf "$RUNTIME_ASSET" -C "$CHECK_ROOT"
-          python3 scripts/check_glibc.py --max-version 2.34 \
-            "$CHECK_ROOT/$RUNTIME_ROOT/astrid" \
-            "$CHECK_ROOT/$RUNTIME_ROOT/astrid-daemon" \
-            "$CHECK_ROOT/$RUNTIME_ROOT/astrid-build" \
-            "$CHECK_ROOT/$RUNTIME_ROOT/astrid-emit"
+          runtime_paths=()
+          for binary in "${runtime_binaries[@]}"; do
+            runtime_paths+=("$CHECK_ROOT/$RUNTIME_ROOT/$binary")
+          done
+          python3 scripts/check_glibc.py --max-version 2.34 "${runtime_paths[@]}"
       - name: Verify static musl runtime executables
         if: ${{ endsWith(matrix.target, 'linux-musl') }}
         env:

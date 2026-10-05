@@ -61,6 +61,7 @@ for m_arch in x86_64 aarch64; do
     AOS_TEST_UNAME_M="$m_arch" AOS_TEST_LIBC=musl AOS_TEST_COSIGN_SHA256="$m_verifier" \
     AOS_VERSION=2026.9.3 sh "$repo_root/install.sh" --yes --no-migrate-prompt
   test -x "$work/musl-$m_arch-home/.aos/bin/aos"
+  test -x "$work/musl-$m_arch-home/.aos/releases/2026.9.3/runtime/bin/astrid-storage-provider-fuse"
 done
 
 for m_failure in signature binding duplicate missing; do

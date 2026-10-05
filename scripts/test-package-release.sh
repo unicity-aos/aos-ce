@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+python3 "$repo_root/scripts/test_runtime_filesystem_contract.py"
 python3 "$repo_root/scripts/validate-release-contract.py"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -367,9 +368,11 @@ assert manifest["verifier"] == {
 }
 PY
 
-# Rehearsal runtime 2026.9.3 has an explicit GNU FUSE provider contract while
-# the pinned stable GNU archive above includes its FUSE provider.
-versioned_repo="$work/aos-2026.9.3-contract"
+# Execute past, October and future identities across the native providers.
+for versioned_version in 2026.9.3 2026.10.0 2027.1.0; do
+for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-apple-darwin; do
+versioned_case="$versioned_version-$target"
+versioned_repo="$work/aos-$versioned_case-contract"
 mkdir -p \
   "$versioned_repo/scripts" \
   "$versioned_repo/crates/unicity-aos-bootstrap" \
@@ -384,19 +387,24 @@ cp "$repo_root/distros/community/unicity-ce/Distro.toml" \
 cp "$repo_root/install.sh" "$repo_root/README.md" "$versioned_repo/"
 cp "$repo_root/scripts/capsule_release.py" \
   "$repo_root/scripts/package-release.sh" \
+  "$repo_root/scripts/runtime_filesystem_contract.py" \
+  "$repo_root/scripts/package_macos_filesystem.py" \
+  "$repo_root/scripts/package_macos_command_center.py" \
+  "$repo_root/scripts/aos-filesystem.sh" \
   "$repo_root/scripts/validate-runtime-archive.py" \
   "$versioned_repo/scripts/"
 python3 - "$versioned_repo/release/runtime-compatibility.toml" \
-  "$versioned_repo/distros/community/unicity-ce/Distro.toml" <<'PY'
+  "$versioned_repo/distros/community/unicity-ce/Distro.toml" "$versioned_version" <<'PY'
 import pathlib
 import sys
 
-runtime_path, distro_path = map(pathlib.Path, sys.argv[1:])
+runtime_path, distro_path = map(pathlib.Path, sys.argv[1:3])
+version = sys.argv[3]
 runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
 replacements = {
-    "version": 'version = "2026.9.3"',
-    "tag": 'tag = "rehearsal-only-2026.9.3"',
-    "version-requirement": 'version-requirement = ">=2026.9.3"',
+    "version": f'version = "{version}"',
+    "tag": f'tag = "rehearsal-only-{version}"',
+    "version-requirement": f'version-requirement = ">={version}"',
     "release-workflow-identity": 'release-workflow-identity = "rehearsal-only:test"',
 }
 in_runtime = False
@@ -418,17 +426,32 @@ distro_path.write_text(
 )
 PY
 
-versioned_runtime_root="$work/astrid-2026.9.3-$target"
-versioned_runtime_archive="$work/runtime-2026.9.3.tar.gz"
-versioned_output="$work/output-2026.9.3"
+versioned_runtime_root="$work/astrid-$versioned_case"
+versioned_runtime_archive="$work/runtime-$versioned_case.tar.gz"
+versioned_output="$work/output-$versioned_case"
 mkdir -p "$versioned_runtime_root" "$versioned_output"
-for binary in astrid astrid-daemon astrid-build astrid-emit astrid-storage-provider-fuse; do
+versioned_provider_name=astrid-storage-provider-fuse
+versioned_command_center=
+if [[ "$target" == *-apple-darwin ]]; then
+  versioned_provider_name=astrid-storage-provider-fskit
+  versioned_command_center="$work/command-center-$versioned_case/AOS Command Center.app"
+  PYTHONPATH="$repo_root/scripts" python3 -c \
+    'from pathlib import Path; import sys; from test_package_macos_command_center import fixture; fixture(Path(sys.argv[1]))' \
+    "$versioned_command_center"
+  PYTHONPATH="$repo_root/scripts" python3 -c \
+    'from pathlib import Path; import sys; from test_package_macos_filesystem import fixture; fixture(Path(sys.argv[1]))' \
+    "$versioned_runtime_root"
+fi
+for binary in astrid astrid-daemon astrid-build astrid-emit "$versioned_provider_name"; do
   printf '#!/bin/sh\nexit 0\n' > "$versioned_runtime_root/$binary"
+  if [[ "$binary" == astrid ]]; then
+    printf '#!/bin/sh\necho "Astrid %s"\n' "$versioned_version" > "$versioned_runtime_root/$binary"
+  fi
   chmod 755 "$versioned_runtime_root/$binary"
 done
 COPYFILE_DISABLE=1 tar -czf "$versioned_runtime_archive" \
   -C "$work" "$(basename "$versioned_runtime_root")"
-bash "$versioned_repo/scripts/package-release.sh" \
+AOS_COMMAND_CENTER_APP="$versioned_command_center" bash "$versioned_repo/scripts/package-release.sh" \
   "$target" \
   "$work/aos" \
   "$versioned_runtime_archive" \
@@ -438,23 +461,23 @@ bash "$versioned_repo/scripts/package-release.sh" \
 versioned_archive="$versioned_output/unicity-aos-$product_version-$target.tar.gz"
 versioned_files="$work/versioned-files"
 tar -tzf "$versioned_archive" > "$versioned_files"
-grep -q '/runtime/bin/astrid-storage-provider-fuse$' "$versioned_files"
-mkdir "$work/versioned-extract"
-tar -xzf "$versioned_archive" -C "$work/versioned-extract"
-versioned_bundle="$work/versioned-extract/unicity-aos-$product_version-$target"
-versioned_provider="$versioned_bundle/runtime/bin/astrid-storage-provider-fuse"
+grep -q "/runtime/bin/$versioned_provider_name$" "$versioned_files"
+mkdir "$work/versioned-extract-$versioned_case"
+tar -xzf "$versioned_archive" -C "$work/versioned-extract-$versioned_case"
+versioned_bundle="$work/versioned-extract-$versioned_case/unicity-aos-$product_version-$target"
+versioned_provider="$versioned_bundle/runtime/bin/$versioned_provider_name"
 test -x "$versioned_provider"
 test "$(stat -c '%a' "$versioned_provider" 2>/dev/null || stat -f '%Lp' "$versioned_provider")" = 755
-python3 - "$versioned_bundle/release-manifest.json" "$versioned_provider" <<'PY'
+python3 - "$versioned_bundle/release-manifest.json" "$versioned_provider" "$versioned_version" "$versioned_provider_name" <<'PY'
 import json
 import pathlib
 import subprocess
 import sys
 
-manifest_path, provider_path = map(pathlib.Path, sys.argv[1:])
+manifest_path, provider_path = map(pathlib.Path, sys.argv[1:3])
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-provider = "runtime/bin/astrid-storage-provider-fuse"
-assert manifest["runtime"]["version"] == "2026.9.3"
+provider = "runtime/bin/" + sys.argv[4]
+assert manifest["runtime"]["version"] == sys.argv[3]
 assert manifest["executables"] == [
     "bin/aos",
     "runtime/bin/astrid",
@@ -472,25 +495,46 @@ assert record == {
     ).split()[0],
 }
 PY
+if [[ "$target" != *-apple-darwin ]]; then
+  bash "$versioned_repo/scripts/package-release.sh" \
+    --extract-release-sealer "$versioned_archive" "$work/sealer-$versioned_case" >/dev/null
+  test -x "$work/sealer-$versioned_case"
+else
+  # Keep the provider, but omit only the app from a fresh archive. Future
+  # runtime versions must not quietly switch the filesystem app to optional.
+  COPYFILE_DISABLE=1 tar -czf "$work/missing-app-$versioned_case.tar.gz" \
+    -C "$work" --exclude='*/AstridFS.app' "$(basename "$versioned_runtime_root")"
+  if AOS_COMMAND_CENTER_APP="$versioned_command_center" \
+    bash "$versioned_repo/scripts/package-release.sh" "$target" "$work/aos" \
+    "$work/missing-app-$versioned_case.tar.gz" \
+    0000000000000000000000000000000000000000000000000000000000000000 \
+    "$work/capsules" "$work/missing-app-output-$versioned_case" >/dev/null 2>&1; then
+    echo "$versioned_case accepted a runtime without the filesystem app" >&2
+    exit 1
+  fi
+fi
 
 versioned_runtime_name=$(basename "$versioned_runtime_root")
-missing_versioned_root="$work/missing-2026.9.3-fuse/$versioned_runtime_name"
-mkdir -p "$missing_versioned_root" "$work/missing-2026.9.3-output"
+missing_versioned_root="$work/missing-$versioned_case-fuse/$versioned_runtime_name"
+mkdir -p "$missing_versioned_root" "$work/missing-$versioned_case-output"
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
   cp "$versioned_runtime_root/$binary" "$missing_versioned_root/$binary"
 done
-COPYFILE_DISABLE=1 tar -czf "$work/missing-2026.9.3-runtime.tar.gz" \
-  -C "$work/missing-2026.9.3-fuse" "$(basename "$versioned_runtime_root")"
+COPYFILE_DISABLE=1 tar -czf "$work/missing-$versioned_case-runtime.tar.gz" \
+  -C "$work/missing-$versioned_case-fuse" "$(basename "$versioned_runtime_root")"
 if bash "$versioned_repo/scripts/package-release.sh" \
   "$target" \
   "$work/aos" \
-  "$work/missing-2026.9.3-runtime.tar.gz" \
+  "$work/missing-$versioned_case-runtime.tar.gz" \
   0000000000000000000000000000000000000000000000000000000000000000 \
   "$work/capsules" \
-  "$work/missing-2026.9.3-output" >/dev/null 2>&1; then
-  echo "2026.9.3 GNU package accepted a runtime without the FUSE provider" >&2
+  "$work/missing-$versioned_case-output" >/dev/null 2>&1; then
+  echo "$versioned_case package accepted a runtime without the FUSE provider" >&2
   exit 1
 fi
+done
+done
+target=x86_64-unknown-linux-gnu
 
 darwin_target=aarch64-apple-darwin
 darwin_runtime_root="$work/astrid-$runtime_version-$darwin_target"

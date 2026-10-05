@@ -133,13 +133,16 @@ PY
 validate_schema_v2_membership() {
   local manifest=$1
   local bundle=${2:-}
-  python3 - "$manifest" "$bundle" <<'PY'
+  python3 - "$manifest" "$bundle" "$repo_root/scripts" <<'PY'
 import json
 import os
 import pathlib
 import re
 import stat
 import sys
+
+sys.path.insert(0, sys.argv.pop())
+from runtime_filesystem_contract import requires_native_filesystem
 
 manifest_path, bundle_arg = sys.argv[1:]
 try:
@@ -159,7 +162,7 @@ runtime_version = runtime.get("version") if isinstance(runtime, dict) else None
 if (
     isinstance(target, str)
     and (target.endswith("-unknown-linux-gnu") or target.endswith("-unknown-linux-musl"))
-    and runtime_version in ("2026.9.0", "2026.9.1", "2026.9.2", "2026.9.3", "2026.9.4")
+    and requires_native_filesystem(runtime_version)
 ):
     runtime_executables.append("astrid-storage-provider-fuse")
 elif isinstance(target, str) and target.endswith("-apple-darwin"):
@@ -543,7 +546,8 @@ fi
 python3 "$repo_root/scripts/capsule_release.py" --artifacts "$capsule_artifacts"
 
 runtime_binaries=(astrid astrid-daemon astrid-build astrid-emit)
-if [[ ( "$target" == *-unknown-linux-gnu || "$target" == *-unknown-linux-musl ) && ( "$runtime_version" == "2026.9.0" || "$runtime_version" == "2026.9.1" || "$runtime_version" == "2026.9.2" || "$runtime_version" == "2026.9.3" || "$runtime_version" == "2026.9.4" ) ]]; then
+filesystem_requirement=$(python3 "$repo_root/scripts/runtime_filesystem_contract.py" "$runtime_version")
+if [[ ( "$target" == *-unknown-linux-gnu || "$target" == *-unknown-linux-musl ) && "$filesystem_requirement" == required ]]; then
   runtime_binaries+=(astrid-storage-provider-fuse)
 elif [[ "$target" == *-apple-darwin ]]; then
   runtime_binaries+=(astrid-storage-provider-fskit)
@@ -583,10 +587,6 @@ for binary in "${runtime_binaries[@]}"; do
 done
 
 if [[ "$target" == *-apple-darwin ]]; then
-  filesystem_requirement=optional
-  if [[ "$runtime_version" == 2026.9.0 || "$runtime_version" == 2026.9.1 || "$runtime_version" == 2026.9.2 || "$runtime_version" == 2026.9.3 || "$runtime_version" == 2026.9.4 ]]; then
-    filesystem_requirement=required
-  fi
   python3 "$repo_root/scripts/package_macos_filesystem.py" \
     "$runtime_root" "$work/$root/runtime/bin" "$filesystem_requirement"
   if [[ -z "${AOS_COMMAND_CENTER_APP:-}" ]]; then
@@ -661,10 +661,13 @@ while IFS= read -r capsule; do
   record_release_file "capsules/$capsule" 600
 done < "$work/$root/capsule-assets.txt"
 
-python3 - "$work/$root/release-manifest.json" "$work/$root/capsule-assets.txt" "$release_inventory" "$product_version" "$target" "$runtime_repository" "$runtime_version" "$runtime_tag" "$runtime_blake3" "$runtime_identity" "$wit_repository" "$wit_commit" "$sdk_rust_version" "$sdk_rust_commit" <<'PY'
+python3 - "$work/$root/release-manifest.json" "$work/$root/capsule-assets.txt" "$release_inventory" "$product_version" "$target" "$runtime_repository" "$runtime_version" "$runtime_tag" "$runtime_blake3" "$runtime_identity" "$wit_repository" "$wit_commit" "$sdk_rust_version" "$sdk_rust_commit" "$repo_root/scripts" <<'PY'
 import json
 import pathlib
 import sys
+
+sys.path.insert(0, sys.argv.pop())
+from runtime_filesystem_contract import requires_native_filesystem
 
 path, capsule_list, inventory_path, product, target, runtime_repo, runtime, tag, digest, runtime_identity, wit_repo, wit_commit, sdk_version, sdk_commit = sys.argv[1:]
 capsules = pathlib.Path(capsule_list).read_text(encoding="utf-8").splitlines()
@@ -683,7 +686,7 @@ runtime_executables = [
     "runtime/bin/astrid-build",
     "runtime/bin/astrid-emit",
 ]
-if (target.endswith("-unknown-linux-gnu") or target.endswith("-unknown-linux-musl")) and runtime in ("2026.9.0", "2026.9.1", "2026.9.2", "2026.9.3", "2026.9.4"):
+if (target.endswith("-unknown-linux-gnu") or target.endswith("-unknown-linux-musl")) and requires_native_filesystem(runtime):
     runtime_executables.append("runtime/bin/astrid-storage-provider-fuse")
 elif target.endswith("-apple-darwin"):
     runtime_executables.append("runtime/bin/astrid-storage-provider-fskit")
