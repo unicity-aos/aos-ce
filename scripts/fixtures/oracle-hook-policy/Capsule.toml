@@ -1,0 +1,19 @@
+[package]
+name = "oracle-hook-test-policy"
+version = "0.1.0"
+description = "Test-only canonical hook responder for a disposable runtime"
+astrid-version = ">=2026.9.4"
+
+[[component]]
+id = "oracle-hook-test-policy"
+file = "oracle_hook_test_policy.wasm"
+type = "executable"
+
+[env]
+QA_MODE = { type = "text", default = "allow", request = "Test response: allow, deny, malformed, silent, context" }
+
+[publish]
+"hook.v1.response.*" = { wit = "opaque" }
+
+[subscribe]
+"hook.v1.event.*" = { wit = "opaque" }

@@ -43,9 +43,14 @@ Every mapping declares one response class.
 ### Observation
 
 The adapter publishes without a correlation ID. Subscribers may observe but
-cannot affect the frontend operation. Session, post-tool, compaction, sub-agent,
-completed-response, and shutdown events use this class. Frontend adapters must
-not conflate a per-turn response event with session termination:
+cannot affect the frontend operation. Examples include explicit session end,
+notifications and Claude's streamed message display. Event classes depend on
+the frontend's supported response contract: Codex/Claude session/subagent start
+collect optional context, while turn completion and subagent stop are binding
+events. Codex/Claude post-tool events are binding. Grok session/subagent start,
+prompt submission and post-tool events are observation-only because Grok
+ignores their output; policies cannot block those native operations.
+Frontend adapters must not conflate a per-turn response event with session termination:
 
 - Codex and Claude `stop` map to `message_sent` and retain
   `last_assistant_message` in the nested frontend payload;
@@ -80,7 +85,15 @@ from the configured kernel-stamped source and verified invoking principal on
 the exact correlation topic. Missing, malformed or lost required replies deny.
 A denial wins over an ask, and an ask wins over no objection. Optional
 same-principal context remains collected for a 25ms quiescence window after
-quorum, bounded by the original one-second collection deadline.
+quorum, bounded by the original one-second collection deadline. This legacy
+list applies only to decision-capable prompt/pre-tool events (including
+permission requests); Grok's passive prompt callback is not an enforcement gate.
+For other binding events, `AOS_ORACLE_REQUIRED_HOOK_POLICIES` maps canonical
+hook names to registration arrays, for example
+`{"config_changed":["configuration-policy=11111111-1111-4111-8111-111111111111"]}`.
+Event-scoped registrations cannot remove legacy prompt/pre-tool requirements.
+Without a configured required source, a binding event returns no objection;
+optional subscribers cannot acquire veto authority by replying.
 
 This is distinct from the Astrid-native lifecycle collection described below.
 It also does not replace administrator-protected service custody: Oracle's
@@ -88,11 +101,15 @@ protected adapter must preserve that deployment's service/principal pins.
 
 ### Additional context
 
-`user_prompt_submit` publishes `message_received` with the exact host
-correlation ID. Subscribers may publish `{ "additional_context": "..." }` to
+Session/subagent start and other frontend-defined context events publish their
+canonical event with the exact host correlation ID. Subscribers may publish
+`{ "additional_context": "..." }` to
 the response topic. The adapter accepts same-principal replies, combines them
 within 64 KiB, and drops the entire partial result if the response subscription
-reports lag or loss.
+reports lag or loss. Prompt submission also collects context, but is a binding
+`message_received` event on Codex/Claude: configured required policies must answer before it is
+allowed. Consult the adapter inventory for frontend-specific classes rather
+than inferring authority from the event name.
 
 ### Binding lifecycle result
 

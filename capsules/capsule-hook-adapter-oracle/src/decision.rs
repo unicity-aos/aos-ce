@@ -18,6 +18,30 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+/// Select policies by canonical event, preserving legacy prompt/tool authority.
+pub(super) fn registrations_for_hook(hook: &str, legacy: &str, scoped: &str) -> Result<String, ()> {
+    let scopes: BTreeMap<String, Vec<String>> = serde_json::from_str(scoped).map_err(|_| ())?;
+    for (name, registrations) in &scopes {
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(());
+        }
+        RequiredReplies::parse(&serde_json::to_string(registrations).map_err(|_| ())?)?;
+    }
+    let mut selected = scopes.get(hook).cloned().unwrap_or_default();
+    if matches!(hook, "before_tool_call" | "message_received") {
+        // Append the protected legacy registrations last: a new scoped
+        // tombstone may not remove an existing required prompt/tool policy.
+        let legacy: Vec<String> = serde_json::from_str(legacy).map_err(|_| ())?;
+        selected.extend(legacy);
+    }
+    serde_json::to_string(&selected).map_err(|_| ())
+}
+
 impl Decision {
     pub(crate) fn unavailable() -> Self {
         Self {
@@ -145,6 +169,47 @@ mod tests {
     use super::*;
     const FIRST: &str = "11111111-1111-4111-8111-111111111111";
     const SECOND: &str = "22222222-2222-4222-8222-222222222222";
+
+    #[test]
+    fn new_hooks_require_only_their_explicit_policies() {
+        let legacy = config(&[FIRST]);
+        let scoped =
+            serde_json::json!({"message_sent": [format!("stop-policy={SECOND}")] }).to_string();
+        let mut stop = RequiredReplies::parse(
+            &registrations_for_hook("message_sent", &legacy, &scoped).unwrap(),
+        )
+        .unwrap();
+        stop.accept(SECOND, r#"{"skip":false}"#);
+        assert!(!stop.finish().skip);
+        assert!(
+            !RequiredReplies::parse(
+                &registrations_for_hook("config_changed", &legacy, &scoped).unwrap()
+            )
+            .unwrap()
+            .finish()
+            .skip
+        );
+        assert!(
+            RequiredReplies::parse(
+                &registrations_for_hook("before_tool_call", &legacy, &scoped).unwrap()
+            )
+            .unwrap()
+            .finish()
+            .skip
+        );
+    }
+
+    #[test]
+    fn scoped_registration_cannot_unregister_legacy_authority() {
+        let legacy = config(&[FIRST]);
+        let scoped = r#"{"before_tool_call":["policy-0=-"]}"#;
+        let selected = registrations_for_hook("before_tool_call", &legacy, scoped).unwrap();
+        assert!(RequiredReplies::parse(&selected).unwrap().finish().skip);
+        assert!(
+            registrations_for_hook("message_sent", "[]", r#"{"message_sent":["policy=bad"]}"#)
+                .is_err()
+        );
+    }
 
     fn config(sources: &[&str]) -> String {
         serde_json::to_string(
