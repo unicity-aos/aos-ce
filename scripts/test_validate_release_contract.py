@@ -232,12 +232,16 @@ class ReleaseReadinessTests(unittest.TestCase):
         musl = VALIDATOR.readiness_metadata(
             ROOT / "release/runtime-musl-compatibility.toml"
         )["runtime"]
-        self.assertTrue(gnu["release-ready"])
+        # Isolate the MUSL gate even while the product itself is staged.
+        gnu["release-ready"] = True
+        gnu["upgrade-self-heal-ready"] = True
         musl["release-ready"] = False
         original = VALIDATOR.readiness_metadata
         def fixture(path):
             if Path(path).name == "runtime-musl-compatibility.toml":
                 return {"schema-version": 1, "runtime": musl}
+            if Path(path).name == "runtime-compatibility.toml":
+                return {**original(path), "runtime": gnu}
             return original(path)
         with patch.object(VALIDATOR, "readiness_metadata", side_effect=fixture):
             with self.assertRaisesRegex(ValueError, "musl runtime compatibility release-ready"):
