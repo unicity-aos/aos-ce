@@ -2,7 +2,22 @@
 
 use std::time::Duration;
 
+use astrid_sdk::SysError;
 use astrid_sdk::ipc::PollResult;
+
+/// The current host returns an empty envelope on timeout; the published SDK
+/// also documents the ABI's Timeout variant. Both mean a quiet slice, not a
+/// closed subscription. Normalize only that exact SDK-mapped variant.
+pub(super) fn quiet_receive(result: Result<PollResult, SysError>) -> Result<PollResult, SysError> {
+    match result {
+        Err(SysError::HostError(detail)) if detail == "Timeout" => Ok(PollResult {
+            messages: Vec::new(),
+            dropped: 0,
+            lagged: 0,
+        }),
+        other => other,
+    }
+}
 
 /// A quiet receive is not completion: providers may still be queued for CPU.
 /// Use actual monotonic elapsed time, not the requested receive timeout, since
@@ -104,5 +119,37 @@ mod tests {
             || Duration::ZERO,
         );
         assert_eq!(result, Err("subscription closed"));
+    }
+
+    #[test]
+    fn sdk_timeout_error_is_quiet_but_a_later_provider_is_collected() {
+        let elapsed = Cell::new(0_u64);
+        let calls = Cell::new(0);
+        let mut responders = 0;
+        collect(
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            |timeout| {
+                calls.set(calls.get() + 1);
+                elapsed.set(elapsed.get() + timeout);
+                quiet_receive(if calls.get() == 2 {
+                    Err(SysError::HostError("Timeout".into()))
+                } else {
+                    Ok(batch(true))
+                })
+            },
+            |result| responders += result.messages.len(),
+            || Duration::from_millis(elapsed.get()),
+        )
+        .unwrap();
+        assert_eq!(responders, 2);
+    }
+
+    #[test]
+    fn non_timeout_host_errors_are_not_silenced() {
+        for detail in ["Closed", "CapabilityDenied", "Unknown(\"Timeout\")"] {
+            let result = quiet_receive(Err(SysError::HostError(detail.into())));
+            assert!(matches!(result, Err(SysError::HostError(value)) if value == detail));
+        }
     }
 }

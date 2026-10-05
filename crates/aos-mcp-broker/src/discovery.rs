@@ -364,7 +364,7 @@ fn discover(req_id: &str) -> Vec<McpToolDescriptor> {
     let drained = drain::collect(
         std::time::Duration::from_millis(DISCOVERY_TIMEOUT_MS),
         std::time::Duration::from_millis(DISCOVERY_SLICE_MS),
-        |timeout| sub.recv(timeout),
+        |timeout| drain::quiet_receive(sub.recv(timeout)),
         |result| {
             seen_any |= !result.messages.is_empty();
             dropped = dropped.saturating_add(result.dropped);
