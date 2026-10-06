@@ -3,7 +3,9 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 python3 "$repo_root/scripts/test_runtime_filesystem_contract.py"
-python3 "$repo_root/scripts/validate-release-contract.py"
+# This composition test runs after the release workflow stages stable, nightly,
+# or numbered RC identity. Publication policy is checked by that workflow first.
+python3 "$repo_root/scripts/validate-release-contract.py" --allow-nightly --allow-release-candidate
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 target=x86_64-unknown-linux-gnu
