@@ -36,6 +36,12 @@ class ReleaseReadinessTests(unittest.TestCase):
             "source": f"git+{repository}?rev={commit}#{commit}"} for name in names]}
         runtime = {"version": "2026.10.0-rc.1", "source-commit": commit}
         VALIDATOR.validate_runtime_dependencies(cargo, lock, runtime)
+        # Published SDK dependencies retain their own older astrid-types;
+        # only the directly pinned runtime library version is source-bound.
+        legacy_lock = copy.deepcopy(lock)
+        legacy_lock["package"].append({"name": "astrid-types", "version": "0.7.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"})
+        VALIDATOR.validate_runtime_dependencies(cargo, legacy_lock, runtime)
         for field, value in (("rev", "b" * 40), ("git", "https://example.com/astrid"),
                              ("version", "=2026.9.4"), ("path", "../astrid")):
             changed = copy.deepcopy(cargo)
@@ -232,12 +238,16 @@ class ReleaseReadinessTests(unittest.TestCase):
         musl = VALIDATOR.readiness_metadata(
             ROOT / "release/runtime-musl-compatibility.toml"
         )["runtime"]
-        self.assertTrue(gnu["release-ready"])
+        # Isolate the MUSL gate even while the product itself is staged.
+        gnu["release-ready"] = True
+        gnu["upgrade-self-heal-ready"] = True
         musl["release-ready"] = False
         original = VALIDATOR.readiness_metadata
         def fixture(path):
             if Path(path).name == "runtime-musl-compatibility.toml":
                 return {"schema-version": 1, "runtime": musl}
+            if Path(path).name == "runtime-compatibility.toml":
+                return {**original(path), "runtime": gnu}
             return original(path)
         with patch.object(VALIDATOR, "readiness_metadata", side_effect=fixture):
             with self.assertRaisesRegex(ValueError, "musl runtime compatibility release-ready"):

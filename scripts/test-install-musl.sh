@@ -7,7 +7,7 @@ for m_target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
   mkdir -p "$m_root"
   cp "$runtime_root"/* "$m_root/"
   COPYFILE_DISABLE=1 tar -czf "$work/$m_target-runtime.tar.gz" -C "$work" "$(basename "$m_root")"
-  bash "$repo_root/scripts/package-release.sh" "$m_target" "$work/aos" \
+  bash "$package_repo/scripts/package-release.sh" "$m_target" "$work/aos" \
     "$work/$m_target-runtime.tar.gz" "$(printf '%064d' 0)" "$work/capsules" "$fixture" >/dev/null
   cp "$good_bundle" "$fixture/unicity-aos-2026.9.3-$m_target.tar.gz.sigstore.json"
 done

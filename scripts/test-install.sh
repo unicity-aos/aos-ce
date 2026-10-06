@@ -6,6 +6,48 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 fixture="$work/fixture"
 fake_bin="$work/fake-bin"
+# These installer fixtures model an existing 2026.9.3 publication. Compose
+# them from current packaging code with only their product identity frozen;
+# test-package-release.sh separately checks the live checkout's identity.
+package_repo="$work/package-fixture-repo"
+mkdir -p "$package_repo/crates/unicity-aos-bootstrap" "$package_repo/distros/community/unicity-ce"
+cp "$repo_root/Cargo.toml" "$package_repo/"
+cp "$repo_root/install.sh" "$repo_root/README.md" "$package_repo/"
+cp "$repo_root/crates/unicity-aos-bootstrap/Cargo.toml" "$package_repo/crates/unicity-aos-bootstrap/"
+cp "$repo_root/distros/community/unicity-ce/Distro.toml" "$package_repo/distros/community/unicity-ce/"
+cp -R "$repo_root/scripts" "$repo_root/release" "$package_repo/"
+ln -s "$repo_root/capsules" "$package_repo/capsules"
+python3 - "$package_repo" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+root = pathlib.Path(sys.argv[1])
+for relative, section in (
+    ("crates/unicity-aos-bootstrap/Cargo.toml", "package"),
+    ("distros/community/unicity-ce/Distro.toml", "distro"),
+    ("release/runtime-compatibility.toml", "product"),
+):
+    path = root / relative
+    text = path.read_text(encoding="utf-8")
+    current = tomllib.loads(text)[section]["version"]
+    needle = f'version = "{current}"'
+    assert text.count(needle) == 1, relative
+    path.write_text(text.replace(needle, 'version = "2026.9.3"'), encoding="utf-8")
+path = root / "distros/community/unicity-ce/Distro.toml"
+text = path.read_text(encoding="utf-8")
+pretty_name = tomllib.loads(text)["distro"]["pretty-name"]
+version = tomllib.loads((root / "crates/unicity-aos-bootstrap/Cargo.toml").read_text())["package"]["version"]
+replacement = f"Unicity CE {version} (Genesis)"
+text = text.replace(f'pretty-name = "{pretty_name}"', f'pretty-name = "{replacement}"')
+path.write_text(text, encoding="utf-8")
+# Assert the composed fixture's identity, not only the fields we rewrote.
+crate = tomllib.loads((root / "crates/unicity-aos-bootstrap/Cargo.toml").read_text())
+distro = tomllib.loads(path.read_text())
+compatibility = tomllib.loads((root / "release/runtime-compatibility.toml").read_text())
+assert crate["package"]["version"] == distro["distro"]["version"] == compatibility["product"]["version"] == "2026.9.3"
+assert distro["distro"]["pretty-name"] == replacement
+PY
 mkdir -p "$fixture" "$fake_bin" "$work/home" "$work/capsules"
 mkdir -p "$work/home/.astrid"
 printf 'standalone-runtime-state\n' > "$work/home/.astrid/sentinel"
@@ -78,7 +120,7 @@ for binary in astrid astrid-daemon astrid-build astrid-emit astrid-storage-provi
   chmod 755 "$runtime_root/$binary"
 done
 COPYFILE_DISABLE=1 tar -czf "$work/runtime.tar.gz" -C "$work" "$(basename "$runtime_root")"
-bash "$repo_root/scripts/package-release.sh" \
+bash "$package_repo/scripts/package-release.sh" \
   x86_64-unknown-linux-gnu \
   "$work/aos" \
   "$work/runtime.tar.gz" \
@@ -306,7 +348,17 @@ sh "$repo_root/install.sh" --yes --no-migrate-prompt
 test -x "$work/home/.aos/bin/aos"
 source "$repo_root/scripts/test-install-musl.sh"
 release_dir="$work/home/.aos/releases/2026.9.3"
-test "$runtime_version" = 2026.9.4
+python3 - "$release_dir/release-manifest.json" "$runtime_version" "$runtime_tag" "$runtime_identity" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+runtime = manifest["runtime"]
+assert runtime["version"] == sys.argv[2], runtime
+assert runtime["tag"] == sys.argv[3], runtime
+assert runtime["release_workflow_identity"] == sys.argv[4], runtime
+PY
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
   test -x "$release_dir/runtime/bin/$binary"
   test ! -e "$work/home/.aos/runtime/bin/$binary"
@@ -357,7 +409,7 @@ PYTHONPATH="$repo_root/scripts" python3 -c \
 COPYFILE_DISABLE=1 tar -czf "$work/darwin-runtime.tar.gz" \
   -C "$work" "$(basename "$darwin_runtime_root")"
 AOS_COMMAND_CENTER_APP="$command_center_app" \
-bash "$repo_root/scripts/package-release.sh" \
+bash "$package_repo/scripts/package-release.sh" \
   aarch64-apple-darwin \
   "$work/aos" \
   "$work/darwin-runtime.tar.gz" \
@@ -645,6 +697,7 @@ test_fuse_musl_install() {
   local original_work="$work"
   local work="$work/musl-runtime-$fuse_version"
   local repo_root="$fuse_repo" fixture="$fuse_fixture"
+  local package_repo="$fuse_repo"
   local release_metadata="$fuse_release_metadata"
   local runtime_version="$fuse_version" runtime_root="$fuse_runtime_root"
   local m_target m_root m_metadata m_arch m_verifier m_failure
@@ -661,11 +714,11 @@ mkdir -p \
   "$fuse_repo/crates/unicity-aos-bootstrap" \
   "$fuse_repo/distros/community/unicity-ce"
 cp "$repo_root/Cargo.toml" "$fuse_repo/Cargo.toml"
-cp "$repo_root/crates/unicity-aos-bootstrap/Cargo.toml" \
+cp "$package_repo/crates/unicity-aos-bootstrap/Cargo.toml" \
   "$fuse_repo/crates/unicity-aos-bootstrap/Cargo.toml"
 cp -R "$repo_root/capsules" "$fuse_repo/"
 cp -R "$repo_root/release" "$fuse_repo/"
-cp "$repo_root/distros/community/unicity-ce/Distro.toml" \
+cp "$package_repo/distros/community/unicity-ce/Distro.toml" \
   "$fuse_repo/distros/community/unicity-ce/Distro.toml"
 cp "$repo_root/install.sh" "$repo_root/README.md" "$fuse_repo/"
 cp "$repo_root/scripts/capsule_release.py" \
@@ -680,6 +733,7 @@ import sys
 
 runtime_path, distro_path = map(pathlib.Path, sys.argv[1:3])
 version = sys.argv[3]
+import tomllib
 runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
 replacements = {
     "version": f'version = "{version}"',
@@ -703,10 +757,14 @@ for index, line in enumerate(runtime_lines):
             runtime_lines[index] = replacements[key]
 runtime_path.write_text("\n".join(runtime_lines) + "\n", encoding="utf-8")
 distro_text = distro_path.read_text(encoding="utf-8")
+current_requirement = tomllib.loads(distro_text)["distro"]["astrid-version"]
+needle = f'astrid-version = "{current_requirement}"'
+assert distro_text.count(needle) == 1
 distro_path.write_text(
-    distro_text.replace('astrid-version = "=0.10.4"', f'astrid-version = "={version}"'),
+    distro_text.replace(needle, f'astrid-version = ">={version}"'),
     encoding="utf-8",
 )
+assert tomllib.loads(distro_path.read_text())["distro"]["astrid-version"] == tomllib.loads(runtime_path.read_text())["runtime"]["version-requirement"] == f">={version}"
 PY
 
 fuse_runtime_root="$work/astrid-$fuse_version-x86_64-unknown-linux-gnu"
@@ -1601,7 +1659,7 @@ if [ "${1:-}" = --version ]; then
 fi
 EOF
 chmod 755 "$work/aos-mismatch"
-bash "$repo_root/scripts/package-release.sh" \
+bash "$package_repo/scripts/package-release.sh" \
   x86_64-unknown-linux-gnu \
   "$work/aos-mismatch" \
   "$work/runtime.tar.gz" \

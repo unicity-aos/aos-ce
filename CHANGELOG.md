@@ -6,7 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [year.month.patch](release/VERSIONING.md). Repairs to unreleased
 implementations are consolidated into their final behavior.
 
-[Unreleased]: https://github.com/unicity-aos/aos-ce/compare/2026.9.3...HEAD
+[Unreleased]: https://github.com/unicity-aos/aos-ce/compare/2026.10.0...HEAD
+[2026.10.0]: https://github.com/unicity-aos/aos-ce/compare/2026.9.3...2026.10.0
 [2026.9.3]: https://github.com/unicity-aos/aos-ce/compare/2026.9.2...2026.9.3
 [2026.9.2]: https://github.com/unicity-aos/aos-ce/compare/2026.9.1...2026.9.2
 [2026.9.1]: https://github.com/unicity-aos/aos-ce/compare/2026.9.0...2026.9.1
@@ -15,12 +16,17 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+## [2026.10.0] - 2026-10-05
+
 ### Added
 
 - Add a shared software-update inventory to Command Center and `aos console`,
   with signed-channel checks, explicit candidate-bound AOS/Oracle installation,
   per-item failures, and honest activation status. Principal-scoped capsule
   discovery keeps distribution-managed capsules out of independent updates.
+- Expand the canonical Oracle event and policy-routing surface so host adapters
+  can forward native client events through the same AOS hook adapter. Client
+  recognition and protocol translation remain in Oracles, not AOS or Astrid.
 
 ### Changed
 
@@ -35,6 +41,12 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Preserve authenticated policy decisions across the Oracle relay instead of
+  treating context text as a blocking decision.
+- Batch fast provider text while preserving ordered delivery and reject stale
+  turn replies after cancellation or replacement.
+- Select the product workspace for principal discovery instead of accidentally
+  inspecting the caller's unrelated project layout.
 - Keep cold MCP tool discovery open through its bounded collection deadline,
   including providers delayed behind other capsule calls. Warm cached discovery
   stays immediate; receive failures are reported instead of called complete.

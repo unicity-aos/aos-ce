@@ -15,6 +15,16 @@ for command in b3sum cargo find python3 sort stat tar; do
   need "$command"
 done
 
+# Bind product filenames and installer assertions to this checkout, while
+# preserving the explicit historical Astrid runtime fixture below.
+product_version=$(python3 - "$repo_root/crates/unicity-aos-bootstrap/Cargo.toml" <<'PY'
+import pathlib
+import sys
+import tomllib
+print(tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["package"]["version"])
+PY
+)
+
 mode_of() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
@@ -128,17 +138,19 @@ snapshot_imported_directories() {
 snapshot_shipped_assets() {
   local home=$1
   local output=$2
-  local release=$home/releases/2026.9.3
+  local release=$home/releases/${product_version}
   : > "$output"
   printf '%s|bin/aos\n' "$(b3sum -- "$home/bin/aos" | awk '{print $1}')" >> "$output"
   for name in $runtime_binaries; do
-    printf '%s|releases/2026.9.3/runtime/bin/%s\n' \
+    printf '%s|releases/%s/runtime/bin/%s\n' \
       "$(b3sum -- "$release/runtime/bin/$name" | awk '{print $1}')" \
+      "$product_version" \
       "$name" >> "$output"
   done
   while IFS= read -r capsule; do
-    printf '%s|releases/2026.9.3/capsules/%s\n' \
+    printf '%s|releases/%s/capsules/%s\n' \
       "$(b3sum -- "$release/capsules/$capsule" | awk '{print $1}')" \
+      "$product_version" \
       "$capsule" >> "$output"
   done < "$release/capsule-assets.txt"
 }
@@ -166,7 +178,7 @@ target_dir=$(
     python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
 )
 product_binary=$target_dir/debug/aos
-test "$($product_binary --version)" = 'Unicity AOS 2026.9.3'
+test "$($product_binary --version)" = "Unicity AOS ${product_version}"
 
 PYTHONPATH="$repo_root/scripts" python3 - "$capsules" <<'PY'
 import pathlib
@@ -275,7 +287,7 @@ bash "$repo_root/scripts/package-release.sh" \
   "$capsules" \
   "$fixture" >/dev/null
 
-asset=$fixture/unicity-aos-2026.9.3-$target.tar.gz
+asset=$fixture/unicity-aos-${product_version}-$target.tar.gz
 bundle=$asset.sigstore.json
 cp "$asset" "$fixture/signed-asset.tar.gz"
 printf 'valid Sigstore fixture\n' > "$fixture/valid.sigstore.json"
@@ -283,16 +295,16 @@ cp "$fixture/valid.sigstore.json" "$bundle"
 asset_sha256=$(shasum -a 256 "$asset" | awk '{print $1}')
 asset_blake3=$(b3sum "$asset" | awk '{print $1}')
 asset_size=$(wc -c < "$asset" | tr -d ' ')
-release_metadata=$fixture/unicity-aos-2026.9.3-release.toml
+release_metadata=$fixture/unicity-aos-${product_version}-release.toml
 cat > "$release_metadata" <<EOF
 schema-version = 1
 kind = "aos-release"
 product = "unicity-aos-ce"
-version = "2026.9.3"
-tag = "2026.9.3"
+version = "${product_version}"
+tag = "${product_version}"
 source-commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 published-at = "2026-07-16T10:00:00Z"
-release-workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/2026.9.3"
+release-workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/${product_version}"
 
 [runtime]
 repository = "astrid-runtime/astrid"
@@ -315,7 +327,7 @@ release-ready = false
 upgrade-self-heal-ready = false
 EOF
 for metadata_target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
-  metadata_asset="unicity-aos-2026.9.3-${metadata_target}.tar.gz"
+  metadata_asset="unicity-aos-${product_version}-${metadata_target}.tar.gz"
   cat >> "$release_metadata" <<EOF
 
 [targets.${metadata_target}]
@@ -386,7 +398,7 @@ install_candidate() {
   PATH="$fake_bin:$PATH" \
   HOME="$home" \
   AOS_TEST_FIXTURE="$fixture" \
-  AOS_VERSION=2026.9.3 \
+  AOS_VERSION=${product_version} \
   ASTRID_FSKIT_APP_DEST="$work/AOS.app" \
   AOS_TEST_FSKIT_LOG="$work/fskit-calls" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
@@ -401,9 +413,9 @@ test "$(find "$legacy/run" -type f | wc -l | tr -d ' ')" -eq 5
 
 install_candidate
 test -x "$aos_home/bin/aos"
-test -x "$aos_home/releases/2026.9.3/runtime/bin/astrid-daemon"
+test -x "$aos_home/releases/${product_version}/runtime/bin/astrid-daemon"
 if [[ "$host_os" == Linux ]]; then
-  test -x "$aos_home/releases/2026.9.3/runtime/bin/astrid-storage-provider-fuse"
+  test -x "$aos_home/releases/${product_version}/runtime/bin/astrid-storage-provider-fuse"
 fi
 for name in $runtime_binaries; do
   test ! -e "$aos_home/runtime/bin/$name"
@@ -465,23 +477,23 @@ snapshot_shipped_assets "$aos_home" "$shipped_before"
 for name in aos $runtime_binaries; do
   case "$name" in
     aos) destination=$aos_home/bin/aos ;;
-    *) destination=$aos_home/releases/2026.9.3/runtime/bin/$name ;;
+    *) destination=$aos_home/releases/${product_version}/runtime/bin/$name ;;
   esac
   printf '#!/bin/sh\nexit 0\n' > "$destination"
   chmod 755 "$destination"
 done
 while IFS= read -r capsule; do
-  printf 'tampered capsule\n' > "$aos_home/releases/2026.9.3/capsules/$capsule"
-done < "$aos_home/releases/2026.9.3/capsule-assets.txt"
+  printf 'tampered capsule\n' > "$aos_home/releases/${product_version}/capsules/$capsule"
+done < "$aos_home/releases/${product_version}/capsule-assets.txt"
 chmod 755 \
   "$aos_home" \
   "$aos_home/bin" \
   "$aos_home/runtime" \
   "$aos_home/releases" \
-  "$aos_home/releases/2026.9.3" \
-  "$aos_home/releases/2026.9.3/runtime" \
-  "$aos_home/releases/2026.9.3/runtime/bin" \
-  "$aos_home/releases/2026.9.3/capsules"
+  "$aos_home/releases/${product_version}" \
+  "$aos_home/releases/${product_version}/runtime" \
+  "$aos_home/releases/${product_version}/runtime/bin" \
+  "$aos_home/releases/${product_version}/capsules"
 
 install_candidate
 assert_imported_activation_layout "$aos_home/runtime"
@@ -492,10 +504,10 @@ for directory in \
   "$aos_home/bin" \
   "$aos_home/runtime" \
   "$aos_home/releases" \
-  "$aos_home/releases/2026.9.3" \
-  "$aos_home/releases/2026.9.3/runtime" \
-  "$aos_home/releases/2026.9.3/runtime/bin" \
-  "$aos_home/releases/2026.9.3/capsules"; do
+  "$aos_home/releases/${product_version}" \
+  "$aos_home/releases/${product_version}/runtime" \
+  "$aos_home/releases/${product_version}/runtime/bin" \
+  "$aos_home/releases/${product_version}/capsules"; do
   test "$(mode_of "$directory")" = 700
 done
 
@@ -567,6 +579,8 @@ import pathlib
 import sys
 
 runtime_path, distro_path = map(pathlib.Path, sys.argv[1:])
+import tomllib
+
 runtime_lines = runtime_path.read_text(encoding="utf-8").splitlines()
 replacements = {
     "version": 'version = "2026.9.3"',
@@ -590,10 +604,14 @@ for index, line in enumerate(runtime_lines):
             runtime_lines[index] = replacements[key]
 runtime_path.write_text("\n".join(runtime_lines) + "\n", encoding="utf-8")
 distro_text = distro_path.read_text(encoding="utf-8")
+current_requirement = tomllib.loads(distro_text)["distro"]["astrid-version"]
+needle = f'astrid-version = "{current_requirement}"'
+assert distro_text.count(needle) == 1
 distro_path.write_text(
-    distro_text.replace('astrid-version = "=0.10.4"', 'astrid-version = "=2026.9.3"'),
+    distro_text.replace(needle, 'astrid-version = ">=2026.9.3"'),
     encoding="utf-8",
 )
+assert tomllib.loads(distro_path.read_text())["distro"]["astrid-version"] == tomllib.loads(runtime_path.read_text())["runtime"]["version-requirement"] == ">=2026.9.3"
 PY
 
 strict_provider=astrid-storage-provider-fuse
@@ -626,7 +644,7 @@ bash "$fuse_repo/scripts/package-release.sh" \
   0000000000000000000000000000000000000000000000000000000000000000 \
   "$capsules" \
   "$fuse_output" >/dev/null
-fuse_asset_name="unicity-aos-2026.9.3-$target.tar.gz"
+fuse_asset_name="unicity-aos-${product_version}-$target.tar.gz"
 fuse_asset="$fuse_output/$fuse_asset_name"
 fuse_asset_sha256=$(shasum -a 256 "$fuse_asset" | awk '{print $1}')
 fuse_asset_blake3=$(b3sum "$fuse_asset" | awk '{print $1}')
@@ -637,16 +655,16 @@ cp "$fuse_asset" "$fuse_fixture/$fuse_asset_name"
 cp "$fixture/valid.sigstore.json" "$fuse_fixture/valid.sigstore.json"
 cp "$fixture/$cosign_asset" "$fuse_fixture/$cosign_asset"
 cp "$fixture/valid.sigstore.json" "$fuse_fixture/$fuse_asset_name.sigstore.json"
-fuse_release_metadata="$fuse_fixture/unicity-aos-2026.9.3-release.toml"
+fuse_release_metadata="$fuse_fixture/unicity-aos-${product_version}-release.toml"
 cat > "$fuse_release_metadata" <<EOF
 schema-version = 1
 kind = "aos-release"
 product = "unicity-aos-ce"
-version = "2026.9.3"
-tag = "2026.9.3"
+version = "${product_version}"
+tag = "${product_version}"
 source-commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 published-at = "2026-07-16T10:00:00Z"
-release-workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/2026.9.3"
+release-workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/${product_version}"
 
 [runtime]
 repository = "astrid-runtime/astrid"
@@ -669,7 +687,7 @@ release-ready = true
 upgrade-self-heal-ready = true
 EOF
 for metadata_target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
-  metadata_asset="unicity-aos-2026.9.3-${metadata_target}.tar.gz"
+  metadata_asset="unicity-aos-${product_version}-${metadata_target}.tar.gz"
   cat >> "$fuse_release_metadata" <<EOF
 
 [targets.${metadata_target}]
@@ -680,21 +698,21 @@ sigstore-bundle = "${metadata_asset}.sigstore.json"
 size = ${fuse_asset_size}
 EOF
 done
-cp "$fixture/valid.sigstore.json" "$fuse_fixture/unicity-aos-2026.9.3-release.toml.sigstore.json"
+cp "$fixture/valid.sigstore.json" "$fuse_fixture/unicity-aos-${product_version}-release.toml.sigstore.json"
 
 fuse_runtime_binaries="astrid astrid-daemon astrid-build astrid-emit $strict_provider"
 fuse_install_candidate() {
   PATH="$fake_bin:$PATH" \
   HOME="$home" \
   AOS_TEST_FIXTURE="$fuse_fixture" \
-  AOS_VERSION=2026.9.3 \
+  AOS_VERSION=${product_version} \
   ASTRID_FSKIT_APP_DEST="$work/AOS.app" \
   AOS_TEST_FSKIT_LOG="$work/fskit-calls" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
 }
 
 fuse_install_candidate
-fuse_release="$aos_home/releases/2026.9.3"
+fuse_release="$aos_home/releases/${product_version}"
 for name in $fuse_runtime_binaries; do
   test -x "$fuse_release/runtime/bin/$name"
   test ! -e "$aos_home/runtime/bin/$name"
@@ -745,4 +763,4 @@ for directory in \
   test "$(mode_of "$directory")" = 700
 done
 
-echo "legacy-layout migration and 2026.9.3 GNU FUSE self-heal checks passed"
+echo "legacy-layout migration and ${product_version} GNU FUSE self-heal checks passed"
