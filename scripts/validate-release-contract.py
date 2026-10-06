@@ -88,7 +88,8 @@ def validate_runtime_dependencies(cargo: dict[str, Any], lock: dict[str, Any],
                 and dependency.get("git") == repository and dependency.get("rev") == commit
                 and not any(key in dependency for key in ("path", "branch", "tag")),
                 f"RC {name} must use the authenticated runtime source and numeric base version")
-        packages = [package for package in lock.get("package", []) if package.get("name") == name]
+        packages = [package for package in lock.get("package", [])
+                    if package.get("name") == name and package.get("version") == base]
         require(len(packages) == 1 and packages[0].get("version") == base
                 and packages[0].get("source") == f"git+{repository}?rev={commit}#{commit}",
                 f"locked RC {name} must match the authenticated runtime source")
