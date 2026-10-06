@@ -18,9 +18,10 @@ mounting still requires the app's supported OS version and extension approval.
 The dev candidate selects published Astrid v2026.10.0-rc.2. GNU/Darwin and MUSL
 provenance is authenticated against that exact release workflow identity;
 compiled runtime declarations and Rust build dependencies agree with its source.
-The `release-ready` and `upgrade-self-heal-ready` gates remain closed until the
-complete composed-product and Oracle journeys finish. This is not a stable
-release authorization. Installed-runtime compatibility remains a minimum
+The `release-ready` and `upgrade-self-heal-ready` gates are supported by composed
+QA package installation, legacy migration, capsule restart persistence, metrics,
+and installed signed Oracle tool calls on macOS and native ARM64 GNU/MUSL Linux.
+This is not a stable release authorization. Installed-runtime compatibility remains a minimum
 requirement, not an exact-version ceiling.
 
 The selected runtime-code rehearsal already exercises real signature-enabled

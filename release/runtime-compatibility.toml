@@ -6,10 +6,10 @@ version = "2026.10.0"
 
 [runtime]
 repository = "astrid-runtime/astrid"
-# Runtime provenance is bound to authenticated October RC metadata. Readiness
-# remains false until the composed product passes its package and upgrade journey.
-release-ready = false
-upgrade-self-heal-ready = false
+# Runtime provenance is bound to authenticated October RC metadata. Composed QA
+# packages passed install, legacy upgrade, capsule use and signed Oracle journeys.
+release-ready = true
+upgrade-self-heal-ready = true
 version = "2026.10.0-rc.2"
 tag = "v2026.10.0-rc.2"
 version-requirement = ">=2026.10.0-rc.2"
