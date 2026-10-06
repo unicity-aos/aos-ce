@@ -1400,7 +1400,15 @@ fn signed_distro_apply_stops_to_a_volume_and_writes_a_bound_receipt() {
     assert_eq!(receipt["distro_id"], "unicity-ce");
     assert_eq!(receipt["distro_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(receipt["principal"], "operator");
-    assert_eq!(receipt["astrid_runtime_version"], "2026.9.4");
+    let compatibility: toml::Value = include_str!("../../../release/runtime-compatibility.toml")
+        .parse()
+        .expect("runtime metadata");
+    assert_eq!(
+        receipt["astrid_runtime_version"],
+        compatibility["runtime"]["version"]
+            .as_str()
+            .expect("runtime version")
+    );
     assert!(receipt["signing_pubkey"].as_str().unwrap().len() > 8);
     assert!(
         receipt["manifest_blake3"]
@@ -1849,7 +1857,17 @@ fn native_status_reports_stopped_without_invoking_the_runtime_cli() {
         assert!(output.stderr.is_empty());
         let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
         assert!(stdout.contains("stopped"));
-        assert!(stdout.contains("2026.9.4"));
+        let compatibility: toml::Value =
+            include_str!("../../../release/runtime-compatibility.toml")
+                .parse()
+                .expect("runtime metadata");
+        assert!(
+            stdout.contains(
+                compatibility["runtime"]["version"]
+                    .as_str()
+                    .expect("runtime version")
+            )
+        );
         if stdout.contains("capsule_inventory") {
             let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
             assert_eq!(json["capsule_inventory"]["state"], "stopped");
