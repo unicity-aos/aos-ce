@@ -44,10 +44,12 @@ CANONICAL_VERSION = (
 NIGHTLY_VERSION = re.compile(
     rf"{CANONICAL_VERSION}-nightly\.[0-9]{{8}}\.g[0-9a-f]{{40}}"
 )
-VERSION = re.compile(rf"(?:{CANONICAL_VERSION}|{NIGHTLY_VERSION.pattern})")
+RELEASE_CANDIDATE = re.compile(rf"{CANONICAL_VERSION}-rc\.[1-9][0-9]*")
+VERSION = re.compile(rf"(?:{CANONICAL_VERSION}|{NIGHTLY_VERSION.pattern}|{RELEASE_CANDIDATE.pattern})")
 SEMVER = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 )
+RUNTIME_VERSION = re.compile(rf"{SEMVER.pattern}(?:-rc\.[1-9][0-9]*)?")
 
 
 def require(condition: bool, message: str) -> None:
@@ -57,6 +59,18 @@ def require(condition: bool, message: str) -> None:
 
 def is_nightly_version(version: str) -> bool:
     return nightly_source_commit(version) is not None
+
+
+def validate_channel_version(channel: str, version: str) -> None:
+    require(VERSION.fullmatch(version) is not None, "unsupported AOS release version")
+    if channel == "nightly":
+        require(is_nightly_version(version), "nightly channel must point to a nightly prerelease")
+    elif channel in ("stable", "dev"):
+        require(re.fullmatch(CANONICAL_VERSION, version) is not None or
+                (channel == "dev" and RELEASE_CANDIDATE.fullmatch(version) is not None),
+                "stable and dev require canonical releases; only dev permits YYYY.MINOR.PATCH-rc.N")
+    else:
+        raise ValueError("unknown AOS channel")
 
 
 def nightly_source_commit(version: str) -> str | None:
@@ -198,7 +212,7 @@ def validate_release(metadata: Any, *, require_ready: bool = False) -> dict[str,
     )
     require(runtime["repository"] == "astrid-runtime/astrid", "release metadata runtime repository must be astrid-runtime/astrid")
     runtime_version = string(runtime["version"], "release metadata.runtime.version")
-    require(SEMVER.fullmatch(runtime_version) is not None, "release metadata runtime version must be canonical semver")
+    require(RUNTIME_VERSION.fullmatch(runtime_version) is not None, "release metadata runtime version must be canonical semver or numbered RC")
     require(runtime["tag"] == f"v{runtime_version}", "release metadata runtime tag/version mismatch")
     runtime_identity = string(runtime["release-workflow-identity"], "release metadata.runtime.release-workflow-identity")
     allowed_runtime_identities = {
@@ -307,10 +321,7 @@ def validate_channel(
     require(release["repository"] == REPOSITORY, f"channel release repository must be {REPOSITORY}")
     version = string(release["version"], "channel metadata.release.version")
     require(VERSION.fullmatch(version) is not None, "channel release version must be calendar semver")
-    if channel == "nightly":
-        require(is_nightly_version(version), "nightly channel must point to a nightly prerelease")
-    else:
-        require("-nightly." not in version, "stable and dev channels must point to canonical releases")
+    validate_channel_version(channel, version)
     require(release["tag"] == version, "channel release tag must equal version")
     require(COMMIT.fullmatch(string(release["source-commit"], "channel metadata.release.source-commit")) is not None, "channel release source-commit is malformed")
     nightly_commit = nightly_source_commit(version)

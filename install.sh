@@ -118,9 +118,23 @@ is_aos_nightly_version() {
   [ "$day" -le "$max_day" ]
 }
 
+is_aos_release_candidate() {
+  printf '%s\n' "$1" | grep -Eq '^(202[6-9]|20[3-9][0-9])\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[1-9][0-9]*$'
+}
+
 is_aos_release_version() {
   printf '%s\n' "$1" | grep -Eq '^(202[6-9]|20[3-9][0-9])\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
-    || is_aos_nightly_version "$1"
+    || is_aos_nightly_version "$1" || is_aos_release_candidate "$1"
+}
+
+is_aos_channel_version() {
+  is_aos_release_version "$2" || return 1
+  case "$1" in
+    nightly) is_aos_nightly_version "$2" ;;
+    dev) ! is_aos_nightly_version "$2" ;;
+    stable) ! is_aos_nightly_version "$2" && ! is_aos_release_candidate "$2" ;;
+    *) return 1 ;;
+  esac
 }
 
 if [ -n "$AOS_VERSION" ] && ! is_aos_release_version "$AOS_VERSION"; then
@@ -351,11 +365,7 @@ validate_channel_metadata() {
   release_workflow_identity=$(toml_value "$metadata" "[release]" release-workflow-identity)
   [ "$release_repository" = "$AOS_TRUSTED_RELEASE_REPO" ] || return 1
   is_aos_release_version "$release_version" || return 1
-  if [ "$expected_channel" = nightly ]; then
-    is_aos_nightly_version "$release_version" || return 1
-  else
-    ! is_aos_nightly_version "$release_version" || return 1
-  fi
+  is_aos_channel_version "$expected_channel" "$release_version" || return 1
   [ "$release_tag_value" = "$release_version" ] || return 1
   printf '%s\n' "$release_source_commit" | grep -Eq '^[0-9a-f]{40}$' || return 1
   if is_aos_nightly_version "$release_version"; then
@@ -480,7 +490,7 @@ validate_release_metadata() {
   runtime_metadata_asset=$(toml_value "$metadata" "[runtime]" release-metadata-asset)
   runtime_metadata_blake3=$(toml_value "$metadata" "[runtime]" release-metadata-blake3)
   [ "$runtime_repository" = astrid-runtime/astrid ] || return 1
-  printf '%s\n' "$runtime_version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || return 1
+  printf '%s\n' "$runtime_version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$' || return 1
   [ "$runtime_tag" = "v${runtime_version}" ] || return 1
   case "$runtime_identity" in
     "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v${runtime_version}"|\

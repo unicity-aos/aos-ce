@@ -76,6 +76,19 @@ def extension_fixture() -> tuple[dict[str, object], dict[str, object], bytes]:
 
 
 class RuntimeReadinessTests(unittest.TestCase):
+    def test_runtime_rc_has_exact_tag_and_metadata_assets(self) -> None:
+        pin = runtime_pin_fixture(release_ready=True)
+        runtime = pin["runtime"]
+        version = "2026.10.0-rc.1"
+        runtime.update({"version": version, "tag": f"v{version}",
+            "release-workflow-identity": f"https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v{version}",
+            "legacy-release-metadata-asset": f"astrid-{version}-release.toml",
+            "musl-release-metadata-asset": f"astrid-{version}-musl-release.toml"})
+        MUSL.validate_runtime_pin(pin, require_ready=True)
+        runtime["tag"] = "v2026.10.0"
+        with self.assertRaises(ValueError):
+            MUSL.validate_runtime_pin(pin, require_ready=True)
+
     def test_unready_pin_is_admitted_but_require_ready_rejects_it(self) -> None:
         pin = runtime_pin_fixture(release_ready=False)
         runtime = MUSL.validate_runtime_pin(pin, require_ready=False)

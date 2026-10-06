@@ -130,6 +130,20 @@ def channel_fixture() -> dict[str, object]:
 
 
 class ReleaseMetadataTests(unittest.TestCase):
+    def test_runtime_rc_retains_exact_authenticated_identity(self) -> None:
+        fixture = release_fixture()
+        runtime = fixture["runtime"]
+        version = "2026.10.0-rc.1"
+        runtime.update({"version": version, "tag": f"v{version}",
+            "release-workflow-identity": f"https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v{version}",
+            "release-metadata-available": True, "source-commit": "d" * 40,
+            "release-metadata-asset": f"astrid-{version}-release.toml",
+            "release-metadata-blake3": "e" * 64})
+        METADATA.validate_release(fixture)
+        runtime["tag"] = "v2026.10.0"
+        with self.assertRaises(ValueError):
+            METADATA.validate_release(fixture)
+
     def test_calendar_semver_uses_year_plus_unbounded_semver_minor(self) -> None:
         self.assertIsNotNone(METADATA.VERSION.fullmatch("2026.13.0"))
         self.assertIsNone(METADATA.VERSION.fullmatch("2026.01.0"))
@@ -139,7 +153,17 @@ class ReleaseMetadataTests(unittest.TestCase):
                 f"2026.13.0-nightly.20260717.g{'0' * 40}"
             )
         )
-        self.assertIsNone(METADATA.VERSION.fullmatch("2026.13.0-rc.1"))
+        self.assertIsNotNone(METADATA.VERSION.fullmatch("2026.13.0-rc.1"))
+
+    def test_release_candidates_are_dev_only(self) -> None:
+        for version in ("2026.10.0-rc.1", "2026.10.0-rc.42"):
+            METADATA.validate_channel_version("dev", version)
+            for channel in ("stable", "nightly"):
+                with self.subTest(channel=channel), self.assertRaises(ValueError):
+                    METADATA.validate_channel_version(channel, version)
+        for version in ("2026.10.0-rc.0", "2026.10.0-rc.01", "2026.10.0-beta.1", "2026.10.0-rc.1+build"):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                METADATA.validate_channel_version("dev", version)
 
     def test_release_accepts_false_staged_gates(self) -> None:
         self.assertEqual(METADATA.validate_release(release_fixture())["version"], "2026.9.0")

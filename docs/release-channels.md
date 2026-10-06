@@ -1,5 +1,13 @@
 # Signed AOS release channels
 
+Dev also accepts numbered release candidates such as `2026.10.0-rc.1`.
+The positive RC number has no leading zeros. RCs are GitHub prereleases and
+cannot move stable or consume the final `2026.10.0` tag. The tag's source keeps
+its canonical version; release checkouts stage the RC product identity while
+preserving the exact authenticated Astrid runtime dependency.
+macOS app bundle versions use the numeric base required by Apple; the CLI,
+archive names and signed release metadata retain the complete RC identity.
+
 AOS resolves direct installs through signed `stable`, `dev`, and `nightly`
 channel pointers. The default is `stable`:
 
