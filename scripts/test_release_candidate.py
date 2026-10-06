@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import tomllib
 import unittest
 
 import release_candidate
@@ -24,13 +25,17 @@ class ReleaseCandidateTests(NightlyVersionTests):
             with tarfile.open(fileobj=io.BytesIO(archive)) as files:
                 files.extractall(root, filter="data")
             # Exercise the working script, including an uncommitted regression fix.
-            shutil.copy2(source / "scripts/test-package-release.sh",
-                         root / "scripts/test-package-release.sh")
+            for name in ("test-package-release.sh", "test-install.sh"):
+                shutil.copy2(source / "scripts" / name, root / "scripts" / name)
             base = release_candidate.nightly_version.canonical_base(root)
-            release_candidate.stage(root, f"{base}-rc.1")
-            run = subprocess.run(["bash", "scripts/test-package-release.sh"],
-                                 cwd=root, capture_output=True, text=True, timeout=120)
-            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            runtime = tomllib.loads((root / "release/runtime-compatibility.toml").read_text())["runtime"]["version"]
+            # Equal product/runtime versions must not confuse fixture rewrites.
+            candidate = runtime if runtime.startswith(base + "-rc.") else f"{base}-rc.1"
+            release_candidate.stage(root, candidate)
+            for script in ("test-package-release.sh", "test-install.sh"):
+                run = subprocess.run(["bash", "scripts/" + script], cwd=root,
+                                     capture_output=True, text=True, timeout=180)
+                self.assertEqual(run.returncode, 0, script + "\n" + run.stdout + run.stderr)
 
     def test_shipped_posix_installer_version_classes(self) -> None:
         text = (release_candidate.nightly_version.ROOT / "install.sh").read_text()
