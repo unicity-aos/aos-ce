@@ -348,7 +348,17 @@ sh "$repo_root/install.sh" --yes --no-migrate-prompt
 test -x "$work/home/.aos/bin/aos"
 source "$repo_root/scripts/test-install-musl.sh"
 release_dir="$work/home/.aos/releases/2026.9.3"
-test "$runtime_version" = 2026.9.4
+python3 - "$release_dir/release-manifest.json" "$runtime_version" "$runtime_tag" "$runtime_identity" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+runtime = manifest["runtime"]
+assert runtime["version"] == sys.argv[2], runtime
+assert runtime["tag"] == sys.argv[3], runtime
+assert runtime["release_workflow_identity"] == sys.argv[4], runtime
+PY
 for binary in astrid astrid-daemon astrid-build astrid-emit; do
   test -x "$release_dir/runtime/bin/$binary"
   test ! -e "$work/home/.aos/runtime/bin/$binary"
