@@ -6,18 +6,18 @@ version = "2026.10.0"
 
 [runtime]
 repository = "astrid-runtime/astrid"
-# Staged product only: replace runtime provenance with authenticated October
-# release metadata and revalidate the composed candidate before publication.
+# Runtime provenance is bound to authenticated October RC metadata. Readiness
+# remains false until the composed product passes its package and upgrade journey.
 release-ready = false
 upgrade-self-heal-ready = false
-version = "2026.9.4"
-tag = "v2026.9.4"
-version-requirement = ">=2026.9.4"
-release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.9.4"
+version = "2026.10.0-rc.1"
+tag = "v2026.10.0-rc.1"
+version-requirement = ">=2026.10.0-rc.1"
+release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.10.0-rc.1"
 release-metadata-available = true
-source-commit = "892487d2dcc52c054184fa9b9b313bf113a234e0"
-release-metadata-asset = "astrid-2026.9.4-release.toml"
-release-metadata-blake3 = "90dcc7a1509128f17fb11c4c45d9696dc99d65c27df767bbef0ab2465b3a8498"
+source-commit = "b8d0e711ebed24b6a40a05f1a0c278656c962d17"
+release-metadata-asset = "astrid-2026.10.0-rc.1-release.toml"
+release-metadata-blake3 = "f3ad7da3ce179529b26f3094b9ddb3b69ad9a14d38fbf0d6c6e67543036f7e8b"
 
 [contracts]
 repository = "astrid-runtime/wit"
