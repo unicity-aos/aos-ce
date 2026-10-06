@@ -5,9 +5,9 @@ import sys
 
 
 def requires_native_filesystem(version: str) -> bool:
-    stable = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version)
+    stable = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*)?", version)
     if stable is None:
-        raise ValueError("runtime filesystem contract requires canonical stable SemVer")
+        raise ValueError("runtime filesystem contract requires canonical SemVer or numbered RC")
     return tuple(map(int, stable.groups())) >= (2026, 9, 0)
 
 

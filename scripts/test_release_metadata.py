@@ -130,6 +130,20 @@ def channel_fixture() -> dict[str, object]:
 
 
 class ReleaseMetadataTests(unittest.TestCase):
+    def test_runtime_rc_retains_exact_authenticated_identity(self) -> None:
+        fixture = release_fixture()
+        runtime = fixture["runtime"]
+        version = "2026.10.0-rc.1"
+        runtime.update({"version": version, "tag": f"v{version}",
+            "release-workflow-identity": f"https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v{version}",
+            "release-metadata-available": True, "source-commit": "d" * 40,
+            "release-metadata-asset": f"astrid-{version}-release.toml",
+            "release-metadata-blake3": "e" * 64})
+        METADATA.validate_release(fixture)
+        runtime["tag"] = "v2026.10.0"
+        with self.assertRaises(ValueError):
+            METADATA.validate_release(fixture)
+
     def test_calendar_semver_uses_year_plus_unbounded_semver_minor(self) -> None:
         self.assertIsNotNone(METADATA.VERSION.fullmatch("2026.13.0"))
         self.assertIsNone(METADATA.VERSION.fullmatch("2026.01.0"))

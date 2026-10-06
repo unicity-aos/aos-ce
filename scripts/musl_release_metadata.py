@@ -79,7 +79,7 @@ def validate_runtime_pin(value: Any, *, require_ready: bool) -> dict[str, Any]:
     )
     version = release_metadata.string(runtime["version"], "musl runtime version")
     release_metadata.require(
-        release_metadata.SEMVER.fullmatch(version) is not None,
+        release_metadata.RUNTIME_VERSION.fullmatch(version) is not None,
         "musl runtime version must be canonical semver",
     )
     tag = release_metadata.string(runtime["tag"], "musl runtime tag")

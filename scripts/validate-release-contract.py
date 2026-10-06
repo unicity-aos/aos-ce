@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import musl_release_metadata
+import release_metadata
 
 try:
     import tomllib
@@ -64,20 +65,58 @@ def readiness_metadata(path: str | Path) -> dict[str, Any]:
         return tomllib.load(file)
 
 
+def validate_runtime_dependencies(cargo: dict[str, Any], lock: dict[str, Any],
+                                  runtime: dict[str, Any]) -> None:
+    """RC libraries come from the authenticated tag source, not stable crates."""
+    version = runtime["version"]
+    dependencies = cargo["workspace"]["dependencies"]
+    for name in ("astrid-core", "astrid-crypto", "astrid-types", "astrid-uplink"):
+        dependency = dependencies[name]
+        requirement = dependency if isinstance(dependency, str) else dependency.get("version")
+        if "-rc." not in version:
+            require(requirement == f"={version}", f"workspace {name} must exactly pin the bundled runtime")
+            require(not isinstance(dependency, dict) or not any(
+                key in dependency for key in ("git", "path", "rev", "branch", "tag")),
+                f"stable {name} must use the registry release")
+            continue
+        base = version.split("-", 1)[0]
+        commit = runtime["source-commit"]
+        repository = "https://github.com/astrid-runtime/astrid"
+        require(re.fullmatch(r"[0-9a-f]{40}", commit) is not None,
+                "RC library source must be a full authenticated commit")
+        require(isinstance(dependency, dict) and requirement == f"={base}"
+                and dependency.get("git") == repository and dependency.get("rev") == commit
+                and not any(key in dependency for key in ("path", "branch", "tag")),
+                f"RC {name} must use the authenticated runtime source and numeric base version")
+        packages = [package for package in lock.get("package", []) if package.get("name") == name]
+        require(len(packages) == 1 and packages[0].get("version") == base
+                and packages[0].get("source") == f"git+{repository}?rev={commit}#{commit}",
+                f"locked RC {name} must match the authenticated runtime source")
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
 
 
 def validate_runtime_minimum(requirement: str, runtime: str) -> None:
-    """Check the stable minimum independently of the selected artifact identity."""
-    version = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    """Match Rust SemVer minimum ordering and explicit prerelease admission."""
+    version = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.([1-9][0-9]*))?"
     minimum = re.fullmatch(r">=" + version, requirement)
     selected = re.fullmatch(version, runtime)
     require(minimum is not None, "runtime requirement must be a canonical >= minimum")
-    require(selected is not None, "selected runtime must be canonical stable semver")
+    require(selected is not None, "selected runtime must be canonical semver or numbered RC")
+    floor_base = tuple(map(int, minimum.groups()[:3]))
+    selected_base = tuple(map(int, selected.groups()[:3]))
+    floor_rc = minimum.group(4)
+    selected_rc = selected.group(4)
+    if selected_rc is not None:
+        require(floor_rc is not None and selected_base == floor_base,
+                "runtime prerelease must be explicitly requested at its numeric base")
+    floor_key = (*floor_base, floor_rc is None, int(floor_rc or 0))
+    selected_key = (*selected_base, selected_rc is None, int(selected_rc or 0))
     require(
-        tuple(map(int, selected.groups())) >= tuple(map(int, minimum.groups())),
+        selected_key >= floor_key,
         "selected runtime is below the compatibility minimum",
     )
 
@@ -218,8 +257,8 @@ def main(argv: list[str] | None = None) -> int:
         "distro version does not match the AOS crate",
     )
     require(
-        re.fullmatch(canonical_semver, runtime_version) is not None,
-        "runtime version must be canonical semver",
+        release_metadata.RUNTIME_VERSION.fullmatch(runtime_version) is not None,
+        "runtime version must be canonical semver or numbered RC",
     )
     require(
         re.fullmatch(canonical_semver, sdk_version) is not None,
@@ -243,11 +282,9 @@ def main(argv: list[str] | None = None) -> int:
         distro[("distro", "astrid-version")] == runtime_requirement,
         "distro Astrid requirement does not match the compatibility minimum",
     )
-    for dependency in ("astrid-core", "astrid-uplink"):
-        require(
-            workspace_dependency(workspace, dependency) == f"={runtime_version}",
-            f"workspace {dependency} must exactly pin the bundled runtime",
-        )
+    validate_runtime_dependencies(readiness_metadata("Cargo.toml"),
+                                  readiness_metadata("Cargo.lock"),
+                                  compatibility_metadata["runtime"])
     require(
         workspace_dependency(workspace, "astrid-sdk") == f"={sdk_version}",
         "workspace astrid-sdk must exactly pin compatibility metadata",

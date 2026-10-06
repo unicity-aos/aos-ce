@@ -490,7 +490,7 @@ validate_release_metadata() {
   runtime_metadata_asset=$(toml_value "$metadata" "[runtime]" release-metadata-asset)
   runtime_metadata_blake3=$(toml_value "$metadata" "[runtime]" release-metadata-blake3)
   [ "$runtime_repository" = astrid-runtime/astrid ] || return 1
-  printf '%s\n' "$runtime_version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || return 1
+  printf '%s\n' "$runtime_version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$' || return 1
   [ "$runtime_tag" = "v${runtime_version}" ] || return 1
   case "$runtime_identity" in
     "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v${runtime_version}"|\

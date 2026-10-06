@@ -49,6 +49,7 @@ VERSION = re.compile(rf"(?:{CANONICAL_VERSION}|{NIGHTLY_VERSION.pattern}|{RELEAS
 SEMVER = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 )
+RUNTIME_VERSION = re.compile(rf"{SEMVER.pattern}(?:-rc\.[1-9][0-9]*)?")
 
 
 def require(condition: bool, message: str) -> None:
@@ -211,7 +212,7 @@ def validate_release(metadata: Any, *, require_ready: bool = False) -> dict[str,
     )
     require(runtime["repository"] == "astrid-runtime/astrid", "release metadata runtime repository must be astrid-runtime/astrid")
     runtime_version = string(runtime["version"], "release metadata.runtime.version")
-    require(SEMVER.fullmatch(runtime_version) is not None, "release metadata runtime version must be canonical semver")
+    require(RUNTIME_VERSION.fullmatch(runtime_version) is not None, "release metadata runtime version must be canonical semver or numbered RC")
     require(runtime["tag"] == f"v{runtime_version}", "release metadata runtime tag/version mismatch")
     runtime_identity = string(runtime["release-workflow-identity"], "release metadata.runtime.release-workflow-identity")
     allowed_runtime_identities = {

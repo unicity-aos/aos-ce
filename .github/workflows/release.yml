@@ -517,7 +517,7 @@ jobs:
           python3 - "$RUNTIME_VERSION" <<'PY'
           import sys
 
-          version = tuple(int(part) for part in sys.argv[1].split("."))
+          version = tuple(int(part) for part in sys.argv[1].split("-", 1)[0].split("."))
           if version < (2026, 9, 0):
               raise SystemExit(
                   "stable Distro sealing requires Astrid 2026.9.0+ with the "

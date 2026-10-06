@@ -18,7 +18,7 @@ if [[ ! -f "$archive" ]]; then
   echo "runtime archive is missing: $archive" >&2
   exit 1
 fi
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$ ]]; then
   echo "invalid runtime version: $version" >&2
   exit 1
 fi

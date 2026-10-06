@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,40 @@ SPEC.loader.exec_module(VALIDATOR)
 
 
 class ReleaseReadinessTests(unittest.TestCase):
+    def test_rc_libraries_bind_exact_authenticated_source(self) -> None:
+        commit = "a" * 40
+        repository = "https://github.com/astrid-runtime/astrid"
+        names = ("astrid-core", "astrid-crypto", "astrid-types", "astrid-uplink")
+        cargo = {"workspace": {"dependencies": {name: {
+            "version": "=2026.10.0", "git": repository, "rev": commit,
+        } for name in names}}}
+        lock = {"package": [{"name": name, "version": "2026.10.0",
+            "source": f"git+{repository}?rev={commit}#{commit}"} for name in names]}
+        runtime = {"version": "2026.10.0-rc.1", "source-commit": commit}
+        VALIDATOR.validate_runtime_dependencies(cargo, lock, runtime)
+        for field, value in (("rev", "b" * 40), ("git", "https://example.com/astrid"),
+                             ("version", "=2026.9.4"), ("path", "../astrid")):
+            changed = copy.deepcopy(cargo)
+            changed["workspace"]["dependencies"]["astrid-core"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                VALIDATOR.validate_runtime_dependencies(changed, lock, runtime)
+        changed_lock = copy.deepcopy(lock)
+        changed_lock["package"][0]["source"] = "registry+https://github.com/rust-lang/crates.io-index"
+        with self.assertRaises(ValueError):
+            VALIDATOR.validate_runtime_dependencies(cargo, changed_lock, runtime)
+        with self.assertRaises(ValueError):
+            VALIDATOR.validate_runtime_dependencies(cargo, lock, {"version": "2026.10.0"})
+
+    def test_runtime_minimum_explicitly_admits_only_matching_rc_base(self) -> None:
+        for runtime in ("2026.10.0-rc.1", "2026.10.0-rc.2", "2026.10.0", "2026.11.0"):
+            VALIDATOR.validate_runtime_minimum(">=2026.10.0-rc.1", runtime)
+        for runtime in ("2026.10.0-rc.1", "2026.11.0-rc.1"):
+            with self.subTest(runtime=runtime), self.assertRaises(ValueError):
+                VALIDATOR.validate_runtime_minimum(">=2026.9.4", runtime)
+        for runtime in ("2026.10.0-rc.0", "2026.10.0-rc.01", "2026.10.0-rc.1+build", "2026.9.0-rc.1"):
+            with self.subTest(runtime=runtime), self.assertRaises(ValueError):
+                VALIDATOR.validate_runtime_minimum(">=2026.10.0-rc.1", runtime)
+
     def test_compiled_distro_runtime_matches_selected_release(self) -> None:
         source = 'pub(crate) const ASTRID_RUNTIME_VERSION: &str = "2026.9.4";'
         VALIDATOR.validate_distro_runtime_version(source, "2026.9.4")
