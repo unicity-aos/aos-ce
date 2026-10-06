@@ -139,7 +139,17 @@ class ReleaseMetadataTests(unittest.TestCase):
                 f"2026.13.0-nightly.20260717.g{'0' * 40}"
             )
         )
-        self.assertIsNone(METADATA.VERSION.fullmatch("2026.13.0-rc.1"))
+        self.assertIsNotNone(METADATA.VERSION.fullmatch("2026.13.0-rc.1"))
+
+    def test_release_candidates_are_dev_only(self) -> None:
+        for version in ("2026.10.0-rc.1", "2026.10.0-rc.42"):
+            METADATA.validate_channel_version("dev", version)
+            for channel in ("stable", "nightly"):
+                with self.subTest(channel=channel), self.assertRaises(ValueError):
+                    METADATA.validate_channel_version(channel, version)
+        for version in ("2026.10.0-rc.0", "2026.10.0-rc.01", "2026.10.0-beta.1", "2026.10.0-rc.1+build"):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                METADATA.validate_channel_version("dev", version)
 
     def test_release_accepts_false_staged_gates(self) -> None:
         self.assertEqual(METADATA.validate_release(release_fixture())["version"], "2026.9.0")

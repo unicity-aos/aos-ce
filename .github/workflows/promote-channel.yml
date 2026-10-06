@@ -58,9 +58,7 @@ jobs:
           version, channel, generation = sys.argv[1:]
           if release_metadata.VERSION.fullmatch(version) is None:
               raise SystemExit("release tag is not a supported AOS release version")
-          nightly = release_metadata.is_nightly_version(version)
-          if (channel == "nightly") != nightly:
-              raise SystemExit("nightly and canonical releases cannot cross channel classes")
+          release_metadata.validate_channel_version(channel, version)
           if not generation.isascii() or not generation.isdecimal() or generation.startswith("0"):
               raise SystemExit("generation must be a canonical positive decimal integer")
           if not 1 <= int(generation) <= release_metadata.MAX_GENERATION:
@@ -110,6 +108,9 @@ jobs:
           [[ "$SOURCE_COMMIT" == "$TAG_COMMIT" ]]
           EXPECTED_PRERELEASE=false
           EXPECTED_EVENT=push
+          if [[ "$CHANNEL" == dev && "$RELEASE_TAG" == *-rc.* ]]; then
+            EXPECTED_PRERELEASE=true
+          fi
           if [[ "$CHANNEL" == nightly ]]; then
             EXPECTED_PRERELEASE=true
             EXPECTED_EVENT=workflow_dispatch

@@ -90,6 +90,8 @@ if [ "$mode" = development ]; then
   require_tool /usr/bin/plutil plutil "stamp"
   require_tool /usr/bin/codesign codesign "ad-hoc sign"
   version=$(product_version)
+  # Apple bundle versions are numeric; the signed archive retains the full RC identity.
+  version=${version%%-*}
   /usr/bin/swift build --package-path "$package_dir" --arch "$arch" -c release
   binary_dir=$(/usr/bin/swift build --package-path "$package_dir" --arch "$arch" -c release --show-bin-path)
   mkdir -p "$destination/Contents/MacOS"

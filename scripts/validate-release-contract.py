@@ -82,11 +82,13 @@ def validate_runtime_minimum(requirement: str, runtime: str) -> None:
     )
 
 
-def validate_product_version(value: str, *, allow_nightly: bool) -> None:
+def validate_product_version(value: str, *, allow_nightly: bool, allow_release_candidate: bool = False) -> None:
     canonical = r"(?:202[6-9]|20[3-9][0-9])\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
     accepted = canonical
     if allow_nightly:
         accepted = rf"(?:{canonical}|{canonical}-nightly\.[0-9]{{8}}\.g[0-9a-f]{{40}})"
+    if allow_release_candidate:
+        accepted = rf"(?:{accepted}|{canonical}-rc\.[1-9][0-9]*)"
     require(
         re.fullmatch(accepted, value) is not None,
         "product version must be an allowed calendar SemVer release identity",
@@ -158,6 +160,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="accept the strict deterministic nightly suffix on the product version",
     )
+    parser.add_argument("--allow-release-candidate", action="store_true",
+                        help="accept numbered dev release candidates on the product version")
     return parser.parse_args(argv)
 
 
@@ -204,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     sdk_version = compatibility[("contracts", "sdk-rust-version")]
     canonical_semver = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 
-    validate_product_version(product_version, allow_nightly=args.allow_nightly)
+    validate_product_version(product_version, allow_nightly=args.allow_nightly, allow_release_candidate=args.allow_release_candidate)
     require(
         compatibility[("product", "version")] == product_version,
         "runtime-compatibility product version does not match the AOS crate",

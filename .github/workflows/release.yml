@@ -27,6 +27,7 @@ jobs:
       contents: read
     outputs:
       nightly: ${{ steps.release.outputs.nightly }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
       version: ${{ steps.release.outputs.version }}
       source-commit: ${{ steps.release.outputs.source-commit }}
     steps:
@@ -49,7 +50,7 @@ jobs:
           VERSION="$GITHUB_REF_NAME"
           SOURCE_COMMIT=$(git rev-parse 'HEAD^{commit}')
           if [[ "$EVENT_NAME" == push ]]; then
-            [[ "$VERSION" =~ ^(202[6-9]|20[3-9][0-9])\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            python3 scripts/release_candidate.py validate-tag --version "$VERSION"
             NIGHTLY=false
           elif [[ "$EVENT_NAME" == workflow_dispatch ]]; then
             NIGHTLY_DATE="${VERSION#*-nightly.}"
@@ -71,6 +72,7 @@ jobs:
           fi
           {
             echo "nightly=$NIGHTLY"
+            echo "prerelease=$([[ "$VERSION" == *-* ]] && echo true || echo false)"
             echo "version=$VERSION"
             echo "source-commit=$SOURCE_COMMIT"
           } >> "$GITHUB_OUTPUT"
@@ -118,11 +120,16 @@ jobs:
       - name: Stage deterministic nightly version
         if: needs.classify.outputs.nightly == 'true'
         run: python3 scripts/nightly_version.py stage --version "$GITHUB_REF_NAME"
+      - name: Stage release candidate version
+        if: needs.classify.outputs.prerelease == 'true' && needs.classify.outputs.nightly != 'true'
+        run: python3 scripts/release_candidate.py stage --version "$GITHUB_REF_NAME"
       - name: Match product, distro, and tag versions
         run: |
           EXTRA=()
           if [[ "${{ needs.classify.outputs.nightly }}" == true ]]; then
             EXTRA+=(--allow-nightly)
+          elif [[ "${{ needs.classify.outputs.prerelease }}" == true ]]; then
+            EXTRA+=(--allow-release-candidate)
           fi
           python3 scripts/validate-release-contract.py --require-release-ready "${EXTRA[@]}"
           PRODUCT=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/unicity-aos-bootstrap/Cargo.toml | head -n1)
@@ -169,6 +176,9 @@ jobs:
       - name: Stage deterministic nightly version
         if: needs.classify.outputs.nightly == 'true'
         run: python3 scripts/nightly_version.py stage --version "$GITHUB_REF_NAME"
+      - name: Stage release candidate version
+        if: needs.classify.outputs.prerelease == 'true' && needs.classify.outputs.nightly != 'true'
+        run: python3 scripts/release_candidate.py stage --version "$GITHUB_REF_NAME"
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: '1.95.0'
@@ -380,6 +390,9 @@ jobs:
       - name: Stage deterministic nightly version
         if: needs.classify.outputs.nightly == 'true'
         run: python3 scripts/nightly_version.py stage --version "$GITHUB_REF_NAME"
+      - name: Stage release candidate version
+        if: needs.classify.outputs.prerelease == 'true' && needs.classify.outputs.nightly != 'true'
+        run: python3 scripts/release_candidate.py stage --version "$GITHUB_REF_NAME"
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: '1.95.0'
@@ -462,6 +475,9 @@ jobs:
       - name: Stage deterministic nightly version
         if: needs.classify.outputs.nightly == 'true'
         run: python3 scripts/nightly_version.py stage --version "$GITHUB_REF_NAME"
+      - name: Stage release candidate version
+        if: needs.classify.outputs.prerelease == 'true' && needs.classify.outputs.nightly != 'true'
+        run: python3 scripts/release_candidate.py stage --version "$GITHUB_REF_NAME"
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: '1.95.0'
@@ -625,7 +641,7 @@ jobs:
       - name: Detect an interrupted never-published draft
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.prerelease }}
         run: |
           RELEASES="$RUNNER_TEMP/releases-preflight.json"
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
@@ -696,12 +712,12 @@ jobs:
           EOF
           if [[ "$GITHUB_REF_NAME" != *-nightly.* ]]; then
             printf '\n' >> release-notes.md
-            python3 scripts/changelog_notes.py --version "$GITHUB_REF_NAME" >> release-notes.md
+            python3 scripts/changelog_notes.py --version "${GITHUB_REF_NAME%%-rc.*}" >> release-notes.md
           fi
       - name: Refuse conflicting releases or authenticate a complete draft
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.prerelease }}
           EXPECTED_SOURCE: ${{ needs.classify.outputs.source-commit }}
         run: |
           RELEASES="$RUNNER_TEMP/releases.json"
@@ -769,7 +785,7 @@ jobs:
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           draft: true
-          prerelease: ${{ needs.classify.outputs.nightly == 'true' }}
+          prerelease: ${{ needs.classify.outputs.prerelease == 'true' }}
           make_latest: false
           overwrite_files: false
           fail_on_unmatched_files: true
@@ -786,7 +802,7 @@ jobs:
         if: env.RECOVER_DRAFT != '1'
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.prerelease }}
         run: |
           RELEASES="$RUNNER_TEMP/releases-after-create.json"
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
@@ -798,7 +814,8 @@ jobs:
       - name: Reauthenticate and publish the exact immutable release
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.prerelease }}
+          NIGHTLY: ${{ needs.classify.outputs.nightly }}
           EXPECTED_SOURCE: ${{ needs.classify.outputs.source-commit }}
         run: |
           EXPECTED_LATEST=true
@@ -816,7 +833,7 @@ jobs:
           done
           [[ "$TAG_TYPE" == commit ]]
           [[ "$TAG_COMMIT" == "$EXPECTED_SOURCE" ]]
-          if [[ "$EXPECTED_PRERELEASE" == true ]]; then
+          if [[ "$NIGHTLY" == true ]]; then
             BASE_VERSION="${GITHUB_REF_NAME%%-nightly.*}"
             BASE_REFS="$RUNNER_TEMP/canonical-base-refs.json"
             gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$BASE_VERSION" > "$BASE_REFS"

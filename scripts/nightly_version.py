@@ -87,6 +87,12 @@ def stage(root: Path, version: str) -> None:
     base = canonical_base(root)
     require(match.group("base") == base, "nightly version must derive from the source AOS version")
     release_date = real_date(match.group("date"))
+    stage_product_version(root, version, release_date)
+
+
+def stage_product_version(root: Path, version: str, release_date: str) -> None:
+    """Stage a validated prerelease without changing its runtime provenance."""
+    base = canonical_base(root)
 
     product_path = root / "crates/unicity-aos-bootstrap/Cargo.toml"
     product = replace_field(read(product_path), "package", "version", base, version)
