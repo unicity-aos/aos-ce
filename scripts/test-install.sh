@@ -23,6 +23,10 @@ import sys
 import tomllib
 
 root = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(root / "scripts"))
+from nightly_version import replace_field
+
+runtime_before = tomllib.loads((root / "release/runtime-compatibility.toml").read_text())["runtime"]
 for relative, section in (
     ("crates/unicity-aos-bootstrap/Cargo.toml", "package"),
     ("distros/community/unicity-ce/Distro.toml", "distro"),
@@ -31,9 +35,7 @@ for relative, section in (
     path = root / relative
     text = path.read_text(encoding="utf-8")
     current = tomllib.loads(text)[section]["version"]
-    needle = f'version = "{current}"'
-    assert text.count(needle) == 1, relative
-    path.write_text(text.replace(needle, 'version = "2026.9.3"'), encoding="utf-8")
+    path.write_text(replace_field(text, section, "version", current, "2026.9.3"), encoding="utf-8")
 path = root / "distros/community/unicity-ce/Distro.toml"
 text = path.read_text(encoding="utf-8")
 pretty_name = tomllib.loads(text)["distro"]["pretty-name"]
@@ -47,6 +49,7 @@ distro = tomllib.loads(path.read_text())
 compatibility = tomllib.loads((root / "release/runtime-compatibility.toml").read_text())
 assert crate["package"]["version"] == distro["distro"]["version"] == compatibility["product"]["version"] == "2026.9.3"
 assert distro["distro"]["pretty-name"] == replacement
+assert compatibility["runtime"] == runtime_before
 PY
 mkdir -p "$fixture" "$fake_bin" "$work/home" "$work/capsules"
 mkdir -p "$work/home/.astrid"

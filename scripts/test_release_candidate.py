@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Run numbered RC staging and the actual tag-push classifier."""
 
+import io
 import os
+from pathlib import Path
+import shutil
 import subprocess
+import tarfile
 import tempfile
+import tomllib
 import unittest
 
 import release_candidate
@@ -11,6 +16,27 @@ from test_nightly_version import NightlyVersionTests
 
 
 class ReleaseCandidateTests(NightlyVersionTests):
+    def test_full_package_contract_after_candidate_staging(self) -> None:
+        source = release_candidate.nightly_version.ROOT
+        archive = subprocess.run(["git", "archive", "HEAD"], cwd=source,
+                                 check=True, capture_output=True).stdout
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            with tarfile.open(fileobj=io.BytesIO(archive)) as files:
+                files.extractall(root, filter="data")
+            # Exercise the working script, including an uncommitted regression fix.
+            for name in ("test-package-release.sh", "test-install.sh"):
+                shutil.copy2(source / "scripts" / name, root / "scripts" / name)
+            base = release_candidate.nightly_version.canonical_base(root)
+            runtime = tomllib.loads((root / "release/runtime-compatibility.toml").read_text())["runtime"]["version"]
+            # Equal product/runtime versions must not confuse fixture rewrites.
+            candidate = runtime if runtime.startswith(base + "-rc.") else f"{base}-rc.1"
+            release_candidate.stage(root, candidate)
+            for script in ("test-package-release.sh", "test-install.sh"):
+                run = subprocess.run(["bash", "scripts/" + script], cwd=root,
+                                     capture_output=True, text=True, timeout=180)
+                self.assertEqual(run.returncode, 0, script + "\n" + run.stdout + run.stderr)
+
     def test_shipped_posix_installer_version_classes(self) -> None:
         text = (release_candidate.nightly_version.ROOT / "install.sh").read_text()
         functions = "is_aos_nightly_version()" + text.split("is_aos_nightly_version()", 1)[1].split('if [ -n "$AOS_VERSION"', 1)[0]
