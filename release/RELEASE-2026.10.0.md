@@ -15,14 +15,13 @@ mounting still requires the app's supported OS version and extension approval.
 
 ## Preparation boundary
 
-The intended runtime is Astrid v2026.10.0. Until its separately authorized release
-publishes authenticated metadata, the compatibility files retain valid v2026.9.4
-provenance with `release-ready` and `upgrade-self-heal-ready` gates closed.
-This is not a ready-to-publish old-runtime fallback. Replace GNU/Darwin and MUSL
-runtime provenance together, update compiled runtime-version declarations and
-exact Rust build dependencies, and validate the composed package before opening
-the gates. Installed-runtime compatibility remains a minimum requirement, not an
-exact-version ceiling.
+The dev candidate selects published Astrid v2026.10.0-rc.2. GNU/Darwin and MUSL
+provenance is authenticated against that exact release workflow identity;
+compiled runtime declarations and Rust build dependencies agree with its source.
+The `release-ready` and `upgrade-self-heal-ready` gates remain closed until the
+complete composed-product and Oracle journeys finish. This is not a stable
+release authorization. Installed-runtime compatibility remains a minimum
+requirement, not an exact-version ceiling.
 
 The selected runtime-code rehearsal already exercises real signature-enabled
 package installation, legacy import, capsule execution and restart persistence,
