@@ -13,6 +13,7 @@
 use astrid_sdk::contracts::hook::HookEventRequest;
 use astrid_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 mod decision;
 use decision::{Decision, RequiredReplies};
@@ -218,6 +219,70 @@ struct CanonicalOraclePayload<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_id: Option<&'a str>,
     payload: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collection: Option<PluginCollectionProvenance<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginCollectionProvenance<'a> {
+    schema: &'static str,
+    host: &'a str,
+    session_id: &'a str,
+    route_id: &'a str,
+    invocation_id: &'a str,
+    source_event: &'a str,
+    payload_sha256: String,
+    semantics: &'static str,
+}
+
+// Matches Codewall's content canonical JSON: sorted object keys, compact UTF-8,
+// integer numbers only. Unsupported input still reaches ordinary hook handling;
+// it cannot claim collection provenance. No bearer token reaches this adapter.
+fn collection_payload_digest(value: &serde_json::Value) -> Option<String> {
+    fn sorted(value: &serde_json::Value) -> Option<serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => {
+                let fields: std::collections::BTreeMap<_, _> = map
+                    .iter()
+                    .map(|(key, value)| Some((key.clone(), sorted(value)?)))
+                    .collect::<Option<_>>()?;
+                Some(serde_json::Value::Object(fields.into_iter().collect()))
+            }
+            serde_json::Value::Array(values) => Some(serde_json::Value::Array(
+                values.iter().map(sorted).collect::<Option<_>>()?,
+            )),
+            serde_json::Value::Number(number) if number.is_f64() => None,
+            other => Some(other.clone()),
+        }
+    }
+    let bytes = serde_json::to_vec(&sorted(value)?).ok()?;
+    Some(
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+fn plugin_collection<'a>(
+    event: &'a OracleHookEvent,
+    payload: &serde_json::Value,
+) -> Option<PluginCollectionProvenance<'a>> {
+    if event.host != "claude"
+        || !matches!(event.event.as_str(), "user_prompt_submit" | "pre_tool_use")
+    {
+        return None;
+    }
+    Some(PluginCollectionProvenance {
+        schema: "oracle.content_source.v1",
+        host: &event.host,
+        session_id: &event.session_id,
+        route_id: &event.route_id,
+        invocation_id: &event.correlation_id,
+        source_event: &event.event,
+        payload_sha256: collection_payload_digest(payload)?,
+        semantics: "observation",
+    })
 }
 
 fn is_clean_segment(value: &str, max: usize) -> bool {
@@ -380,6 +445,7 @@ fn canonical_request(
         turn_id: event.turn_id.as_deref(),
         workspace_id: event.workspace_id.as_deref(),
         payload: &normalized,
+        collection: plugin_collection(event, &normalized),
     };
     let request = HookEventRequest {
         hook: mapping.hook.to_owned(),
@@ -612,6 +678,35 @@ pub struct OracleHookAdapter;
 
 #[capsule]
 impl OracleHookAdapter {
+    /// Report the collection contract to an authenticated, correlation-scoped probe.
+    #[astrid::interceptor("content_source_capability_v1")]
+    pub fn content_source_capability_v1(&self, payload: serde_json::Value) -> Result<(), SysError> {
+        let caller = runtime::caller()?;
+        let Some(principal) = caller.principal.as_deref() else {
+            return Ok(());
+        };
+        let Some(id) = payload
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(());
+        };
+        if id.len() != 32
+            || !id.bytes().all(|c| c.is_ascii_hexdigit())
+            || payload.get("principal").and_then(serde_json::Value::as_str) != Some(principal)
+        {
+            return Ok(());
+        }
+        ipc::publish_json(
+            &format!("oracle.v1.content.capability.reply.{id}"),
+            &serde_json::json!({
+                "schema":"oracle.content_source.v1", "request_id":id, "principal":principal,
+                "host":"claude", "events":["user_prompt_submit", "pre_tool_use"],
+                "semantics":"observation", "digest":"sha256_canonical_json_v1"
+            }),
+        )
+    }
+
     /// Translate a token-validated Codex hook.
     #[astrid::interceptor("on_codex_hook")]
     pub fn on_codex_hook(&self, payload: serde_json::Value) -> Result<(), SysError> {
@@ -672,6 +767,80 @@ mod tests {
             workspace_id: Some("workspace-one".to_owned()),
             payload: serde_json::json!({"prompt": "hello"}),
         }
+    }
+
+    #[test]
+    fn plugin_collection_identity_survives_retry() {
+        let event = host_event("claude");
+        let first = collection(&event);
+        assert_eq!(first["schema"], "oracle.content_source.v1");
+        assert_eq!(first["invocation_id"], event.correlation_id);
+        assert_eq!(
+            first["payload_sha256"],
+            "8a44725210b9dcd4fefd9f0eca07b70ae45e69274a3105fb25eb426a2cf8bbf4"
+        );
+        assert_eq!(first, collection(&event));
+    }
+
+    fn collection(event: &OracleHookEvent) -> serde_json::Value {
+        let request =
+            canonical_request(event, Frontend::Claude.mapping(&event.event).unwrap()).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&request.payload).unwrap();
+        payload["collection"].clone()
+    }
+
+    #[test]
+    fn plugin_collection_distinct_invocations() {
+        let mut event = host_event("claude");
+        let first = collection(&event);
+        event.correlation_id = "c".repeat(32);
+        event.delivery_id = format!("{}-{}", event.route_id, event.correlation_id);
+        let second = collection(&event);
+        assert_ne!(first["invocation_id"], second["invocation_id"]);
+        assert_eq!(first["payload_sha256"], second["payload_sha256"]);
+    }
+
+    #[test]
+    fn plugin_collection_spoofed_metadata() {
+        let mut event = host_event("claude");
+        let original = collection(&event);
+        event.payload["collection"] = serde_json::json!({
+            "host": "codex", "source_event": "permission_request",
+            "invocation_id": "forged", "payload_sha256": "forged"
+        });
+        let actual = collection(&event);
+        assert_eq!(actual["host"], "claude");
+        assert_eq!(actual["source_event"], "user_prompt_submit");
+        assert_eq!(actual["invocation_id"], event.correlation_id);
+        assert_ne!(actual["payload_sha256"], original["payload_sha256"]);
+    }
+
+    #[test]
+    fn plugin_collection_tool_event() {
+        let mut event = host_event("claude");
+        event.event = "pre_tool_use".to_owned();
+        event.payload =
+            serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "echo hello"}});
+        let request = canonical_request(&event, observe("before_tool_call")).unwrap();
+        assert!(request.correlation_id.is_none());
+        let actual = collection(&event);
+        assert_eq!(actual["invocation_id"], event.correlation_id);
+        assert_eq!(actual["semantics"], "observation");
+        event.event = "permission_request".to_owned();
+        assert!(collection(&event).is_null());
+        event.event = "user_prompt_submit".to_owned();
+        event.host = "codex".to_owned();
+        assert!(collection(&event).is_null());
+    }
+
+    #[test]
+    fn plugin_collection_unsupported_numbers_preserve_host_event() {
+        let mut event = host_event("claude");
+        event.payload = serde_json::json!({"prompt": "hello", "fraction": 1.5});
+        let request = canonical_request(&event, context("message_received")).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&request.payload).unwrap();
+        assert_eq!(payload["payload"], event.payload);
+        assert!(payload.get("collection").is_none());
     }
 
     #[test]

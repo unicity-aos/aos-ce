@@ -141,6 +141,32 @@ after its own adapter can faithfully translate the merged result into that
 frontend's native response schema. That change needs per-frontend conformance
 tests for deny, allow/no-op, malformed response, timeout, and transport error.
 
+## Content collection provenance
+
+Claude `user_prompt_submit` and `pre_tool_use` canonical payloads carry an
+adapter-owned `collection` object with schema `oracle.content_source.v1`.
+It includes host, session, route, invocation ID, source event, payload SHA-256
+and `semantics=observation`. Invocation identity uses the authenticated host
+correlation ID; response correlation remains governed by the hook's response
+class. Nested user fields cannot override collection provenance.
+
+The digest covers the normalized nested payload using sorted compact UTF-8
+JSON, with integer numbers only. Unsupported numeric shapes omit collection
+provenance while preserving the ordinary hook response. Tokens are stripped
+at ingress and are never included in collection metadata.
+
+Consumers pin the adapter's kernel source UUID and verified principal. The
+content-free `oracle.v1.content.capability.request` probe accepts a 32-character
+hex request ID plus the caller's principal, and replies on the corresponding
+`oracle.v1.content.capability.reply.<id>` topic. Its response names Claude's two
+collection events and the canonical digest contract. Consumers must authenticate
+the reply and bound its lifetime; a manifest or environment value alone is not
+proof that this implementation is running.
+
+Collection observations do not attest that the host blocked an action. The
+binding policy relay and its deny/ask/no-objection response remain independent
+of asynchronous collection and central analysis.
+
 ## Priority and layering
 
 Do not assign priorities to observation subscribers. Equal default priority
