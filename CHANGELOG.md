@@ -16,6 +16,13 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Fixed
+
+- Select the product runtime workspace consistently when starting or attaching
+  from different project directories, without changing relative file arguments
+  or the agent's MCP project context. Requires the corresponding Astrid daemon
+  workspace selector in the bundled runtime.
+
 ## [2026.10.0] - 2026-10-05
 
 ### Added

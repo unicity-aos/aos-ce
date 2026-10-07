@@ -154,6 +154,14 @@ impl Fixture {
 
     fn install_runtime(&self, body: &str) {
         fs::create_dir_all(self.home.join("runtime")).expect("create fixture runtime home");
+        // Model the new CLI global selector before the fake verb handlers.
+        // Verify it on every dispatch; do not silently strip arbitrary options.
+        let body = body
+            .strip_prefix("#!/bin/sh\n")
+            .expect("shell runtime fixture");
+        let body = format!(
+            "#!/bin/sh\n[ \"$1\" = --daemon-workspace ] && [ \"$2\" = \"$ASTRID_HOME\" ] || exit 97\nshift 2\n{body}"
+        );
         fs::write(&self.runtime, body).expect("write fake runtime");
         Self::make_executable(&self.runtime);
     }
