@@ -199,8 +199,15 @@ utc_before_or_equal() {
 
 utc_epoch() {
   value=$1
-  date -u -d "$value" '+%s' 2>/dev/null ||
-    date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$value" '+%s' 2>/dev/null
+  epoch=$(date -u -d "$value" '+%s' 2>/dev/null ||
+    date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$value" '+%s' 2>/dev/null ||
+    date -u -D '%Y-%m-%dT%H:%M:%SZ' -d "$value" '+%s' 2>/dev/null) || return 1
+  # BusyBox needs an explicit input format and may normalize invalid dates.
+  # Require an exact UTC round trip before using this value for expiry checks.
+  canonical=$(date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null ||
+    date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || return 1
+  [ "$canonical" = "$value" ] || return 1
+  printf '%s\n' "$epoch"
 }
 
 toml_value() {

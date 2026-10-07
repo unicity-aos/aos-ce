@@ -116,6 +116,11 @@ jobs:
       - run: python3 scripts/test_package_macos_command_center.py
       - run: bash scripts/test_build_command_center.sh
       - run: bash scripts/test-install.sh
+      - name: Verify installer timestamps with GNU and BusyBox date
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox
+          AOS_TEST_REQUIRE_BUSYBOX=1 python3 scripts/test_installer_timestamps.py
       - run: python3 scripts/capsule_release.py
       - run: python3 scripts/test_capsule_release.py
       - run: python3 scripts/test_validate_runtime_archive.py
