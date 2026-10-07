@@ -15,6 +15,7 @@ use astrid_core::PrincipalId;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use unicity_aos_bootstrap::{AOS_WORKSPACE_STATE_DIR, AosHome};
 
+mod checksum;
 mod cli;
 mod command_center;
 #[cfg(unix)]
@@ -53,6 +54,8 @@ struct ProductCli {
 
 #[derive(Subcommand)]
 enum ProductCommand {
+    /// Print a file's BLAKE3 digest without starting or changing the runtime.
+    Checksum { path: std::path::PathBuf },
     /// Open the terminal Command Center for approvals and private input.
     #[cfg(unix)]
     Console(console::ConsoleArgs),
@@ -389,6 +392,7 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
     }
 
     match cli.command {
+        Some(ProductCommand::Checksum { path }) => Some(checksum::run(&path)),
         #[cfg(unix)]
         Some(ProductCommand::Console(args)) => Some(console::run(args)),
         Some(ProductCommand::Init(_)) => None,
@@ -685,6 +689,7 @@ fn is_owned_root(value: &str) -> bool {
     matches!(
         value,
         "init"
+            | "checksum"
             | "status"
             | "migrate"
             | "update"
