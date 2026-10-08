@@ -1235,28 +1235,34 @@ fn handle_health_service() -> ExitCode {
 }
 
 fn handle_hook(principal: Option<String>, args: hook::HookArgs) -> ExitCode {
-    let home = match resolve_home() {
-        Ok(home) => home,
-        Err(code) => return code,
-    };
-    set_runtime_environment(&home);
     let principal = principal.unwrap_or_else(|| "default".to_owned());
-    match hook::handle(principal, args) {
-        Ok(Some(context)) => {
-            print!("{context}");
-            if let Err(error) = io::stdout().flush() {
-                eprintln!("aos: failed to write hook response: {error}");
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            }
+    // Resolve the Codewall route before anything else can fail: once a route
+    // governs this hook, every later error must deny instead of failing open.
+    let protection = hook::protection(&principal, &args);
+    let result = match resolve_home() {
+        Ok(home) => {
+            set_runtime_environment(&home);
+            hook::handle(principal, args, protection.as_ref())
         }
-        Ok(None) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("aos: hook delivery failed: {error}");
-            ExitCode::FAILURE
+        Err(code) if protection.is_none() => return code,
+        Err(_) => Err("AOS home unavailable".to_owned()),
+    };
+    let exit = hook::exit_for(protection.as_ref(), result);
+    if let Some(stderr) = &exit.stderr {
+        eprintln!("{stderr}");
+    }
+    if let Some(stdout) = &exit.stdout {
+        print!("{stdout}");
+        if let Err(error) = io::stdout().flush() {
+            eprintln!("aos: failed to write hook response: {error}");
+            return if protection.is_some() {
+                ExitCode::from(2)
+            } else {
+                ExitCode::FAILURE
+            };
         }
     }
+    ExitCode::from(exit.code)
 }
 
 fn set_runtime_environment(home: &AosHome) {

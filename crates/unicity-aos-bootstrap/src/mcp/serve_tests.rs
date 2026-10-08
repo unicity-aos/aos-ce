@@ -14,6 +14,143 @@ fn codewall_mcp_tool_request_uses_actual_native_tool_for_reserved_gate() {
     );
 }
 
+fn gate_call(id: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"aos_pretooluse_gate","arguments":{"tool_name":"Bash","tool_input":{"command":"pwd"}}}})
+}
+
+fn decision(skip: bool, ask: bool) -> crate::codewall_service::Decision {
+    crate::codewall_service::Decision {
+        skip,
+        ask,
+        reason: Some("codewall review".into()),
+    }
+}
+
+fn gate_response(id: Value, hook: Value) -> Vec<u8> {
+    json_frame(&json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":hook.to_string()}],"isError":false}})).expect("frame")
+}
+
+fn permission(frame: &[u8]) -> Value {
+    let response: Value = serde_json::from_slice(frame).expect("response");
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text");
+    let hook: Value = serde_json::from_str(text).expect("hook json");
+    hook["hookSpecificOutput"]["permissionDecision"].clone()
+}
+
+#[test]
+fn codewall_gate_ask_is_forwarded_so_runtime_policy_is_consulted() {
+    let request = gate_call(json!(7));
+    assert!(matches!(
+        codewall_dispatch(&request, Some(decision(false, true))),
+        CodewallDispatch::ForwardAsk(_)
+    ));
+    assert!(matches!(
+        codewall_dispatch(&request, Some(decision(true, false))),
+        CodewallDispatch::Reply(_)
+    ));
+    assert!(matches!(
+        codewall_dispatch(&request, Some(decision(false, false))),
+        CodewallDispatch::Forward
+    ));
+    assert!(matches!(
+        codewall_dispatch(&request, None),
+        CodewallDispatch::Forward
+    ));
+    let ordinary = json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"fs.read","arguments":{}}});
+    assert!(matches!(
+        codewall_dispatch(&ordinary, Some(decision(false, true))),
+        CodewallDispatch::Reply(_)
+    ));
+}
+
+#[test]
+fn runtime_deny_wins_over_codewall_ask() {
+    let request = gate_call(json!(7));
+    let CodewallDispatch::ForwardAsk(ask) =
+        codewall_dispatch(&request, Some(decision(false, true)))
+    else {
+        panic!("ask must be forwarded");
+    };
+    let mut asks = CodewallAsks::default();
+    assert!(asks.hold(&request, ask).is_none());
+    let deny = gate_response(
+        json!(7),
+        json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"aos"}}),
+    );
+    assert_eq!(asks.resolve(&deny), None);
+    assert!(asks.is_empty());
+}
+
+#[test]
+fn codewall_ask_survives_runtime_continue_error_and_unrelated_frames() {
+    let mut asks = CodewallAsks::default();
+    for id in [json!(7), json!("seven"), json!(8)] {
+        let request = gate_call(id);
+        let CodewallDispatch::ForwardAsk(ask) =
+            codewall_dispatch(&request, Some(decision(false, true)))
+        else {
+            panic!("ask must be forwarded");
+        };
+        assert!(asks.hold(&request, ask).is_none());
+    }
+    // Same numeric id from another request is not this ask.
+    let unrelated = gate_response(json!(9), json!({"continue":true}));
+    assert_eq!(asks.resolve(&unrelated), None);
+    let allow = gate_response(json!(7), json!({"continue":true}));
+    assert_eq!(permission(&asks.resolve(&allow).expect("ask")), "ask");
+    let error = json_frame(
+        &json!({"jsonrpc":"2.0","id":"seven","error":{"code":-32603,"message":"runtime stopped"}}),
+    )
+    .expect("frame");
+    let replaced = asks.resolve(&error).expect("ask");
+    assert_eq!(permission(&replaced), "ask");
+    let response: Value = serde_json::from_slice(&replaced).expect("response");
+    assert_eq!(response["id"], "seven");
+    // A duplicate in-flight id cannot carry a second ask; it is denied.
+    let request = gate_call(json!(8));
+    let CodewallDispatch::ForwardAsk(ask) =
+        codewall_dispatch(&request, Some(decision(false, true)))
+    else {
+        panic!("ask must be forwarded");
+    };
+    assert_eq!(
+        asks.hold(&request, ask)
+            .and_then(|reply| json_frame(&reply))
+            .map(|frame| permission(&frame)),
+        Some(json!("deny"))
+    );
+}
+
+#[test]
+fn routed_mcp_rejects_batched_and_unparseable_tool_calls() {
+    let call = gate_call(json!(1));
+    assert!(matches!(
+        classify_client_frame(&json_frame(&call).expect("frame")),
+        ClientFrame::ToolCall(_)
+    ));
+    assert!(matches!(
+        classify_client_frame(&json_frame(&json!([call])).expect("frame")),
+        ClientFrame::Unsafe
+    ));
+    assert!(matches!(
+        classify_client_frame(b"{\"method\":\"tools/call\",\n"),
+        ClientFrame::Unsafe
+    ));
+    assert!(matches!(
+        classify_client_frame(
+            &json_frame(&json!([{"jsonrpc":"2.0","method":"notifications/initialized"}]))
+                .expect("frame")
+        ),
+        ClientFrame::Other
+    ));
+    assert!(matches!(classify_client_frame(b"\n"), ClientFrame::Other));
+    let rejection = unsafe_frame_rejection();
+    assert_eq!(rejection["id"], Value::Null);
+    assert_eq!(rejection["error"]["code"], -32600);
+}
+
 #[test]
 fn codewall_mcp_denial_keeps_reserved_hook_binding() {
     let request = json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"aos_pretooluse_gate","arguments":{"tool_name":"Bash","tool_input":{"command":"pwd"}}}});

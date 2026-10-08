@@ -100,6 +100,65 @@ mod codewall_tests {
     }
 
     #[test]
+    fn route_lookup_only_guards_codewall_binding_events() {
+        let mut looked_up = false;
+        assert!(
+            protection_with("stop", OutputFormat::Json, || {
+                looked_up = true;
+                Err("unreachable".into())
+            })
+            .is_none()
+        );
+        assert!(!looked_up);
+        assert!(protection_with("pre_tool_use", OutputFormat::Json, || Ok(None)).is_none());
+        for event in ["pre_tool_use", "permission_request", "user_prompt_submit"] {
+            assert!(
+                protection_with(event, OutputFormat::Json, || Err("unsafe route".into())).is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn protected_hook_errors_deny_in_json_format() {
+        let protection = protection_with("pre_tool_use", OutputFormat::Json, || {
+            Err("unsafe route".into())
+        });
+        for error in [
+            "ASTRID_HOOK_TOKEN is required for `aos hook`",
+            "hook payload is not valid JSON",
+            "AOS home unavailable",
+        ] {
+            let exit = exit_for(protection.as_ref(), Err(error.into()));
+            assert_eq!(exit.code, 0);
+            let stdout = exit.stdout.expect("deny reply");
+            let reply: Value = serde_json::from_str(&stdout).expect("json");
+            assert_eq!(reply["event"], "pre_tool_use");
+            assert_eq!(reply["decision"]["skip"], true);
+            assert_eq!(reply["decision"]["ask"], false);
+        }
+    }
+
+    #[test]
+    fn protected_hook_errors_block_with_exit_two_in_context_format() {
+        let protection = protection_with("user_prompt_submit", OutputFormat::Context, || {
+            Err("unsafe route".into())
+        });
+        let exit = exit_for(protection.as_ref(), Err("payload too large".into()));
+        assert_eq!(exit.code, 2);
+        assert!(exit.stdout.is_none());
+        assert!(exit.stderr.expect("reason").contains("payload too large"));
+    }
+
+    #[test]
+    fn unprotected_hook_errors_keep_their_failure_exit() {
+        let exit = exit_for(None, Err("runtime stopped".into()));
+        assert_eq!(exit.code, 1);
+        assert!(exit.stdout.is_none());
+        let exit = exit_for(None, Ok(Some("context".into())));
+        assert_eq!((exit.code, exit.stdout.as_deref()), (0, Some("context")));
+    }
+
+    #[test]
     fn configured_binding_event_rejects_missing_action_fields() {
         assert!(codewall_action("pre_tool_use", &json!({})).is_err());
         assert!(codewall_action("user_prompt_submit", &json!({"prompt":42})).is_err());
@@ -176,7 +235,110 @@ struct HostHookResponse {
     decision: Option<output::Decision>,
 }
 
-pub(crate) fn handle(principal: String, args: HookArgs) -> Result<Option<String>, String> {
+/// Events whose action Codewall evaluates when a protected route exists.
+const CODEWALL_EVENTS: [&str; 3] = ["pre_tool_use", "permission_request", "user_prompt_submit"];
+
+/// A Codewall route governs this hook, so every failure must deny rather than
+/// exit with a status the host treats as non-blocking.
+pub(crate) struct Protection {
+    event: String,
+    format: OutputFormat,
+    route: Result<crate::codewall_service::Route, String>,
+}
+
+/// Resolve the Codewall route first. It needs only the effective UID and the
+/// principal, so it does not depend on the token, payload or AOS home.
+pub(crate) fn protection(principal: &str, args: &HookArgs) -> Option<Protection> {
+    protection_with(&args.event, args.format, || {
+        crate::codewall_service::load(principal)
+    })
+}
+
+fn protection_with(
+    event: &str,
+    format: OutputFormat,
+    load: impl FnOnce() -> Result<Option<crate::codewall_service::Route>, String>,
+) -> Option<Protection> {
+    if !CODEWALL_EVENTS.contains(&event) {
+        return None;
+    }
+    let route = match load() {
+        Ok(None) => return None,
+        Ok(Some(route)) => Ok(route),
+        Err(error) => Err(error),
+    };
+    Some(Protection {
+        event: event.to_owned(),
+        format,
+        route,
+    })
+}
+
+impl Protection {
+    /// JSON callers receive the same neutral deny the hook returns for a
+    /// Codewall veto. Context callers get exit 2, which Claude Code treats as
+    /// blocking for PreToolUse, PermissionRequest and UserPromptSubmit.
+    fn deny(&self, error: &str) -> HookExit {
+        let reason = format!("Codewall-protected hook failed closed: {error}");
+        if matches!(self.format, OutputFormat::Json)
+            && let Ok(Some(reply)) = output::reply(
+                &self.event,
+                Some(&output::Decision {
+                    skip: true,
+                    ask: false,
+                    reason: Some(reason.clone()),
+                }),
+                None,
+            )
+        {
+            return HookExit {
+                stdout: Some(reply),
+                stderr: Some(format!("aos: {reason}")),
+                code: 0,
+            };
+        }
+        HookExit {
+            stdout: None,
+            stderr: Some(format!("aos: {reason}")),
+            code: 2,
+        }
+    }
+}
+
+/// What `aos hook` writes and how it exits.
+pub(crate) struct HookExit {
+    pub(crate) stdout: Option<String>,
+    pub(crate) stderr: Option<String>,
+    pub(crate) code: u8,
+}
+
+pub(crate) fn exit_for(
+    protection: Option<&Protection>,
+    result: Result<Option<String>, String>,
+) -> HookExit {
+    match (result, protection) {
+        (Ok(stdout), _) => HookExit {
+            stdout,
+            stderr: None,
+            code: 0,
+        },
+        (Err(error), Some(protection)) => protection.deny(&error),
+        (Err(error), None) => HookExit {
+            stdout: None,
+            stderr: Some(format!("aos: hook delivery failed: {error}")),
+            code: 1,
+        },
+    }
+}
+
+pub(crate) fn handle(
+    principal: String,
+    args: HookArgs,
+    protection: Option<&Protection>,
+) -> Result<Option<String>, String> {
+    if protection.is_some() && !matches!(args.format, OutputFormat::Json) {
+        return Err("Codewall binding hooks require --format json".into());
+    }
     let token = std::env::var("ASTRID_HOOK_TOKEN")
         .map_err(|_| "ASTRID_HOOK_TOKEN is required for `aos hook`".to_owned())?;
     validate_token(&token)?;
@@ -229,39 +391,31 @@ pub(crate) fn handle(principal: String, args: HookArgs) -> Result<Option<String>
         .map_err(|error| format!("could not start hook client: {error}"))?;
     let timeout = Duration::from_millis(args.timeout_ms);
     runtime.block_on(async {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let codewall = match codewall_action(&request.event, &request.payload) {
-            Ok(Some(action)) => match crate::codewall_service::load(&request.principal_id) {
-                Ok(Some(route)) => {
-                    if !matches!(args.format, OutputFormat::Json) {
-                        return Err("Codewall binding hooks require --format json".into());
+        // Codewall evaluation has its own deadline (codewall_service::GATE_TIMEOUT),
+        // longer than the gate supervisor's; runtime delivery then gets the
+        // caller's full --timeout-ms. The routed worst case is their sum.
+        let codewall = match protection {
+            None => None,
+            Some(protection) => Some(
+                match (
+                    &protection.route,
+                    codewall_action(&request.event, &request.payload),
+                ) {
+                    (Ok(route), Ok(Some(action))) => {
+                        crate::codewall_service::evaluate(route, &action)
+                            .await
+                            .unwrap_or_else(|_| crate::codewall_service::unavailable())
                     }
-                    Some(
-                        tokio::time::timeout_at(
-                            deadline,
-                            crate::codewall_service::evaluate(&route, &action),
-                        )
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .unwrap_or_else(crate::codewall_service::unavailable),
-                    )
-                }
-                Ok(None) => None,
-                Err(_) => Some(crate::codewall_service::unavailable()),
-            },
-            Err(_) => match crate::codewall_service::load(&request.principal_id) {
-                Ok(None) => None,
-                _ => Some(crate::codewall_service::unavailable()),
-            },
-            Ok(None) => None,
+                    _ => crate::codewall_service::unavailable(),
+                },
+            ),
         };
+        let deadline = tokio::time::Instant::now() + timeout;
         let fallback = codewall.as_ref().filter(|decision| decision.ask).cloned();
         let event = request.event.clone();
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let result = tokio::time::timeout_at(
             deadline,
-            deliver(principal, request, remaining, args.format, codewall),
+            deliver(principal, request, timeout, args.format, codewall),
         )
         .await;
         let result = match result {

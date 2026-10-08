@@ -285,6 +285,137 @@ fn codewall_blocking_reply(
     Some(json!({"jsonrpc":"2.0","id":id,"result":content}))
 }
 
+/// What to do with a client tools/call after Codewall evaluated it.
+#[derive(Debug)]
+enum CodewallDispatch {
+    /// No Codewall objection: forward unchanged.
+    Forward,
+    /// Codewall answers without consulting the runtime.
+    Reply(Value),
+    /// Codewall asks on the PreToolUse gate. The runtime must still be
+    /// consulted so its deny can win; otherwise this ask is returned.
+    ForwardAsk(Value),
+}
+
+fn codewall_dispatch(
+    request: &Value,
+    decision: Option<crate::codewall_service::Decision>,
+) -> CodewallDispatch {
+    let Some(decision) = decision.filter(|d| d.skip || d.ask) else {
+        return CodewallDispatch::Forward;
+    };
+    let reply = codewall_blocking_reply(request, &decision).unwrap_or_else(unsafe_frame_rejection);
+    let is_gate =
+        request.pointer("/params/name").and_then(Value::as_str) == Some("aos_pretooluse_gate");
+    if decision.ask && !decision.skip && is_gate {
+        CodewallDispatch::ForwardAsk(reply)
+    } else {
+        CodewallDispatch::Reply(reply)
+    }
+}
+
+/// Codewall asks awaiting the runtime's own gate verdict, keyed by the host's
+/// JSON-RPC id. Deny wins, else ask, mirroring `hook::output::combine`.
+#[derive(Default)]
+struct CodewallAsks {
+    held: std::collections::HashMap<String, Value>,
+}
+
+const MAX_HELD_CODEWALL_ASKS: usize = 256;
+
+impl CodewallAsks {
+    /// Hold `ask` for `request`. Returns a deny reply to send instead of
+    /// forwarding when the ask cannot be tracked.
+    fn hold(&mut self, request: &Value, ask: Value) -> Option<Value> {
+        let key = request.get("id").map(Value::to_string);
+        match key {
+            Some(key)
+                if self.held.len() < MAX_HELD_CODEWALL_ASKS && !self.held.contains_key(&key) =>
+            {
+                self.held.insert(key, ask);
+                None
+            }
+            _ => codewall_blocking_reply(
+                request,
+                &crate::codewall_service::Decision {
+                    skip: true,
+                    ask: false,
+                    reason: Some("Codewall review could not be tracked for this request".into()),
+                },
+            )
+            .or_else(|| Some(unsafe_frame_rejection())),
+        }
+    }
+
+    fn forget(&mut self, id: &Value) {
+        self.held.remove(&id.to_string());
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    /// For a client-bound response to a held ask, return the frame to send
+    /// instead, or `None` to forward the runtime's frame unchanged.
+    fn resolve(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        if self.held.is_empty() {
+            return None;
+        }
+        let response: Value = serde_json::from_slice(frame).ok()?;
+        if response.get("method").is_some() {
+            return None;
+        }
+        let ask = self.held.remove(&response.get("id")?.to_string())?;
+        if runtime_gate_denies(&response) {
+            None
+        } else {
+            json_frame(&ask)
+        }
+    }
+}
+
+fn runtime_gate_denies(response: &Value) -> bool {
+    response
+        .pointer("/result/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .any(|hook| {
+            hook.pointer("/hookSpecificOutput/permissionDecision")
+                .and_then(Value::as_str)
+                == Some("deny")
+        })
+}
+
+#[derive(Debug)]
+enum ClientFrame {
+    ToolCall(Value),
+    /// A batch containing tools/call, or a frame that is not JSON. Codewall
+    /// cannot evaluate it, so a routed session refuses it.
+    Unsafe,
+    Other,
+}
+
+fn classify_client_frame(frame: &[u8]) -> ClientFrame {
+    if frame.iter().all(u8::is_ascii_whitespace) {
+        return ClientFrame::Other;
+    }
+    let is_call = |v: &Value| v.get("method").and_then(Value::as_str) == Some("tools/call");
+    match serde_json::from_slice::<Value>(frame) {
+        Ok(value) if is_call(&value) => ClientFrame::ToolCall(value),
+        Ok(Value::Array(batch)) if batch.iter().any(is_call) => ClientFrame::Unsafe,
+        Ok(_) => ClientFrame::Other,
+        Err(_) => ClientFrame::Unsafe,
+    }
+}
+
+fn unsafe_frame_rejection() -> Value {
+    json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Codewall requires each tools/call to be a single JSON-RPC request"}})
+}
+
 pub(crate) fn handle_serve(principal: Option<String>, mut args: ServeArgs) -> ExitCode {
     if let Err(error) = native_surface(&args) {
         eprintln!("aos mcp serve: {error}");
@@ -420,6 +551,7 @@ async fn serve(
     let mut approval_tick = tokio::time::interval(std::time::Duration::from_millis(50));
     let mut upstream_open = true;
     let mut interrupt_rx = Some(interrupt_receiver());
+    let mut codewall_asks = CodewallAsks::default();
 
     loop {
         tokio::select! {
@@ -461,27 +593,46 @@ async fn serve(
                     ServeFailure::Io("bundled MCP transport input is closed".to_owned())
                 })?;
                 let mut outbound = outbound.to_vec();
-                if let Ok(request) = serde_json::from_slice::<Value>(&outbound)
-                    && request.get("method").and_then(Value::as_str) == Some("tools/call")
-                {
-                    let decision = match crate::codewall_service::load(principal.unwrap_or("default")) {
-                        Ok(Some(route)) => match codewall_action(&request) {
-                            Ok(Some(action)) => Some(crate::codewall_service::evaluate(&route, &action).await
-                                .unwrap_or_else(|_| crate::codewall_service::unavailable())),
+                match classify_client_frame(&outbound) {
+                    ClientFrame::ToolCall(request) => {
+                        let decision = match crate::codewall_service::load(principal.unwrap_or("default")) {
+                            Ok(Some(route)) => match codewall_action(&request) {
+                                Ok(Some(action)) => Some(crate::codewall_service::evaluate(&route, &action).await
+                                    .unwrap_or_else(|_| crate::codewall_service::unavailable())),
+                                Ok(None) => None,
+                                Err(_) => Some(crate::codewall_service::unavailable()),
+                            },
                             Ok(None) => None,
                             Err(_) => Some(crate::codewall_service::unavailable()),
-                        },
-                        Ok(None) => None,
-                        Err(_) => Some(crate::codewall_service::unavailable()),
-                    };
-                    if let Some(decision) = decision && (decision.skip || decision.ask) {
-                        let response = codewall_blocking_reply(&request, &decision)
-                            .ok_or_else(|| ServeFailure::Io("unable to return Codewall policy decision".into()))?;
-                        let frame = json_frame(&response).ok_or_else(|| ServeFailure::Io("unable to encode Codewall policy decision".into()))?;
-                        write_frame(&mut upstream_out, &frame).await.map_err(|e| ServeFailure::Io(e.to_string()))?;
-                        if let Some(id) = request.get("id") { mrtr.forget(id); }
-                        client_frame.clear();
-                        continue;
+                        };
+                        let reply = match codewall_dispatch(&request, decision) {
+                            CodewallDispatch::Forward => None,
+                            CodewallDispatch::Reply(reply) => Some(reply),
+                            CodewallDispatch::ForwardAsk(ask) => codewall_asks.hold(&request, ask),
+                        };
+                        if let Some(response) = reply {
+                            let frame = json_frame(&response).ok_or_else(|| ServeFailure::Io("unable to encode Codewall policy decision".into()))?;
+                            write_frame(&mut upstream_out, &frame).await.map_err(|e| ServeFailure::Io(e.to_string()))?;
+                            if let Some(id) = request.get("id") { mrtr.forget(id); }
+                            client_frame.clear();
+                            continue;
+                        }
+                    }
+                    ClientFrame::Unsafe => {
+                        if !matches!(crate::codewall_service::load(principal.unwrap_or("default")), Ok(None)) {
+                            let frame = json_frame(&unsafe_frame_rejection()).ok_or_else(|| ServeFailure::Io("unable to encode Codewall rejection".into()))?;
+                            write_frame(&mut upstream_out, &frame).await.map_err(|e| ServeFailure::Io(e.to_string()))?;
+                            client_frame.clear();
+                            continue;
+                        }
+                    }
+                    ClientFrame::Other => {
+                        if let Ok(message) = serde_json::from_slice::<Value>(&outbound)
+                            && message.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+                            && let Some(id) = message.pointer("/params/requestId")
+                        {
+                            codewall_asks.forget(id);
+                        }
                     }
                 }
                 if let Some(pending) = pending.as_mut()
@@ -493,6 +644,7 @@ async fn serve(
                         pending::Upstream::Forward(message) => outbound = json_frame(&message).ok_or_else(|| ServeFailure::Io("failed to encode approval transport".into()))?,
                         pending::Upstream::Reply(response) => {
                             let frame = json_frame(&response).ok_or_else(|| ServeFailure::Io("failed to encode approval status".into()))?;
+                            let frame = codewall_asks.resolve(&frame).unwrap_or(frame);
                             write_frame(&mut upstream_out, &frame).await.map_err(|e| ServeFailure::Io(e.to_string()))?;
                             client_frame.clear();
                             continue;
@@ -555,6 +707,7 @@ async fn serve(
                                 "failed to encode native input_required error".to_owned(),
                             )
                         })?;
+                        let frame = codewall_asks.resolve(&frame).unwrap_or(frame);
                         write_frame(&mut upstream_out, &frame).await.map_err(|error| {
                             ServeFailure::Io(format!("failed to write MCP client: {error}"))
                         })?;
@@ -570,6 +723,7 @@ async fn serve(
                                 "failed to encode native input_required error".to_owned(),
                             )
                         })?;
+                        let frame = codewall_asks.resolve(&frame).unwrap_or(frame);
                         write_frame(&mut upstream_out, &frame).await.map_err(|error| {
                             ServeFailure::Io(format!("failed to write MCP client: {error}"))
                         })?;
@@ -593,7 +747,8 @@ async fn serve(
                 }
                 match transport_action(&transport_frame, mode, client_supports_form) {
                     TransportAction::Forward => {
-                        write_frame(&mut upstream_out, &transport_frame)
+                        let frame = codewall_asks.resolve(&transport_frame);
+                        write_frame(&mut upstream_out, frame.as_deref().unwrap_or(&transport_frame))
                             .await
                             .map_err(|error| {
                                 ServeFailure::Io(format!(
