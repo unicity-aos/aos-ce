@@ -1,4 +1,38 @@
 use super::*;
+
+#[test]
+fn codewall_mcp_tool_request_uses_actual_native_tool_for_reserved_gate() {
+    let native = json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"aos_pretooluse_gate","arguments":{"tool_name":"Bash","tool_input":{"command":"pwd"}}}});
+    let action = codewall_action(&native).expect("request").expect("tool");
+    assert!(
+        matches!(action, crate::codewall_service::Action::Tool { name, arguments } if name == "Bash" && arguments == json!({"command":"pwd"}))
+    );
+    let ordinary = json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"fs.read","arguments":{"path":"/tmp/a"}}});
+    let action = codewall_action(&ordinary).expect("request").expect("tool");
+    assert!(
+        matches!(action, crate::codewall_service::Action::Tool { name, arguments } if name == "fs.read" && arguments == json!({"path":"/tmp/a"}))
+    );
+}
+
+#[test]
+fn codewall_mcp_denial_keeps_reserved_hook_binding() {
+    let request = json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"aos_pretooluse_gate","arguments":{"tool_name":"Bash","tool_input":{"command":"pwd"}}}});
+    let deny = crate::codewall_service::Decision {
+        skip: true,
+        ask: false,
+        reason: Some("blocked".into()),
+    };
+    let reply = codewall_blocking_reply(&request, &deny).expect("reply");
+    assert_eq!(reply["result"]["isError"], false);
+    let text = reply["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text");
+    let hook: Value = serde_json::from_str(text).expect("hook json");
+    assert_eq!(hook["hookSpecificOutput"]["permissionDecision"], "deny");
+    let request = json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"fs.read","arguments":{}}});
+    let reply = codewall_blocking_reply(&request, &deny).expect("reply");
+    assert_eq!(reply["result"]["isError"], true);
+}
 use serde_json::json;
 
 fn initialize(capabilities: Value) -> String {

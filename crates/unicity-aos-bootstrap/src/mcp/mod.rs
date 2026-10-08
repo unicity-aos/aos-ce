@@ -223,6 +223,68 @@ enum InteractionMode {
     Deny,
 }
 
+fn codewall_action(request: &Value) -> Result<Option<crate::codewall_service::Action>, String> {
+    if request.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return Ok(None);
+    }
+    let params = request
+        .get("params")
+        .and_then(Value::as_object)
+        .ok_or("MCP tool parameters missing")?;
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("MCP tool name missing")?;
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !arguments.is_object() {
+        return Err("MCP tool arguments must be an object".into());
+    }
+    if name == "aos_pretooluse_gate" {
+        let tool = arguments
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or("native tool name missing")?;
+        let input = arguments
+            .get("tool_input")
+            .filter(|v| v.is_object())
+            .cloned()
+            .ok_or("native tool arguments missing")?;
+        return Ok(Some(crate::codewall_service::Action::Tool {
+            name: tool.to_owned(),
+            arguments: input,
+        }));
+    }
+    Ok(Some(crate::codewall_service::Action::Tool {
+        name: name.to_owned(),
+        arguments,
+    }))
+}
+
+fn codewall_blocking_reply(
+    request: &Value,
+    decision: &crate::codewall_service::Decision,
+) -> Option<Value> {
+    let id = request.get("id")?.clone();
+    let name = request.pointer("/params/name").and_then(Value::as_str)?;
+    let reason = decision
+        .reason
+        .as_deref()
+        .unwrap_or("Codewall policy unavailable");
+    let content = if name == "aos_pretooluse_gate" {
+        let permission = if decision.skip { "deny" } else { "ask" };
+        let hook = json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":permission,"permissionDecisionReason":reason}});
+        json!({"content":[{"type":"text","text":hook.to_string()}],"isError":false})
+    } else {
+        json!({"content":[{"type":"text","text":format!("Codewall policy blocked tool: {reason}")}],"isError":true})
+    };
+    Some(json!({"jsonrpc":"2.0","id":id,"result":content}))
+}
+
 pub(crate) fn handle_serve(principal: Option<String>, mut args: ServeArgs) -> ExitCode {
     if let Err(error) = native_surface(&args) {
         eprintln!("aos mcp serve: {error}");
@@ -399,6 +461,29 @@ async fn serve(
                     ServeFailure::Io("bundled MCP transport input is closed".to_owned())
                 })?;
                 let mut outbound = outbound.to_vec();
+                if let Ok(request) = serde_json::from_slice::<Value>(&outbound)
+                    && request.get("method").and_then(Value::as_str) == Some("tools/call")
+                {
+                    let decision = match crate::codewall_service::load(principal.unwrap_or("default")) {
+                        Ok(Some(route)) => match codewall_action(&request) {
+                            Ok(Some(action)) => Some(crate::codewall_service::evaluate(&route, &action).await
+                                .unwrap_or_else(|_| crate::codewall_service::unavailable())),
+                            Ok(None) => None,
+                            Err(_) => Some(crate::codewall_service::unavailable()),
+                        },
+                        Ok(None) => None,
+                        Err(_) => Some(crate::codewall_service::unavailable()),
+                    };
+                    if let Some(decision) = decision && (decision.skip || decision.ask) {
+                        let response = codewall_blocking_reply(&request, &decision)
+                            .ok_or_else(|| ServeFailure::Io("unable to return Codewall policy decision".into()))?;
+                        let frame = json_frame(&response).ok_or_else(|| ServeFailure::Io("unable to encode Codewall policy decision".into()))?;
+                        write_frame(&mut upstream_out, &frame).await.map_err(|e| ServeFailure::Io(e.to_string()))?;
+                        if let Some(id) = request.get("id") { mrtr.forget(id); }
+                        client_frame.clear();
+                        continue;
+                    }
+                }
                 if let Some(pending) = pending.as_mut()
                     && let Ok(message) = serde_json::from_slice::<Value>(&outbound)
                 {

@@ -5,7 +5,7 @@
 //! the bundled runtime under the product-owned home and workspace layout.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitStatus;
 use std::process::{Command, ExitCode};
@@ -16,6 +16,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use unicity_aos_bootstrap::{AOS_WORKSPACE_STATE_DIR, AosHome};
 
 mod cli;
+mod codewall_service;
 mod command_center;
 #[cfg(unix)]
 mod console;
@@ -77,6 +78,10 @@ enum ProductCommand {
     },
     /// Deliver a host hook through the authenticated AOS event bus.
     Hook(hook::HookArgs),
+    /// Report installed runtime assets required for protected Codewall routing.
+    CodewallServiceCapability,
+    /// Submit a bounded inventory report to the configured Codewall service.
+    CodewallServiceInventory,
     /// Expose this AOS installation to an MCP host over stdio.
     Mcp {
         #[command(subcommand)]
@@ -379,11 +384,12 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
                     | ProductCommand::Status(_)
                     | ProductCommand::Principals(_)
                     | ProductCommand::NativeSetup(_)
+                    | ProductCommand::CodewallServiceInventory
             )
         )
     {
         eprintln!(
-            "aos: '--principal' is supported for `aos init`, `aos status`, `aos hook`, `aos mcp`, `aos principals`, and `aos native-setup`; this AOS-owned command does not accept a runtime principal"
+            "aos: '--principal' is supported for `aos init`, `aos status`, `aos hook`, `aos mcp`, `aos principals`, `aos native-setup`, and `aos codewall-service-inventory`; this AOS-owned command does not accept a runtime principal"
         );
         return Some(ExitCode::from(2));
     }
@@ -408,6 +414,56 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
             command: DistroCommand::Apply(args),
         }) => Some(handle_distro_apply(cli.principal, args)),
         Some(ProductCommand::Hook(args)) => Some(handle_hook(cli.principal, args)),
+        Some(ProductCommand::CodewallServiceCapability) => {
+            let home = match resolve_home() {
+                Ok(home) => home,
+                Err(code) => return Some(code),
+            };
+            match codewall_service::capability(&home) {
+                Ok(value) => {
+                    println!("{value}");
+                    Some(ExitCode::SUCCESS)
+                }
+                Err(error) => {
+                    eprintln!("aos: {error}");
+                    Some(ExitCode::FAILURE)
+                }
+            }
+        }
+        Some(ProductCommand::CodewallServiceInventory) => {
+            let principal = cli.principal.unwrap_or_else(|| "default".to_owned());
+            let mut input = Vec::new();
+            if let Err(error) = io::stdin().take(1024 * 1024 + 1).read_to_end(&mut input) {
+                eprintln!("aos: could not read Codewall inventory: {error}");
+                return Some(ExitCode::FAILURE);
+            }
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("aos: could not start Codewall inventory client: {error}");
+                    return Some(ExitCode::FAILURE);
+                }
+            };
+            match runtime.block_on(codewall_service::inventory(&principal, &input)) {
+                Ok(receipt) => {
+                    if io::stdout()
+                        .write_all(&receipt)
+                        .and_then(|()| io::stdout().flush())
+                        .is_err()
+                    {
+                        return Some(ExitCode::FAILURE);
+                    }
+                    Some(ExitCode::SUCCESS)
+                }
+                Err(error) => {
+                    eprintln!("aos: {error}");
+                    Some(ExitCode::FAILURE)
+                }
+            }
+        }
         Some(ProductCommand::Mcp {
             command: McpCommand::Serve(args),
         }) => {
@@ -693,6 +749,8 @@ fn is_owned_root(value: &str) -> bool {
             | "self_update"
             | "distro"
             | "hook"
+            | "codewall-service-capability"
+            | "codewall-service-inventory"
             | "mcp"
             | "daemon"
             | "principals"

@@ -19,6 +19,98 @@ const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 
 mod output;
 
+fn codewall_action(
+    event: &str,
+    payload: &Value,
+) -> Result<Option<crate::codewall_service::Action>, String> {
+    match event {
+        "pre_tool_use" | "permission_request" => {
+            let name = payload
+                .get("tool_name")
+                .or_else(|| payload.get("toolName"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or("Codewall tool name missing")?;
+            let arguments = payload
+                .get("tool_input")
+                .or_else(|| payload.get("toolInput"))
+                .filter(|v| v.is_object())
+                .cloned()
+                .ok_or("Codewall tool arguments missing")?;
+            Ok(Some(crate::codewall_service::Action::Tool {
+                name: name.to_owned(),
+                arguments,
+            }))
+        }
+        "user_prompt_submit" => {
+            let text = payload
+                .get("prompt")
+                .and_then(Value::as_str)
+                .ok_or("Codewall prompt missing")?;
+            Ok(Some(crate::codewall_service::Action::Prompt {
+                text: text.to_owned(),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod codewall_tests {
+    #[test]
+    fn codewall_ask_survives_oracle_failure_but_keeps_timely_oracle_reply() {
+        let ask = crate::codewall_service::Decision {
+            skip: false,
+            ask: true,
+            reason: Some("review required".into()),
+        };
+        let recovered = binding_result("pre_tool_use", Some(&ask), Err("runtime stopped".into()))
+            .expect("binding fallback")
+            .expect("neutral output");
+        let parsed: serde_json::Value = serde_json::from_str(&recovered).expect("json");
+        assert_eq!(parsed["decision"]["ask"], true);
+        assert_eq!(parsed["decision"]["reason"], "review required");
+        let oracle_deny = r#"{"decision":{"skip":true,"ask":false,"reason":"other policy"}}"#;
+        assert_eq!(
+            binding_result("pre_tool_use", Some(&ask), Ok(Some(oracle_deny.into())))
+                .expect("oracle reply"),
+            Some(oracle_deny.into())
+        );
+        assert!(binding_result("pre_tool_use", None, Err("runtime stopped".into())).is_err());
+    }
+
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_hook_extracts_tool_and_prompt_without_authority_fields() {
+        let tool = codewall_action(
+            "pre_tool_use",
+            &json!({"tool_name":"Bash","tool_input":{"command":"pwd"},"principal_id":"attacker"}),
+        )
+        .expect("tool");
+        assert!(
+            matches!(tool, Some(crate::codewall_service::Action::Tool { name, arguments }) if name == "Bash" && arguments == json!({"command":"pwd"}))
+        );
+        let prompt =
+            codewall_action("user_prompt_submit", &json!({"prompt":"hello"})).expect("prompt");
+        assert!(
+            matches!(prompt, Some(crate::codewall_service::Action::Prompt { text }) if text == "hello")
+        );
+    }
+
+    #[test]
+    fn configured_binding_event_rejects_missing_action_fields() {
+        assert!(codewall_action("pre_tool_use", &json!({})).is_err());
+        assert!(codewall_action("user_prompt_submit", &json!({"prompt":42})).is_err());
+        assert!(
+            codewall_action("stop", &json!({}))
+                .expect("other event")
+                .is_none()
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 enum OutputFormat {
     #[default]
@@ -137,10 +229,71 @@ pub(crate) fn handle(principal: String, args: HookArgs) -> Result<Option<String>
         .map_err(|error| format!("could not start hook client: {error}"))?;
     let timeout = Duration::from_millis(args.timeout_ms);
     runtime.block_on(async {
-        tokio::time::timeout(timeout, deliver(principal, request, timeout, args.format))
-            .await
-            .map_err(|_| "hook delivery exceeded its deadline".to_owned())?
+        let deadline = tokio::time::Instant::now() + timeout;
+        let codewall = match codewall_action(&request.event, &request.payload) {
+            Ok(Some(action)) => match crate::codewall_service::load(&request.principal_id) {
+                Ok(Some(route)) => {
+                    if !matches!(args.format, OutputFormat::Json) {
+                        return Err("Codewall binding hooks require --format json".into());
+                    }
+                    Some(
+                        tokio::time::timeout_at(
+                            deadline,
+                            crate::codewall_service::evaluate(&route, &action),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_else(crate::codewall_service::unavailable),
+                    )
+                }
+                Ok(None) => None,
+                Err(_) => Some(crate::codewall_service::unavailable()),
+            },
+            Err(_) => match crate::codewall_service::load(&request.principal_id) {
+                Ok(None) => None,
+                _ => Some(crate::codewall_service::unavailable()),
+            },
+            Ok(None) => None,
+        };
+        let fallback = codewall.as_ref().filter(|decision| decision.ask).cloned();
+        let event = request.event.clone();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let result = tokio::time::timeout_at(
+            deadline,
+            deliver(principal, request, remaining, args.format, codewall),
+        )
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => Err("hook delivery exceeded its deadline".into()),
+        };
+        binding_result(&event, fallback.as_ref(), result)
     })
+}
+
+fn binding_result(
+    event: &str,
+    binding_ask: Option<&crate::codewall_service::Decision>,
+    result: Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    match result {
+        Ok(reply) => Ok(reply),
+        Err(error) => {
+            let Some(decision) = binding_ask else {
+                return Err(error);
+            };
+            output::reply(
+                event,
+                Some(&output::Decision {
+                    skip: false,
+                    ask: true,
+                    reason: decision.reason.clone(),
+                }),
+                None,
+            )
+        }
+    }
 }
 
 async fn installed_responder(principal: PrincipalId) -> Result<Uuid, String> {
@@ -179,7 +332,22 @@ async fn deliver(
     request: HostHookRequest,
     timeout: Duration,
     format: OutputFormat,
+    codewall: Option<crate::codewall_service::Decision>,
 ) -> Result<Option<String>, String> {
+    // A protected veto remains binding even if the user runtime is stopped.
+    if let Some(decision) = &codewall
+        && decision.skip
+    {
+        return output::reply(
+            &request.event,
+            Some(&output::Decision {
+                skip: true,
+                ask: false,
+                reason: decision.reason.clone(),
+            }),
+            None,
+        );
+    }
     let responder_source = if matches!(format, OutputFormat::Json) {
         Some(installed_responder(principal.clone()).await?)
     } else {
@@ -222,9 +390,19 @@ async fn deliver(
         if response.event.as_deref() != Some(request.event.as_str()) {
             return Err("hook response is missing the exact event".into());
         }
+        let combined = codewall.map(|cw| {
+            output::combine(
+                response.decision.clone(),
+                output::Decision {
+                    skip: cw.skip,
+                    ask: cw.ask,
+                    reason: cw.reason,
+                },
+            )
+        });
         return output::reply(
             &request.event,
-            response.decision.as_ref(),
+            combined.as_ref().or(response.decision.as_ref()),
             response.context.as_deref(),
         );
     }

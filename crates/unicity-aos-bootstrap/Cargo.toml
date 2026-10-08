@@ -14,9 +14,11 @@ axum.workspace = true
 blake3.workspace = true
 clap.workspace = true
 fs2.workspace = true
+hex = "0.4"
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.11"
 tokio.workspace = true
 toml.workspace = true
 uuid.workspace = true
@@ -36,6 +38,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["N
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
+tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
