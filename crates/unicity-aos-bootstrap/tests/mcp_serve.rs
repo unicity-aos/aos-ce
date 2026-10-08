@@ -37,6 +37,19 @@ impl Fixture {
     }
 
     fn install_runtime(&self, body: &str) {
+        let (shebang, program) = body.split_once('\n').expect("runtime fixture shebang");
+        // Fake runtimes must enforce the product selector, then parse the
+        // original host arguments just as the real CLI does.
+        let selector = match shebang {
+            "#!/bin/sh" => {
+                "[ \"$1\" = --daemon-workspace ] && [ \"$2\" = \"$ASTRID_HOME\" ] || exit 97\nshift 2\n"
+            }
+            "#!/usr/bin/env python3" => {
+                "import os, sys\nassert sys.argv[1:3] == ['--daemon-workspace', os.environ['ASTRID_HOME']]\ndel sys.argv[1:3]\n"
+            }
+            _ => panic!("unsupported runtime fixture interpreter: {shebang}"),
+        };
+        let body = format!("{shebang}\n{selector}{program}");
         fs::write(&self.runtime, body).expect("write fake runtime");
         let mut permissions = fs::metadata(&self.runtime)
             .expect("runtime metadata")

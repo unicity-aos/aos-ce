@@ -16,6 +16,7 @@ pub mod health;
 mod init_resume;
 mod legacy_private_permissions;
 mod migration;
+mod runtime_command;
 mod runtime_environment;
 pub mod status;
 pub use migration::{LegacyDistro, MigrationOutcome};
@@ -334,23 +335,6 @@ impl AosHome {
         self.runtime_command_with_args(std::iter::empty::<&OsStr>())
     }
 
-    /// Build a command for the bundled runtime with product CLI arguments.
-    ///
-    /// The command is executed directly, not through a shell. This preserves
-    /// argument boundaries and leaves the runtime in charge of its established
-    /// local socket, credentials, and operator protocol.
-    /// # Errors
-    /// Returns an error when the release runtime bin or inherited host PATH
-    /// cannot be represented safely as a child PATH.
-    pub fn runtime_command_with_args<I, S>(&self, args: I) -> io::Result<Command>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let runtime_binary = self.runtime_binary();
-        self.runtime_executable_command(&runtime_binary, args)
-    }
-
     fn runtime_executable_command<I, S>(&self, executable: &Path, args: I) -> io::Result<Command>
     where
         I: IntoIterator<Item = S>,
@@ -409,10 +393,11 @@ impl AosHome {
             self.ensure_runtime_available()?;
         }
         let mut args = Vec::new();
-        if let Some(workspace) = workspace {
-            args.push(OsString::from("--workspace"));
-            args.push(workspace.as_os_str().to_owned());
-        }
+        args.push(OsString::from("--workspace"));
+        args.push(workspace.map_or_else(
+            || std::path::absolute(self.runtime_home()).map(PathBuf::into_os_string),
+            |workspace| Ok(workspace.as_os_str().to_owned()),
+        )?);
         if verbose {
             args.push(OsString::from("--verbose"));
         }
@@ -1218,7 +1203,15 @@ done
             .expect("build runtime command");
         let args: Vec<_> = command.get_args().collect();
 
-        assert_eq!(args, ["status", "--json"]);
+        assert_eq!(
+            args,
+            [
+                "--daemon-workspace",
+                "/tmp/unicity-aos-test/runtime",
+                "status",
+                "--json"
+            ]
+        );
         assert_eq!(command.get_program(), home.runtime_binary());
     }
 
@@ -1234,6 +1227,16 @@ done
             .expect("build foreground daemon command");
 
         assert_eq!(command.get_program(), home.runtime_daemon_binary());
+        let default_command = home
+            .foreground_daemon_command(None, false)
+            .expect("default foreground daemon");
+        assert_eq!(
+            default_command.get_args().collect::<Vec<_>>(),
+            [
+                std::ffi::OsStr::new("--workspace"),
+                home.runtime_home().as_os_str()
+            ]
+        );
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["--workspace", "/workspace", "--verbose"]
