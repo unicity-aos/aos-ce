@@ -272,9 +272,10 @@ fn enroll(
     artifacts: &KeyArtifacts,
     owned: &mut OwnedCleanup,
 ) -> Result<SetupDocument, SetupError> {
-    let public_key = generate_device_key(home, principal, artifacts, owned)?;
-    let mut token =
-        parse_pair_token(&run_runtime(home, runtime_issue_args(principal), None)?.stdout)?;
+    let (mut token, public_key) = prepare_enrollment(
+        || parse_pair_token(&run_runtime(home, runtime_issue_args(principal), None)?.stdout),
+        || generate_device_key(home, principal, artifacts, owned),
+    )?;
     let redeemed = match run_runtime(
         home,
         runtime_redeem_args(principal, &public_key)?,
@@ -294,6 +295,22 @@ fn enroll(
     // Redeem already happened; this path does not call pair-device revoke.
     write_responder(config_path, principal, &redeemed.key_id)?;
     Ok(SetupDocument::local(principal, connection))
+}
+
+fn prepare_enrollment(
+    issue: impl FnOnce() -> Result<Vec<u8>, SetupError>,
+    generate: impl FnOnce() -> Result<String, SetupError>,
+) -> Result<(Vec<u8>, String), SetupError> {
+    // Pairing requires the live daemon and its authority check. Do this before
+    // key generation can create directories in a stopped volume-only runtime.
+    let mut token = issue()?;
+    match generate() {
+        Ok(public_key) => Ok((token, public_key)),
+        Err(error) => {
+            token.fill(0);
+            Err(error)
+        }
+    }
 }
 
 fn generate_device_key(
