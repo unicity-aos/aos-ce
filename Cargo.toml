@@ -38,10 +38,10 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 astrid-sdk = { version = "=0.7.1", features = ["derive"] }
-astrid-core = { version = "=2026.10.0", git = "https://github.com/astrid-runtime/astrid", rev = "e0f6d685ff5a54f58f15574cbe417a45a29b22b3" }
-astrid-crypto = { version = "=2026.10.0", git = "https://github.com/astrid-runtime/astrid", rev = "e0f6d685ff5a54f58f15574cbe417a45a29b22b3" }
-astrid-types = { version = "=2026.10.0", git = "https://github.com/astrid-runtime/astrid", rev = "e0f6d685ff5a54f58f15574cbe417a45a29b22b3", features = ["clock"] }
-astrid-uplink = { version = "=2026.10.0", git = "https://github.com/astrid-runtime/astrid", rev = "e0f6d685ff5a54f58f15574cbe417a45a29b22b3" }
+astrid-core = { version = "=2026.10.0", git = "https://github.com/astrid-runtime/astrid", rev = "3de7671a6926f68f5cedd3d837110e17fda3aae9" }
+astrid-crypto = { version = "=2026.10.0", git = "https://github.com/astrid-runtime/astrid", rev = "3de7671a6926f68f5cedd3d837110e17fda3aae9" }
+astrid-types = { version = "=2026.10.0", git = "https://github.com/astrid-runtime/astrid", rev = "3de7671a6926f68f5cedd3d837110e17fda3aae9", features = ["clock"] }
+astrid-uplink = { version = "=2026.10.0", git = "https://github.com/astrid-runtime/astrid", rev = "3de7671a6926f68f5cedd3d837110e17fda3aae9" }
 axum = "0.8"
 blake3 = "1.8.5"
 clap = { version = "4.6", features = ["derive"] }
