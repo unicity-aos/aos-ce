@@ -6,18 +6,19 @@ version = "2026.10.0"
 
 [runtime]
 repository = "astrid-runtime/astrid"
-# Runtime provenance is bound to authenticated October RC metadata. Composed QA
-# packages passed install, legacy upgrade, capsule use and signed Oracle journeys.
+# Runtime provenance is bound to authenticated rc.3 metadata. Readiness gates
+# retain prior composed QA evidence; replacement public-package journeys are
+# tracked separately and are not established by this provenance update.
 release-ready = true
 upgrade-self-heal-ready = true
-version = "2026.10.0-rc.2"
-tag = "v2026.10.0-rc.2"
-version-requirement = ">=2026.10.0-rc.2"
-release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.10.0-rc.2"
+version = "2026.10.0-rc.3"
+tag = "v2026.10.0-rc.3"
+version-requirement = ">=2026.10.0-rc.3"
+release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.10.0-rc.3"
 release-metadata-available = true
-source-commit = "e0f6d685ff5a54f58f15574cbe417a45a29b22b3"
-release-metadata-asset = "astrid-2026.10.0-rc.2-release.toml"
-release-metadata-blake3 = "5588798e4e114811b06cce89fa357906682ac75d12048af9a95e37df5784cd30"
+source-commit = "3de7671a6926f68f5cedd3d837110e17fda3aae9"
+release-metadata-asset = "astrid-2026.10.0-rc.3-release.toml"
+release-metadata-blake3 = "97af6ee18bfe38412a3e6f2a7075106aa9028aeeaa4c60a1547af0947f737d00"
 
 [contracts]
 repository = "astrid-runtime/wit"
