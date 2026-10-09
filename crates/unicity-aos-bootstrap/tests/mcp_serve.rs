@@ -92,6 +92,15 @@ exit "${AOS_TEST_EXIT:-0}"
 
 #[test]
 fn socket_approval_returns_pending_and_resumes_once_after_human_decision() {
+    socket_approval_roundtrip("serve");
+}
+
+#[test]
+fn attach_socket_approval_returns_pending_and_resumes_once_after_human_decision() {
+    socket_approval_roundtrip("attach");
+}
+
+fn socket_approval_roundtrip(transport: &str) {
     use serde_json::{Value, json};
     use std::os::unix::net::UnixListener;
     let fixture = Fixture::new("pending-native-approval");
@@ -163,7 +172,7 @@ for line in sys.stdin:
         .command()
         .args([
             "mcp",
-            "serve",
+            transport,
             "--interaction",
             "native",
             "--interaction-socket",
@@ -235,6 +244,15 @@ for line in sys.stdin:
 
 #[test]
 fn serve_forwards_host_arguments_exactly_and_separates_home_from_workspace() {
+    transport_forwards_host_arguments("serve");
+}
+
+#[test]
+fn attach_preserves_the_shared_gateway_and_separates_home_from_workspace() {
+    transport_forwards_host_arguments("attach");
+}
+
+fn transport_forwards_host_arguments(transport: &str) {
     let fixture = Fixture::new("argv");
     fixture.install_runtime(RECORDING_RUNTIME);
     let workspace = fixture.root.join("project wörkspace ✨");
@@ -246,7 +264,7 @@ fn serve_forwards_host_arguments_exactly_and_separates_home_from_workspace() {
             "--principal",
             "grok-code",
             "mcp",
-            "serve",
+            transport,
             "--interaction",
             "native",
             "--workspace",
@@ -262,10 +280,13 @@ fn serve_forwards_host_arguments_exactly_and_separates_home_from_workspace() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let expected = format!(
-        "<--principal>\n<grok-code>\n<mcp>\n<serve>\n<--workspace>\n<{}>\n<--request-timeout>\n<1d5m>\n",
+    let mut expected = format!(
+        "<--principal>\n<grok-code>\n<mcp>\n<{transport}>\n<--workspace>\n<{}>\n",
         workspace.display()
     );
+    if transport == "serve" {
+        expected.push_str("<--request-timeout>\n<1d5m>\n");
+    }
     assert_eq!(
         fs::read_to_string(&fixture.args).expect("read runtime argv"),
         expected

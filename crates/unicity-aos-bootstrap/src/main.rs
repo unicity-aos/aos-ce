@@ -119,6 +119,8 @@ struct ForegroundDaemonArgs {
 enum McpCommand {
     /// Serve AOS tools and broker interactions over stdio.
     Serve(mcp::ServeArgs),
+    /// Attach to the shared runtime gateway with AOS-owned interactions.
+    Attach(mcp::ServeArgs),
 }
 
 #[derive(Subcommand)]
@@ -416,7 +418,21 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
             command: McpCommand::Serve(args),
         }) => {
             open_command_center();
-            Some(mcp::handle_serve(cli.principal, args))
+            Some(mcp::handle_serve(
+                cli.principal,
+                args,
+                mcp::RuntimeTransport::Serve,
+            ))
+        }
+        Some(ProductCommand::Mcp {
+            command: McpCommand::Attach(args),
+        }) => {
+            open_command_center();
+            Some(mcp::handle_serve(
+                cli.principal,
+                args,
+                mcp::RuntimeTransport::Attach,
+            ))
         }
         Some(ProductCommand::Principals(args)) => Some(cli::handle_principals(
             cli.principal,
