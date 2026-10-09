@@ -223,7 +223,26 @@ enum InteractionMode {
     Deny,
 }
 
-pub(crate) fn handle_serve(principal: Option<String>, mut args: ServeArgs) -> ExitCode {
+#[derive(Clone, Copy)]
+pub(crate) enum RuntimeTransport {
+    Serve,
+    Attach,
+}
+
+impl RuntimeTransport {
+    const fn command(self) -> &'static str {
+        match self {
+            Self::Serve => "serve",
+            Self::Attach => "attach",
+        }
+    }
+}
+
+pub(crate) fn handle_serve(
+    principal: Option<String>,
+    mut args: ServeArgs,
+    transport: RuntimeTransport,
+) -> ExitCode {
     if let Err(error) = native_surface(&args) {
         eprintln!("aos mcp serve: {error}");
         return ExitCode::FAILURE;
@@ -247,7 +266,7 @@ pub(crate) fn handle_serve(principal: Option<String>, mut args: ServeArgs) -> Ex
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(serve(&home, principal.as_deref(), &args)) {
+    match runtime.block_on(serve(&home, principal.as_deref(), &args, transport)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(ServeFailure::Exit(status)) => {
             eprintln!("aos mcp serve: bundled MCP transport exited with {status}");
@@ -285,18 +304,28 @@ fn prefer_console(args: &mut ServeArgs, home: &std::path::Path) {
     }
 }
 
-fn runtime_arguments(principal: Option<&str>, args: &ServeArgs) -> Vec<OsString> {
+fn runtime_arguments(
+    principal: Option<&str>,
+    args: &ServeArgs,
+    transport: RuntimeTransport,
+) -> Vec<OsString> {
     let mut arguments = Vec::<OsString>::new();
     if let Some(principal) = principal {
         arguments.push(OsString::from("--principal"));
         arguments.push(OsString::from(principal));
     }
-    arguments.extend([OsString::from("mcp"), OsString::from("serve")]);
+    arguments.extend([OsString::from("mcp"), OsString::from(transport.command())]);
     if let Some(workspace) = args.workspace.as_ref() {
         arguments.push(OsString::from("--workspace"));
         arguments.push(workspace.as_os_str().to_os_string());
     }
-    if let Some(timeout) = args.request_timeout.as_ref() {
+    // Astrid's serve command accepts this legacy host hint, but attach does not.
+    // Hosts own their tool deadline; never pass an unsupported flag to attach.
+    if let Some(timeout) = args
+        .request_timeout
+        .as_ref()
+        .filter(|_| matches!(transport, RuntimeTransport::Serve))
+    {
         arguments.push(OsString::from("--request-timeout"));
         arguments.push(OsString::from(timeout));
     }
@@ -307,13 +336,14 @@ async fn serve(
     home: &AosHome,
     principal: Option<&str>,
     args: &ServeArgs,
+    transport: RuntimeTransport,
 ) -> Result<(), ServeFailure> {
     home.ensure_runtime_transport_available()
         .map_err(|error| ServeFailure::Io(format!("failed to prepare bundled runtime: {error}")))?;
     #[cfg(not(unix))]
     let _ = args.interaction_timeout;
     let mode = args.interaction;
-    let runtime_args = runtime_arguments(principal, args);
+    let runtime_args = runtime_arguments(principal, args, transport);
 
     let mut standard_command = home
         .runtime_command_with_args(&runtime_args)
