@@ -27,6 +27,47 @@ fn failed(error: SetupError) -> String {
 }
 
 #[test]
+fn unavailable_daemon_refuses_enrollment_before_creating_key_directories() {
+    let root = temp_root("stopped-runtime");
+    let runtime = root.join("runtime");
+    fs::create_dir(&runtime).expect("runtime");
+    fs::write(runtime.join("astrid.volume"), b"preserved fixture").expect("volume");
+    let error = prepare_enrollment(
+        || Err(SetupError::Failed("daemon not running".to_owned())),
+        || {
+            fs::create_dir_all(runtime.join("keys/local")).expect("key directory");
+            Ok("ab".repeat(32))
+        },
+    )
+    .expect_err("stopped daemon refuses enrollment");
+    assert_eq!(failed(error), "daemon not running");
+    assert!(!runtime.join("keys").exists());
+    assert_eq!(
+        fs::read(runtime.join("astrid.volume")).expect("volume"),
+        b"preserved fixture"
+    );
+    fs::remove_dir_all(root).expect("remove owned fixture");
+}
+
+#[test]
+fn enrollment_generates_keys_only_after_pairing_authority_succeeds() {
+    let issued = std::cell::Cell::new(false);
+    let (token, public_key) = prepare_enrollment(
+        || {
+            issued.set(true);
+            Ok(b"synthetic-pairing-token".to_vec())
+        },
+        || {
+            assert!(issued.get());
+            Ok("ab".repeat(32))
+        },
+    )
+    .expect("prepared enrollment");
+    assert_eq!(token, b"synthetic-pairing-token");
+    assert_eq!(public_key, "ab".repeat(32));
+}
+
+#[test]
 fn pairing_args_never_include_a_token_or_force_flag() {
     let principal = principal();
     let generate: Vec<String> = runtime_generate_args(&principal)

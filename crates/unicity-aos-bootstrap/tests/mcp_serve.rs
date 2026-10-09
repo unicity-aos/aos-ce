@@ -51,11 +51,6 @@ impl Fixture {
         };
         let body = format!("{shebang}\n{selector}{program}");
         fs::write(&self.runtime, body).expect("write fake runtime");
-        let mut permissions = fs::metadata(&self.runtime)
-            .expect("runtime metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&self.runtime, permissions).expect("make runtime executable");
     }
 
     fn command(&self) -> Command {
@@ -65,7 +60,15 @@ impl Fixture {
             // protocol fixture. This child does not run Cargo or rustup.
             .env("HOME", &self.root)
             .env("AOS_HOME", &self.root)
-            .env("UNICITY_AOS_RUNTIME_BIN", &self.runtime)
+            // Concurrent execution of fresh scripts can exceed the protocol
+            // deadline on macOS before their first read. Keep the executable
+            // fixed; isolated programs and selector assertions stay unchanged.
+            .env(
+                "UNICITY_AOS_RUNTIME_BIN",
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/mcp-runtime-launcher.sh"),
+            )
+            .env("AOS_TEST_RUNTIME_PROGRAM", &self.runtime)
             .env("AOS_TEST_ARGS", &self.args)
             .env("AOS_TEST_HOME", self.root.join("home-marker"))
             .env("AOS_TEST_WORKSPACE", self.root.join("workspace-marker"))
