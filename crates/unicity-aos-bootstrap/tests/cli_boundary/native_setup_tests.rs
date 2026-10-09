@@ -83,6 +83,15 @@ fn native_setup_enrolls_local_personal_device_without_overwriting_or_leaking_tok
         "<pair-device>\n<issue>\n<--scope>\n<use-only>\n<--label>\n<aos-tray>\n<--raw>\n"
     ));
     assert!(recorded.contains("<pair-device>\n<redeem>\n<--public-key>\n"));
+    assert!(
+        recorded
+            .find("<pair-device>\n<issue>")
+            .expect("pairing issue")
+            < recorded
+                .find("<keypair>\n<generate>")
+                .expect("key generation"),
+        "pairing authority must succeed before generating keys"
+    );
     assert!(recorded.contains("STDIN:astrid_pair_device-token\n"));
     for line in recorded.lines() {
         if line.starts_with('<') {
@@ -360,13 +369,15 @@ fn native_setup_does_not_fall_back_when_pair_device_is_unsupported_or_fails() {
         String::from_utf8_lossy(&unsupported.stderr)
     );
     let recorded = fs::read_to_string(&fixture.args).expect("read unsupported args");
-    assert!(recorded.contains("<keypair>\n<generate>"));
+    assert!(recorded.contains("<pair-device>\n<issue>"));
+    assert!(!recorded.contains("<keypair>\n<generate>"));
     assert!(!recorded.contains("<agent>\n<list>"));
     let (connection, _, key) = native_setup_home_paths(&fixture);
     assert!(
         !key.exists(),
-        "unsupported generate must not leave a device key"
+        "unsupported pairing must not generate a device key"
     );
+    assert!(!fixture.home.join("runtime/keys").exists());
     assert!(!connection.exists());
 
     let failed = fixture
@@ -384,8 +395,11 @@ fn native_setup_does_not_fall_back_when_pair_device_is_unsupported_or_fails() {
     );
     assert!(
         !key.exists(),
-        "failed pairing after generate must not leave a device key"
+        "failed pairing must not generate a device key"
     );
+    assert!(!fixture.home.join("runtime/keys").exists());
+    let recorded = fs::read_to_string(&fixture.args).expect("read refused pairing args");
+    assert!(!recorded.contains("<keypair>\n<generate>"));
     assert!(!connection.exists());
     assert!(!fixture.home.join("runtime/config.toml").exists());
 }
