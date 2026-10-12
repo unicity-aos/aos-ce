@@ -72,6 +72,7 @@ pub(super) struct Listener {
     path: PathBuf,
     inode: u64,
     device: u64,
+    _lease: super::socket_lease::SocketLease,
 }
 impl Listener {
     pub fn bind(home: &Path) -> io::Result<Self> {
@@ -93,17 +94,21 @@ impl Listener {
             ));
         }
         let path = directory.join("approval.sock");
-        // Never unlink a socket belonging to another console, even if it looks stale.
+        let mut lease = super::socket_lease::SocketLease::acquire(&directory)?;
+        lease.recover(&path)?;
         let socket = UnixListener::bind(&path)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         let meta = fs::symlink_metadata(&path)?;
         socket.set_nonblocking(true)?;
-        Ok(Self {
+        let listener = Self {
             socket,
             path,
             inode: meta.ino(),
             device: meta.dev(),
-        })
+            _lease: lease,
+        };
+        listener._lease.record(listener.device, listener.inode)?;
+        Ok(listener)
     }
 }
 impl Drop for Listener {

@@ -18,6 +18,8 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Recover a crashed console's recorded approval socket under an exclusive
+  owner lock, without replacing live consoles or unattributed sockets.
 - Reclaim an interrupted installer's same-version release staging and backup
   directories after a successful retry, preserving live owners and backups
   that have not been superseded.

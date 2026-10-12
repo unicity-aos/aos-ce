@@ -1,6 +1,7 @@
 //! Human terminal control surface. No chat, LLM, or capsule-owned UI dependency.
 mod model;
 mod native;
+mod socket_lease;
 mod transport;
 mod updates_view;
 mod view;
