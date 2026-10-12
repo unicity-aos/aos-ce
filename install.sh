@@ -26,6 +26,8 @@ channel_current_path=
 channel_generation_dir=
 install_lock=
 install_lock_acquired=0
+download_pid=
+download_ticker_pid=
 
 [ -z "$AOS_CHANNEL_INPUT" ] || channel_explicit=1
 if [ "$AOS_VERSION" = latest ]; then
@@ -775,6 +777,14 @@ reclaim_abandoned_release_transactions() {
 cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
+  if [ -n "$download_ticker_pid" ]; then
+    kill "$download_ticker_pid" 2>/dev/null || :
+    wait "$download_ticker_pid" 2>/dev/null || :
+  fi
+  if [ -n "$download_pid" ]; then
+    kill "$download_pid" 2>/dev/null || :
+    wait "$download_pid" 2>/dev/null || :
+  fi
   if [ "$installation_started" -eq 1 ]; then
     restore || status=1
   elif [ "$release_committed" -eq 1 ] && [ -n "$release_backup" ]; then
@@ -818,28 +828,92 @@ cache_verified_verifier() {
 }
 
 COSIGN_BIN="$work/cosign"
-verifier_root=$(verifier_cache_root) || exit 1
-cached_verifier="$verifier_root/$cosign_sha256"
-if [ -L "$cached_verifier" ] || { [ -e "$cached_verifier" ] && [ ! -f "$cached_verifier" ]; }; then
-  echo "refusing non-regular cached verifier" >&2
-  exit 1
-fi
-if [ -f "$cached_verifier" ] && [ "$(sha256_file "$cached_verifier")" = "$cosign_sha256" ]; then
-  echo "Reusing the checksum-verified Sigstore verifier."
-  cp "$cached_verifier" "$COSIGN_BIN"
-else
-  echo "Downloading the pinned Sigstore verifier (approximately 140 MB)..."
-  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fSL \
-    --connect-timeout 15 --speed-limit 1024 --speed-time 60 --max-time 1800 \
-    "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/${cosign_asset}" \
-    -o "$COSIGN_BIN"
-fi
-[ ! -L "$COSIGN_BIN" ] || { echo "downloaded Sigstore verifier is a symlink" >&2; exit 1; }
-[ "$(sha256_file "$COSIGN_BIN")" = "$cosign_sha256" ] || {
-  echo "Sigstore verifier checksum mismatch" >&2
-  exit 1
+download_large() {
+  if [ -t 2 ]; then
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fSL --progress-bar \
+      --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+      --retry 3 --retry-delay 2 --retry-max-time 1800 --max-time 1800 "$1" -o "$2"
+  else
+    download_ready=$(mktemp "${2}.progress.XXXXXX") || return 1
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+      --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+      --retry 3 --retry-delay 2 --retry-max-time 1800 --max-time 1800 "$1" -o "$2" &
+    download_pid=$!
+    download_start=$(date +%s)
+    download_label=${1##*/}
+    {
+      ticker_sleep_pid=
+      trap 'if [ -n "$ticker_sleep_pid" ]; then kill "$ticker_sleep_pid" 2>/dev/null || :; wait "$ticker_sleep_pid" 2>/dev/null || :; fi; exit 0' HUP INT TERM
+      previous_bytes=0
+      previous_sample=$download_start
+      last_progress=$download_start
+      while :; do
+        sleep 15 &
+        ticker_sleep_pid=$!
+        # Publish readiness only after the trap owns the current timer PID.
+        printf 'ready\n' > "$download_ready"
+        wait "$ticker_sleep_pid" || exit 0
+        ticker_sleep_pid=
+        kill -0 "$download_pid" 2>/dev/null || exit 0
+        received=0
+        if [ -f "$2" ]; then
+          received=$(wc -c < "$2" | tr -d ' ')
+        fi
+        now=$(date +%s)
+        elapsed=$((now - download_start))
+        if [ "$received" -gt "$previous_bytes" ]; then
+          interval=$((now - previous_sample))
+          [ "$interval" -gt 0 ] || interval=1
+          rate=$(((received - previous_bytes) / interval))
+          last_progress=$now
+          printf '[download] %s: %s bytes received, %s bytes/s, elapsed %ss\n' \
+            "$download_label" "$received" "$rate" "$elapsed" >&2
+        else
+          age=$((now - last_progress))
+          printf '[download] %s: no progress reported for %ss, elapsed %ss\n' \
+            "$download_label" "$age" "$elapsed" >&2
+        fi
+        previous_bytes=$received
+        previous_sample=$now
+      done
+    } &
+    download_ticker_pid=$!
+    while [ ! -s "$download_ready" ]; do
+      kill -0 "$download_ticker_pid" 2>/dev/null || break
+      sleep 0.01
+    done
+    if wait "$download_pid"; then download_status=0; else download_status=$?; fi
+    download_pid=
+    kill "$download_ticker_pid" 2>/dev/null || :
+    wait "$download_ticker_pid" 2>/dev/null || :
+    download_ticker_pid=
+    rm -f "$download_ready"
+    return "$download_status"
+  fi
 }
-chmod 700 "$COSIGN_BIN"
+
+prepare_cosign() {
+  verifier_root=$(verifier_cache_root) || return 1
+  cached_verifier="$verifier_root/$cosign_sha256"
+  if [ -L "$cached_verifier" ] || { [ -e "$cached_verifier" ] && [ ! -f "$cached_verifier" ]; }; then
+    echo "refusing non-regular cached verifier" >&2
+    return 1
+  fi
+  if [ -f "$cached_verifier" ] && [ "$(sha256_file "$cached_verifier")" = "$cosign_sha256" ]; then
+    echo "Reusing the checksum-verified Sigstore verifier." >&2
+    cp "$cached_verifier" "$COSIGN_BIN" || return 1
+  else
+    echo "Downloading the pinned Sigstore verifier (approximately 140 MB)..." >&2
+    download_large "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/${cosign_asset}" "$COSIGN_BIN" || return 1
+  fi
+  [ -f "$COSIGN_BIN" ] && [ ! -L "$COSIGN_BIN" ] &&
+    [ "$(sha256_file "$COSIGN_BIN")" = "$cosign_sha256" ] || {
+      echo "Sigstore verifier download or checksum verification failed" >&2
+      return 1
+    }
+  chmod 700 "$COSIGN_BIN"
+}
+prepare_cosign
 
 if [ -z "$AOS_VERSION" ]; then
   channel_base="${AOS_CHANNEL_BASE_URL}/channel-${AOS_CHANNEL}"
@@ -989,9 +1063,51 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   exit 0
 fi
 
-echo "Downloading Unicity AOS $AOS_VERSION for $target..."
-curl --proto '=https' --tlsv1.2 -fsSL "$release_base/$asset" -o "$work/$asset"
-curl --proto '=https' --tlsv1.2 -fsSL "$release_base/$asset_bundle" -o "$work/$asset_bundle"
+artifact_cache="$AOS_HOME/cache/releases/$AOS_VERSION/$target/$asset_sha256"
+artifact_cache_pending=0
+if [ ! -d "$AOS_HOME" ]; then
+  artifact_cache_pending=1
+else
+  for cache_dir in "$AOS_HOME" "$AOS_HOME/cache" "$AOS_HOME/cache/releases" \
+    "$AOS_HOME/cache/releases/$AOS_VERSION" "$AOS_HOME/cache/releases/$AOS_VERSION/$target" "$artifact_cache"; do
+    [ ! -L "$cache_dir" ] && { [ ! -e "$cache_dir" ] || [ -d "$cache_dir" ]; } || {
+      echo "unsafe AOS archive cache directory: $cache_dir" >&2; exit 1
+    }
+    [ -d "$cache_dir" ] || mkdir "$cache_dir"
+    chmod 700 "$cache_dir"
+  done
+fi
+cached_archive="$artifact_cache/$asset"
+cached_bundle="$artifact_cache/$asset_bundle"
+cache_hit=0
+if [ -L "$cached_archive" ] || [ -L "$cached_bundle" ] || \
+  { [ -e "$cached_archive" ] && [ ! -f "$cached_archive" ]; } || \
+  { [ -e "$cached_bundle" ] && [ ! -f "$cached_bundle" ]; }; then
+  echo "unsafe AOS archive cache entry" >&2; exit 1
+fi
+if [ "$artifact_cache_pending" -eq 0 ] && \
+  [ -f "$cached_archive" ] && [ -f "$cached_bundle" ] && \
+  [ "$(sha256_file "$cached_archive")" = "$asset_sha256" ]; then
+  cp "$cached_archive" "$work/$asset"
+  cp "$cached_bundle" "$work/$asset_bundle"
+  if "$COSIGN_BIN" verify-blob \
+    --bundle "$work/$asset_bundle" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity "$release_identity" \
+    --use-signed-timestamps "$work/$asset" >/dev/null 2>&1; then
+    cache_hit=1
+    echo "Using authenticated AOS archive cache for $AOS_VERSION." >&2
+  fi
+fi
+if [ "$cache_hit" -ne 1 ]; then
+  if [ "$artifact_cache_pending" -eq 0 ]; then
+    rm -f "$cached_archive" "$cached_bundle"
+  fi
+  echo "Downloading Unicity AOS $AOS_VERSION for $target..." >&2
+  download_large "$release_base/$asset" "$work/$asset"
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+    --connect-timeout 30 --max-time 120 "$release_base/$asset_bundle" -o "$work/$asset_bundle"
+fi
 [ "$(sha256_file "$work/$asset")" = "$asset_sha256" ] || {
   echo "Unicity AOS archive checksum mismatch" >&2
   exit 1
@@ -1002,6 +1118,16 @@ curl --proto '=https' --tlsv1.2 -fsSL "$release_base/$asset_bundle" -o "$work/$a
   --certificate-identity "$release_identity" \
   --use-signed-timestamps \
   "$work/$asset" >/dev/null
+if [ "$cache_hit" -ne 1 ] && [ "$artifact_cache_pending" -eq 0 ]; then
+  cache_archive_stage=$(mktemp "$artifact_cache/.archive.XXXXXX")
+  cache_bundle_stage=$(mktemp "$artifact_cache/.bundle.XXXXXX")
+  cp "$work/$asset" "$cache_archive_stage"
+  cp "$work/$asset_bundle" "$cache_bundle_stage"
+  chmod 600 "$cache_archive_stage" "$cache_bundle_stage"
+  ln "$cache_archive_stage" "$cached_archive" 2>/dev/null || :
+  ln "$cache_bundle_stage" "$cached_bundle" 2>/dev/null || :
+  rm -f "$cache_archive_stage" "$cache_bundle_stage"
+fi
 
 mkdir "$work/unpack"
 if tar -tzf "$work/$asset" | awk -v target="$target" -v version="$AOS_VERSION" '
@@ -1341,10 +1467,6 @@ acquire_install_lock
 cache_verified_verifier || { echo "could not retain the verified Sigstore verifier" >&2; exit 1; }
 validate_accepted_channel
 
-if [ -x "$AOS_BIN_DIR/aos" ]; then
-  "$AOS_BIN_DIR/aos" stop >/dev/null 2>&1 || true
-fi
-
 mkdir -p "$AOS_BIN_DIR" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/run" "$AOS_HOME/releases"
 chmod 700 "$AOS_HOME" "$AOS_HOME/libexec" "$AOS_HOME/runtime" "$AOS_HOME/run" "$AOS_HOME/releases"
 if [ -n "$channel_root" ]; then
@@ -1458,6 +1580,56 @@ restore() {
   return "$result"
 }
 
+installed_release_matches() {
+  [ -d "$release_dir" ] && [ ! -L "$release_dir" ] || return 1
+  [ -x "$AOS_BIN_DIR/aos" ] || return 1
+  for pair in \
+    "bin/aos:$AOS_BIN_DIR/aos" \
+    "libexec/install.sh:$AOS_HOME/libexec/install.sh" \
+    "release-manifest.json:$release_dir/release-manifest.json" \
+    "Distro.toml:$release_dir/Distro.toml" \
+    "capsule-assets.txt:$release_dir/capsule-assets.txt"; do
+    source_file="$bundle/${pair%%:*}"
+    target_file=${pair#*:}
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] \
+      && cmp -s "$source_file" "$target_file" || return 1
+  done
+  for name in $runtime_binaries; do
+    target_file="$release_dir/runtime/bin/$name"
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -x "$target_file" ] \
+      && cmp -s "$bundle/runtime/bin/$name" "$target_file" || return 1
+    [ ! -e "$AOS_HOME/runtime/bin/$name" ] || return 1
+  done
+  for member in Distro.lock Distro.sig; do
+    if [ "$distro_archive_signed" -eq 1 ]; then
+      [ -f "$release_dir/$member" ] && [ ! -L "$release_dir/$member" ] \
+        && cmp -s "$bundle/$member" "$release_dir/$member" || return 1
+    fi
+  done
+  while IFS= read -r capsule; do
+    target_file="$release_dir/capsules/$capsule"
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] \
+      && cmp -s "$bundle/capsules/$capsule" "$target_file" || return 1
+  done < "$bundle/capsule-assets.txt"
+  for optional in "runtime/bin/AstridFS.app" "runtime/bin/macos" "share/AOS Command Center.app"; do
+    if [ -d "$bundle/$optional" ]; then
+      [ -d "$release_dir/$optional" ] && [ ! -L "$release_dir/$optional" ] \
+        && diff -qr "$bundle/$optional" "$release_dir/$optional" >/dev/null || return 1
+    fi
+  done
+  return 0
+}
+
+if installed_release_matches; then
+  echo "Using verified existing AOS $staged_version installation." >&2
+  installation_started=1
+  stage_channel_receipt
+  installation_started=0
+  # Continue with post-install reconciliation below, without replacing files.
+else
+  if [ -x "$AOS_BIN_DIR/aos" ]; then
+    "$AOS_BIN_DIR/aos" stop >/dev/null 2>&1 || true
+  fi
 installation_started=1
 if ! install_one "$bundle/bin/aos" "$AOS_BIN_DIR/aos" aos 755; then exit 1; fi
 if ! install_one "$bundle/libexec/install.sh" "$AOS_HOME/libexec/install.sh" installer 600; then exit 1; fi
@@ -1521,6 +1693,8 @@ if [ -d "$AOS_HOME/runtime/bin" ] && [ ! -L "$AOS_HOME/runtime/bin" ]; then
 fi
 installation_started=0
 rm -rf "$release_backup"
+fi
+# Both replacement and verified reuse finish the same lock-owned recovery.
 reclaim_abandoned_release_transactions
 release_install_lock
 
@@ -1709,6 +1883,27 @@ if [ "$os" = Darwin ] && [ -d "$release_dir/share/AOS Command Center.app" ]; the
   fi
 fi
 
+if [ "$artifact_cache_pending" -eq 1 ]; then
+  for cache_dir in "$AOS_HOME/cache" "$AOS_HOME/cache/releases" \
+    "$AOS_HOME/cache/releases/$AOS_VERSION" "$AOS_HOME/cache/releases/$AOS_VERSION/$target" "$artifact_cache"; do
+    [ ! -L "$cache_dir" ] && { [ ! -e "$cache_dir" ] || [ -d "$cache_dir" ]; } || {
+      echo "unsafe AOS archive cache directory: $cache_dir" >&2; exit 1
+    }
+    [ -d "$cache_dir" ] || mkdir "$cache_dir"
+    chmod 700 "$cache_dir"
+  done
+  for cache_name in "$asset" "$asset_bundle"; do
+    cache_file="$artifact_cache/$cache_name"
+    [ ! -L "$cache_file" ] || { echo "unsafe AOS archive cache entry" >&2; exit 1; }
+    if [ ! -e "$cache_file" ]; then
+      cache_stage=$(mktemp "$artifact_cache/.asset.XXXXXX")
+      cp "$work/$cache_name" "$cache_stage"
+      chmod 600 "$cache_stage"
+      ln "$cache_stage" "$cache_file" 2>/dev/null || :
+      rm -f "$cache_stage"
+    fi
+  done
+fi
 echo "Installed Unicity AOS $staged_version."
 case ":$PATH:" in
   *":$AOS_BIN_DIR:"*) init_command="aos init" ;;
