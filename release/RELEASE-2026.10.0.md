@@ -15,15 +15,17 @@ mounting still requires the app's supported OS version and extension approval.
 
 ## Preparation boundary
 
-The dev candidate selects published Astrid v2026.10.0-rc.3. GNU/Darwin and MUSL
+The dev candidate selects published Astrid v2026.10.0-rc.4. GNU/Darwin and MUSL
 provenance is authenticated against that exact release workflow identity;
 compiled runtime declarations and Rust build dependencies agree with its source.
 The retained `release-ready` and `upgrade-self-heal-ready` gates are supported
 by prior composed QA package installation, legacy migration, capsule restart persistence, metrics,
 and installed signed Oracle tool calls on macOS and native ARM64 GNU/MUSL Linux.
-Those results are not a pass of the replacement AOS rc.4 public packages; their
-complete installed journeys remain pending. Astrid rc.3's unchanged canonical
-Apple Silicon FSKit runner passed against the published archive bytes.
+Those results are not a pass of the replacement AOS rc.5 public packages; their
+complete installed journeys remain pending. Astrid rc.4's unchanged canonical
+Apple Silicon FSKit runner passed against the published archive bytes. The AOS
+installer now shares checksum-verified Sigstore verifier bytes with Oracle and
+tolerates healthy slow downloads without bypassing signature verification.
 This is not a stable release authorization. Installed-runtime compatibility remains a minimum
 requirement, not an exact-version ceiling.
 
