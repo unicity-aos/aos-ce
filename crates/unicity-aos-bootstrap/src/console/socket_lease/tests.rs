@@ -15,6 +15,19 @@ impl Home {
         Self(path)
     }
 }
+
+#[test]
+fn lease_drop_releases_lock_with_an_inherited_descriptor() {
+    let home = Home::new();
+    drop(Listener::bind(&home.0).expect("initial listener"));
+    let directory = home.0.join("console");
+    let lease = SocketLease::acquire(&directory).expect("lease");
+    // dup shares the same open-file description as a descriptor inherited by fork.
+    let inherited = lease._file.try_clone().expect("inherited description");
+    drop(lease);
+    assert!(SocketLease::acquire(&directory).is_ok());
+    drop(inherited);
+}
 impl Drop for Home {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -44,7 +57,16 @@ fn crash_child() {
         return;
     };
     let path = PathBuf::from(home);
-    let _listener = Listener::bind(&path).expect("child listener");
+    let stage = std::env::var("AOS_CONSOLE_CRASH_TEST_STAGE").unwrap_or_default();
+    let _listener = Listener::bind_with_checkpoint(&path, |current| {
+        if stage == format!("{current:?}") {
+            fs::write(path.join("ready"), b"ready").expect("child readiness");
+            loop {
+                std::thread::park();
+            }
+        }
+    })
+    .expect("child listener");
     fs::write(path.join("ready"), b"ready").expect("child readiness");
     loop {
         std::thread::park();
@@ -53,6 +75,12 @@ fn crash_child() {
 
 #[test]
 fn killed_console_can_restart_without_manual_socket_removal() {
+    for stage in ["Bound", "Configured", "Published", "Returned"] {
+        kill_and_recover(stage);
+    }
+}
+
+fn kill_and_recover(stage: &str) {
     let home = Home::new();
     let mut child = Command::new(std::env::current_exe().expect("test binary"))
         .args([
@@ -61,6 +89,7 @@ fn killed_console_can_restart_without_manual_socket_removal() {
             "--nocapture",
         ])
         .env("AOS_CONSOLE_CRASH_TEST_HOME", &home.0)
+        .env("AOS_CONSOLE_CRASH_TEST_STAGE", stage)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -76,11 +105,15 @@ fn killed_console_can_restart_without_manual_socket_removal() {
     }
     child.kill().expect("kill only owned child");
     child.wait().expect("reap owned child");
-    assert!(home.0.join("console/approval.sock").exists());
+    assert_eq!(
+        home.0.join("console/approval.sock").exists(),
+        matches!(stage, "Published" | "Returned")
+    );
     let recovered = Listener::bind(&home.0).expect("recover crashed listener");
     assert!(UnixStream::connect(home.0.join("console/approval.sock")).is_ok());
     drop(recovered);
     assert!(!home.0.join("console/approval.sock").exists());
+    assert!(!home.0.join("console/approval.owner.sock").exists());
 }
 
 #[test]
@@ -97,7 +130,7 @@ fn legacy_socket_without_record_is_preserved() {
 }
 
 #[test]
-fn live_socket_is_preserved_even_with_a_matching_unheld_record() {
+fn live_socket_is_preserved_even_with_a_matching_unheld_link() {
     let home = Home::new();
     drop(Listener::bind(&home.0).expect("initial listener"));
     let directory = home.0.join("console");
@@ -105,17 +138,47 @@ fn live_socket_is_preserved_even_with_a_matching_unheld_record() {
     let live = UnixListener::bind(&path).expect("live socket");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private socket");
     let meta = fs::symlink_metadata(&path).expect("socket identity");
-    let lease = SocketLease::acquire(&directory).expect("record lease");
-    lease
-        .record(meta.dev(), meta.ino())
-        .expect("matching record");
-    drop(lease);
+    fs::hard_link(&path, directory.join("approval.owner.sock")).expect("ownership link");
     assert!(Listener::bind(&home.0).is_err());
     assert_eq!(
         fs::symlink_metadata(&path).expect("preserved").ino(),
         meta.ino()
     );
     drop(live);
+}
+
+#[test]
+fn obsolete_or_torn_lock_record_cannot_prevent_restart() {
+    let home = Home::new();
+    drop(Listener::bind(&home.0).expect("initial listener"));
+    // Lock bytes are no longer authority; even an interrupted old writer is safe.
+    for bytes in [b"".as_slice(), b"[123,", b"old record"] {
+        fs::write(home.0.join("console/approval.lock"), bytes).expect("old record");
+        drop(Listener::bind(&home.0).expect("restart ignores obsolete record"));
+    }
+}
+
+#[test]
+fn publication_never_overwrites_a_new_destination() {
+    let home = Home::new();
+    let path = home.0.join("console/approval.sock");
+    let result = Listener::bind_with_checkpoint(&home.0, |stage| {
+        if stage == BindStage::Configured {
+            fs::write(&path, b"keep").expect("competing destination");
+        }
+    });
+    assert!(result.is_err());
+    assert_eq!(fs::read(path).expect("destination preserved"), b"keep");
+}
+
+#[test]
+fn replaced_owner_is_not_reclaimed() {
+    let home = Home::new();
+    drop(Listener::bind(&home.0).expect("initial listener"));
+    let owner = home.0.join("console/approval.owner.sock");
+    fs::write(&owner, b"keep").expect("replacement owner");
+    assert!(Listener::bind(&home.0).is_err());
+    assert_eq!(fs::read(owner).expect("owner retained"), b"keep");
 }
 
 #[test]

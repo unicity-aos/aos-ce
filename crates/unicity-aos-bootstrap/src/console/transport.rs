@@ -70,12 +70,20 @@ pub(super) fn same_user(stream: &UnixStream) -> io::Result<()> {
 pub(super) struct Listener {
     pub socket: UnixListener,
     path: PathBuf,
+    owner: PathBuf,
     inode: u64,
     device: u64,
     _lease: super::socket_lease::SocketLease,
 }
 impl Listener {
     pub fn bind(home: &Path) -> io::Result<Self> {
+        Self::bind_with_checkpoint(home, |_| {})
+    }
+
+    pub(super) fn bind_with_checkpoint(
+        home: &Path,
+        mut checkpoint: impl FnMut(super::socket_lease::BindStage),
+    ) -> io::Result<Self> {
         // Canonicalize the existing home once, including macOS /var aliases.
         let home = home.canonicalize()?;
         let directory = home.join("console");
@@ -94,20 +102,27 @@ impl Listener {
             ));
         }
         let path = directory.join("approval.sock");
-        let mut lease = super::socket_lease::SocketLease::acquire(&directory)?;
+        let lease = super::socket_lease::SocketLease::acquire(&directory)?;
         lease.recover(&path)?;
-        let socket = UnixListener::bind(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        let meta = fs::symlink_metadata(&path)?;
+        let owner = directory.join("approval.owner.sock");
+        let socket = UnixListener::bind(&owner)?;
+        checkpoint(super::socket_lease::BindStage::Bound);
+        fs::set_permissions(&owner, fs::Permissions::from_mode(0o600))?;
+        let meta = fs::symlink_metadata(&owner)?;
         socket.set_nonblocking(true)?;
+        checkpoint(super::socket_lease::BindStage::Configured);
+        // link is atomic and refuses an existing destination. Retaining the
+        // source link eliminates both bind-to-record and torn-record windows.
+        fs::hard_link(&owner, &path)?;
+        checkpoint(super::socket_lease::BindStage::Published);
         let listener = Self {
             socket,
             path,
+            owner,
             inode: meta.ino(),
             device: meta.dev(),
             _lease: lease,
         };
-        listener._lease.record(listener.device, listener.inode)?;
         Ok(listener)
     }
 }
@@ -118,6 +133,16 @@ impl Drop for Listener {
             && meta.dev() == self.device
         {
             let _ = fs::remove_file(&self.path);
+        }
+        let public_still_owned = fs::symlink_metadata(&self.path)
+            .map(|meta| meta.ino() == self.inode && meta.dev() == self.device)
+            .unwrap_or_else(|error| error.kind() != io::ErrorKind::NotFound);
+        if !public_still_owned
+            && let Ok(meta) = fs::symlink_metadata(&self.owner)
+            && meta.ino() == self.inode
+            && meta.dev() == self.device
+        {
+            let _ = fs::remove_file(&self.owner);
         }
     }
 }
