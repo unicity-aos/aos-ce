@@ -109,7 +109,21 @@ pub async fn read_with_inventory(
     principal: PrincipalId,
     include_capsules: bool,
 ) -> Result<AosStatus, String> {
-    let inventory_principal = principal.to_string();
+    read_with_inventory_for(home, principal, include_capsules, None).await
+}
+
+/// Explicit operator inventory selection. The status caller remains authenticated;
+/// cross-principal metadata is authorized by the kernel, never by a GUI selection.
+pub async fn read_with_inventory_for(
+    home: &AosHome,
+    principal: PrincipalId,
+    include_capsules: bool,
+    target: Option<PrincipalId>,
+) -> Result<AosStatus, String> {
+    if target.is_some() && !include_capsules {
+        return Err("an inventory principal requires capsule inventory".to_owned());
+    }
+    let inventory_principal = target.as_ref().unwrap_or(&principal).to_string();
     let connection = tokio::time::timeout(STATUS_TIMEOUT, KernelClient::connect(principal))
         .await
         .map_err(|_| "connection timed out".to_owned())
@@ -140,11 +154,9 @@ pub async fn read_with_inventory(
         KernelResponse::Status(status) => {
             let mut status = AosStatus::from(status);
             if include_capsules {
-                let response = tokio::time::timeout(
-                    STATUS_TIMEOUT,
-                    client.request(KernelRequest::GetCapsuleMetadata),
-                )
-                .await;
+                let response =
+                    tokio::time::timeout(STATUS_TIMEOUT, client.request(inventory_request(target)))
+                        .await;
                 status.capsule_inventory = Some(CapsuleInventory::from_response(
                     inventory_principal,
                     response.ok().and_then(Result::ok),
@@ -155,6 +167,12 @@ pub async fn read_with_inventory(
         KernelResponse::Error(error) => Err(error),
         _ => Err("runtime returned an unexpected status response".to_owned()),
     }
+}
+
+fn inventory_request(target: Option<PrincipalId>) -> KernelRequest {
+    target.map_or(KernelRequest::GetCapsuleMetadata, |target_principal| {
+        KernelRequest::GetCapsuleMetadataForPrincipal { target_principal }
+    })
 }
 
 /// Confirm that the runtime has released its coordination state and singleton
@@ -292,8 +310,23 @@ mod tests {
 
     use astrid_core::kernel_api::DaemonStatus;
 
-    use super::{AosStatus, confirm_stopped};
+    use super::{AosStatus, confirm_stopped, inventory_request};
     use crate::AosHome;
+
+    #[test]
+    fn inventory_selection_uses_the_explicit_kernel_authority_path() {
+        use astrid_core::{PrincipalId, kernel_api::KernelRequest};
+        assert!(matches!(
+            inventory_request(None),
+            KernelRequest::GetCapsuleMetadata
+        ));
+        let target = PrincipalId::new("claude-code").unwrap();
+        assert!(matches!(
+            inventory_request(Some(target.clone())),
+            KernelRequest::GetCapsuleMetadataForPrincipal { target_principal }
+                if target_principal == target
+        ));
+    }
 
     fn temporary_status_home(case: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

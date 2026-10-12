@@ -61,6 +61,13 @@ aos --principal codex-code mcp serve
 aos daemon foreground --workspace /workspace
 ```
 
+The Command Center reads selected-principal capsule inventory as its authenticated
+local operator, not as the selected agent:
+`aos status --json --include-capsules --inventory-principal claude-code`.
+The kernel requires authority to inspect another principal. This is read-only,
+does not start the runtime, and does not grant the selected principal access to
+global status. `--principal` still selects the authenticated status caller.
+
 On Unix, `aos daemon foreground` replaces the AOS process with the persistent
 bundled daemon, preserving direct signal and exit-status ownership for process
 supervisors. On other hosts it waits for the daemon and preserves its exit

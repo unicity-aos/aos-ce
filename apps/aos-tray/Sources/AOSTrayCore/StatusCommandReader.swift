@@ -38,7 +38,9 @@ public enum StatusCommandReader {
         }
         if let principal {
             guard !principal.isEmpty else { throw OverviewError.invalidStatus }
-            process.arguments?.append("--principal=\(principal)")
+            // Inventory is an operator read of an explicitly selected principal.
+            // Mount/status requests retain their existing caller selection.
+            process.arguments?.append(includeCapsules ? "--inventory-principal=\(principal)" : "--principal=\(principal)")
         }
         var environment = ProcessInfo.processInfo.environment
         environment["AOS_HOME"] = home

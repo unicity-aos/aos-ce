@@ -14,6 +14,9 @@ pub(crate) struct StatusArgs {
     /// Include principal-visible capsule metadata without starting the runtime.
     #[arg(long, requires = "json")]
     pub(crate) include_capsules: bool,
+    /// Inspect this principal's inventory as the status caller (requires kernel authority).
+    #[arg(long, requires = "include_capsules", value_name = "PRINCIPAL")]
+    pub(crate) inventory_principal: Option<String>,
     /// Authenticated runtime principal for this status request.
     #[arg(
         id = "status-principal",
@@ -55,8 +58,16 @@ pub(crate) fn handle_status(
     command_principal: Option<String>,
     json: bool,
     include_capsules: bool,
+    inventory_principal: Option<String>,
     mountpoint: Option<PathBuf>,
 ) -> ExitCode {
+    let inventory_principal = match inventory_principal.map(PrincipalId::new).transpose() {
+        Ok(principal) => principal,
+        Err(error) => {
+            eprintln!("aos: invalid inventory principal: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let principal = match status_principal(leading_principal, command_principal) {
         Ok(principal) => principal,
         Err(error) => {
@@ -79,17 +90,19 @@ pub(crate) fn handle_status(
             return ExitCode::FAILURE;
         }
     };
-    let mut aos_status = match runtime.block_on(unicity_aos_bootstrap::status::read_with_inventory(
-        &home,
-        principal.clone(),
-        include_capsules,
-    )) {
-        Ok(aos_status) => aos_status,
-        Err(error) => {
-            eprintln!("aos: runtime status unavailable: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let mut aos_status =
+        match runtime.block_on(unicity_aos_bootstrap::status::read_with_inventory_for(
+            &home,
+            principal.clone(),
+            include_capsules,
+            inventory_principal,
+        )) {
+            Ok(aos_status) => aos_status,
+            Err(error) => {
+                eprintln!("aos: runtime status unavailable: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     if let Some(path) = mountpoint {
         if aos_status.state != "running" {
@@ -137,6 +150,33 @@ mod tests {
 
     #[test]
     fn product_cli_parses_and_validates_status_principal() {
+        assert!(
+            ProductCli::try_parse_from([
+                "aos",
+                "status",
+                "--json",
+                "--inventory-principal",
+                "alice"
+            ])
+            .is_err()
+        );
+        let selected = ProductCli::try_parse_from([
+            "aos",
+            "--principal",
+            "operator",
+            "status",
+            "--json",
+            "--include-capsules",
+            "--inventory-principal",
+            "alice",
+        ])
+        .unwrap();
+        assert_eq!(selected.principal.as_deref(), Some("operator"));
+        let Some(ProductCommand::Status(status)) = selected.command else {
+            panic!("expected status");
+        };
+        assert_eq!(status.inventory_principal.as_deref(), Some("alice"));
+        assert!(status.principal.is_none());
         assert!(ProductCli::try_parse_from(["aos", "status", "--include-capsules"]).is_err());
         let inventory_cli = ProductCli::try_parse_from([
             "aos",

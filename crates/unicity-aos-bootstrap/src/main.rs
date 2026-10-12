@@ -403,6 +403,7 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
             args.principal,
             args.json,
             args.include_capsules,
+            args.inventory_principal,
             args.mountpoint,
         )),
         Some(ProductCommand::Migrate {

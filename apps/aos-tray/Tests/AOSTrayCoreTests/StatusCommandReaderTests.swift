@@ -39,7 +39,7 @@ import Testing
 
     @Test func requestedPrincipalIsPassedAndResponseMustMatch() throws {
         let response = String(stopped.dropLast()) + #", "capsule_inventory":{"principal":"alice","state":"stopped"}}"#
-        try fixture("[ $# = 4 ] && [ \"$4\" = --principal=alice ] || exit 7\nprintf '%s' '\(response)'\n") { command, home in
+        try fixture("[ $# = 4 ] && [ \"$4\" = --inventory-principal=alice ] || exit 7\nprintf '%s' '\(response)'\n") { command, home in
             let status = try StatusCommandReader.readBlocking(binary: command, home: home,
                 includeCapsules: true, principal: "alice")
             #expect(status.capsuleInventory?.principal == "alice")
