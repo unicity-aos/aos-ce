@@ -712,11 +712,16 @@ acquire_install_lock() {
       printf '%s\n' "$owner" | grep -Eq '^[1-9][0-9]*$' && \
       ! kill -0 "$owner" 2>/dev/null; then
       stale_lock="${install_lock}.stale.$$"
+      if [ -e "$stale_lock" ] || [ -L "$stale_lock" ]; then
+        echo "refusing to overwrite an abandoned install ownership record" >&2
+        return 1
+      fi
       if ! mv "$install_lock" "$stale_lock" 2>/dev/null; then
         echo "another AOS installation owns the install lock" >&2
         return 1
       fi
-      rm -rf "$stale_lock"
+      # Retain the dead owner's identity until a replacement commits. A retry
+      # may itself be interrupted, and its predecessor's backup is still useful.
       mkdir "$install_lock"
     else
       echo "another AOS installation owns the install lock" >&2
@@ -724,8 +729,47 @@ acquire_install_lock() {
     fi
   fi
   printf '%s\n' "$$" > "$install_lock/pid"
-  chmod 600 "$install_lock/pid"
+  printf '%s\n' "$staged_version" > "$install_lock/version"
+  chmod 600 "$install_lock/pid" "$install_lock/version"
   install_lock_acquired=1
+}
+
+reclaim_abandoned_release_transactions() {
+  for abandoned_lock in "$AOS_HOME/update"/install.lock.stale.*; do
+    [ -d "$abandoned_lock" ] && [ ! -L "$abandoned_lock" ] || continue
+    abandoned_suffix=${abandoned_lock##*.}
+    case "$abandoned_suffix" in ''|*[!0-9]*) continue ;; esac
+    [ -f "$abandoned_lock/pid" ] && [ ! -L "$abandoned_lock/pid" ] || continue
+    abandoned_owner=
+    IFS= read -r abandoned_owner < "$abandoned_lock/pid" || continue
+    printf '%s\n' "$abandoned_owner" | grep -Eq '^[1-9][0-9]*$' || continue
+    kill -0 "$abandoned_owner" 2>/dev/null && continue
+    abandoned_version=$staged_version
+    if [ -e "$abandoned_lock/version" ] || [ -L "$abandoned_lock/version" ]; then
+      [ -f "$abandoned_lock/version" ] && [ ! -L "$abandoned_lock/version" ] || continue
+      IFS= read -r abandoned_version < "$abandoned_lock/version" || continue
+    fi
+    # Only the release replaced by this successful transaction is disposable.
+    [ "$abandoned_version" = "$staged_version" ] || continue
+    for abandoned_kind in new rollback; do
+      abandoned_path="$AOS_HOME/releases/.${staged_version}.${abandoned_kind}.${abandoned_owner}"
+      [ ! -L "$abandoned_path" ] || continue
+      [ -d "$abandoned_path" ] || continue
+      rm -rf "$abandoned_path" || return 1
+    done
+    # Legacy locks did not record a version. Preserve their ownership record
+    # while any version's transaction remains, including unsafe path types.
+    abandoned_remaining=0
+    for abandoned_path in "$AOS_HOME/releases"/.*.new."$abandoned_owner" \
+      "$AOS_HOME/releases"/.*.rollback."$abandoned_owner"; do
+      if [ -e "$abandoned_path" ] || [ -L "$abandoned_path" ]; then
+        abandoned_remaining=1
+      fi
+    done
+    if [ "$abandoned_remaining" -eq 0 ]; then
+      rm -rf "$abandoned_lock" || return 1
+    fi
+  done
 }
 
 cleanup() {
@@ -1477,6 +1521,7 @@ if [ -d "$AOS_HOME/runtime/bin" ] && [ ! -L "$AOS_HOME/runtime/bin" ]; then
 fi
 installation_started=0
 rm -rf "$release_backup"
+reclaim_abandoned_release_transactions
 release_install_lock
 
 # Optional Finder/FSKit mounts follow AstridFS.app LSMinimumSystemVersion

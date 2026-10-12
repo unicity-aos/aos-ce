@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+sh "$repo_root/scripts/test_abandoned_install_cleanup.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 fixture="$work/fixture"
@@ -1335,9 +1336,16 @@ wait "$live_lock_pid" 2>/dev/null || true
 rm -rf "$work/channel-home/.aos/update/install.lock"
 mkdir "$work/channel-home/.aos/update/install.lock"
 printf '%s\n' 999999999 > "$work/channel-home/.aos/update/install.lock/pid"
+abandoned_stage="$work/channel-home/.aos/releases/.2026.9.3.new.999999999"
+abandoned_backup="$work/channel-home/.aos/releases/.2026.9.3.rollback.999999999"
+mkdir "$abandoned_stage" "$abandoned_backup"
+printf '%s\n' interrupted > "$abandoned_stage/owned-fixture"
+printf '%s\n' recoverable > "$abandoned_backup/owned-fixture"
 PATH="$fake_bin:$PATH" HOME="$work/channel-home" AOS_TEST_FIXTURE="$fixture" \
   sh "$repo_root/install.sh" --yes --no-migrate-prompt >/dev/null
 test ! -e "$work/channel-home/.aos/update/install.lock"
+test ! -e "$abandoned_stage"
+test ! -e "$abandoned_backup"
 
 for lexical_case in schema generation size; do
   cp "$fixture/channel-good.toml" "$fixture/channel.toml"

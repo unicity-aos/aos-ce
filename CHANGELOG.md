@@ -16,6 +16,12 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Fixed
+
+- Reclaim an interrupted installer's same-version release staging and backup
+  directories after a successful retry, preserving live owners and backups
+  that have not been superseded.
+
 ## [2026.10.0] - 2026-10-05
 
 ### Added
