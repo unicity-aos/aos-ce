@@ -101,9 +101,18 @@ fn command(script: &std::path::Path) -> Result<Command, String> {
     Ok(command)
 }
 
-fn discover(script: &std::path::Path) -> Result<Metadata, String> {
+fn channel_command(script: &std::path::Path, channel: &str) -> Result<Command, String> {
+    if !["stable", "dev"].contains(&channel) {
+        return Err("Oracle updates support stable and dev, not this selected channel".into());
+    }
+    let mut command = command(script)?;
+    command.args(["--oracle-channel", channel]);
+    Ok(command)
+}
+
+fn discover(script: &std::path::Path, channel: &str) -> Result<Metadata, String> {
     let bytes = process::capture(
-        command(script)?.args(["--check", "--json"]),
+        channel_command(script, channel)?.args(["--check", "--json"]),
         Duration::from_mins(5),
     )?;
     let metadata: Metadata = serde_json::from_slice(&bytes)
@@ -123,7 +132,7 @@ fn discover(script: &std::path::Path) -> Result<Metadata, String> {
     Ok(metadata)
 }
 
-pub(super) fn check(home: &AosHome) -> Vec<Item> {
+pub(super) fn check(home: &AosHome, channel: &str) -> Vec<Item> {
     let mut items = Vec::new();
     let mut latest: Option<Result<Metadata, String>> = None;
     for host in ["codex", "claude", "grok"] {
@@ -157,11 +166,11 @@ pub(super) fn check(home: &AosHome) -> Vec<Item> {
         match installed(home, host) {
             Ok((version, script)) => {
                 item.installed_version = version.clone();
-                if let Err(message) = command(&script) {
+                if let Err(message) = channel_command(&script, channel) {
                     item.availability = "unsupported".into();
                     item.message = message;
                 } else {
-                    let result = latest.get_or_insert_with(|| discover(&script));
+                    let result = latest.get_or_insert_with(|| discover(&script, channel));
                     match result {
                         Ok(metadata) => {
                             let newer = semver::Version::parse(&metadata.version).ok()
@@ -200,7 +209,7 @@ pub(super) fn check(home: &AosHome) -> Vec<Item> {
     items
 }
 
-pub(super) fn apply(home: &AosHome, item: &Item) -> Result<(), String> {
+pub(super) fn apply(home: &AosHome, item: &Item, channel: &str) -> Result<(), String> {
     let host = item
         .id
         .strip_prefix("oracle:")
@@ -209,7 +218,7 @@ pub(super) fn apply(home: &AosHome, item: &Item) -> Result<(), String> {
     if installed_version != item.installed_version {
         return Err("Oracle installation changed; check again".into());
     }
-    let current = discover(&script)?;
+    let current = discover(&script, channel)?;
     if semver::Version::parse(&current.version).map_err(|e| e.to_string())?
         <= semver::Version::parse(&installed_version).map_err(|e| e.to_string())?
     {
@@ -224,7 +233,7 @@ pub(super) fn apply(home: &AosHome, item: &Item) -> Result<(), String> {
         return Err("Oracle release changed since discovery; check again".into());
     }
     process::run(
-        command(&script)?
+        channel_command(&script, channel)?
             .args([
                 "--plugins-only",
                 "--no-install-aos",
@@ -243,6 +252,36 @@ pub(super) fn apply(home: &AosHome, item: &Item) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_executes_selected_channel_and_rejects_nightly() {
+        let temp =
+            std::env::temp_dir().join(format!("aos-oracle-channel-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp).unwrap();
+        let script = temp.join("install.sh");
+        fs::write(&script, r#"#!/bin/sh
+set -eu
+[ "$1" = --oracle-channel ]
+channel=$2
+[ "$3" = --check ]
+[ "$4" = --json ]
+case "$channel" in
+  dev) version=2026.10.0-rc.5 ;;
+  stable) version=2026.9.2 ;;
+  *) exit 1 ;;
+esac
+printf '{"schema_version":1,"kind":"oracle","version":"%s","plugin_blake3":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verification":"metadata"}' "$version"
+"#).unwrap();
+        assert_eq!(discover(&script, "dev").unwrap().version, "2026.10.0-rc.5");
+        assert_eq!(discover(&script, "stable").unwrap().version, "2026.9.2");
+        assert!(
+            discover(&script, "nightly")
+                .err()
+                .unwrap()
+                .contains("selected channel")
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
 
     #[test]
     fn registration_is_distinct_from_pack_and_rejects_aliased_snapshot() {

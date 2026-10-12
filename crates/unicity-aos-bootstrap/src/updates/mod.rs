@@ -358,7 +358,7 @@ pub(crate) fn check(channel: Option<&str>) -> Result<Inventory, String> {
         checked_at: Some(now()),
         items: vec![item],
     };
-    inventory.items.extend(oracle::check(&home));
+    inventory.items.extend(oracle::check(&home, channel));
     save(&home, &inventory)?;
     Ok(inventory)
 }
@@ -403,7 +403,7 @@ pub(crate) fn apply(selection: &str, expected_channel: Option<&str>) -> Result<I
         let result = if reviewed.id == "aos" {
             apply_aos(reviewed, &inventory.channel)
         } else {
-            oracle::apply(&home, reviewed)
+            oracle::apply(&home, reviewed, &inventory.channel)
         };
         let item = &mut inventory.items[index];
         item.action = "check".into();

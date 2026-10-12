@@ -51,6 +51,58 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn oracle_discovery_and_apply_use_the_confirmed_dev_channel() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("extensions/oracles");
+    fs::create_dir_all(root.join("claude")).unwrap();
+    fs::create_dir_all(root.join("plugins/2026.9.2")).unwrap();
+    fs::write(root.join("claude/PluginRegistration.toml"), "schema-version = 1\noracle-version = \"2026.9.2\"\nhost = \"claude\"\nsource = \"release\"\nplugin-snapshot = \"../../../plugins/2026.9.2\"\n").unwrap();
+    fs::write(root.join("plugins/2026.9.2/install.sh"), r#"#!/bin/sh
+set -eu
+[ "$1" = --oracle-channel ]
+[ "$2" = dev ]
+case "$*" in
+  *--check*) printf '{"schema_version":1,"kind":"oracle","version":"2026.10.0-rc.5","plugin_blake3":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verification":"metadata"}\n';;
+  *) printf '%s\n' "$*" "$AOS_EXPECTED_PLUGIN_BLAKE3" > "$AOS_HOME/oracle-applied";;
+esac
+"#).unwrap();
+    let check = fixture.run(&["updates", "check", "--channel", "dev", "--json"]);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let inventory: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    let oracle = inventory["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "oracle:claude")
+        .unwrap();
+    assert_eq!(oracle["candidate_version"], "2026.10.0-rc.5");
+    assert_eq!(oracle["availability"], "available");
+    let apply = fixture.run(&[
+        "updates",
+        "apply",
+        "oracle:claude",
+        "--expected-channel",
+        "dev",
+        "--yes",
+        "--json",
+    ]);
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let args = fs::read_to_string(fixture.0.join("oracle-applied")).unwrap();
+    assert!(args.contains("--oracle-channel dev"));
+    assert!(args.contains("--oracle-version 2026.10.0-rc.5"));
+    assert!(args.contains(&"a".repeat(64)));
+    assert!(!fixture.0.join("runtime").exists());
+}
+
+#[test]
 fn read_check_confirm_and_apply_are_distinct() {
     let fixture = Fixture::new();
     let output = fixture.run(&["updates", "list", "--json"]);
