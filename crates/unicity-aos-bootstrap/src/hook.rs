@@ -149,29 +149,41 @@ async fn installed_responder(principal: PrincipalId) -> Result<Uuid, String> {
     let mut client = KernelClient::connect(principal)
         .await
         .map_err(|error| format!("could not discover hook responder: {error}"))?;
-    let response = client
-        .request(KernelRequest::GetCapsuleMetadata)
-        .await
-        .map_err(|error| format!("could not read hook responder metadata: {error}"))?;
-    match response {
-        KernelResponse::CapsuleMetadata(entries) => select_responder(
-            entries
-                .iter()
-                .map(|entry| (entry.name.as_str(), entry.source_id)),
-        ),
-        _ => Err("runtime did not return hook responder metadata".into()),
+    loop {
+        let response = client
+            .request(KernelRequest::GetCapsuleMetadata)
+            .await
+            .map_err(|error| format!("could not read hook responder metadata: {error}"))?;
+        let source = match response {
+            KernelResponse::CapsuleMetadata(entries) => select_responder(
+                entries
+                    .iter()
+                    .map(|entry| (entry.name.as_str(), entry.source_id)),
+            )?,
+            _ => return Err("runtime did not return hook responder metadata".into()),
+        };
+        if let Some(source) = source {
+            return Ok(source);
+        }
+        // A ready daemon warms persisted principal views asynchronously. Wait
+        // only for an installed responder, within handle's existing deadline;
+        // never provision, reload or accept an unverified response identity.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
 fn select_responder<'a>(
     entries: impl Iterator<Item = (&'a str, Option<Uuid>)>,
-) -> Result<Uuid, String> {
+) -> Result<Option<Uuid>, String> {
     let mut matches = entries.filter(|(name, _)| *name == "aos-mcp");
-    let source = matches.next().and_then(|(_, source)| source);
+    let source = matches
+        .next()
+        .ok_or_else(|| "aos-mcp is not installed for the hook principal".to_owned())?
+        .1;
     if matches.next().is_some() {
         return Err("ambiguous aos-mcp registry identity".into());
     }
-    source.ok_or_else(|| "aos-mcp is not loaded for the hook principal".into())
+    Ok(source)
 }
 
 async fn deliver(
@@ -356,17 +368,35 @@ mod tests {
     }
 
     #[test]
-    fn responder_must_be_one_loaded_registry_entry() {
+    fn responder_must_be_one_installed_registry_entry() {
         let source = Uuid::new_v4();
         assert_eq!(
             select_responder([("aos-mcp", Some(source))].into_iter()).unwrap(),
-            source
+            Some(source)
         );
         assert!(select_responder([("other", Some(source))].into_iter()).is_err());
-        assert!(select_responder([("aos-mcp", None)].into_iter()).is_err());
+        assert_eq!(
+            select_responder([("aos-mcp", None)].into_iter()).unwrap(),
+            None
+        );
         assert!(
             select_responder([("aos-mcp", Some(source)), ("aos-mcp", None)].into_iter()).is_err()
         );
+    }
+
+    #[test]
+    fn cold_responder_can_transition_to_loaded_without_accepting_missing_or_duplicates() {
+        let source = Uuid::new_v4();
+        let cold = select_responder([("aos-mcp", None)].into_iter());
+        assert_eq!(
+            cold,
+            Ok(None),
+            "an installed cold view is pending, not a refusal"
+        );
+        let warm = select_responder([("aos-mcp", Some(source))].into_iter());
+        assert_eq!(warm, Ok(Some(source)));
+        assert!(select_responder(std::iter::empty()).is_err());
+        assert!(select_responder([("aos-mcp", None), ("aos-mcp", None)].into_iter()).is_err());
     }
 
     #[test]
