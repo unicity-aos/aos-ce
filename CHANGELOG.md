@@ -18,6 +18,9 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Reuse authenticated installer downloads and intact installations, repair
+  missing or mode-damaged managed files, and report progress on slow transfers.
+  Retain the verified Sigstore tool across authenticated installer handoffs.
 - Recover a crashed console's identity-linked approval socket under an exclusive
   owner lock, without replacing live consoles or unattributed sockets.
 - Reclaim an interrupted installer's same-version release staging and backup

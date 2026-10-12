@@ -326,11 +326,14 @@ legacy_installer="$work/legacy-install.sh"
 cp "$repo_root/install.sh" "$legacy_installer"
 printf '\n# predecessor installer identity\n' >> "$legacy_installer"
 delegated_home="$work/delegated-home"
+delegated_curl_log="$work/delegated-curl.log"
 PATH="$fake_bin:$PATH" \
 HOME="$delegated_home" \
 AOS_TEST_FIXTURE="$fixture" \
+AOS_TEST_CURL_LOG="$delegated_curl_log" \
 AOS_VERSION=2026.9.3 \
 sh "$legacy_installer" --yes --no-migrate-prompt > "$work/delegated-install.log"
+test "$(grep -Fc '/cosign-linux-amd64' "$delegated_curl_log")" -eq 1
 grep -F 'Handing installation to the authenticated Unicity AOS 2026.9.3 updater...' \
   "$work/delegated-install.log" >/dev/null
 for binary in astrid astrid-daemon astrid-build astrid-emit astrid-storage-provider-fuse; do
@@ -410,6 +413,15 @@ PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" \
 test ! -s "$curl_log" || ! grep -Fq '/cosign-linux-amd64' "$curl_log"
 test ! -s "$curl_log" || ! grep -Fq '/unicity-aos-2026.9.3-x86_64-unknown-linux-gnu.tar.gz' "$curl_log"
 grep -Fq 'Using verified existing AOS' "$work/repeat.out"
+chmod 644 "$release_dir/release-manifest.json"
+PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_VERSION=2026.9.3 sh "$repo_root/install.sh" --yes --no-migrate-prompt \
+  > "$work/mode-repair.out" 2>&1
+test "$(stat -c '%a' "$release_dir/release-manifest.json" 2>/dev/null || stat -f '%Lp' "$release_dir/release-manifest.json")" = 600
+if grep -Fq 'Using verified existing AOS' "$work/mode-repair.out"; then
+  echo 'installer skipped a mode-damaged private release member' >&2
+  exit 1
+fi
 rm "$release_dir/runtime/bin/astrid"
 PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" \
   AOS_TEST_CURL_LOG="$curl_log" AOS_VERSION=2026.9.3 \

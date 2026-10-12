@@ -1169,6 +1169,9 @@ done
 # all signature and digest checks before committing, so this remains fail-closed
 # while ensuring every release installs its own schema.
 if [ ! -f "$0" ] || [ -L "$0" ] || ! cmp -s "$bundle/libexec/install.sh" "$0"; then
+  # Check-only exits above. Retain verified bytes atomically before the child
+  # repeats authentication, so a fresh home does not download cosign twice.
+  cache_verified_verifier || { echo "could not retain the verified Sigstore verifier" >&2; exit 1; }
   echo "Handing installation to the authenticated Unicity AOS $AOS_VERSION updater..."
   set --
   if [ "$version_explicit" -eq 1 ]; then
@@ -1580,6 +1583,11 @@ restore() {
   return "$result"
 }
 
+installed_mode_matches() {
+  installed_mode=$(stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null) || return 1
+  [ "$installed_mode" = "$2" ]
+}
+
 installed_release_matches() {
   [ -d "$release_dir" ] && [ ! -L "$release_dir" ] || return 1
   [ -x "$AOS_BIN_DIR/aos" ] || return 1
@@ -1593,23 +1601,30 @@ installed_release_matches() {
     target_file=${pair#*:}
     [ -f "$target_file" ] && [ ! -L "$target_file" ] \
       && cmp -s "$source_file" "$target_file" || return 1
+    case "${pair%%:*}" in
+      bin/aos) installed_mode_matches "$target_file" 755 || return 1 ;;
+      *) installed_mode_matches "$target_file" 600 || return 1 ;;
+    esac
   done
   for name in $runtime_binaries; do
     target_file="$release_dir/runtime/bin/$name"
     [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -x "$target_file" ] \
       && cmp -s "$bundle/runtime/bin/$name" "$target_file" || return 1
+    installed_mode_matches "$target_file" 700 || return 1
     [ ! -e "$AOS_HOME/runtime/bin/$name" ] || return 1
   done
   for member in Distro.lock Distro.sig; do
     if [ "$distro_archive_signed" -eq 1 ]; then
       [ -f "$release_dir/$member" ] && [ ! -L "$release_dir/$member" ] \
         && cmp -s "$bundle/$member" "$release_dir/$member" || return 1
+      installed_mode_matches "$release_dir/$member" 600 || return 1
     fi
   done
   while IFS= read -r capsule; do
     target_file="$release_dir/capsules/$capsule"
     [ -f "$target_file" ] && [ ! -L "$target_file" ] \
       && cmp -s "$bundle/capsules/$capsule" "$target_file" || return 1
+    installed_mode_matches "$target_file" 600 || return 1
   done < "$bundle/capsule-assets.txt"
   for optional in "runtime/bin/AstridFS.app" "runtime/bin/macos" "share/AOS Command Center.app"; do
     if [ -d "$bundle/$optional" ]; then
