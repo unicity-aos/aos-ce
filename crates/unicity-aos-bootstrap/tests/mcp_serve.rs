@@ -5,6 +5,7 @@ use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,13 +18,22 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "aos-mcp-serve-{name}-{}-{}",
-            std::process::id(),
+        Self::at_timestamp(
+            name,
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock after epoch")
-                .as_nanos()
+                .as_nanos(),
+        )
+    }
+
+    fn at_timestamp(name: &str, timestamp: u128) -> Self {
+        // Wall-clock precision does not guarantee unique parallel fixtures.
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "aos-mcp-serve-{name}-{}-{timestamp}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir_all(&root).expect("create fixture");
         let fixture = Self {
@@ -81,6 +91,19 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn fixtures_with_the_same_clock_tick_do_not_share_or_delete_each_others_state() {
+    let first = Fixture::at_timestamp("same-tick", 0);
+    let second = Fixture::at_timestamp("same-tick", 0);
+    assert_ne!(first.root, second.root);
+    fs::write(&second.args, "preserved").expect("write second fixture state");
+    drop(first);
+    assert_eq!(
+        fs::read_to_string(&second.args).expect("first cleanup must not delete second state"),
+        "preserved"
+    );
 }
 
 const RECORDING_RUNTIME: &str = r#"#!/bin/sh

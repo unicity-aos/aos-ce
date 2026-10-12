@@ -300,13 +300,16 @@ if grep -F '@unicity-aos/capsule-' "$bundle_root/Distro.toml" >/dev/null; then
   echo "release archive retained a legacy capsule repository source" >&2
   exit 1
 fi
-python3 - "$manifest" "$product_version" "$runtime_version" "$runtime_identity" <<'PY'
+python3 - "$manifest" "$product_version" "$runtime_version" "$runtime_identity" "$repo_root/release/runtime-compatibility.toml" <<'PY'
 import json
 import pathlib
 import sys
+import tomllib
 
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-product_version, runtime_version, runtime_identity = sys.argv[2:]
+product_version, runtime_version, runtime_identity = sys.argv[2:5]
+with pathlib.Path(sys.argv[5]).open("rb") as file:
+    source_contracts = tomllib.load(file)["contracts"]
 assert manifest["schema_version"] == 2
 assert manifest["product"]["version"] == product_version
 expected_executables = [
@@ -353,10 +356,12 @@ assert manifest["runtime"]["version"] == runtime_version
 assert manifest["runtime"]["digest"] == "blake3:" + "0" * 64
 assert "sha256" not in manifest["runtime"]
 assert manifest["runtime"]["release_workflow_identity"] == runtime_identity
-assert manifest["contracts"]["repository"] == "astrid-runtime/wit"
-assert manifest["contracts"]["commit"] == "278dbca3e32f327d0f2358644fc86559779ba0fd"
-assert manifest["contracts"]["sdk_rust_version"] == "0.7.1"
-assert manifest["contracts"]["sdk_rust_commit"] == "bbbc61c8821d6c536fb25d2068b6b646e759ad35"
+assert manifest["contracts"] == {
+    "repository": source_contracts["repository"],
+    "commit": source_contracts["commit"],
+    "sdk_rust_version": source_contracts["sdk-rust-version"],
+    "sdk_rust_commit": source_contracts["sdk-rust-commit"],
+}
 assert manifest["capsules"]["count"] == 22
 assert len(manifest["capsules"]["assets"]) == 22
 assert len(set(manifest["capsules"]["assets"])) == 22
