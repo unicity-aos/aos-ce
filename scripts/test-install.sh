@@ -225,15 +225,29 @@ cat > "$fake_bin/curl" <<'EOF'
 set -eu
 output=
 url=
+max_time=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -o) output=$2; shift ;;
+    --max-time) max_time=$2; shift ;;
     http*) url=$1 ;;
   esac
   shift
 done
 [ -n "$output" ]
 [ -n "$url" ]
+case "$url" in
+  */cosign-*) [ "$max_time" -gt 120 ] ;;
+esac
+[ -z "${AOS_TEST_CURL_LOG:-}" ] || printf '%s\n' "$url" >> "$AOS_TEST_CURL_LOG"
+case "$url" in
+  */cosign-*)
+    if [ "${AOS_TEST_SLOW_COSIGN:-0}" = 1 ]; then
+      printf '#!/bin/sh\n' > "$output"
+      /bin/sleep 0.3
+    fi
+    ;;
+esac
 cp "$AOS_TEST_FIXTURE/$(basename "$url")" "$output"
 EOF
 cat > "$fixture/cosign-linux-amd64" <<'EOF'
@@ -278,8 +292,9 @@ cat > "$fake_bin/sha256sum" <<'EOF'
 #!/bin/sh
 set -eu
 case "$1" in
-  */cosign)
-    if [ "${AOS_TEST_BAD_COSIGN_DIGEST:-0}" = 1 ]; then
+  */cosign|*/.cosign.*)
+    if [ "${AOS_TEST_BAD_COSIGN_DIGEST:-0}" = 1 ] \
+      || grep -Fqx 'corrupt verifier' "$1"; then
       printf '%064d  %s\n' 0 "$1"
     else
       printf '%s  %s\n' \
@@ -381,6 +396,64 @@ test "$(stat -c '%a' "$work/home/.aos/libexec/install.sh" 2>/dev/null || stat -f
 test "$(cat "$work/home/.astrid/sentinel")" = 'standalone-runtime-state'
 test -f "$fixture/cosign-called"
 test ! -e "$fixture/path-cosign-called"
+cosign_cache="$work/home/.aos/cache/tools/cosign/v3.1.1/cosign-linux-amd64/cosign"
+test -f "$cosign_cache"
+test ! -L "$cosign_cache"
+curl_log="$work/curl-requests.log"
+: > "$curl_log"
+PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_TEST_CURL_LOG="$curl_log" AOS_VERSION=2026.9.3 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt > "$work/repeat.out" 2>&1
+test ! -s "$curl_log" || ! grep -Fq '/cosign-linux-amd64' "$curl_log"
+test ! -s "$curl_log" || ! grep -Fq '/unicity-aos-2026.9.3-x86_64-unknown-linux-gnu.tar.gz' "$curl_log"
+grep -Fq 'Using verified existing AOS' "$work/repeat.out"
+rm "$release_dir/runtime/bin/astrid"
+PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_TEST_CURL_LOG="$curl_log" AOS_VERSION=2026.9.3 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt > "$work/repair.out" 2>&1
+test -x "$release_dir/runtime/bin/astrid"
+if grep -Fq 'Using verified existing AOS' "$work/repair.out"; then
+  echo 'installer skipped a missing managed runtime binary' >&2
+  exit 1
+fi
+printf 'corrupt verifier\n' > "$cosign_cache"
+: > "$curl_log"
+PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_TEST_CURL_LOG="$curl_log" AOS_VERSION=2026.9.3 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt > "$work/verifier-repair.out" 2>&1
+grep -Fq '/cosign-linux-amd64' "$curl_log"
+archive_cache="$work/home/.aos/cache/releases/2026.9.3/x86_64-unknown-linux-gnu/$asset_sha256/$(basename "$asset")"
+printf 'corrupt archive\n' > "$archive_cache"
+: > "$curl_log"
+PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_TEST_CURL_LOG="$curl_log" AOS_VERSION=2026.9.3 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt > "$work/archive-repair.out" 2>&1
+grep -Fq "/$(basename "$asset")" "$curl_log"
+rm "$cosign_cache"
+ln -s "$fixture/cosign-linux-amd64" "$cosign_cache"
+if PATH="$fake_bin:$PATH" HOME="$work/home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_VERSION=2026.9.3 sh "$repo_root/install.sh" --yes --no-migrate-prompt \
+  > "$work/verifier-symlink.out" 2>&1; then
+  echo 'symlinked verifier cache was accepted' >&2
+  exit 1
+fi
+grep -Fq 'unsafe Sigstore verifier cache entry' "$work/verifier-symlink.out"
+rm "$cosign_cache"
+cp "$fixture/cosign-linux-amd64" "$cosign_cache"
+chmod 700 "$cosign_cache"
+progress_bin="$work/progress-bin"
+mkdir "$progress_bin"
+cat > "$progress_bin/sleep" <<'EOF'
+#!/bin/sh
+if [ "$1" = 15 ]; then exec /bin/sleep 0.05; fi
+exec /bin/sleep "$@"
+EOF
+chmod 700 "$progress_bin/sleep"
+slow_home="$work/slow-home"
+PATH="$progress_bin:$fake_bin:$PATH" HOME="$slow_home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_TEST_SLOW_COSIGN=1 AOS_VERSION=2026.9.3 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt > "$work/slow-progress.out" 2>&1
+grep -Fq '[download] cosign-linux-amd64:' "$work/slow-progress.out"
 test "$(stat -c '%a' "$work/home/.aos" 2>/dev/null || stat -f '%Lp' "$work/home/.aos")" = 700
 test "$(stat -c '%a' "$release_dir/release-manifest.json" 2>/dev/null || stat -f '%Lp' "$release_dir/release-manifest.json")" = 600
 test "$(stat -c '%a' "$release_dir/runtime/bin/astrid" 2>/dev/null || stat -f '%Lp' "$release_dir/runtime/bin/astrid")" = 700
@@ -458,6 +531,7 @@ HOME="$darwin_home" \
 AOS_TEST_FIXTURE="$darwin_fixture" \
 AOS_TEST_UNAME_S=Darwin \
 AOS_TEST_UNAME_M=arm64 \
+AOS_TEST_MACOS_VERSION=26.0 \
 AOS_TEST_FSKIT_LOG="$work/fskit-calls" \
 AOS_TEST_OPEN="$fake_bin/open" \
 AOS_TEST_OPEN_LOG="$work/command-center-open" \
