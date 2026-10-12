@@ -745,11 +745,51 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+verifier_cache_root() {
+  for verifier_parent in "$AOS_HOME" "$AOS_HOME/cache" "$AOS_HOME/cache/verifiers"; do
+    if [ -L "$verifier_parent" ] || { [ -e "$verifier_parent" ] && [ ! -d "$verifier_parent" ]; }; then
+      echo "refusing unsafe verifier cache directory: $verifier_parent" >&2
+      return 1
+    fi
+  done
+  printf '%s\n' "$AOS_HOME/cache/verifiers"
+}
+
+cache_verified_verifier() {
+  verifier_root=$(verifier_cache_root) || return 1
+  mkdir -p "$verifier_root" || return 1
+  chmod 700 "$AOS_HOME/cache" "$verifier_root" || return 1
+  verifier_destination="$verifier_root/$cosign_sha256"
+  if [ -L "$verifier_destination" ] || { [ -e "$verifier_destination" ] && [ ! -f "$verifier_destination" ]; }; then
+    echo "refusing unsafe cached verifier: $verifier_destination" >&2
+    return 1
+  fi
+  verifier_temporary=$(mktemp "$verifier_root/.cosign.XXXXXX") || return 1
+  if ! install -m 0700 "$COSIGN_BIN" "$verifier_temporary" ||
+      ! cmp -s "$COSIGN_BIN" "$verifier_temporary" ||
+      ! mv -f "$verifier_temporary" "$verifier_destination"; then
+    rm -f "$verifier_temporary"
+    return 1
+  fi
+}
+
 COSIGN_BIN="$work/cosign"
-echo "Downloading the pinned Sigstore verifier..."
-curl --proto '=https' --tlsv1.2 -fsSL \
-  "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/${cosign_asset}" \
-  -o "$COSIGN_BIN"
+verifier_root=$(verifier_cache_root) || exit 1
+cached_verifier="$verifier_root/$cosign_sha256"
+if [ -L "$cached_verifier" ] || { [ -e "$cached_verifier" ] && [ ! -f "$cached_verifier" ]; }; then
+  echo "refusing non-regular cached verifier" >&2
+  exit 1
+fi
+if [ -f "$cached_verifier" ] && [ "$(sha256_file "$cached_verifier")" = "$cosign_sha256" ]; then
+  echo "Reusing the checksum-verified Sigstore verifier."
+  cp "$cached_verifier" "$COSIGN_BIN"
+else
+  echo "Downloading the pinned Sigstore verifier (approximately 140 MB)..."
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fSL \
+    --connect-timeout 15 --speed-limit 1024 --speed-time 60 --max-time 1800 \
+    "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/${cosign_asset}" \
+    -o "$COSIGN_BIN"
+fi
 [ ! -L "$COSIGN_BIN" ] || { echo "downloaded Sigstore verifier is a symlink" >&2; exit 1; }
 [ "$(sha256_file "$COSIGN_BIN")" = "$cosign_sha256" ] || {
   echo "Sigstore verifier checksum mismatch" >&2
@@ -1254,6 +1294,7 @@ if [ -x "$AOS_BIN_DIR/aos" ] && [ "$ASSUME_YES" -ne 1 ]; then
 fi
 
 acquire_install_lock
+cache_verified_verifier || { echo "could not retain the verified Sigstore verifier" >&2; exit 1; }
 validate_accepted_channel
 
 if [ -x "$AOS_BIN_DIR/aos" ]; then

@@ -278,7 +278,7 @@ cat > "$fake_bin/sha256sum" <<'EOF'
 #!/bin/sh
 set -eu
 case "$1" in
-  */cosign)
+  */cosign|*/cache/verifiers/ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc|*/cache/verifiers/94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5)
     if [ "${AOS_TEST_BAD_COSIGN_DIGEST:-0}" = 1 ]; then
       printf '%064d  %s\n' 0 "$1"
     else
