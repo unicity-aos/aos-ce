@@ -14,9 +14,10 @@ CalSemVer here. The month is not zero-padded.
   is not a traditional SemVer compatibility-major guarantee.
 
 AOS's next monthly source version is `2026.10.0`. Numbered dev candidates use
-`2026.10.0-rc.N`; the current preparation binds published Astrid `v2026.10.0-rc.4`
-and its authenticated metadata. Publication gates remain closed until the
-assembled candidate journeys finish; dev publication does not promote stable.
+`2026.10.0-rc.N`; the current AOS RC7 preparation binds published Astrid `v2026.10.0-rc.6`
+and its authenticated metadata. Dev publication requires the exact candidate build and release gates;
+complete installed journeys are required for release-readiness acceptance.
+Dev publication does not promote stable.
 Oracle retains its
 independent release version; matching version numbers are not an implicit
 requirement to release unchanged host plugins. Git tags retain their existing

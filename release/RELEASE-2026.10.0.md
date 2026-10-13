@@ -15,19 +15,26 @@ mounting still requires the app's supported OS version and extension approval.
 
 ## Preparation boundary
 
-The dev candidate selects published Astrid v2026.10.0-rc.4. GNU/Darwin and MUSL
-provenance is authenticated against that exact release workflow identity;
+The AOS RC7 preparation selects published Astrid v2026.10.0-rc.6. GNU/Darwin
+and MUSL metadata is authenticated against that exact release workflow identity;
 compiled runtime declarations and Rust build dependencies agree with its source.
-The retained `release-ready` and `upgrade-self-heal-ready` gates are supported
-by prior composed QA package installation, legacy migration, capsule restart persistence, metrics,
-and installed signed Oracle tool calls on macOS and native ARM64 GNU/MUSL Linux.
-Those results are not a pass of the replacement AOS rc.5 public packages; their
-complete installed journeys remain pending. Astrid rc.4's unchanged canonical
-Apple Silicon FSKit runner passed against the published archive bytes. The AOS
-installer now shares checksum-verified Sigstore verifier bytes with Oracle and
-tolerates healthy slow downloads without bypassing signature verification.
-This is not a stable release authorization. Installed-runtime compatibility remains a minimum
-requirement, not an exact-version ceiling.
+The minimum runtime is RC6, which carries the correlated nested-failure protocol
+used by the packaged AOS broker, including calls resumed after approval.
+
+The retained `release-ready` and `upgrade-self-heal-ready` gates have prior
+composed QA installation, migration, persistence, metrics and Oracle tool-call
+evidence. They do not establish acceptance of the new AOS RC7 public packages.
+Those installed journeys, including nested failure followed by healthy recovery,
+remain pending publication. The unchanged canonical Apple Silicon FSKit runner
+passed all eleven checks on the actual RC6 release-run archive, and host
+restoration was verified before protected release approval. The public RC6 Apple
+archive matches those certified bytes; all six public runtime archives have
+passed signature, metadata digest/size and canonical archive checks.
+
+The AOS installer shares checksum-verified Sigstore verifier bytes with Oracle
+and tolerates healthy slow downloads without bypassing verification. This is
+not stable release authorization. Installed-runtime compatibility remains a
+minimum requirement, not an exact-version ceiling.
 
 The selected runtime-code rehearsal already exercises real signature-enabled
 package installation, legacy import, capsule execution and restart persistence,
