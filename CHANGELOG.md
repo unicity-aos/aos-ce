@@ -16,18 +16,7 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
-### Fixed
-
-- Reuse authenticated installer downloads and intact installations, repair
-  missing or mode-damaged managed files, and report progress on slow transfers.
-  Retain the verified Sigstore tool across authenticated installer handoffs.
-- Recover a crashed console's identity-linked approval socket under an exclusive
-  owner lock, without replacing live consoles or unattributed sockets.
-- Reclaim an interrupted installer's same-version release staging and backup
-  directories after a successful retry, preserving live owners and backups
-  that have not been superseded.
-
-## [2026.10.0] - 2026-10-05
+## [2026.10.0] - 2026-10-13
 
 ### Added
 
@@ -52,6 +41,19 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Reuse authenticated installer downloads and intact installations, repair
+  missing or mode-damaged managed files, and report progress on slow transfers.
+  Retain the verified Sigstore tool across authenticated installer handoffs.
+- Recover a crashed console's identity-linked approval socket under an exclusive
+  owner lock, without replacing live consoles or unattributed sockets.
+- Reclaim an interrupted installer's same-version release staging and backup
+  directories after a successful retry, preserving live owners and backups
+  that have not been superseded.
+- Wait for the native hook adapter to become ready after a cold runtime start
+  before routing the first host hook.
+- Return authenticated nested provider failures promptly, including tool calls
+  resumed after approval, and allow healthy calls to continue on the same
+  connection. Older runtimes retain bounded timeout compatibility.
 - Select the product runtime workspace consistently when starting or attaching
   from different project directories, without changing relative file arguments
   or the agent's MCP project context. Requires the corresponding Astrid daemon
