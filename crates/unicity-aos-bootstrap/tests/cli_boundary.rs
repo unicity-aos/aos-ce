@@ -849,7 +849,13 @@ fn both_version_forms_report_product_and_runtime_without_delegation() {
         env!("CARGO_PKG_VERSION"),
         compatibility["runtime"]["version"].as_str().unwrap()
     );
-    for args in [vec!["version"], vec!["--version"], vec!["-V"]] {
+    for args in [
+        vec!["version"],
+        vec!["--version"],
+        vec!["-V"],
+        vec!["--principal", "alice", "--version"],
+        vec!["--principal=alice", "-V"],
+    ] {
         let output = fixture.command().args(args).output().unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);

@@ -747,7 +747,7 @@ fn leading_owned_root(args: &[OsString]) -> Option<&str> {
         Ok(Some(index)) => args
             .get(index)
             .and_then(|arg| arg.to_str())
-            .filter(|root| is_owned_root(root)),
+            .filter(|root| is_owned_root(root) || matches!(*root, "-V" | "--version")),
         Ok(None) => None,
         Err(()) => args
             .iter()
@@ -761,7 +761,7 @@ fn leading_runtime_root_index(args: &[OsString]) -> Result<Option<usize>, ()> {
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].to_str().ok_or(())?;
-        if !arg.starts_with('-') {
+        if !arg.starts_with('-') || matches!(arg, "-V" | "--version") {
             return Ok(Some(index));
         }
         if arg == "--" {
