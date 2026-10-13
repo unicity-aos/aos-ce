@@ -108,6 +108,8 @@ fn prior_receipt_upgrade_refuses_wrong_owner_key_and_unverified_release() {
         "future",
         "same_version",
         "future_runtime",
+        "substituted_runtime",
+        "runtime_build_metadata",
     ] {
         let fixture = Fixture::new(&format!("receipt-upgrade-{damage}"));
         fixture.install_runtime(RECORDING_RUNTIME);
@@ -129,6 +131,10 @@ fn prior_receipt_upgrade_refuses_wrong_owner_key_and_unverified_release() {
             "future" => receipt["distro_version"] = "2027.1.0".into(),
             "same_version" => receipt["distro_version"] = env!("CARGO_PKG_VERSION").into(),
             "future_runtime" => receipt["astrid_runtime_version"] = "2027.1.0".into(),
+            "substituted_runtime" => receipt["astrid_runtime_version"] = "2026.10.0-rc.5".into(),
+            "runtime_build_metadata" => {
+                receipt["astrid_runtime_version"] = "2026.10.0-rc.4+substituted".into()
+            }
             _ => unreachable!(),
         }
         fs::write(&path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();

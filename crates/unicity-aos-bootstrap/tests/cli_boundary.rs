@@ -128,7 +128,13 @@ impl Fixture {
         fs::write(release.join("Distro.toml"), &manifest_bytes).expect("write fixture Distro.toml");
         fs::write(release.join("Distro.lock"), &lock_bytes).expect("write fixture Distro.lock");
         fs::write(release.join("Distro.sig"), &signature_bytes).expect("write fixture Distro.sig");
+        let compatibility: toml::Value =
+            include_str!("../../../release/runtime-compatibility.toml")
+                .parse()
+                .expect("parse current runtime pin");
+        let current_runtime = compatibility["runtime"]["version"].as_str().unwrap();
         let release_manifest = serde_json::json!({
+            "runtime": {"version": runtime.unwrap_or(current_runtime)},
             "release_files": {
                 "Distro.toml": {
                     "blake3": blake3::hash(&manifest_bytes).to_hex().to_string(),

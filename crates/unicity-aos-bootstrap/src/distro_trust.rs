@@ -198,12 +198,17 @@ fn verify_release_directory(
             invalid_data("bundled Distro.sig does not verify against Distro.lock and pubkey")
         })?;
 
-    verify_release_inventory(
+    let packaged_runtime = verify_release_inventory(
         release_dir,
         &manifest_bytes,
         &lock_bytes,
         signature_text.as_bytes(),
     )?;
+    if packaged_runtime != runtime_version {
+        return Err(invalid_data(
+            "release-manifest.json runtime does not match the expected exact runtime",
+        ));
+    }
 
     Ok(VerifiedDistro {
         manifest_path,
@@ -410,7 +415,7 @@ fn verify_release_inventory(
     manifest_bytes: &[u8],
     lock_bytes: &[u8],
     signature_bytes: &[u8],
-) -> io::Result<()> {
+) -> io::Result<String> {
     let path = release_dir.join("release-manifest.json");
     require_regular_file(&path, "release-manifest.json")?;
     let metadata = fs::metadata(&path)?;
@@ -448,7 +453,12 @@ fn verify_release_inventory(
             )));
         }
     }
-    Ok(())
+    manifest
+        .get("runtime")
+        .and_then(|runtime| runtime.get("version"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| invalid_data("release-manifest.json is missing the exact runtime version"))
 }
 
 fn parse_public_key(wire: &str) -> io::Result<PublicKey> {
