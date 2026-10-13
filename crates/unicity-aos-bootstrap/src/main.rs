@@ -208,28 +208,7 @@ impl UpdateChannel {
 }
 
 fn parse_aos_version(value: &str) -> Result<String, String> {
-    let components = value.split('.').collect::<Vec<_>>();
-    let canonical = |component: &str| {
-        component == "0"
-            || (component.as_bytes().first().is_some_and(u8::is_ascii_digit)
-                && !component.starts_with('0')
-                && component.bytes().all(|byte| byte.is_ascii_digit()))
-    };
-    if components.len() != 3
-        || components[0].len() != 4
-        || !components[0].bytes().all(|byte| byte.is_ascii_digit())
-        || !canonical(components[1])
-        || !canonical(components[2])
-    {
-        return Err("expected YYYY.MINOR.PATCH without leading zeroes".to_owned());
-    }
-    let year = components[0]
-        .parse::<u16>()
-        .map_err(|_| "release year is invalid".to_owned())?;
-    if !(2026..=2099).contains(&year) {
-        return Err("release year must be between 2026 and 2099".to_owned());
-    }
-    Ok(value.to_owned())
+    version::parse_release(value)
 }
 
 #[derive(Args)]

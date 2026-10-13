@@ -1782,6 +1782,33 @@ exit 23
 }
 
 #[test]
+fn exact_prerelease_updates_reach_the_trusted_installer() {
+    let fixture = Fixture::new("exact-prerelease-update");
+    let libexec = fixture.home.join("libexec");
+    fs::create_dir_all(&libexec).unwrap();
+    fs::write(
+        libexec.join("install.sh"),
+        r#"#!/bin/sh
+[ "$*" = "--version $EXPECTED_VERSION --yes --no-migrate-prompt" ] || exit 91
+"#,
+    )
+    .unwrap();
+    for version in [
+        "2026.10.0-rc.7",
+        "2026.10.0-nightly.20261013.gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        let output = fixture
+            .command()
+            .args(["update", "--version", version])
+            .env("EXPECTED_VERSION", version)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        assert!(!fixture.args.exists());
+    }
+}
+
+#[test]
 fn update_check_is_read_only_and_uses_the_product_version() {
     let fixture = Fixture::new("update-check");
     let libexec = fixture.home.join("libexec");
