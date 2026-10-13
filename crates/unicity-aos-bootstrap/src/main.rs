@@ -1004,6 +1004,12 @@ fn handle_distro_apply(leading_principal: Option<String>, args: DistroApplyArgs)
         Ok(home) => home,
         Err(code) => return code,
     };
+    if home.runtime_binary() != home.bundled_runtime_binary() {
+        eprintln!(
+            "aos: Distro Apply requires the selected bundled runtime; remove UNICITY_AOS_RUNTIME_BIN"
+        );
+        return ExitCode::FAILURE;
+    }
     let verified = match distro_trust::verify_selected_release(&home) {
         Ok(verified) => verified,
         Err(error) => {

@@ -244,3 +244,38 @@ fn distro_apply_refuses_a_foreign_runtime_override_before_any_dispatch() {
     );
     assert_eq!(fs::read(receipt).unwrap(), before);
 }
+
+#[test]
+fn capsule_update_discovery_keeps_verified_ownership_with_a_runtime_override() {
+    let fixture = Fixture::new("capsule-update-runtime-override");
+    fixture.install_signed_distro();
+    fixture.install_runtime(r#"#!/bin/sh
+case "$3" in
+  agent) printf '%s' '[{"principal":"operator","enabled":true}]' ;;
+  capsule) printf '%s' '{"schema_version":1,"principal":"operator","items":[{"name":"user-probe","installed_version":"1.0.0","wasm_hash":null,"candidate_version":"1.1.0","availability":"available","message":"New version"}]}' ;;
+  *) exit 93 ;;
+esac
+"#);
+    let foreign = fixture.root.join("foreign-discovery-runtime");
+    fs::copy(&fixture.runtime, &foreign).unwrap();
+    Fixture::make_executable(&foreign);
+    let output = fixture
+        .command()
+        .env("UNICITY_AOS_RUNTIME_BIN", foreign)
+        .args(["updates", "capsules", "--principal", "operator", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let inventory: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(inventory["items"][0]["candidate_version"], "1.1.0");
+    let message = inventory["items"][0]["message"].as_str().unwrap();
+    assert!(message.contains("Review with: aos"), "{message}");
+    assert!(
+        !message.contains("ownership could not be verified"),
+        "{message}"
+    );
+}
