@@ -16,6 +16,8 @@ use serde::Serialize;
 mod native_setup_tests;
 #[path = "cli_boundary/principals_tests.rs"]
 mod principals_tests;
+#[path = "cli_boundary/receipt_upgrade_tests.rs"]
+mod receipt_upgrade_tests;
 
 struct Fixture {
     root: PathBuf,
@@ -83,19 +85,31 @@ impl Fixture {
     }
 
     fn install_signed_distro(&self) {
+        self.install_signed_distro_at(&self.release_dir(), env!("CARGO_PKG_VERSION"), None);
+    }
+
+    fn install_signed_distro_at(&self, release: &Path, version: &str, runtime: Option<&str>) {
         let keypair = KeyPair::from_secret_key(&[7_u8; 32]).expect("fixture signing key");
         let signing_pubkey = format!("ed25519:{}", keypair.export_public_key().to_base64());
         let embedded = include_str!("../../../distros/community/unicity-ce/Distro.toml");
         let original_pubkey = "ed25519:utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA=";
-        let manifest_bytes = embedded
-            .replace(original_pubkey, &signing_pubkey)
-            .into_bytes();
+        let text = embedded.replace(original_pubkey, &signing_pubkey);
+        let manifest_bytes = if let Some(runtime) = runtime {
+            let mut manifest: toml::Value = text.parse().expect("parse prior fixture manifest");
+            manifest["distro"]["version"] = version.into();
+            manifest["distro"]["astrid-version"] = format!(">={runtime}").into();
+            toml::to_string(&manifest)
+                .expect("encode prior fixture manifest")
+                .into_bytes()
+        } else {
+            text.into_bytes()
+        };
         let manifest_hash = format!("blake3:{}", blake3::hash(&manifest_bytes).to_hex());
         let lock = FixtureLock {
             schema_version: 1,
             distro: FixtureLockMeta {
                 id: "unicity-ce".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
+                version: version.to_owned(),
                 resolved_at: "2026-01-01T00:00:00Z".to_owned(),
             },
             capsules: Vec::new(),
@@ -110,7 +124,7 @@ impl Fixture {
         hasher.update(&canonical_lock);
         let signature = keypair.sign(hasher.finalize().as_bytes()).to_hex();
         let signature_bytes = format!("{signature}\n").into_bytes();
-        let release = self.release_dir();
+        fs::create_dir_all(release).expect("create signed release fixture");
         fs::write(release.join("Distro.toml"), &manifest_bytes).expect("write fixture Distro.toml");
         fs::write(release.join("Distro.lock"), &lock_bytes).expect("write fixture Distro.lock");
         fs::write(release.join("Distro.sig"), &signature_bytes).expect("write fixture Distro.sig");

@@ -87,7 +87,19 @@ struct ActiveReceipt {
 /// Verify the exact release members used by the selected Distro Apply path.
 pub(crate) fn verify_selected_release(home: &AosHome) -> io::Result<VerifiedDistro> {
     let release_dir = home.release_dir();
-    require_directory(&release_dir, "release directory")?;
+    verify_release_directory(
+        &release_dir,
+        env!("CARGO_PKG_VERSION"),
+        ASTRID_RUNTIME_VERSION,
+    )
+}
+
+fn verify_release_directory(
+    release_dir: &Path,
+    product_version: &str,
+    runtime_version: &str,
+) -> io::Result<VerifiedDistro> {
+    require_directory(release_dir, "release directory")?;
 
     let manifest_path = release_dir.join("Distro.toml");
     let lock_path = release_dir.join("Distro.lock");
@@ -120,14 +132,14 @@ pub(crate) fn verify_selected_release(home: &AosHome) -> io::Result<VerifiedDist
         )));
     }
     let distro_version = required_string(distro, "version", "Distro.toml [distro]")?;
-    if distro_version != env!("CARGO_PKG_VERSION") {
+    if distro_version != product_version {
         return Err(invalid_data(format!(
             "bundled distro version {distro_version:?} does not match AOS release {}",
-            env!("CARGO_PKG_VERSION")
+            product_version
         )));
     }
     let astrid_version = required_string(distro, "astrid-version", "Distro.toml [distro]")?;
-    validate_runtime_requirement(&astrid_version, ASTRID_RUNTIME_VERSION)?;
+    validate_runtime_requirement(&astrid_version, runtime_version)?;
     let signing = distro
         .get("signing")
         .and_then(toml::Value::as_table)
@@ -187,7 +199,7 @@ pub(crate) fn verify_selected_release(home: &AosHome) -> io::Result<VerifiedDist
         })?;
 
     verify_release_inventory(
-        &release_dir,
+        release_dir,
         &manifest_bytes,
         &lock_bytes,
         signature_text.as_bytes(),
@@ -235,7 +247,8 @@ pub(crate) fn seed_runtime_trust(home: &AosHome, signing_pubkey: &str) -> io::Re
     }
 }
 
-/// Refuse to dispatch when an existing receipt binds another apply.
+/// Accept an exact receipt or authenticate its retained predecessor before apply.
+/// This check never rewrites the receipt; only successful apply and stop do so.
 pub(crate) fn check_existing_receipt(
     home: &AosHome,
     distro: &VerifiedDistro,
@@ -263,13 +276,8 @@ pub(crate) fn check_existing_receipt(
         || !receipt.active
         || !receipt.cutover_complete
         || receipt.distro_id != distro.distro_id
-        || receipt.distro_version != distro.distro_version
-        || receipt.manifest_blake3 != distro.manifest_blake3
         || receipt.signing_pubkey != distro.signing_pubkey
         || receipt.pin_blake3 != blake3::hash(distro.signing_pubkey.as_bytes()).to_string()
-        || receipt.lock_blake3 != distro.lock_blake3
-        || receipt.signature_blake3 != distro.signature_blake3
-        || receipt.astrid_runtime_version != ASTRID_RUNTIME_VERSION
     {
         return Err(invalid_data(
             "existing AOS Distro Apply receipt does not match the selected distro or key",
@@ -280,7 +288,54 @@ pub(crate) fn check_existing_receipt(
             "existing AOS Distro Apply receipt does not match the selected principal",
         ));
     }
+    if receipt_matches_release(&receipt, distro, ASTRID_RUNTIME_VERSION) {
+        return Ok(());
+    }
+    let previous_version = semver::Version::parse(&receipt.distro_version)
+        .map_err(|_| invalid_data("prior receipt has an invalid product version"))?;
+    let selected_version = semver::Version::parse(&distro.distro_version)
+        .map_err(|_| invalid_data("selected distro has an invalid product version"))?;
+    if previous_version.to_string() != receipt.distro_version
+        || previous_version >= selected_version
+    {
+        return Err(invalid_data(
+            "existing AOS Distro Apply receipt does not match the selected distro or key",
+        ));
+    }
+    let previous_runtime = semver::Version::parse(&receipt.astrid_runtime_version)
+        .map_err(|_| invalid_data("prior receipt has an invalid runtime version"))?;
+    let selected_runtime = semver::Version::parse(ASTRID_RUNTIME_VERSION)
+        .map_err(|_| invalid_data("selected distro has an invalid runtime version"))?;
+    if previous_runtime > selected_runtime {
+        return Err(invalid_data("receipt upgrade cannot downgrade the runtime"));
+    }
+    let releases = home.root().join("releases");
+    require_directory(&releases, "retained releases directory")?;
+    let previous = verify_release_directory(
+        &releases.join(&receipt.distro_version),
+        &receipt.distro_version,
+        &receipt.astrid_runtime_version,
+    )?;
+    if previous.signing_pubkey != distro.signing_pubkey
+        || !receipt_matches_release(&receipt, &previous, &receipt.astrid_runtime_version)
+    {
+        return Err(invalid_data(
+            "prior receipt does not bind an authenticated retained release",
+        ));
+    }
     Ok(())
+}
+
+fn receipt_matches_release(
+    receipt: &ActiveReceipt,
+    distro: &VerifiedDistro,
+    runtime: &str,
+) -> bool {
+    receipt.distro_version == distro.distro_version
+        && receipt.manifest_blake3 == distro.manifest_blake3
+        && receipt.lock_blake3 == distro.lock_blake3
+        && receipt.signature_blake3 == distro.signature_blake3
+        && receipt.astrid_runtime_version == runtime
 }
 
 /// Write the success receipt after exact stop confirmation.

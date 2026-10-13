@@ -41,6 +41,7 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Reapply or recover the bundled distro after a product/runtime upgrade by authenticating the retained prior receipt under the same signing key and principal; failed applies preserve the prior receipt.
 - Both AOS version commands identify the product and bundled Astrid runtime. Automatic update checks follow the installed release train and never advertise an older stable release as an upgrade.
 - Reuse authenticated installer downloads and intact installations, repair
   missing or mode-damaged managed files, and report progress on slow transfers.
