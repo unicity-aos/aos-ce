@@ -490,12 +490,13 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
                 "isError": is_error,
             })
         }
-        execute::DispatchOutcome::ApprovalRequired(required) => {
+        execute::DispatchOutcome::ApprovalRequired(required, delivery_id) => {
             if approval::remember_pending_result_route(
                 &required.request_id,
                 &req.name,
                 &req.req_id,
                 &provider_source_id,
+                delivery_id.as_deref(),
             ) {
                 log::info(format!(
                     "{}: broker response method=tool.call req_id={} tool={} \

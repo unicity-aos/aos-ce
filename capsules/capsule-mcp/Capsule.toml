@@ -112,6 +112,8 @@ policy_rules = { type = "string", default = "", request = "Per-principal policy 
 # fixed topic must be declared here even though there is no static handler
 # — the subscription is drained inline inside `dispatch_with_approval`.
 "astrid.v1.approval" = "@unicity-astrid/wit/approval/required"
+# Dynamic, publisher-scoped host receipts; no interceptor handler.
+"astrid.v1.delivery.failure.*" = { wit = "opaque" }
 # Dynamic-subscribe pattern: `execute::dispatch_with_approval` calls
 # `ipc::subscribe("tool.v1.execute.<bare>.result")` per broker call. The
 # kernel gates runtime subscribes against this list, so the pattern must

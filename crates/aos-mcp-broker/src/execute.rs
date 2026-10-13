@@ -27,6 +27,8 @@ use serde_json::{Value, json};
 
 use crate::approval::{self, ApprovalRequired, GrantRequired};
 
+pub(crate) mod delivery_failure;
+
 /// Per-call drain window for the `tool.v1.execute.<name>.result` reply.
 /// Bounded well under the runner's 60 s `TOOL_CALL_DEADLINE` so the bridge
 /// times out first and synthesises a clean `isError:true` result rather
@@ -103,7 +105,7 @@ pub(crate) enum DispatchOutcome {
     /// The tool requested capability approval mid-call; the broker must
     /// relay this to the shim and, on the returned choice, publish the
     /// matching `astrid.v1.approval.response.<request_id>` decision.
-    ApprovalRequired(ApprovalRequired),
+    ApprovalRequired(ApprovalRequired, Option<String>),
     /// The kernel access gate refused the call because the principal has not
     /// granted the target capsule. The kernel DROPPED the original
     /// `tool.call` (nothing is parked) and published a `grant_required`
@@ -158,6 +160,22 @@ pub(crate) fn dispatch_with_approval(
 
     let route_topic = format!("tool.v1.execute.{tool_name}");
     let result_topic = format!("tool.v1.execute.{tool_name}.result");
+    // Use a fresh independent publication ID, not a caller-controlled tool ID.
+    let delivery_id = uuid::Uuid::new_v4().simple().to_string();
+    let principal = match runtime::caller().ok().and_then(|caller| caller.principal) {
+        Some(principal) => principal,
+        None => {
+            return DispatchOutcome::Failed("tool dispatch has no authenticated principal".into());
+        }
+    };
+    let failure_sub = match delivery_failure::subscribe(&delivery_id) {
+        Ok(sub) => sub,
+        Err(error) => {
+            return DispatchOutcome::Failed(format!(
+                "failed to subscribe to delivery failures: {error}"
+            ));
+        }
+    };
 
     // Subscribe to BOTH the per-tool result topic and the fixed approval
     // topic BEFORE publishing the execute request, so neither a fast
@@ -186,6 +204,7 @@ pub(crate) fn dispatch_with_approval(
 
     let forward = json!({
         "type": "tool_execute_request",
+        "_astrid_delivery_id": delivery_id,
         "call_id": call_id,
         "tool_name": tool_name,
         "arguments": arguments,
@@ -205,6 +224,14 @@ pub(crate) fn dispatch_with_approval(
     let mut remaining = EXECUTE_TIMEOUT_MS;
     while remaining > 0 {
         let step = remaining.min(EXECUTE_SLICE_MS);
+        if let Some(reason) =
+            delivery_failure::poll(&failure_sub, &delivery_id, &route_topic, &principal)
+        {
+            return DispatchOutcome::Failed(format!(
+                "{}: tool '{tool_name}' runtime invocation failed: {reason}",
+                crate::profile::log_tag()
+            ));
+        }
 
         // Check the approval topic first (non-blocking). Both a capability
         // approval AND a kernel grant-gate miss ride the same already-subscribed
@@ -220,8 +247,8 @@ pub(crate) fn dispatch_with_approval(
             Some(DispatchOutcome::GrantRequired(grant)) => {
                 return DispatchOutcome::GrantRequired(grant);
             }
-            Some(DispatchOutcome::ApprovalRequired(req)) => {
-                return DispatchOutcome::ApprovalRequired(req);
+            Some(DispatchOutcome::ApprovalRequired(req, _)) => {
+                return DispatchOutcome::ApprovalRequired(req, Some(delivery_id.clone()));
             }
             _ => {}
         }
@@ -249,8 +276,8 @@ pub(crate) fn dispatch_with_approval(
             Some(DispatchOutcome::GrantRequired(grant)) => {
                 return DispatchOutcome::GrantRequired(grant);
             }
-            Some(DispatchOutcome::ApprovalRequired(req)) => {
-                return DispatchOutcome::ApprovalRequired(req);
+            Some(DispatchOutcome::ApprovalRequired(req, _)) => {
+                return DispatchOutcome::ApprovalRequired(req, Some(delivery_id.clone()));
             }
             _ => {}
         }
@@ -316,7 +343,7 @@ fn poll_signal(sub: &ipc::Subscription) -> Option<DispatchOutcome> {
             approval = Some(req);
         }
     }
-    approval.map(DispatchOutcome::ApprovalRequired)
+    approval.map(|req| DispatchOutcome::ApprovalRequired(req, None))
 }
 
 /// Match a `tool.v1.execute.<name>.result` envelope against the selected live

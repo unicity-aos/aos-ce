@@ -324,6 +324,9 @@ struct ApprovalRespond {
 }
 
 /// Bounded broker-owned correlation state for parked approval results.
+mod result;
+use result::resolve_with_decision;
+
 const PENDING_RESULT_ROUTES_KEY: &str = "mcp.approval.pending_result_routes";
 const PENDING_RESULT_ROUTE_TTL_MS: u64 = 120_000;
 const MAX_PENDING_RESULT_ROUTES: usize = 128;
@@ -333,6 +336,8 @@ struct PendingResultRoute {
     tool_name: String,
     call_id: String,
     provider_source_id: String,
+    #[serde(default)]
+    delivery_id: Option<String>,
     created_at_ms: u64,
 }
 
@@ -341,6 +346,10 @@ impl PendingResultRoute {
         self.tool_name == tool_name
             && self.call_id == call_id
             && crate::cache::is_valid_provider_source_id(&self.provider_source_id)
+            && self
+                .delivery_id
+                .as_deref()
+                .is_none_or(crate::execute::delivery_failure::is_valid_id)
     }
 
     fn is_fresh(&self, now_ms: u64) -> bool {
@@ -359,11 +368,13 @@ pub(crate) fn remember_pending_result_route(
     tool_name: &str,
     call_id: &str,
     provider_source_id: &str,
+    delivery_id: Option<&str>,
 ) -> bool {
     if response_topic(request_id).is_none()
         || !crate::execute::is_valid_tool_name(tool_name)
         || crate::broker::reply_topic(call_id).is_none()
         || !crate::cache::is_valid_provider_source_id(provider_source_id)
+        || delivery_id.is_some_and(|id| !crate::execute::delivery_failure::is_valid_id(id))
     {
         return false;
     }
@@ -389,6 +400,7 @@ pub(crate) fn remember_pending_result_route(
             tool_name: tool_name.to_string(),
             call_id: call_id.to_string(),
             provider_source_id: provider_source_id.to_string(),
+            delivery_id: delivery_id.map(str::to_owned),
             created_at_ms: now_ms,
         },
     );
@@ -407,7 +419,7 @@ pub(crate) fn deny_untracked_approval(request_id: &str) {
 /// Consume the broker-owned provider binding for an approval response.
 /// Mismatched echoed routing tokens fail closed and still consume the entry so
 /// a forged or replayed response cannot probe it repeatedly.
-fn take_pending_result_route(req: &ApprovalRespond) -> Option<String> {
+fn take_pending_result_route(req: &ApprovalRespond) -> Option<PendingResultRoute> {
     let now_ms = crate::discovery::wall_ms();
     let mut routes = load_pending_result_routes();
     let route = routes.remove(&req.request_id);
@@ -416,9 +428,7 @@ fn take_pending_result_route(req: &ApprovalRespond) -> Option<String> {
     if !persisted {
         return None;
     }
-    route
-        .filter(|route| route.is_fresh(now_ms) && route.matches(&req.tool_name, &req.call_id))
-        .map(|route| route.provider_source_id)
+    route.filter(|route| route.is_fresh(now_ms) && route.matches(&req.tool_name, &req.call_id))
 }
 
 fn load_pending_result_routes() -> BTreeMap<String, PendingResultRoute> {
@@ -495,7 +505,7 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
         return Ok(());
     };
 
-    let Some(provider_source_id) = take_pending_result_route(&req) else {
+    let Some(result_route) = take_pending_result_route(&req) else {
         log::warn(format!(
             "{}: broker approval.respond: missing or mismatched provider route for request_id '{}'; denying",
             crate::profile::log_tag(),
@@ -526,7 +536,7 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
                 crate::profile::log_tag(),
                 req.request_id
             ));
-            resolve_with_decision(&req, &response_topic, DENY, None, &provider_source_id);
+            resolve_with_decision(&req, &response_topic, DENY, None, &result_route);
             return Ok(());
         }
     };
@@ -537,7 +547,7 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
             crate::profile::log_tag(),
             req.request_id
         ));
-        resolve_with_decision(&req, &response_topic, DENY, None, &provider_source_id);
+        resolve_with_decision(&req, &response_topic, DENY, None, &result_route);
         return Ok(());
     }
 
@@ -552,7 +562,7 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
         &response_topic,
         decision,
         req.reason.as_deref(),
-        &provider_source_id,
+        &result_route,
     );
     Ok(())
 }
@@ -978,127 +988,6 @@ fn grant_ack(reply_topic: &str, req_id: &str, granted: bool) {
         ));
     }
 }
-
-/// Publish `decision` on the per-request response topic to unblock the host,
-/// then drain the resumed/denied tool result and deliver it to the shim.
-///
-/// Subscribe-before-publish: the result subscription on
-/// `tool.v1.execute.<tool_name>.result` is established BEFORE the decision is
-/// published so the tool cannot resume and publish ahead of us. Then we drain
-/// for `call_id` and reply on `astrid.v1.response.<req_id>` with the same
-/// terminal `tool.call` shape the broker's non-parked path produces.
-///
-/// `tool_name` is charset-validated (it must form the result topic). A
-/// non-routable `tool_name`, a subscribe failure, or a drain timeout still
-/// publishes the decision (so the host-blocked tool is never left hanging)
-/// and delivers a best-effort `isError` reply to the shim.
-fn resolve_with_decision(
-    req: &ApprovalRespond,
-    response_topic: &str,
-    decision: &'static str,
-    reason: Option<&str>,
-    provider_source_id: &str,
-) {
-    let reply_topic = crate::broker::reply_topic(&req.req_id);
-
-    // Validate the tool name BEFORE building the result topic — the same
-    // charset gate the execute path applies, so a hostile / buggy echo
-    // cannot smuggle topic segments into our subscription.
-    if !crate::execute::is_valid_tool_name(&req.tool_name) {
-        log::warn(format!(
-            "{}: broker approval.respond: invalid tool_name '{}' for request_id '{}'; \
-             publishing decision without result drain",
-            crate::profile::log_tag(),
-            req.tool_name,
-            req.request_id
-        ));
-        // Still unblock the host so the tool retires, then surface an error.
-        publish_decision(response_topic, &req.request_id, decision, reason);
-        if let Some(reply) = &reply_topic {
-            deliver_error(reply, &req.req_id, "approval echoed an invalid tool name");
-        }
-        return;
-    }
-
-    let result_topic = format!("tool.v1.execute.{}.result", req.tool_name);
-
-    // Subscribe BEFORE publishing the decision so the resumed tool's result
-    // cannot race ahead of our subscription. A subscribe failure is
-    // non-fatal: we still publish the decision (the host must not be left
-    // blocked) and fall back to a best-effort error reply.
-    let result_sub = match ipc::subscribe(&result_topic) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            log::warn(format!(
-                "{}: broker approval.respond: failed to subscribe {result_topic}: {e}",
-                crate::profile::log_tag()
-            ));
-            None
-        }
-    };
-
-    publish_decision(response_topic, &req.request_id, decision, reason);
-
-    let Some(reply) = &reply_topic else {
-        // Decision is published (tool unblocked) but we have no channel to
-        // deliver the terminal result on. The shim will time out its own
-        // request; nothing more we can do.
-        log::warn(format!(
-            "{}: broker approval.respond: decision published but req_id '{}' unroutable; \
-             no terminal reply delivered",
-            crate::profile::log_tag(),
-            req.req_id
-        ));
-        return;
-    };
-
-    // Drain the resumed/denied result and deliver it as the terminal reply.
-    match result_sub.and_then(|sub| drain_result(&sub, &req.call_id, provider_source_id)) {
-        Some((content, is_error)) => deliver_result(reply, &req.req_id, content, is_error),
-        None => deliver_error(
-            reply,
-            &req.req_id,
-            "tool did not return a result after the approval decision",
-        ),
-    }
-}
-
-/// Drain `tool.v1.execute.<name>.result` for `call_id` after a decision,
-/// returning `(content, is_error)` for the first matching result or `None` on
-/// timeout. Bounded by [`RESUME_TIMEOUT_MS`]; polled in [`RESUME_SLICE_MS`]
-/// slices so a result published the instant the tool resumes is picked up
-/// promptly. Reuses the execute path's result-envelope parser so both legs
-/// agree on the wire shape.
-fn drain_result(
-    sub: &ipc::Subscription,
-    call_id: &str,
-    provider_source_id: &str,
-) -> Option<(Value, bool)> {
-    let mut remaining = RESUME_TIMEOUT_MS;
-    while remaining > 0 {
-        let step = remaining.min(RESUME_SLICE_MS);
-        match sub.recv(step) {
-            Ok(poll) => {
-                for msg in poll.messages {
-                    if let Some(found) = crate::execute::match_result(
-                        &msg.payload,
-                        call_id,
-                        &msg.source_id,
-                        provider_source_id,
-                    ) {
-                        return Some(found);
-                    }
-                }
-            }
-            Err(_) => {
-                // Slice timeout — keep draining until the budget closes.
-            }
-        }
-        remaining = remaining.saturating_sub(step);
-    }
-    None
-}
-
 /// Deliver a terminal `tool.call` reply to the shim carrying the resumed/
 /// denied tool result, mirroring [`crate::broker::handle_mcp_call`]'s
 /// non-parked reply shape so the shim needs no special-casing.
@@ -1400,6 +1289,7 @@ mod tests {
             tool_name: "shell.exec".to_string(),
             call_id: "call-7".to_string(),
             provider_source_id: "0191f3a2-b4c7-7d8e-9f01-234567890abc".to_string(),
+            delivery_id: None,
             created_at_ms: 10_000,
         };
 
