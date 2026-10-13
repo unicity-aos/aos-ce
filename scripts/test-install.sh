@@ -34,6 +34,12 @@ with tempfile.TemporaryDirectory() as raw:
     command = ["sh", "-c", function + '\nAOS_HOME=$1; clear_host_update_notice', "clear", str(home)]
     subprocess.run(command, check=True)
     assert list(p.name for p in state.iterdir()) == ["keep"]
+    (state / "available").write_text("undeletable notice")
+    failure_command = ["sh", "-c", 'set -e\nrm() { return 1; }\n' + function
+                       + '\nAOS_HOME=$1; clear_host_update_notice; printf "completed"', "clear", str(home)]
+    result = subprocess.run(failure_command, capture_output=True, text=True)
+    assert result.returncode == 0 and result.stdout == "completed", result
+    assert (state / "available").read_text() == "undeletable notice"
     state.rename(home / "outside")
     state.symlink_to(home / "outside", target_is_directory=True)
     (home / "outside/available").write_text("must survive")

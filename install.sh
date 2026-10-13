@@ -1747,7 +1747,7 @@ clear_host_update_notice() {
   for notice_member in available stamp retry; do
     notice_file="$notice_root/$notice_member"
     if [ -f "$notice_file" ] || [ -L "$notice_file" ]; then
-      rm -f "$notice_file"
+      rm -f "$notice_file" || :
     fi
   done
 }
