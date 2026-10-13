@@ -198,6 +198,10 @@ fn verify_release_directory(
             invalid_data("bundled Distro.sig does not verify against Distro.lock and pubkey")
         })?;
 
+    // The signed lock authenticates Distro.toml, including its runtime requirement.
+    // The private release inventory checks local package consistency; it is not
+    // an independent signature over the historical runtime identity. Neither it
+    // nor the prior receipt selects the runtime dispatched by this binary.
     let packaged_runtime = verify_release_inventory(
         release_dir,
         &manifest_bytes,
@@ -252,7 +256,7 @@ pub(crate) fn seed_runtime_trust(home: &AosHome, signing_pubkey: &str) -> io::Re
     }
 }
 
-/// Accept an exact receipt or authenticate its retained predecessor before apply.
+/// Accept an exact receipt or authenticate its retained predecessor distro before apply.
 /// This check never rewrites the receipt; only successful apply and stop do so.
 pub(crate) fn check_existing_receipt(
     home: &AosHome,

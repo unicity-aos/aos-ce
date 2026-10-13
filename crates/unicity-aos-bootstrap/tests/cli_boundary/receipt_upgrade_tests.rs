@@ -156,3 +156,54 @@ fn prior_receipt_upgrade_refuses_wrong_owner_key_and_unverified_release() {
         assert_eq!(fs::read(path).unwrap(), before, "{damage}");
     }
 }
+
+#[test]
+fn historical_runtime_labels_cannot_select_the_runtime_of_the_new_apply() {
+    let fixture = Fixture::new("receipt-upgrade-runtime-authority");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    fixture.install_signed_distro();
+    let path = prior_receipt(&fixture);
+    let mut receipt: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    receipt["astrid_runtime_version"] = "2026.10.0-rc.5".into();
+    fs::write(&path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    let inventory_path = fixture
+        .home
+        .join("releases")
+        .join(PRIOR_PRODUCT)
+        .join("release-manifest.json");
+    let mut inventory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&inventory_path).unwrap()).unwrap();
+    inventory["runtime"]["version"] = "2026.10.0-rc.5".into();
+    fs::write(
+        inventory_path,
+        serde_json::to_vec_pretty(&inventory).unwrap(),
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .args([
+            "distro",
+            "apply",
+            "--principal",
+            "operator",
+            "--yes",
+            "--offline",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let current: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let compatibility: toml::Value = include_str!("../../../../release/runtime-compatibility.toml")
+        .parse()
+        .unwrap();
+    assert_eq!(
+        current["astrid_runtime_version"],
+        compatibility["runtime"]["version"].as_str().unwrap()
+    );
+    assert_eq!(current["distro_version"], env!("CARGO_PKG_VERSION"));
+    assert!(fixture.root.join("apply-args").exists());
+}
