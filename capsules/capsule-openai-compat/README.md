@@ -19,6 +19,7 @@ Configure `base_url` to point at any compatible provider:
 | Mistral | `https://api.mistral.ai` | |
 | DeepSeek | `https://api.deepseek.com` | |
 | Fireworks | `https://api.fireworks.ai/inference` | |
+| Novita | `https://api.novita.ai/openai` | |
 | LM Studio | `http://localhost:1234` | Requires operator local-egress exemption -- see below |
 | vLLM | `http://localhost:8000` | Requires operator local-egress exemption -- see below |
 | llama.cpp | `http://localhost:8080` | Requires operator local-egress exemption -- see below |
