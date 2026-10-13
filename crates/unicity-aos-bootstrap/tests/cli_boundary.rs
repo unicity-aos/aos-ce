@@ -1833,16 +1833,6 @@ printf '%s\n' '{"schema_version":1}'
         .command()
         .args(["update", "--check", "--json", "--channel", "dev"])
         .env("EXPECTED_PRODUCT_VERSION", env!("CARGO_PKG_VERSION"))
-        .env(
-            "EXPECTED_CHANNEL",
-            if env!("CARGO_PKG_VERSION").contains("-nightly.") {
-                "nightly"
-            } else if env!("CARGO_PKG_VERSION").contains("-rc.") {
-                "dev"
-            } else {
-                "stable"
-            },
-        )
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);

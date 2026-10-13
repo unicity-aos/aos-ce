@@ -1,20 +1,25 @@
 # AOS Community Edition
 
-AOS Community Edition is the open agent operating system for people who want
-an inspectable, composable environment for agents.
+AOS gives AI agents a shared local environment for tools, permissions and services.
+Connect your agent, approve the access it needs, and give it capabilities you can
+inspect and extend. AOS uses the Astrid runtime to execute those capabilities as
+isolated WebAssembly capsules with explicit permissions and an audit trail.
 
-It owns the Community Edition product surface: the `aos` CLI, HTTP API,
-distributions, first-party capsules, provider and model experience, and
-Unicity Audit.
+Use AOS to:
 
-## Workspace layout
+- **Connect your existing agent to local capabilities.** Oracle plugins connect
+  Claude, Codex and Grok to AOS; the product also exposes an MCP interface.
+- **Control access to tools and data.** Actions routed through AOS use runtime
+  capabilities and approval flows, with a Command Center for local decisions.
+- **Keep agent environments separate.** Principals have their own provisioned
+  environments, while an authenticated operator manages the installation.
+- **Build the missing capability.** Compose capsules into tools, connectors,
+  services or agent harnesses. The bundled Forge tooling teaches an agent how
+  to build and verify a capsule with only the permissions it needs.
 
-```text
-crates/       Product CLI, HTTP API, control client, and shared product code
-capsules/     First-party production capsules
-distros/      Community distribution manifests and release metadata
-docs/         Product and operator documentation
-```
+Community Edition includes the `aos` CLI, Command Center, first-party capsules
+and a coordinated Astrid runtime. Install it below, then connect your host using
+[the Oracle plugins](https://github.com/unicity-aos/oracles#readme).
 
 ## Install
 
@@ -25,6 +30,7 @@ the product-owned `~/.aos` root:
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL https://aos.unicity.ai/install.sh | sh
 aos init
+aos status
 ```
 
 On macOS, packaged `aos` and bundled `astrid`/`astrid-daemon` binaries declare
@@ -166,3 +172,12 @@ allowlist, integrity checks, recovery behavior, and command.
 Except where otherwise noted, AOS Community Edition is dual-licensed under the
 [MIT License](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE), at your
 option.
+
+## Repository layout
+
+```text
+crates/       Product CLI, HTTP API, control client, and shared product code
+capsules/     First-party production capsules
+distros/      Community distribution manifests and release metadata
+docs/         Product and operator documentation
+```
