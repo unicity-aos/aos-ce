@@ -359,7 +359,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 [[package]]
 name = "astrid-config"
 version = "2026.10.0"
-source = "git+https://github.com/astrid-runtime/astrid?rev=ac8867eaf6855a18b99425bdc4d0264fdc73a298#ac8867eaf6855a18b99425bdc4d0264fdc73a298"
+source = "git+https://github.com/astrid-runtime/astrid?rev=00a5654b5dc5fcc913f1fe3b9383360a33d879a0#00a5654b5dc5fcc913f1fe3b9383360a33d879a0"
 dependencies = [
  "astrid-core",
  "directories",
@@ -374,7 +374,7 @@ dependencies = [
 [[package]]
 name = "astrid-core"
 version = "2026.10.0"
-source = "git+https://github.com/astrid-runtime/astrid?rev=ac8867eaf6855a18b99425bdc4d0264fdc73a298#ac8867eaf6855a18b99425bdc4d0264fdc73a298"
+source = "git+https://github.com/astrid-runtime/astrid?rev=00a5654b5dc5fcc913f1fe3b9383360a33d879a0#00a5654b5dc5fcc913f1fe3b9383360a33d879a0"
 dependencies = [
  "async-trait",
  "base64",
@@ -399,7 +399,7 @@ dependencies = [
 [[package]]
 name = "astrid-crypto"
 version = "2026.10.0"
-source = "git+https://github.com/astrid-runtime/astrid?rev=ac8867eaf6855a18b99425bdc4d0264fdc73a298#ac8867eaf6855a18b99425bdc4d0264fdc73a298"
+source = "git+https://github.com/astrid-runtime/astrid?rev=00a5654b5dc5fcc913f1fe3b9383360a33d879a0#00a5654b5dc5fcc913f1fe3b9383360a33d879a0"
 dependencies = [
  "base64",
  "blake3",
@@ -415,7 +415,7 @@ dependencies = [
 [[package]]
 name = "astrid-events"
 version = "2026.10.0"
-source = "git+https://github.com/astrid-runtime/astrid?rev=ac8867eaf6855a18b99425bdc4d0264fdc73a298#ac8867eaf6855a18b99425bdc4d0264fdc73a298"
+source = "git+https://github.com/astrid-runtime/astrid?rev=00a5654b5dc5fcc913f1fe3b9383360a33d879a0#00a5654b5dc5fcc913f1fe3b9383360a33d879a0"
 dependencies = [
  "astrid-core",
  "astrid-runtime",
@@ -437,7 +437,7 @@ dependencies = [
 [[package]]
 name = "astrid-runtime"
 version = "2026.10.0"
-source = "git+https://github.com/astrid-runtime/astrid?rev=ac8867eaf6855a18b99425bdc4d0264fdc73a298#ac8867eaf6855a18b99425bdc4d0264fdc73a298"
+source = "git+https://github.com/astrid-runtime/astrid?rev=00a5654b5dc5fcc913f1fe3b9383360a33d879a0#00a5654b5dc5fcc913f1fe3b9383360a33d879a0"
 dependencies = [
  "futures",
  "tokio",
@@ -502,7 +502,7 @@ dependencies = [
 [[package]]
 name = "astrid-types"
 version = "2026.10.0"
-source = "git+https://github.com/astrid-runtime/astrid?rev=ac8867eaf6855a18b99425bdc4d0264fdc73a298#ac8867eaf6855a18b99425bdc4d0264fdc73a298"
+source = "git+https://github.com/astrid-runtime/astrid?rev=00a5654b5dc5fcc913f1fe3b9383360a33d879a0#00a5654b5dc5fcc913f1fe3b9383360a33d879a0"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -515,7 +515,7 @@ dependencies = [
 [[package]]
 name = "astrid-uplink"
 version = "2026.10.0"
-source = "git+https://github.com/astrid-runtime/astrid?rev=ac8867eaf6855a18b99425bdc4d0264fdc73a298#ac8867eaf6855a18b99425bdc4d0264fdc73a298"
+source = "git+https://github.com/astrid-runtime/astrid?rev=00a5654b5dc5fcc913f1fe3b9383360a33d879a0#00a5654b5dc5fcc913f1fe3b9383360a33d879a0"
 dependencies = [
  "anyhow",
  "astrid-config",
