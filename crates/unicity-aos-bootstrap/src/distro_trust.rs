@@ -86,6 +86,11 @@ struct ActiveReceipt {
 
 /// Verify the exact release members used by the selected Distro Apply path.
 pub(crate) fn verify_selected_release(home: &AosHome) -> io::Result<VerifiedDistro> {
+    if home.runtime_binary() != home.bundled_runtime_binary() {
+        return Err(invalid_data(
+            "Distro Apply requires the selected bundled runtime; remove UNICITY_AOS_RUNTIME_BIN",
+        ));
+    }
     let release_dir = home.release_dir();
     verify_release_directory(
         &release_dir,

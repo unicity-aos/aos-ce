@@ -39,7 +39,10 @@ impl Fixture {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).expect("create fixture");
-        let runtime = root.join("fake-runtime");
+        let runtime = root
+            .join("runtime-home/releases")
+            .join(env!("CARGO_PKG_VERSION"))
+            .join("runtime/bin/astrid");
         let args = root.join("args");
         let bootstrap_args = root.join("bootstrap-args");
         let home = root.join("runtime-home");
@@ -182,12 +185,15 @@ impl Fixture {
         let body = format!(
             "#!/bin/sh\n[ \"$1\" = --daemon-workspace ] && [ \"$2\" = \"$ASTRID_HOME\" ] || exit 97\nshift 2\n{body}"
         );
+        fs::create_dir_all(self.runtime.parent().unwrap())
+            .expect("create packaged runtime fixture");
         fs::write(&self.runtime, body).expect("write fake runtime");
         Self::make_executable(&self.runtime);
     }
 
     fn install_daemon(&self, body: &str) {
         let daemon = self.runtime.with_file_name("astrid-daemon");
+        fs::create_dir_all(daemon.parent().unwrap()).expect("create packaged daemon fixture");
         fs::write(&daemon, body).expect("write fake daemon");
         Self::make_executable(&daemon);
     }

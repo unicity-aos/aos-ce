@@ -271,6 +271,12 @@ impl AosHome {
         self.runtime_binary_with(|name| std::env::var_os(name))
     }
 
+    /// The product-pinned runtime executable, independent of operator overrides.
+    #[must_use]
+    pub fn bundled_runtime_binary(&self) -> PathBuf {
+        self.release_runtime_bin_dir().join(runtime_binary_name())
+    }
+
     /// The daemon executable installed beside the bundled runtime CLI.
     #[must_use]
     pub fn runtime_daemon_binary(&self) -> PathBuf {
@@ -287,7 +293,7 @@ impl AosHome {
         {
             return path;
         }
-        self.release_runtime_bin_dir().join(runtime_binary_name())
+        self.bundled_runtime_binary()
     }
 
     /// Import a standalone Astrid Runtime home into this product installation.

@@ -207,3 +207,40 @@ fn historical_runtime_labels_cannot_select_the_runtime_of_the_new_apply() {
     assert_eq!(current["distro_version"], env!("CARGO_PKG_VERSION"));
     assert!(fixture.root.join("apply-args").exists());
 }
+
+#[test]
+fn distro_apply_refuses_a_foreign_runtime_override_before_any_dispatch() {
+    let fixture = Fixture::new("receipt-upgrade-foreign-runtime");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    fixture.install_signed_distro();
+    let receipt = prior_receipt(&fixture);
+    let before = fs::read(&receipt).unwrap();
+    let foreign = fixture.root.join("foreign-runtime");
+    fs::write(
+        &foreign,
+        "#!/bin/sh\nprintf foreign > \"$AOS_TEST_FOREIGN_MARKER\"\nexit 0\n",
+    )
+    .unwrap();
+    Fixture::make_executable(&foreign);
+    let marker = fixture.root.join("foreign-dispatched");
+    let output = fixture
+        .command()
+        .env("UNICITY_AOS_RUNTIME_BIN", foreign)
+        .env("AOS_TEST_FOREIGN_MARKER", &marker)
+        .args([
+            "distro",
+            "apply",
+            "--principal",
+            "operator",
+            "--yes",
+            "--offline",
+        ])
+        .output()
+        .unwrap();
+    assert!(!marker.exists(), "foreign runtime was dispatched");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("requires the selected bundled runtime")
+    );
+    assert_eq!(fs::read(receipt).unwrap(), before);
+}
