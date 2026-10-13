@@ -21,6 +21,26 @@ for selected, installed, newer in (
     result = subprocess.run(["sh", "-c", function + '\naos_version_newer "$1" "$2"', "compare", selected, installed])
     assert (result.returncode == 0) == newer, (selected, installed)
 PYTEST
+python3 - "$repo_root/install.sh" <<'PYNOTICE'
+import pathlib, subprocess, sys, tempfile
+source = pathlib.Path(sys.argv[1]).read_text()
+function = "clear_host_update_notice() {" + source.split("clear_host_update_notice() {", 1)[1].split("\n# Both replacement", 1)[0]
+with tempfile.TemporaryDirectory() as raw:
+    home = pathlib.Path(raw).resolve()
+    state = home / "update/host-update-check"
+    state.mkdir(parents=True)
+    for name in ("available", "stamp", "retry", "keep"):
+        (state / name).write_text("old notice")
+    command = ["sh", "-c", function + '\nAOS_HOME=$1; clear_host_update_notice', "clear", str(home)]
+    subprocess.run(command, check=True)
+    assert list(p.name for p in state.iterdir()) == ["keep"]
+    state.rename(home / "outside")
+    state.symlink_to(home / "outside", target_is_directory=True)
+    (home / "outside/available").write_text("must survive")
+    subprocess.run(command, check=True)
+    assert (home / "outside/available").read_text() == "must survive"
+PYNOTICE
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 fixture="$work/fixture"

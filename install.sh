@@ -1737,8 +1737,24 @@ fi
 installation_started=0
 rm -rf "$release_backup"
 fi
+# Cached host notices may describe the preceding binary and release train.
+# Invalidate only these disposable files through non-redirected directories.
+clear_host_update_notice() {
+  notice_root="$AOS_HOME/update/host-update-check"
+  for notice_parent in "$AOS_HOME/update" "$notice_root"; do
+    [ ! -L "$notice_parent" ] && { [ ! -e "$notice_parent" ] || [ -d "$notice_parent" ]; } || return 0
+  done
+  for notice_member in available stamp retry; do
+    notice_file="$notice_root/$notice_member"
+    if [ -f "$notice_file" ] || [ -L "$notice_file" ]; then
+      rm -f "$notice_file"
+    fi
+  done
+}
+
 # Both replacement and verified reuse finish the same lock-owned recovery.
 reclaim_abandoned_release_transactions
+clear_host_update_notice
 release_install_lock
 
 # Optional Finder/FSKit mounts follow AstridFS.app LSMinimumSystemVersion
