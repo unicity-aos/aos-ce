@@ -27,6 +27,7 @@ mod mcp;
 mod native_setup;
 mod principals;
 mod updates;
+mod version;
 
 use command_center::{open_command_center, runtime_start_requested};
 
@@ -54,6 +55,8 @@ struct ProductCli {
 
 #[derive(Subcommand)]
 enum ProductCommand {
+    /// Show the AOS product and its bundled Astrid runtime versions.
+    Version(version::Arguments),
     /// Print a file's BLAKE3 digest without starting or changing the runtime.
     Checksum { path: std::path::PathBuf },
     /// Open the terminal Command Center for approvals and private input.
@@ -181,6 +184,20 @@ enum UpdateChannel {
 }
 
 impl UpdateChannel {
+    fn installed_default() -> Self {
+        Self::for_version(env!("CARGO_PKG_VERSION"))
+    }
+
+    fn for_version(version: &str) -> Self {
+        if version.contains("-nightly.") {
+            Self::Nightly
+        } else if version.contains("-rc.") {
+            Self::Dev
+        } else {
+            Self::Stable
+        }
+    }
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Stable => "stable",
@@ -360,6 +377,9 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
     ) {
         Ok(cli) => cli,
         Err(error) => {
+            if error.kind() == clap::error::ErrorKind::DisplayVersion {
+                return Some(version::print(&version::Arguments::default()));
+            }
             let exit_code = if error.use_stderr() {
                 ExitCode::from(2)
             } else {
@@ -394,6 +414,7 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
     }
 
     match cli.command {
+        Some(ProductCommand::Version(args)) => Some(version::print(&args)),
         Some(ProductCommand::Checksum { path }) => Some(checksum::run(&path)),
         #[cfg(unix)]
         Some(ProductCommand::Console(args)) => Some(console::run(args)),
@@ -706,6 +727,7 @@ fn is_owned_root(value: &str) -> bool {
     matches!(
         value,
         "init"
+            | "version"
             | "checksum"
             | "status"
             | "migrate"
@@ -875,7 +897,9 @@ fn handle_self_update(args: &UpdateArgs) -> ExitCode {
     } else {
         command.args([
             "--channel",
-            args.channel.unwrap_or(UpdateChannel::Stable).as_str(),
+            args.channel
+                .unwrap_or_else(UpdateChannel::installed_default)
+                .as_str(),
         ]);
     }
     if args.check {

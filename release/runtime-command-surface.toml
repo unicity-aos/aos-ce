@@ -32,12 +32,12 @@ inherited = [
   "who",
   "doctor",
   "setup",
-  "version",
   "completions",
 ]
 
 # Public runtime roots replaced at the same location by an AOS implementation.
 product-owned = [
+  "version",
   "mcp",
   "distro",
   "init",

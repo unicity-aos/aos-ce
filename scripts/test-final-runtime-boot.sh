@@ -92,7 +92,7 @@ import json
 import sys
 
 expected, encoded = sys.argv[1:]
-actual = json.loads(encoded).get("version")
+actual = json.loads(encoded).get("runtime_version")
 if actual != expected:
     raise SystemExit(f"candidate runtime version {actual!r} does not match exact pin {expected!r}")
 PY

@@ -178,7 +178,7 @@ target_dir=$(
     python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
 )
 product_binary=$target_dir/debug/aos
-test "$($product_binary --version)" = "Unicity AOS ${product_version}"
+test "$($product_binary --version | head -1)" = "Unicity AOS ${product_version}"
 
 PYTHONPATH="$repo_root/scripts" python3 - "$capsules" <<'PY'
 import pathlib

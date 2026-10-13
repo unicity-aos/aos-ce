@@ -139,6 +139,31 @@ is_aos_channel_version() {
   esac
 }
 
+# Versions have passed the canonical validators. Compare SemVer precedence,
+# including numeric prerelease identifiers, without shell integer overflow.
+aos_version_newer() {
+  awk -v selected="$1" -v installed="$2" '
+    function compare(a,b) {
+      if (a ~ /^[0-9]+$/ && b ~ /^[0-9]+$/) {
+        if (length(a) != length(b)) return length(a) > length(b) ? 1 : -1
+      } else if (a ~ /^[0-9]+$/) return -1
+      else if (b ~ /^[0-9]+$/) return 1
+      if ("x" a == "x" b) return 0
+      return "x" a > "x" b ? 1 : -1
+    }
+    BEGIN {
+      split(selected,s,"-"); split(installed,i,"-")
+      split(s[1],sb,"."); split(i[1],ib,".")
+      for (n=1;n<=3;n++) { c=compare(sb[n],ib[n]); if(c) exit c>0 ? 0 : 1 }
+      if (s[2] == i[2]) exit 1
+      if (s[2] == "") exit 0
+      if (i[2] == "") exit 1
+      ns=split(s[2],sp,"."); ni=split(i[2],ip,".")
+      for(n=1;n<=ns && n<=ni;n++) { c=compare(sp[n],ip[n]); if(c) exit c>0 ? 0 : 1 }
+      exit ns>ni ? 0 : 1
+    }'
+}
+
 if [ -n "$AOS_VERSION" ] && ! is_aos_release_version "$AOS_VERSION"; then
   echo "invalid AOS version: $AOS_VERSION" >&2
   exit 2
@@ -1041,7 +1066,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   installed_version=${AOS_INSTALLED_VERSION:-}
   if [ -z "$installed_version" ]; then
     [ -x "$AOS_BIN_DIR/aos" ] || { echo "no installed AOS to compare" >&2; exit 1; }
-    installed_version=$("$AOS_BIN_DIR/aos" --version | awk '{print $NF}')
+    installed_version=$("$AOS_BIN_DIR/aos" --version | awk 'NR == 1 {print $NF}')
   fi
   is_aos_release_version "$installed_version" || { echo "invalid installed AOS version" >&2; exit 1; }
   if [ "$JSON_OUTPUT" -eq 1 ]; then
@@ -1053,12 +1078,15 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
       "$installed_version" "$AOS_VERSION" "$AOS_CHANNEL" "$target" "$asset_sha256" >&3
     exit 0
   fi
-  if [ "$installed_version" != "$AOS_VERSION" ]; then
+  if aos_version_newer "$AOS_VERSION" "$installed_version"; then
     # shellcheck disable=SC2016 # Backticks are literal command formatting.
     printf 'Update available: AOS %s -> %s (%s). Run `aos update --channel %s`.\n' \
       "$installed_version" "$AOS_VERSION" "$AOS_CHANNEL" "$AOS_CHANNEL"
-  else
+  elif [ "$installed_version" = "$AOS_VERSION" ]; then
     printf 'AOS %s matches the signed %s channel.\n' "$installed_version" "$AOS_CHANNEL"
+  else
+    printf 'AOS %s is ahead of the signed %s channel (%s); no upgrade available.\n' \
+      "$installed_version" "$AOS_CHANNEL" "$AOS_VERSION"
   fi
   exit 0
 fi
@@ -1397,7 +1425,7 @@ while IFS= read -r capsule; do
   }
 done < "$bundle/capsule-assets.txt"
 
-staged_version=$("$bundle/bin/aos" --version | awk '{print $NF}')
+staged_version=$("$bundle/bin/aos" --version | awk 'NR == 1 {print $NF}')
 if ! is_aos_release_version "$staged_version"; then
   echo "staged AOS binary reported an invalid product version" >&2
   exit 1

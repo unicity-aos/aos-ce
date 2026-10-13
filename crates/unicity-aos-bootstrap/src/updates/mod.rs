@@ -105,7 +105,7 @@ struct ChannelMetadata {
 fn initial() -> Inventory {
     Inventory {
         schema_version: 1,
-        channel: "stable".into(),
+        channel: super::UpdateChannel::installed_default().as_str().into(),
         checked_at: None,
         items: vec![Item {
             id: "aos".into(),

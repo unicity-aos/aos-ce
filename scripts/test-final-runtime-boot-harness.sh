@@ -70,7 +70,7 @@ if command == "_daemon":
     raise SystemExit(0)
 
 if command == "version":
-    print(json.dumps({"version": os.environ.get("FAKE_VERSION", "9.9.9")}))
+    print(json.dumps({"runtime_version": os.environ.get("FAKE_VERSION", "9.9.9")}))
     raise SystemExit(0)
 
 if command == "start":
