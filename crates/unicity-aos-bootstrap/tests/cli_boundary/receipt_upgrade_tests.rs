@@ -106,6 +106,8 @@ fn prior_receipt_upgrade_refuses_wrong_owner_key_and_unverified_release() {
         "missing",
         "redirected",
         "future",
+        "same_version",
+        "future_runtime",
     ] {
         let fixture = Fixture::new(&format!("receipt-upgrade-{damage}"));
         fixture.install_runtime(RECORDING_RUNTIME);
@@ -125,6 +127,8 @@ fn prior_receipt_upgrade_refuses_wrong_owner_key_and_unverified_release() {
                 std::os::unix::fs::symlink(outside, &prior).unwrap();
             }
             "future" => receipt["distro_version"] = "2027.1.0".into(),
+            "same_version" => receipt["distro_version"] = env!("CARGO_PKG_VERSION").into(),
+            "future_runtime" => receipt["astrid_runtime_version"] = "2027.1.0".into(),
             _ => unreachable!(),
         }
         fs::write(&path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
