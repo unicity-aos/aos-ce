@@ -16,10 +16,6 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
-### Fixed
-
-- Both AOS version commands identify the product and bundled Astrid runtime. Automatic update checks follow the installed release train and never advertise an older stable release as an upgrade.
-
 ## [2026.10.0] - 2026-10-13
 
 ### Added
@@ -45,6 +41,7 @@ implementations are consolidated into their final behavior.
 
 ### Fixed
 
+- Both AOS version commands identify the product and bundled Astrid runtime. Automatic update checks follow the installed release train and never advertise an older stable release as an upgrade.
 - Reuse authenticated installer downloads and intact installations, repair
   missing or mode-damaged managed files, and report progress on slow transfers.
   Retain the verified Sigstore tool across authenticated installer handoffs.
