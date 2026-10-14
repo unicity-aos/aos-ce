@@ -6,19 +6,19 @@ version = "2026.10.0"
 
 [runtime]
 repository = "astrid-runtime/astrid"
-# Runtime provenance is bound to authenticated rc.6 metadata. Readiness gates
+# Runtime provenance is bound to authenticated stable metadata. Readiness gates
 # retain prior composed QA evidence; replacement public-package journeys are
 # tracked separately and are not established by this provenance update.
 release-ready = true
 upgrade-self-heal-ready = true
-version = "2026.10.0-rc.6"
-tag = "v2026.10.0-rc.6"
-version-requirement = ">=2026.10.0-rc.6"
-release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.10.0-rc.6"
+version = "2026.10.0"
+tag = "v2026.10.0"
+version-requirement = ">=2026.10.0"
+release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v2026.10.0"
 release-metadata-available = true
 source-commit = "00a5654b5dc5fcc913f1fe3b9383360a33d879a0"
-release-metadata-asset = "astrid-2026.10.0-rc.6-release.toml"
-release-metadata-blake3 = "358c7324c9118cf5ba23b6e15926b9c7ae95b3cdf7865c6c724c575945793f3d"
+release-metadata-asset = "astrid-2026.10.0-release.toml"
+release-metadata-blake3 = "09dc5f41f56f5eb8a9b012135f4d62a063e9df9012c0b19eee68967899723d9f"
 
 [contracts]
 repository = "astrid-runtime/wit"

@@ -29,9 +29,14 @@ the product-owned `~/.aos` root:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL https://aos.unicity.ai/install.sh | sh
+export PATH="$HOME/.aos/bin:$PATH"
 aos init
 aos status
 ```
+
+The `export` command makes `aos` available in the current shell. Add that line
+to your shell profile to keep it available in new terminals. If you install to
+a custom location, use the binary directory printed by the installer.
 
 On macOS, packaged `aos` and bundled `astrid`/`astrid-daemon` binaries declare
 `LC_BUILD_VERSION` minos 11.0. Command Center declares `LSMinimumSystemVersion`
