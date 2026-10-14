@@ -48,14 +48,14 @@ pub struct ShellTools {
 /// Input arguments for the `run_shell_command` tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct RunShellArgs {
-    /// The exact bash command to execute.
+    /// The exact shell command to execute (POSIX sh on hosts without Bash).
     pub command: String,
 }
 
 /// Input arguments for the `spawn_background_process` tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct SpawnBackgroundArgs {
-    /// The exact bash command to run in the background.
+    /// The exact shell command to run in the background (POSIX sh without Bash).
     pub command: String,
 }
 
@@ -358,6 +358,16 @@ fn extract_action(command: &str) -> String {
     parts.join(" ")
 }
 
+// The approved command is passed as a separate argv element.  POSIX sh
+// chooses the interpreter inside the same sandbox, then execs it exactly
+// once.  A failed host gate or Bash launch cannot replay user code.
+const SHELL_LAUNCHER: &str =
+    "if command -v bash >/dev/null 2>&1; then exec bash -c \"$1\"; else exec sh -c \"$1\"; fi";
+
+fn shell_args(command: &str) -> [&str; 4] {
+    ["-c", SHELL_LAUNCHER, "aos-shell", command]
+}
+
 /// Sandboxed shell execution tools for running commands and managing processes.
 ///
 /// All commands run through the host's sandbox escape hatch (Seatbelt on macOS,
@@ -366,7 +376,8 @@ fn extract_action(command: &str) -> String {
 /// human approval.
 #[capsule]
 impl ShellTools {
-    /// Execute a shell command and return its output. The command runs in bash
+    /// Execute a shell command and return its output. The command runs in Bash
+    /// when available, or POSIX sh on hosts without Bash.
     /// via the host sandbox. Requires human approval — the approval prompt
     /// shows the command and its risk level. Use this for running tests,
     /// builds, git operations, or any CLI tool.
@@ -397,7 +408,7 @@ impl ShellTools {
 
         // Spawn the command via the SDK Process Airlock.
         // The core OS enforces the Capability and wraps it in bwrap/Seatbelt.
-        let result = process::spawn("bash", &["-c", trimmed])?;
+        let result = process::spawn("sh", &shell_args(trimmed))?;
 
         // If the command fails, we return the stderr as an API error so the LLM knows it failed.
         // `Output.exit` carries the typed `ExitInfo` so we can tell signal kills from
@@ -446,7 +457,7 @@ impl ShellTools {
         // per-capsule registry so it stays alive across tool calls and the
         // LLM can continue to address it by integer ID. Dropping the
         // `Process` (on kill or final read) releases the kernel slot.
-        let handle = process::spawn_background("bash", &["-c", trimmed])?;
+        let handle = process::spawn_background("sh", &shell_args(trimmed))?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut map = self
             .background
@@ -554,6 +565,63 @@ impl ShellTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_launcher_executes_exactly_once_without_bash() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let path = std::env::temp_dir().join(format!(
+            "aos-shell-no-bash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        symlink("/bin/sh", path.join("sh")).unwrap();
+        let output = Command::new("/bin/sh")
+            .args(shell_args("printf 'one $HOME ; \"quoted\" $1';\nexit 127"))
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+        assert_eq!(output.status.code(), Some(127));
+        assert_eq!(output.stdout, b"one $HOME ; \"quoted\" $1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_launcher_uses_bash_when_present() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let bash = ["/bin/bash", "/usr/bin/bash"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file());
+        let Some(bash) = bash else { return };
+        let path = std::env::temp_dir().join(format!(
+            "aos-shell-with-bash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        symlink("/bin/sh", path.join("sh")).unwrap();
+        symlink(bash, path.join("bash")).unwrap();
+        let output = Command::new("/bin/sh")
+            .args(shell_args("[[ 1 == 1 ]] && printf bash"))
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"bash");
+    }
 
     // -- Subcommand extraction (depth 1) --
 

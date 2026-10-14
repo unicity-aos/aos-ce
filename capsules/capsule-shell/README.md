@@ -17,6 +17,10 @@ In the OS model, this capsule is the process spawner with a built-in safety net.
 | `kill_process` | Terminate a background process and collect final output |
 
 All commands execute via the host's Process Airlock (Seatbelt on macOS, bwrap on Linux).
+The capsule uses Bash when it is installed and POSIX `sh` otherwise, including
+on minimal Alpine installations. Bash-only syntax needs Bash installed. A
+restricted principal that permits only `bash` must also permit `sh`, because
+the capsule launches through `sh` to select the available interpreter.
 
 ## Approval system
 

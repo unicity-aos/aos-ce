@@ -16,6 +16,12 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+### Fixed
+
+- Run approved shell commands with Bash when available and POSIX `sh` on
+  minimal hosts without Bash, including Alpine. Foreground and background
+  commands keep their existing approval and sandbox boundaries.
+
 ## [2026.10.0] - 2026-10-13
 
 ### Added
