@@ -6,7 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [year.month.patch](release/VERSIONING.md). Repairs to unreleased
 implementations are consolidated into their final behavior.
 
-[Unreleased]: https://github.com/unicity-aos/aos-ce/compare/2026.10.0...HEAD
+[Unreleased]: https://github.com/unicity-aos/aos-ce/compare/2026.10.1...HEAD
+[2026.10.1]: https://github.com/unicity-aos/aos-ce/compare/2026.10.0...2026.10.1
 [2026.10.0]: https://github.com/unicity-aos/aos-ce/compare/2026.9.3...2026.10.0
 [2026.9.3]: https://github.com/unicity-aos/aos-ce/compare/2026.9.2...2026.9.3
 [2026.9.2]: https://github.com/unicity-aos/aos-ce/compare/2026.9.1...2026.9.2
@@ -16,11 +17,18 @@ implementations are consolidated into their final behavior.
 
 ## [Unreleased]
 
+## [2026.10.1] - 2026-10-15
+
 ### Fixed
 
 - Run approved shell commands with Bash when available and POSIX `sh` on
   minimal hosts without Bash, including Alpine. Foreground and background
   commands keep their existing approval and sandbox boundaries.
+- After installing on Linux, run the packaged runtime's host setup check and
+  report missing native prerequisites as an installation failure with recovery
+  instructions. Keep the installed package available for repair and retry.
+- Bundle Astrid 2026.10.1 with its native runtime-media isolation, Linux
+  multi-user startup, host setup, workspace rename and Apple Node repairs.
 
 ## [2026.10.0] - 2026-10-13
 
