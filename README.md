@@ -38,6 +38,11 @@ The `export` command makes `aos` available in the current shell. Add that line
 to your shell profile to keep it available in new terminals. If you install to
 a custom location, use the binary directory printed by the installer.
 
+On Linux, the installer checks native host setup using the installed AOS
+runtime. If that check fails, the authenticated package remains installed but
+the installer exits unsuccessfully before recommending `aos init`. Follow the
+printed host instructions, then run `aos setup` again before `aos init`.
+
 On macOS, packaged `aos` and bundled `astrid`/`astrid-daemon` binaries declare
 `LC_BUILD_VERSION` minos 11.0. Command Center declares `LSMinimumSystemVersion`
 13.0 and is not copied onto older hosts. Optional Finder volume mounts follow

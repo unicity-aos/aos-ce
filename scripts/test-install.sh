@@ -145,6 +145,12 @@ if [ "${1:-}" = --version ]; then
   echo 'Unicity AOS 2026.9.3'
   exit 0
 fi
+if [ "${1:-}" = setup ]; then
+  if [ -n "${AOS_TEST_SETUP_OBSERVED:-}" ]; then
+    printf '%s\n%s\n' "${AOS_HOME:-}" "${UNICITY_AOS_RUNTIME_BIN:-}" > "$AOS_TEST_SETUP_OBSERVED"
+  fi
+  exit "${AOS_TEST_SETUP_EXIT:-0}"
+fi
 exit 0
 EOF
 chmod 755 "$work/aos"
@@ -414,6 +420,25 @@ AOS_VERSION=2026.9.3 \
 sh "$repo_root/install.sh" --yes --no-migrate-prompt
 
 test -x "$work/home/.aos/bin/aos"
+preflight_home="$work/preflight-fail-home"
+if PATH="$fake_bin:$PATH" HOME="$preflight_home" AOS_TEST_FIXTURE="$fixture" \
+  AOS_TEST_SETUP_EXIT=17 AOS_TEST_SETUP_OBSERVED="$work/preflight-observed" \
+  UNICITY_AOS_RUNTIME_BIN="$work/wrong-runtime" AOS_VERSION=2026.9.3 \
+  sh "$repo_root/install.sh" --yes --no-migrate-prompt >"$work/preflight-fail.out" 2>&1; then
+  echo "installer reported success when Linux host setup failed" >&2
+  exit 1
+fi
+grep -F 'Installed Unicity AOS 2026.9.3, but Linux host setup is incomplete.' \
+  "$work/preflight-fail.out" >/dev/null
+grep -F "rerun $preflight_home/.aos/bin/aos setup" "$work/preflight-fail.out" >/dev/null
+test -x "$preflight_home/.aos/bin/aos"
+test -x "$preflight_home/.aos/releases/2026.9.3/runtime/bin/astrid"
+test "$(sed -n '1p' "$work/preflight-observed")" = "$preflight_home/.aos"
+test "$(sed -n '2p' "$work/preflight-observed")" = \
+  "$preflight_home/.aos/releases/2026.9.3/runtime/bin/astrid"
+test ! -e "$preflight_home/.aos/update/install.lock"
+test -z "$(find "$preflight_home/.aos/releases" -maxdepth 1 \
+  \( -name '.2026.9.3.rollback.*' -o -name '.2026.9.3.new.*' \) -print)"
 source "$repo_root/scripts/test-install-musl.sh"
 release_dir="$work/home/.aos/releases/2026.9.3"
 python3 - "$release_dir/release-manifest.json" "$runtime_version" "$runtime_tag" "$runtime_identity" <<'PY'
