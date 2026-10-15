@@ -145,12 +145,6 @@ if [ "${1:-}" = --version ]; then
   echo 'Unicity AOS 2026.9.3'
   exit 0
 fi
-if [ "${1:-}" = setup ]; then
-  if [ -n "${AOS_TEST_SETUP_OBSERVED:-}" ]; then
-    printf '%s\n%s\n' "${AOS_HOME:-}" "${UNICITY_AOS_RUNTIME_BIN:-}" > "$AOS_TEST_SETUP_OBSERVED"
-  fi
-  exit "${AOS_TEST_SETUP_EXIT:-0}"
-fi
 exit 0
 EOF
 chmod 755 "$work/aos"
@@ -170,7 +164,21 @@ PY
 runtime_root="$work/astrid-$runtime_version-x86_64-unknown-linux-gnu"
 mkdir -p "$runtime_root"
 for binary in astrid astrid-daemon astrid-build astrid-emit astrid-storage-provider-fuse; do
-  printf '#!/bin/sh\necho %s\n' "$binary" > "$runtime_root/$binary"
+  if [ "$binary" = astrid ]; then
+    cat > "$runtime_root/$binary" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = setup ]; then
+  if [ -n "${AOS_TEST_SETUP_OBSERVED:-}" ]; then
+    printf '%s\n%s\n%s\n' "${ASTRID_HOME:-}" "${ASTRID_RUN_DIR:-}" "${PATH%%:*}" \
+      > "$AOS_TEST_SETUP_OBSERVED"
+  fi
+  exit "${AOS_TEST_SETUP_EXIT:-0}"
+fi
+echo astrid
+EOF
+  else
+    printf '#!/bin/sh\necho %s\n' "$binary" > "$runtime_root/$binary"
+  fi
   chmod 755 "$runtime_root/$binary"
 done
 COPYFILE_DISABLE=1 tar -czf "$work/runtime.tar.gz" -C "$work" "$(basename "$runtime_root")"
@@ -433,9 +441,10 @@ grep -F 'Installed Unicity AOS 2026.9.3, but Linux host setup is incomplete.' \
 grep -F "rerun $preflight_home/.aos/bin/aos setup" "$work/preflight-fail.out" >/dev/null
 test -x "$preflight_home/.aos/bin/aos"
 test -x "$preflight_home/.aos/releases/2026.9.3/runtime/bin/astrid"
-test "$(sed -n '1p' "$work/preflight-observed")" = "$preflight_home/.aos"
-test "$(sed -n '2p' "$work/preflight-observed")" = \
-  "$preflight_home/.aos/releases/2026.9.3/runtime/bin/astrid"
+test "$(sed -n '1p' "$work/preflight-observed")" = "$preflight_home/.aos/runtime"
+test "$(sed -n '2p' "$work/preflight-observed")" = "$preflight_home/.aos/run"
+test "$(sed -n '3p' "$work/preflight-observed")" = \
+  "$preflight_home/.aos/releases/2026.9.3/runtime/bin"
 test ! -e "$preflight_home/.aos/update/install.lock"
 test -z "$(find "$preflight_home/.aos/releases" -maxdepth 1 \
   \( -name '.2026.9.3.rollback.*' -o -name '.2026.9.3.new.*' \) -print)"
