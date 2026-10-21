@@ -1,0 +1,163 @@
+schema-version = 1
+kind = "aos-ce-station-seed"
+status = "proposal-incomplete"
+
+[station]
+station-id = "aos"
+pages-base-url = "https://unicity-aos.github.io/station/v1"
+reserved-namespace = "aos" # allowlist scope only; no namespace claim is emitted
+
+[source]
+repository = "https://github.com/unicity-aos/aos-ce"
+repository-slug = "unicity-aos/aos-ce"
+github-owner-id = 261740341
+github-repository-id = 1298696137
+commit = "efaa39f3f0ba80cf2c24985fd4383d8d73dd801a"
+tree = "46a8a976d54eb82ac922c56ae41d713595895ff5"
+tag = "2026.1.3"
+workflow-identity = "https://github.com/unicity-aos/aos-ce/.github/workflows/release.yml@refs/tags/2026.1.3"
+workflow-issuer = "https://token.actions.githubusercontent.com"
+
+# These 19 entries are an allowlist check only.  The adapter reads package.name
+# and package.version from each exact tagged Capsule.toml and rejects any
+# mismatch before prepare_v2; this file is never a record source.
+[[seed]]
+directory = "capsule-cli"
+package = "aos-cli"
+version = "0.2.0"
+coordinate = "@aos/aos-cli@0.2.0"
+
+[[seed]]
+directory = "capsule-registry"
+package = "aos-registry"
+version = "0.2.0"
+coordinate = "@aos/aos-registry@0.2.0"
+
+[[seed]]
+directory = "capsule-openai-compat"
+package = "aos-openai-compat"
+version = "0.2.0"
+coordinate = "@aos/aos-openai-compat@0.2.0"
+
+[[seed]]
+directory = "capsule-react"
+package = "aos-react"
+version = "0.2.2"
+coordinate = "@aos/aos-react@0.2.2"
+
+[[seed]]
+directory = "capsule-session"
+package = "aos-session"
+version = "0.2.0"
+coordinate = "@aos/aos-session@0.2.0"
+
+[[seed]]
+directory = "capsule-identity"
+package = "aos-identity"
+version = "0.2.0"
+coordinate = "@aos/aos-identity@0.2.0"
+
+[[seed]]
+directory = "capsule-users"
+package = "aos-users"
+version = "0.1.0"
+coordinate = "@aos/aos-users@0.1.0"
+
+[[seed]]
+directory = "capsule-router"
+package = "aos-router"
+version = "0.2.0"
+coordinate = "@aos/aos-router@0.2.0"
+
+[[seed]]
+directory = "capsule-prompt-builder"
+package = "aos-prompt-builder"
+version = "0.2.0"
+coordinate = "@aos/aos-prompt-builder@0.2.0"
+
+[[seed]]
+directory = "capsule-context-engine"
+package = "aos-context-engine"
+version = "0.2.0"
+coordinate = "@aos/aos-context-engine@0.2.0"
+
+[[seed]]
+directory = "capsule-hook-bridge"
+package = "aos-hook-bridge"
+version = "0.2.0"
+coordinate = "@aos/aos-hook-bridge@0.2.0"
+
+[[seed]]
+directory = "capsule-shell"
+package = "aos-shell"
+version = "0.2.0"
+coordinate = "@aos/aos-shell@0.2.0"
+
+[[seed]]
+directory = "capsule-http"
+package = "aos-http"
+version = "0.1.1"
+coordinate = "@aos/aos-http@0.1.1"
+
+[[seed]]
+directory = "capsule-fs"
+package = "aos-fs"
+version = "0.2.0"
+coordinate = "@aos/aos-fs@0.2.0"
+
+[[seed]]
+directory = "capsule-system"
+package = "aos-system"
+version = "0.2.0"
+coordinate = "@aos/aos-system@0.2.0"
+
+[[seed]]
+directory = "capsule-forge"
+package = "aos-forge"
+version = "0.1.0"
+coordinate = "@aos/aos-forge@0.1.0"
+
+[[seed]]
+directory = "capsule-skills"
+package = "aos-skills"
+version = "0.2.0"
+coordinate = "@aos/aos-skills@0.2.0"
+
+[[seed]]
+directory = "capsule-agents"
+package = "aos-agents"
+version = "0.2.0"
+coordinate = "@aos/aos-agents@0.2.0"
+
+[[seed]]
+directory = "capsule-memory"
+package = "aos-memory"
+version = "0.2.0"
+coordinate = "@aos/aos-memory@0.2.0"
+
+[[blocked]]
+directory = "capsule-mcp"
+package = "aos-mcp"
+reason = "current-main extra; wait for a new signed versioned AOS release"
+
+[[blocked]]
+directory = "capsule-hook-adapter-oracle"
+package = "aos-hook-adapter-oracle"
+reason = "current-main extra; wait for a new signed versioned AOS release"
+
+[[blocked]]
+directory = "capsule-meta-harness"
+package = "aos-meta-harness"
+reason = "current-main extra; wait for a new signed versioned AOS release"
+
+[[excluded]]
+package = "aos-openai"
+reason = "not in the 2026.1.3 community seed"
+
+[[excluded]]
+package = "aos-telegram"
+reason = "not in the 2026.1.3 community seed"
+
+[[excluded]]
+package = "astrid-capsule-*"
+reason = "legacy standalone identity; never an AOS CE seed coordinate"
