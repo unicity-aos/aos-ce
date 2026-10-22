@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import base64
+import struct
 import subprocess
 import tarfile
 import tomllib
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -14,6 +18,12 @@ LOCK_PATH = ROOT / "assets/linux-vcpu.lock"
 LINUX_SOURCES_LOCK_PATH = ROOT / "linux/SOURCES.lock"
 SOURCE_SHA_SECTION_NAME = b"aos_source_sha"
 EXPECTED_BUILDER_OCI = "ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b"
+PROVENANCE_MEMBER = "Capsule.provenance.json"
+PROVENANCE_SCHEMA_VERSION = 1
+PROVENANCE_ALGORITHM = "ed25519-blake3-tree-v1"
+PROVENANCE_CONTENT_DOMAIN = b"astrid:capsule-content:v1\0"
+PROVENANCE_SIGNATURE_DOMAIN = b"astrid:capsule-provenance:v1\0"
+_ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 
 
 class LineageError(RuntimeError):
@@ -163,16 +173,52 @@ def archive_members(path: Path) -> dict[str, tuple[tarfile.TarInfo, bytes]]:
     try:
         with tarfile.open(path, mode="r:gz") as archive:
             for info in archive:
+                validate_archive_member_name(info.name)
                 if info.isdir():
                     continue
                 if not info.isreg():
                     raise LineageError(f"builder emitted non-regular member {info.name}")
+                if info.pax_headers:
+                    raise LineageError(f"builder member {info.name} has PAX metadata")
                 if info.name in members:
                     raise LineageError(f"builder emitted duplicate member {info.name}")
+                if info.name == PROVENANCE_MEMBER and info.size > 64 * 1024:
+                    raise LineageError("builder provenance envelope exceeds 64 KiB")
                 members[info.name] = (info, archive.extractfile(info).read())
     except (OSError, tarfile.TarError) as error:
         raise LineageError(f"invalid builder archive {path}: {error}") from error
     return members
+
+
+def read_pinned_source_member(path: Path, root: Path) -> bytes:
+    """Read a regular checkout member without following symlinks below the root."""
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise LineageError(f"source member is outside the checkout: {path}") from error
+    if not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        raise LineageError(f"invalid source member path: {path}")
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise LineageError(f"source member path contains a symlink: {path}")
+    if not path.is_file():
+        raise LineageError(f"missing declared source member: {path}")
+    return path.read_bytes()
+
+
+def validate_archive_member_name(name: str) -> None:
+    """Use the same fail-closed canonical path shape as Astrid archives."""
+    if (
+        not name
+        or name.startswith("/")
+        or "\\" in name
+        or "\0" in name
+        or any(part in ("", ".", "..") for part in name.split("/"))
+        or (len(name) >= 2 and name[0].isalpha() and name[1] == ":")
+    ):
+        raise LineageError(f"non-canonical capsule member path: {name}")
 
 
 def declared_members(spec: dict) -> list[str]:
@@ -191,8 +237,138 @@ def declared_members(spec: dict) -> list[str]:
 
 
 def expected_builder_members(spec: dict) -> set[str]:
-    expected = {"Capsule.toml", *declared_members(spec), LOCK_PATH.relative_to(ROOT).as_posix()}
+    expected = {
+        "Capsule.toml",
+        *declared_members(spec),
+        LOCK_PATH.relative_to(ROOT).as_posix(),
+        PROVENANCE_MEMBER,
+    }
     return expected
+
+
+def _hex_bytes(value: object, length: int, label: str) -> bytes:
+    if (
+        not isinstance(value, str)
+        or len(value) != length * 2
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise LineageError(f"provenance {label} must be {length * 2} lowercase hex characters")
+    return bytes.fromhex(value)
+
+
+def _base64_bytes(value: object, length: int, label: str) -> bytes:
+    if not isinstance(value, str):
+        raise LineageError(f"provenance {label} must be base64 text")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, base64.binascii.Error) as error:
+        raise LineageError(f"provenance {label} is not canonical base64") from error
+    if len(decoded) != length:
+        raise LineageError(f"provenance {label} must decode to {length} bytes")
+    return decoded
+
+
+def content_tree_digest(members: dict[str, bytes]) -> str:
+    """Mirror the Astrid canonical member-tree digest contract."""
+    framed = bytearray(PROVENANCE_CONTENT_DOMAIN)
+    for name in sorted(members):
+        data = members[name]
+        path = name.encode("utf-8")
+        framed.extend(struct.pack("<Q", len(path)))
+        framed.extend(path)
+        framed.extend(struct.pack("<Q", len(data)))
+        framed.extend(bytes.fromhex(blake3_bytes(data)))
+    return blake3_bytes(framed)
+
+
+def _verify_ed25519(public_key: bytes, message: bytes, signature: bytes) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        public_path = root / "public.spki"
+        message_path = root / "message.bin"
+        signature_path = root / "signature.bin"
+        public_path.write_bytes(_ED25519_SPKI_PREFIX + public_key)
+        message_path.write_bytes(message)
+        signature_path.write_bytes(signature)
+        try:
+            result = subprocess.run(
+                [
+                    "openssl",
+                    "pkeyutl",
+                    "-verify",
+                    "-pubin",
+                    "-keyform",
+                    "DER",
+                    "-inkey",
+                    str(public_path),
+                    "-rawin",
+                    "-in",
+ str(message_path),
+                    "-sigfile",
+ str(signature_path),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        except OSError as error:
+            raise LineageError(f"unable to run OpenSSL Ed25519 verifier: {error}") from error
+        if result.returncode != 0:
+            raise LineageError(
+                "provenance signature verification failed: "
+                f"{result.stdout.strip()} {result.stderr.strip()}".strip()
+            )
+
+
+def verify_builder_provenance(
+    members: dict[str, tuple[tarfile.TarInfo, bytes]],
+    *,
+    expected_signer: str,
+    label: str = "builder",
+) -> dict:
+    """Verify the builder envelope against its own archive, then discard it."""
+    if PROVENANCE_MEMBER not in members:
+        raise LineageError(f"{label} archive is missing {PROVENANCE_MEMBER}")
+    _, envelope_bytes = members[PROVENANCE_MEMBER]
+    if len(envelope_bytes) > 64 * 1024:
+        raise LineageError(f"{label} provenance envelope exceeds 64 KiB")
+    try:
+        envelope = json.loads(envelope_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise LineageError(f"invalid {label} provenance envelope: {error}") from error
+    if not isinstance(envelope, dict):
+        raise LineageError(f"{label} provenance envelope must be an object")
+    if (
+        envelope.get("schema_version") != PROVENANCE_SCHEMA_VERSION
+        or envelope.get("algorithm") != PROVENANCE_ALGORITHM
+    ):
+        raise LineageError(f"unsupported {label} provenance schema or algorithm")
+    content_digest = envelope.get("content_digest")
+    if not isinstance(content_digest, str):
+        raise LineageError(f"{label} provenance content digest must be a string")
+    _hex_bytes(content_digest, 32, "content digest")
+    signer = _base64_bytes(envelope.get("signer"), 32, "signer")
+    if signer != _base64_bytes(expected_signer, 32, "expected signer"):
+        raise LineageError(f"{label} signer differs from the trusted signer pin")
+    signature = _base64_bytes(envelope.get("signature"), 64, "signature")
+    builder_content = {
+        name: data for name, (_, data) in members.items() if name != PROVENANCE_MEMBER
+    }
+    actual_digest = content_tree_digest(builder_content)
+    if content_digest != actual_digest:
+        raise LineageError(
+            f"{label} provenance digest mismatch: expected {content_digest}, "
+            f"got {actual_digest}"
+        )
+    message = PROVENANCE_SIGNATURE_DOMAIN + content_digest.encode("ascii")
+    _verify_ed25519(signer, message, signature)
+    return {
+        "schema_version": envelope["schema_version"],
+        "algorithm": envelope["algorithm"],
+        "content_digest": content_digest,
+        "signer": envelope["signer"],
+        "signature": envelope["signature"],
+    }
 
 
 def validate_declared_hashes(spec: dict, content_by_path: dict[str, bytes]) -> None:

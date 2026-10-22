@@ -17,13 +17,18 @@ fi
 
 export COPYFILE_DISABLE=1
 export SOURCE_DATE_EPOCH=0
+: "${AOS_BUILDER_SIGNER:?set AOS_BUILDER_SIGNER to the pinned builder public key}"
 
-validator_args=()
+validator_args=(--builder "$builder" --builder-signer "$AOS_BUILDER_SIGNER")
 if [[ -n "${AOS_SOURCE_SHA:-}" ]]; then
-  validator_args=(--source-sha "$AOS_SOURCE_SHA")
+  validator_args+=(--source-sha "$AOS_SOURCE_SHA")
 fi
 
 python3 "$realm_root/scripts/canonical_package.py" \
   --builder "$builder" \
+  --builder-signer "$AOS_BUILDER_SIGNER" \
+  --allow-unsigned \
   --output "$output"
-python3 "$realm_root/scripts/validate_capsule.py" "$output" "${validator_args[@]}"
+python3 "$realm_root/scripts/validate_capsule.py" "$output" \
+  --lineage "$output.lineage.json" \
+  "${validator_args[@]}"

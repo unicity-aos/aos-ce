@@ -17,18 +17,22 @@ from lineage import (
     LineageError,
     LOCK_PATH,
     MANIFEST_PATH,
+    PROVENANCE_MEMBER,
     ROOT,
     archive_members,
     blake3_bytes,
     blake3_file,
+    content_tree_digest,
     declared_members,
     expected_builder_members,
     manifest,
+    read_pinned_source_member,
     locked_builder_metadata,
     source_sha_custom_section,
     sha256_bytes,
     sha256_file,
     validate_declared_hashes,
+    verify_builder_provenance,
 )
 
 
@@ -60,9 +64,20 @@ def embed_source_sha(wasm: bytes, expected_source_sha: str) -> bytes:
     return wasm[:8] + section + wasm[8:]
 
 
-def package(builder_path: Path, output_path: Path) -> dict:
+def package(
+    builder_path: Path,
+    output_path: Path,
+    *,
+    allow_unsigned: bool,
+    expected_builder_signer: str,
+) -> dict:
+    if not allow_unsigned:
+        raise LineageError("refusing to emit an unsigned canonical capsule")
     spec = manifest()
     builder = archive_members(builder_path)
+    builder_provenance = verify_builder_provenance(
+        builder, expected_signer=expected_builder_signer
+    )
     expected = expected_builder_members(spec)
     builder_names = set(builder)
 
@@ -79,21 +94,28 @@ def package(builder_path: Path, output_path: Path) -> dict:
     if missing:
         raise LineageError(f"builder is missing members: {sorted(missing)}")
 
+    selected_source_sha = source_sha()
     content: dict[str, bytes] = {}
     for name in sorted(expected):
-        if name == "Capsule.toml":
-            content[name] = MANIFEST_PATH.read_bytes()
+        if name == PROVENANCE_MEMBER:
+            # The builder signature covers the builder tree, not this canonical
+            # tree. It was verified above and is deliberately never carried.
+            continue
+        elif name == "Capsule.toml":
+            content[name] = read_pinned_source_member(MANIFEST_PATH, ROOT)
         elif name == "aos_linux_realm.wasm":
-            content[name] = embed_source_sha(builder[name][1], source_sha())
+            content[name] = embed_source_sha(builder[name][1], selected_source_sha)
         elif name == LOCK_PATH.relative_to(ROOT).as_posix():
-            content[name] = LOCK_PATH.read_bytes()
+            content[name] = read_pinned_source_member(LOCK_PATH, ROOT)
         elif name.startswith("wit/"):
             content[name] = builder[name][1]
         else:
             source = ROOT / name
-            if not source.is_file():
-                raise LineageError(f"missing declared source member: {name}")
-            content[name] = source.read_bytes()
+            content[name] = read_pinned_source_member(source, ROOT)
+
+        if name != "aos_linux_realm.wasm" and not name.startswith("wit/"):
+            if content[name] != builder[name][1]:
+                raise LineageError(f"builder member differs from pinned source: {name}")
 
     validate_declared_hashes(spec, content)
 
@@ -142,8 +164,14 @@ def package(builder_path: Path, output_path: Path) -> dict:
     }
     return {
         "format": "aos-linux-realm-private-lineage-1",
-        "source_sha": source_sha(),
+        "source_sha": selected_source_sha,
         "builder": locked_builder_metadata(),
+        "builder_provenance": builder_provenance,
+        "canonical_provenance": {
+            "state": "unsigned",
+            "reason": "controlled astrid archive-signing command is pending",
+        },
+        "unsigned_content_digest": content_tree_digest(content),
         "builder_archive": {
             "blake3": blake3_file(builder_path),
             "sha256": sha256_file(builder_path),
@@ -169,10 +197,34 @@ def main() -> int:
         type=Path,
         default=ROOT / "dist/aos-linux-realm.capsule",
     )
+    parser.add_argument(
+        "--allow-unsigned",
+        action="store_true",
+        help=(
+            "emit the QA canonical archive without a final Astrid signature; "
+            "release packaging must wait for the supported archive signer"
+        ),
+    )
+    parser.add_argument(
+        "--builder-signer",
+        required=True,
+        help="trusted builder Ed25519 public key as canonical base64",
+    )
     args = parser.parse_args()
 
     try:
-        lineage = package(args.builder.resolve(), args.output.resolve())
+        if not args.allow_unsigned:
+            raise LineageError(
+                "canonical capsules are unsigned until Astrid provides an "
+                "archive-signing command; pass --allow-unsigned only for the "
+                "QA artifact"
+            )
+        lineage = package(
+            args.builder.resolve(),
+            args.output.resolve(),
+            allow_unsigned=True,
+            expected_builder_signer=args.builder_signer,
+        )
     except LineageError as error:
         print(f"error: {error}", file=os.sys.stderr)
         return 2
@@ -180,7 +232,7 @@ def main() -> int:
     lineage_path = args.output.with_suffix(args.output.suffix + ".lineage.json")
     lineage_path.write_text(json.dumps(lineage, indent=2, sort_keys=True) + "\n")
     print(
-        f"canonical capsule: {args.output} bytes={lineage['capsule']['bytes']} "
+        f"unsigned canonical QA capsule: {args.output} bytes={lineage['capsule']['bytes']} "
         f"blake3={lineage['capsule']['blake3']} sha256={lineage['capsule']['sha256']}"
     )
     return 0
