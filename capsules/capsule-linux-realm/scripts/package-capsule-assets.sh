@@ -24,7 +24,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$mode" == "check" ]]; then
-  exec python3 "$realm_root/scripts/validate_capsule.py"
+  : "${AOS_BUILDER_SIGNER:?set AOS_BUILDER_SIGNER to the pinned builder public key}"
+  exec python3 "$realm_root/scripts/validate_capsule.py" \
+    --builder "$builder" --builder-signer "$AOS_BUILDER_SIGNER"
 fi
 
 if [[ ! -f "$builder" ]]; then
@@ -35,4 +37,9 @@ fi
 
 export COPYFILE_DISABLE=1
 export SOURCE_DATE_EPOCH=0
-exec python3 "$realm_root/scripts/canonical_package.py" --builder "$builder"
+: "${AOS_BUILDER_SIGNER:?set AOS_BUILDER_SIGNER to the pinned builder public key}"
+echo "packaging unsigned canonical QA capsule (Astrid archive signer pending)" >&2
+exec python3 "$realm_root/scripts/canonical_package.py" \
+  --builder "$builder" \
+  --builder-signer "$AOS_BUILDER_SIGNER" \
+  --allow-unsigned

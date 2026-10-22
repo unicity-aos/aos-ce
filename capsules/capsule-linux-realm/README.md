@@ -500,11 +500,11 @@ cargo check -p aos-linux-realm --target wasm32-unknown-unknown
 (
   cd capsules/capsule-linux-realm
   aos capsule build --output build-output
+  # Supply the trusted public key from an independently approved builder receipt.
+  export AOS_BUILDER_SIGNER='<approved base64 Ed25519 builder public key>'
   ./scripts/package-capsule-assets.sh
   ./scripts/package-capsule-assets.sh --check
 )
-astrid --principal default capsule install \
-  capsules/capsule-linux-realm/dist/aos-linux-realm.capsule
 ```
 
 The signed worker uses Rust's tier-3 `wasm64-unknown-unknown` target. Rustup does
@@ -519,8 +519,14 @@ but its archive metadata is platform-dependent. The Linux Realm script replaces
 that metadata with zeroed time and owner fields, stable modes, sorted regular
 members, and no filesystem-specific attributes. It also records the source
 commit and every member digest in a private lineage manifest. The companion
-validator rejects a missing, stale, or extra member and does not use the public
-community-capsule allowlist validator.
+validator rejects a missing, stale, or extra member, compares locally selected
+assets with the signed builder bytes, and rechecks the builder signature against
+the independently pinned builder key. The canonical output is explicitly
+unsigned QA material until a final archive-signing command signs its member
+tree; it is not a normal installation or release artifact. An isolated install
+test can use the direct builder-signed archive with explicit trust approval,
+which does not substitute for canonical release packaging. This path does not
+use the public community-capsule allowlist validator.
 
 The installed realm appears as the single `realm_shell` MCP tool when an Astrid
 MCP broker such as `aos-mcp` is present and `astrid --principal default mcp

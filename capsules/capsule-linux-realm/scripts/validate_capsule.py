@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -16,12 +17,21 @@ from lineage import (
     LineageError,
     LOCK_PATH,
     MANIFEST_PATH,
+    PROVENANCE_ALGORITHM,
+    PROVENANCE_MEMBER,
+    PROVENANCE_SCHEMA_VERSION,
     ROOT,
     blake3_file,
     blake3_bytes,
+    content_tree_digest,
     declared_members,
     locked_builder_metadata,
     read_source_sha_section,
+    read_pinned_source_member,
+    archive_members,
+    validate_archive_member_name,
+    sha256_file,
+    verify_builder_provenance,
 )
 
 FORBIDDEN_CONTROLLER_PATHS = (
@@ -46,7 +56,8 @@ def current_source_sha() -> str:
 
 
 def validate_gzip_header(path: Path) -> None:
-    header = path.open("rb").read(10)
+    with path.open("rb") as stream:
+        header = stream.read(10)
     if len(header) != 10 or header[:2] != b"\x1f\x8b" or header[2] != 8:
         raise LineageError("capsule is not a gzip file")
     if header[3] != 0:
@@ -62,12 +73,15 @@ def read_members(path: Path) -> dict[str, bytes]:
     try:
         with tarfile.open(path, mode="r:gz") as archive:
             for info in archive:
+                validate_archive_member_name(info.name)
                 if not info.isreg():
                     raise LineageError(f"non-regular capsule member {info.name}")
                 if info.pax_headers:
                     raise LineageError(f"capsule member {info.name} has PAX metadata")
                 if info.name in members:
                     raise LineageError(f"duplicate capsule member {info.name}")
+                if info.name == PROVENANCE_MEMBER and info.size > 64 * 1024:
+                    raise LineageError("canonical provenance envelope exceeds 64 KiB")
                 if (
                     info.mode != 0o644
                     or info.uid != 0
@@ -86,10 +100,98 @@ def read_members(path: Path) -> dict[str, bytes]:
     return members
 
 
+def _hex_field(value: object, length: int, label: str) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) != length * 2
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise LineageError(f"lineage {label} must be {length * 2} lowercase hex characters")
+
+
+def _base64_field(value: object, length: int, label: str) -> None:
+    if not isinstance(value, str):
+        raise LineageError(f"lineage {label} must be base64 text")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, base64.binascii.Error) as error:
+        raise LineageError(f"lineage {label} is not canonical base64") from error
+    if len(decoded) != length:
+        raise LineageError(f"lineage {label} must decode to {length} bytes")
+
+
+def validate_provenance(
+    lineage: dict,
+    members: dict[str, bytes],
+    builder_path: Path,
+    expected_builder_signer: str,
+    expected_canonical_signer: str | None,
+) -> None:
+    builder = lineage.get("builder_provenance")
+    if not isinstance(builder, dict):
+        raise LineageError("lineage is missing verified builder provenance")
+    if (
+        builder.get("schema_version") != PROVENANCE_SCHEMA_VERSION
+        or builder.get("algorithm") != PROVENANCE_ALGORITHM
+    ):
+        raise LineageError("lineage builder provenance schema is unsupported")
+    _hex_field(builder.get("content_digest"), 32, "builder content digest")
+    _base64_field(builder.get("signer"), 32, "builder signer")
+    _base64_field(builder.get("signature"), 64, "builder signature")
+    recorded_builder_archive = lineage.get("builder_archive")
+    if not isinstance(recorded_builder_archive, dict) or (
+        recorded_builder_archive.get("blake3") != blake3_file(builder_path)
+        or recorded_builder_archive.get("sha256") != sha256_file(builder_path)
+    ):
+        raise LineageError("builder archive differs from lineage")
+    actual_builder = verify_builder_provenance(
+        archive_members(builder_path), expected_signer=expected_builder_signer
+    )
+    if actual_builder != builder:
+        raise LineageError("builder provenance differs from the verified builder archive")
+
+    canonical = lineage.get("canonical_provenance")
+    if not isinstance(canonical, dict):
+        raise LineageError("lineage is missing canonical provenance state")
+    state = canonical.get("state")
+    content = {
+        name: data for name, data in members.items() if name != PROVENANCE_MEMBER
+    }
+    unsigned_digest = lineage.get("unsigned_content_digest")
+    if not isinstance(unsigned_digest, str):
+        raise LineageError("lineage is missing the unsigned content digest")
+    if content_tree_digest(content) != unsigned_digest:
+        raise LineageError("capsule content differs from the unsigned lineage digest")
+
+    if state == "unsigned":
+        if PROVENANCE_MEMBER in members:
+            raise LineageError("unsigned canonical capsule unexpectedly contains provenance")
+        return
+    if state != "signed":
+        raise LineageError("unsupported canonical provenance state")
+    if PROVENANCE_MEMBER not in members:
+        raise LineageError("signed canonical capsule is missing its provenance envelope")
+    if expected_canonical_signer is None:
+        raise LineageError("signed canonical capsule needs a trusted signer pin")
+    tar_members = {
+        name: (None, data) for name, data in members.items()
+    }
+    verified = verify_builder_provenance(
+        tar_members, label="canonical", expected_signer=expected_canonical_signer
+    )
+    if canonical != {"state": "signed", **verified}:
+        raise LineageError("canonical provenance differs from the lineage record")
+    if verified["content_digest"] != unsigned_digest:
+        raise LineageError("signed provenance does not cover the recorded canonical tree")
+
+
 def validate(
     artifact: Path,
     lineage_path: Path,
     expected_source_sha: str,
+    builder_path: Path,
+    expected_builder_signer: str,
+    expected_canonical_signer: str | None = None,
 ) -> dict:
     try:
         lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
@@ -107,7 +209,7 @@ def validate(
         raise LineageError("lineage builder OCI or toolchain pins differ from source locks")
 
     recorded = lineage.get("capsule", {})
-    actual_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    actual_sha256 = sha256_file(artifact)
     actual_blake3 = blake3_file(artifact)
     if (
         artifact.stat().st_size != recorded.get("bytes")
@@ -117,6 +219,9 @@ def validate(
         raise LineageError("capsule digest differs from private lineage manifest")
 
     members = read_members(artifact)
+    validate_provenance(
+        lineage, members, builder_path, expected_builder_signer, expected_canonical_signer
+    )
     expected_members = lineage.get("members", {})
     if set(members) != set(expected_members):
         raise LineageError(
@@ -131,9 +236,9 @@ def validate(
         if len(content) != expected.get("bytes") or content_sha256 != expected.get("sha256") or content_blake3 != expected.get("blake3"):
             raise LineageError(f"stale capsule member {name}")
 
-    if members["Capsule.toml"] != MANIFEST_PATH.read_bytes():
+    if members["Capsule.toml"] != read_pinned_source_member(MANIFEST_PATH, ROOT):
         raise LineageError("embedded Capsule.toml differs from source manifest")
-    if members[LOCK_PATH.relative_to(ROOT).as_posix()] != LOCK_PATH.read_bytes():
+    if members[LOCK_PATH.relative_to(ROOT).as_posix()] != read_pinned_source_member(LOCK_PATH, ROOT):
         raise LineageError("embedded linux-vcpu.lock differs from source lock")
     controller = members["aos_linux_realm.wasm"]
     embedded_source_sha = read_source_sha_section(controller)
@@ -154,7 +259,7 @@ def validate(
         if path == "aos_linux_realm.wasm":
             continue
         source = ROOT / path
-        if not source.is_file() or source.read_bytes() != members[path]:
+        if read_pinned_source_member(source, ROOT) != members[path]:
             raise LineageError(f"capsule member {path} differs from source")
 
     return {
@@ -173,13 +278,23 @@ def main() -> int:
         default=ROOT / "dist/aos-linux-realm.capsule.lineage.json",
     )
     parser.add_argument("--source-sha", type=str)
+    parser.add_argument("--builder", required=True, type=Path)
+    parser.add_argument("--builder-signer", required=True)
+    parser.add_argument("--canonical-signer")
     args = parser.parse_args()
 
     artifact = args.artifact.resolve()
     lineage_path = args.lineage.resolve()
     try:
         source_sha = args.source_sha or current_source_sha()
-        result = validate(artifact, lineage_path, source_sha)
+        result = validate(
+            artifact,
+            lineage_path,
+            source_sha,
+            args.builder.resolve(),
+            args.builder_signer,
+            args.canonical_signer,
+        )
     except LineageError as error:
         print(f"error: {error}", file=os.sys.stderr)
         return 2
