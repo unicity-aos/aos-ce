@@ -620,7 +620,7 @@ impl AosHome {
     }
 
     fn ensure_runtime_executable(&self, binary: &Path, label: &str) -> io::Result<()> {
-        let metadata = fs::metadata(binary).map_err(|error| {
+        let metadata = fs::symlink_metadata(binary).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 io::Error::new(
                     io::ErrorKind::NotFound,
@@ -633,6 +633,15 @@ impl AosHome {
                 error
             }
         })?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "bundled {label} executable must not be a symlink at {}",
+                    binary.display()
+                ),
+            ));
+        }
         if !metadata.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1295,6 +1304,35 @@ done
                 .contains("astrid-daemon executable is not executable")
         );
         fs::remove_dir_all(fixture).expect("remove foreground daemon fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_inventory_rejects_a_symlinked_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
+
+        let fixture = temporary_home();
+        let home = AosHome::from_root(&fixture);
+        install_capsule_fixtures(home.root());
+        install_runtime_inventory(&home);
+
+        let outside = fixture.join("outside-astrid");
+        fs::write(&outside, b"#!/bin/sh\nexit 0\n").expect("write external executable");
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700))
+            .expect("make external target executable");
+
+        let bundled = home.runtime_binary();
+        fs::remove_file(&bundled).expect("remove regular bundled astrid");
+        symlink(&outside, &bundled).expect("replace bundled astrid with symlink");
+
+        let error = home
+            .ensure_runtime_available()
+            .expect_err("symlinked runtime executable must fail closed");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("must not be a symlink"));
+        fs::remove_dir_all(fixture).expect("remove symlinked runtime fixture");
     }
 
     #[test]
