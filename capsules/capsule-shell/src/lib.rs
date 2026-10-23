@@ -261,14 +261,51 @@ fn split_on_background_operator(segment: &str) -> Vec<&str> {
     parts
 }
 
+/// Wrapper utilities that delegate execution to a subsequent command token.
+const COMMAND_WRAPPERS: &[&str] = &["sudo", "env", "command", "nohup", "nice", "exec", "time"];
+
+/// Strip surrounding single or double quotes from a shell token.
+fn unquote_token(token: &str) -> &str {
+    token.trim_matches(|c| c == '"' || c == '\'')
+}
+
+/// Extract the bare executable name from a potentially quoted or path-qualified token.
+fn program_basename(token: &str) -> &str {
+    let unquoted = unquote_token(token);
+    unquoted.rsplit('/').next().unwrap_or(unquoted)
+}
+
+/// Advance past leading `KEY=VALUE` assignments and command wrappers (`sudo`, `env`, etc.).
+fn strip_wrappers<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    let mut idx = 0;
+    while idx < tokens.len() {
+        let token = unquote_token(tokens[idx]);
+        if token.contains('=') && !token.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        let base = program_basename(token);
+        if COMMAND_WRAPPERS.contains(&base) {
+            idx += 1;
+            while idx < tokens.len() && unquote_token(tokens[idx]).starts_with('-') {
+                idx += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    &tokens[idx..]
+}
+
 /// Check a single command (no shell operators) for catastrophic patterns.
 fn check_single_command_catastrophic(command: &str) -> Option<&'static str> {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let raw_tokens: Vec<&str> = command.split_whitespace().collect();
+    let tokens = strip_wrappers(&raw_tokens);
     if tokens.is_empty() {
         return None;
     }
 
-    let program = tokens[0];
+    let program = program_basename(tokens[0]);
 
     // Unconditionally blocked commands
     if BLOCKED_COMMANDS.contains(&program) {
@@ -278,14 +315,26 @@ fn check_single_command_catastrophic(command: &str) -> Option<&'static str> {
     }
 
     // dd targeting block devices
-    if program == "dd" && tokens.iter().any(|t| t.starts_with("of=/dev/")) {
+    if program == "dd"
+        && tokens[1..].iter().any(|t| {
+            unquote_token(t)
+                .strip_prefix("of=")
+                .is_some_and(|path| normalize_shell_path(path).starts_with("/dev/"))
+        })
+    {
         return Some("Writing directly to block devices via dd is blocked.");
     }
 
     // chmod/chown -R on system paths
     if matches!(program, "chmod" | "chown")
-        && tokens.iter().any(|t| *t == "-R" || t.starts_with("-R"))
-        && tokens.iter().any(|t| is_protected_path(t))
+        && tokens[1..].iter().any(|t| {
+            let flag = unquote_token(t);
+            flag == "-R" || flag == "--recursive" || flag.starts_with("-R")
+        })
+        && tokens[1..]
+            .iter()
+            .filter(|t| !unquote_token(t).starts_with('-'))
+            .any(|t| is_protected_path(t))
     {
         return Some("Recursive permission changes on system paths are blocked.");
     }
@@ -293,7 +342,7 @@ fn check_single_command_catastrophic(command: &str) -> Option<&'static str> {
     // rm targeting protected paths (rm -rf /tmp/foo is fine, rm -rf / is not)
     if program == "rm" {
         for token in &tokens[1..] {
-            if token.starts_with('-') {
+            if unquote_token(token).starts_with('-') {
                 continue;
             }
             if is_protected_path(token) {
@@ -308,17 +357,54 @@ fn check_single_command_catastrophic(command: &str) -> Option<&'static str> {
     None
 }
 
+/// Strip quotes, expand home shortcuts, and resolve `.` / `..` components on
+/// absolute paths so `/tmp/..` and `/tmp/../etc` are recognized as `/` and `/etc`.
+fn normalize_shell_path(raw: &str) -> String {
+    let unquoted = unquote_token(raw);
+    let expanded = if unquoted == "~" || unquoted == "$HOME" || unquoted == "${HOME}" {
+        "/home/user".to_string()
+    } else if let Some(rest) = unquoted
+        .strip_prefix("~/")
+        .or_else(|| unquoted.strip_prefix("$HOME/"))
+        .or_else(|| unquoted.strip_prefix("${HOME}/"))
+    {
+        format!("/home/user/{rest}")
+    } else {
+        unquoted.to_string()
+    };
+
+    if !expanded.starts_with('/') {
+        return expanded;
+    }
+
+    let mut segments = Vec::new();
+    for segment in expanded.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment),
+        }
+    }
+
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    }
+}
+
 /// Check if a path is a protected system path.
 ///
 /// Matches exact paths and paths directly under protected roots.
 /// Does NOT block subdirectories of allowed workspace paths.
 fn is_protected_path(path: &str) -> bool {
+    let normalized = normalize_shell_path(path);
+    let path = normalized.as_str();
+
     // Exact match against protected paths
     if PROTECTED_PATHS.contains(&path) {
-        return true;
-    }
-    // Home directory shortcuts
-    if path == "~" || path == "$HOME" || path == "${HOME}" {
         return true;
     }
     // One level under protected roots: /usr/local is protected, /tmp/build is not
@@ -864,5 +950,38 @@ mod tests {
         assert!(check_catastrophic("cargo build --release").is_none());
         assert!(check_catastrophic("ls -la").is_none());
         assert!(check_catastrophic("cat /etc/hosts").is_none());
+    }
+
+    #[test]
+    fn catastrophic_quoted_protected_paths_blocked() {
+        assert!(check_catastrophic("rm -rf \"/\"").is_some());
+        assert!(check_catastrophic("rm -rf '/'").is_some());
+        assert!(check_catastrophic("rm -rf \"$HOME\"").is_some());
+        assert!(check_catastrophic("rm -rf \"${HOME}\"").is_some());
+        assert!(check_catastrophic("chmod -R 777 \"/etc\"").is_some());
+        assert!(check_catastrophic("dd if=/dev/zero of=\"/dev/sda\"").is_some());
+        assert!(check_catastrophic("dd if=/dev/zero \"of=/dev/sda\"").is_some());
+    }
+
+    #[test]
+    fn catastrophic_parent_traversal_into_protected_paths_blocked() {
+        assert!(check_catastrophic("rm -rf /tmp/..").is_some());
+        assert!(check_catastrophic("rm -rf /tmp/../etc").is_some());
+        assert!(check_catastrophic("rm -rf /tmp/../usr/local").is_some());
+        assert!(check_catastrophic("chmod -R 777 /tmp/../etc").is_some());
+        assert!(check_catastrophic("dd if=/dev/zero of=/tmp/../dev/sda").is_some());
+        // Traversal that stays inside /tmp remains allowed
+        assert!(check_catastrophic("rm -rf /tmp/a/../build").is_none());
+    }
+
+    #[test]
+    fn catastrophic_path_qualified_and_wrapped_commands_blocked() {
+        assert!(check_catastrophic("/bin/rm -rf /").is_some());
+        assert!(check_catastrophic("/sbin/shutdown -h now").is_some());
+        assert!(check_catastrophic("/usr/sbin/mkfs.ext4 /dev/sda1").is_some());
+        assert!(check_catastrophic("sudo rm -rf /").is_some());
+        assert!(check_catastrophic("sudo -n rm -rf /etc").is_some());
+        assert!(check_catastrophic("env rm -rf /").is_some());
+        assert!(check_catastrophic("command -p rm -rf /").is_some());
     }
 }
